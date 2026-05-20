@@ -1,0 +1,8 @@
+# 风控配置
+risk:
+  max_position_size: 0.1        # 单标的仓位上限 (占总资产%)
+  max_total_leverage: 1.0        # 最大总杠杆
+  max_loss_per_day: 0.02        # 单日最大亏损 (%)
+  max_drawdown: 0.1             # 最大回撤限制
+  max_orders_per_minute: 30     # 单分钟最大下单数
+  max_position_pct_per_symbol: 0.2  # 单标的持仓占比上限

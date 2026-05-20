@@ -1,0 +1,40 @@
+[project]
+name = "quant"
+version = "0.1.0"
+description = "Quantitative Trading System based on AKQuant"
+authors = [{name = "Quant Developer"}]
+requires-python = ">=3.9"
+dependencies = [
+    "akquant>=0.2.0",
+    "akshare>=1.10.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "pyarrow>=14.0.0",
+    "talib-binary>=0.4.19",
+    "scikit-learn>=1.3.0",
+    "plotly>=5.18.0",
+    "pyyaml>=6.0",
+    "python-dateutil>=2.8.0",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N"]
+ignore = ["E501"]

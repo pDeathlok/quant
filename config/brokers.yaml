@@ -1,0 +1,14 @@
+# 券商配置示例
+broker:
+  name: "模拟券商"
+  mode: "simulation"  # simulation / paper / live
+  commission_rate: 0.0003
+  min_commission: 5.0
+  slippage: 0.0
+
+# 实盘券商配置 (示例)
+live_broker:
+  name: "某券商"
+  account: "YOUR_ACCOUNT"
+  password: "YOUR_PASSWORD"
+  server: "交易服务器地址"

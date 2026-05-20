@@ -1,0 +1,15 @@
+# 策略配置示例
+strategies:
+  momentum:
+    fast_ma: 5
+    slow_ma: 20
+    holding_period: 5
+
+  mean_reversion:
+    lookback_period: 20
+    entry_threshold: 2.0
+    exit_threshold: 0.5
+
+  breakout:
+    lookback_period: 20
+    volume_multiplier: 1.5
