@@ -2,13 +2,63 @@
 # -*- coding: utf-8 -*-
 """
 因子库模块
+
+统一支持 Tushare 和 AKShare 数据源，通过数据适配器自动处理字段差异
 """
+
+# 数据适配器
+from .data_adapter import FactorDataAdapter, FactorDataLoader
+
+# 数据源配置
+from .data_source import (
+    DataSourceConfig,
+    DataSourceManager,
+    get_data_source_manager,
+    init_data_source
+)
 
 # 基类
 from .base import Factor, RollingFactor
 
-# 技术指标因子
+# 技术指标因子（仅导入实际存在的类）
 from .technical import (
+    MA,
+    EMA,
+    MACD,
+    RSI,
+    ATR,
+    BollingerBands,
+    KDJ,
+    WilliamsR,
+    BIAS,
+    PSY,
+    VR,
+    OBV,
+    CCI,
+    DMI,
+    ADX,
+    Momentum,
+    ROC,
+    Stochastic,
+    VolumeRatio,
+    Volatility,
+    DownsideVolatility,
+    IdiosyncraticVolatility,
+    EarningsQuality,
+    ROE,
+    ROA,
+    ROIC,
+    MarketCap,
+    PERatio,
+    PBRatio,
+    VWAP,
+    DonchianChannel,
+    KeltnerChannel,
+    ParabolicSAR,
+    EaseOfMovement,
+    ChaikinMoneyFlow,
+    MassIndex,
+    # 别名
     MAFactor,
     EMAFactor,
     MACDFactor,
@@ -24,79 +74,22 @@ from .technical import (
     CCIFactor,
     DMIFactor,
     ADXFactor,
-    TRIXFactor,
-    MASSFactor,
-    VIDYAFactor,
-    EOMFactor,
-    KSTFactor,
-    STC_Factor,
-    DeMarkerFactor,
-    RAVI_Factor,
-    ADLIndicatorFactor,
-    ChaikinOscillatorFactor,
-    PriceVolumeTrendFactor,
-    AccumulationDistributionFactor,
-    OnBalanceVolumeFactor,
+    MomentumFactor,
+    RateOfChangeFactor,
+    VolatilityFactor,
+    DownsideVolatilityFactor,
+    IdiosyncraticVolatilityFactor,
+    EarningsQualityFactor,
+    ROEStabilityFactor,
+    ProfitabilityFactor,
+    QualityScoreFactor,
     VolumeWeightedAveragePriceFactor,
-    AverageTrueRangeFactor,
-    BollingerBandsFactor,
     DonchianChannelFactor,
     KeltnerChannelFactor,
     ParabolicSARFactor,
-    IchimokuCloudFactor,
     EaseOfMovementFactor,
-    ForceIndexFactor,
-    ChandeMomentumOscillatorFactor,
-    UltimateOscillatorFactor,
-    StochasticRSIFactor,
-    WilliamsAccumulationDistributionFactor,
-    CoppockCurveFactor,
-    KnowSureThingFactor,
-    ElderRayIndexFactor,
-    HullMovingAverageFactor,
-    ZeroLagExponentialMovingAverageFactor,
-    VolumeWeightedMovingAverageFactor,
-    JurikMovingAverageFactor,
-    LeastSquaresMovingAverageFactor,
-    DoubleExponentialMovingAverageFactor,
-    TripleExponentialMovingAverageFactor,
-    VolumeRateOfChangeFactor,
-    PriceRateOfChangeFactor,
-    MassIndexFactor,
-    EhlerFisherTransformFactor,
-    InverseFisherTransformFactor,
-    RSI2Factor,
-    RSI7Factor,
-    RSI14Factor,
-    RSI21Factor,
-    BBANDSWidthFactor,
-    BBANDSPercentBFactor,
-    MACDSignalFactor,
-    MACDHistogramFactor,
-    MomentumFactor,
-    RateOfChangeFactor,
-    StochasticKFactor,
-    StochasticDFactor,
-    WilliamsPercentRFactor,
-    CommodityChannelIndexFactor,
-    AverageDirectionalIndexFactor,
-    DirectionalMovementIndexFactor,
-    ParabolicSARFactor,
-    ADLineFactor,
     ChaikinMoneyFlowFactor,
-    EaseOfMovementValueFactor,
-    ForceIndexValueFactor,
-    ChandeMomentumFactor,
-    UltimateOscillatorValueFactor,
-    StochasticRSIValueFactor,
-    CoppockCurveValueFactor,
-    ElderRayBullPowerFactor,
-    ElderRayBearPowerFactor,
-    VolumeProfileHighFactor,
-    VolumeProfileLowFactor,
-    VolumeProfileVolumeFactor,
-    VolumeProfileValueAreaFactor,
-    VolumeProfilePOCFactor,
+    MassIndexFactor,
 )
 
 # 动量/反转因子
@@ -174,6 +167,14 @@ __version__ = "1.0.0"
 
 # 导出所有模块
 __all__ = [
+    # 数据适配器和数据源
+    'FactorDataAdapter',
+    'FactorDataLoader',
+    'DataSourceConfig',
+    'DataSourceManager',
+    'get_data_source_manager',
+    'init_data_source',
+    
     # 基类
     'Factor',
     'RollingFactor',

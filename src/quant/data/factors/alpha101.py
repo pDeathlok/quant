@@ -49,11 +49,12 @@ class Alpha002Factor(RollingFactor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """(-1 * correlation(rank(delta(log(volume), 2)), rank(((close - open) / open)), 6))"""
+        # 使用标准字段名（数据已通过适配器自动适配）
         if 'open' not in df.columns:
             df['open'] = df['close'].shift(1)
         
-        # 计算log成交量的2日变化
-        log_vol = np.log(df['vol'])
+        # 计算log成交量的2日变化（使用标准字段 volume）
+        log_vol = np.log(df['volume'])
         delta_log_vol = log_vol.diff(2)
         
         # 计算开盘收益率
@@ -89,9 +90,9 @@ class Alpha003Factor(RollingFactor):
         if 'open' not in df.columns:
             df['open'] = df['close'].shift(1)
         
-        # 排名
+        # 排名（使用标准字段 volume）
         rank_open = df['open'].rank(pct=True)
-        rank_vol = df['vol'].rank(pct=True)
+        rank_vol = df['volume'].rank(pct=True)
         
         # 计算滚动协方差
         cov = pd.DataFrame({'open': rank_open, 'vol': rank_vol}).rolling(self.window).cov()
@@ -103,7 +104,7 @@ class Alpha003Factor(RollingFactor):
         return -cov_values.rank(pct=True)
 
 
-class Alpha004Factor(RollingFactor):
+class Alpha004Factor(Factor):
     """Alpha004: 成交量和价格变化的时序排名乘积"""
     
     def __init__(self):
@@ -111,8 +112,8 @@ class Alpha004Factor(RollingFactor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """(rank(ts_rank(volume, 3) * ts_rank((-1 * delta(close, 1)), 3)))"""
-        # 3天内成交量的时序排名
-        ts_rank_vol = df['vol'].rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
+        # 3天内成交量的时序排名（使用标准字段 volume）
+        ts_rank_vol = df['volume'].rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
         
         # 3天内负收益的时序排名
         neg_ret = -df['close'].diff(1)
@@ -175,7 +176,8 @@ class Alpha007Factor(RollingFactor):
                 return np.nan
             return stats.pearsonr(x[:, 0], x[:, 1])[0]
         
-        combined = pd.DataFrame({'high': df['high'], 'vol': df['vol']})
+        # 使用标准字段 volume
+        combined = pd.DataFrame({'high': df['high'], 'vol': df['volume']})
         corr = combined.rolling(self.window).apply(
             lambda x: stats.pearsonr(x[:, 0], x[:, 1])[0] if len(x) >= self.window else np.nan,
             raw=True
@@ -199,9 +201,9 @@ class Alpha008Factor(RollingFactor):
         open_ret_sum = (df['close'] - df['open']) / df['open']
         open_ret_sum = open_ret_sum.rolling(self.window).sum()
         
-        # 成交量波动率与均值的比
-        vol_std = df['vol'].rolling(self.window).std()
-        vol_mean = df['vol'].rolling(self.window).mean()
+        # 成交量波动率与均值的比（使用标准字段 volume）
+        vol_std = df['volume'].rolling(self.window).std()
+        vol_mean = df['volume'].rolling(self.window).mean()
         vol_ratio = vol_std / vol_mean.replace(0, np.nan)
         
         return (open_ret_sum.rank(pct=True) * vol_ratio.rank(pct=True)).rank(pct=True)
@@ -215,7 +217,8 @@ class Alpha009Factor(Factor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """((-1) * rank(rank(delta(volume, 1)) * rank(-1 * delta(close, 1))))"""
-        vol_delta = df['vol'].diff(1)
+        # 使用标准字段 volume
+        vol_delta = df['volume'].diff(1)
         close_delta = -df['close'].diff(1)
         
         return -(vol_delta.rank(pct=True) * close_delta.rank(pct=True)).rank(pct=True)
@@ -229,7 +232,8 @@ class Alpha010Factor(Factor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """((-1) * Ts_Rank(rank(volume), 3))"""
-        rank_vol = df['vol'].rank(pct=True)
+        # 使用标准字段 volume
+        rank_vol = df['volume'].rank(pct=True)
         ts_rank = rank_vol.rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
         return -ts_rank
 

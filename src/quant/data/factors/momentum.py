@@ -81,16 +81,28 @@ class IndustryMomentumFactor(Factor):
         if industry_df is None:
             raise ValueError("需要提供行业信息")
         
-        # 合并行业信息
-        merged = df.reset_index().merge(industry_df[['ts_code', 'industry']], on='ts_code')
+        # 获取索引名称
+        index_names = df.index.names
+        
+        # 合并行业信息（支持标准字段 symbol 和 Tushare 字段 ts_code）
+        df_reset = df.reset_index()
+        key_col = 'symbol' if 'symbol' in df_reset.columns else 'ts_code'
+        industry_key = 'symbol' if 'symbol' in industry_df.columns else 'ts_code'
+        
+        merged = df_reset.merge(
+            industry_df.rename(columns={industry_key: key_col})[[key_col, 'industry']], 
+            on=key_col
+        )
         
         # 计算每个股票的动量
-        merged['momentum'] = merged.groupby('ts_code')['close'].pct_change(self.window)
+        merged['momentum'] = merged.groupby(key_col)['close'].pct_change(self.window)
         
-        # 行业内排名
-        merged['industry_momentum'] = merged.groupby(['industry', 'trade_date'])['momentum'].rank(pct=True)
+        # 行业内排名（支持标准字段 date 和 Tushare 字段 trade_date）
+        date_col = 'date' if 'date' in merged.columns else 'trade_date'
+        merged['industry_momentum'] = merged.groupby(['industry', date_col])['momentum'].rank(pct=True)
         
-        return merged.set_index(['ts_code', 'trade_date'])['industry_momentum']
+        # 恢复原始索引
+        return merged.set_index(index_names)['industry_momentum']
 
 
 class CrossSectionalMomentumFactor(Factor):
@@ -101,15 +113,23 @@ class CrossSectionalMomentumFactor(Factor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """计算横截面动量（用于多股票）"""
-        if 'ts_code' not in df.columns:
+        # 支持标准字段 symbol 和 Tushare 字段 ts_code
+        symbol_col = 'symbol' if 'symbol' in df.columns else ('ts_code' if 'ts_code' in df.columns else None)
+        
+        if symbol_col is None:
             return df['close'].pct_change(self.window)
         
         # 计算每个股票的动量
         df = df.copy()
-        df['momentum'] = df.groupby('ts_code')['close'].pct_change(self.window)
+        df['momentum'] = df.groupby(symbol_col)['close'].pct_change(self.window)
         
-        # 横截面排名
-        df['cs_momentum'] = df.groupby('trade_date')['momentum'].rank(pct=True)
+        # 横截面排名（支持标准字段 date 和 Tushare 字段 trade_date）
+        date_col = 'date' if 'date' in df.columns else ('trade_date' if 'trade_date' in df.columns else None)
+        
+        if date_col is not None:
+            df['cs_momentum'] = df.groupby(date_col)['momentum'].rank(pct=True)
+        else:
+            df['cs_momentum'] = df['momentum'].rank(pct=True)
         
         return df['cs_momentum']
 

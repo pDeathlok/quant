@@ -63,7 +63,8 @@ class Alpha191_04Factor(RollingFactor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """volume / mean(volume, 20)"""
-        return df['vol'] / df['vol'].rolling(self.window).mean()
+        # 使用标准字段 volume
+        return df['volume'] / df['volume'].rolling(self.window).mean()
 
 
 class Alpha191_05Factor(RollingFactor):
@@ -73,11 +74,12 @@ class Alpha191_05Factor(RollingFactor):
         super().__init__(window)
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
-        """amount / mean(amount, 20)"""
-        if 'amount' not in df.columns:
+        """turnover / mean(turnover, 20)"""
+        # 使用标准字段 turnover
+        if 'turnover' not in df.columns:
             return pd.Series(np.nan, index=df.index)
         
-        return df['amount'] / df['amount'].rolling(self.window).mean()
+        return df['turnover'] / df['turnover'].rolling(self.window).mean()
 
 
 class Alpha191_06Factor(Factor):
@@ -109,13 +111,14 @@ class Alpha191_08Factor(Factor):
         pass
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
-        """(open - pre_close) / pre_close"""
+        """(open - prev_close) / prev_close"""
+        # 使用标准字段 prev_close
         if 'open' not in df.columns:
             df['open'] = df['close'].shift(1)
-        if 'pre_close' not in df.columns:
-            df['pre_close'] = df['close'].shift(1)
+        if 'prev_close' not in df.columns:
+            df['prev_close'] = df['close'].shift(1)
         
-        return (df['open'] - df['pre_close']) / df['pre_close']
+        return (df['open'] - df['prev_close']) / df['prev_close']
 
 
 class Alpha191_09Factor(RollingFactor):
@@ -185,7 +188,8 @@ class Alpha191_14Factor(RollingFactor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """volume / mean(volume.shift(1), 5)"""
-        return df['vol'] / df['vol'].shift(1).rolling(self.window).mean()
+        # 使用标准字段 volume
+        return df['volume'] / df['volume'].shift(1).rolling(self.window).mean()
 
 
 class Alpha191_15Factor(Factor):

@@ -2299,3 +2299,47 @@ class IndustryDummy(Factor):
         dummies = pd.get_dummies(data[self.industry_column], prefix="industry")
         
         return dummies
+
+
+# ==================== 别名定义（用于兼容 __init__.py 导入）====================
+
+# 技术指标别名（仅为存在的类创建别名）
+MAFactor = MA
+EMAFactor = EMA
+MACDFactor = MACD
+RSIFactor = RSI
+ATRFactor = ATR
+BOLLFactor = BollingerBands
+KDJFactor = KDJ
+WilliamsRFactor = WilliamsR
+BIASFactor = BIAS
+PSYFactor = PSY
+VRFactor = VR
+OBVFactor = OBV
+CCIFactor = CCI
+DMIFactor = DMI
+ADXFactor = ADX
+
+# 动量/趋势因子别名
+MomentumFactor = Momentum
+RateOfChangeFactor = ROC
+
+# 波动率因子别名
+VolatilityFactor = Volatility
+DownsideVolatilityFactor = DownsideVolatility
+IdiosyncraticVolatilityFactor = IdiosyncraticVolatility
+
+# 质量因子别名
+EarningsQualityFactor = EarningsQuality
+ROEStabilityFactor = ROE
+ProfitabilityFactor = ROE
+QualityScoreFactor = ROE
+
+# 其他别名
+VolumeWeightedAveragePriceFactor = VWAP
+DonchianChannelFactor = DonchianChannel
+KeltnerChannelFactor = KeltnerChannel
+ParabolicSARFactor = ParabolicSAR
+EaseOfMovementFactor = EaseOfMovement
+ChaikinMoneyFlowFactor = ChaikinMoneyFlow
+MassIndexFactor = MassIndex
