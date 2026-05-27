@@ -65,16 +65,7 @@ class Alpha002Factor(RollingFactor):
         rank_ret = open_ret.rank(pct=True)
         
         # 计算滚动相关性
-        def corr_func(x):
-            if len(x) < self.window:
-                return np.nan
-            return stats.pearsonr(x[:, 0], x[:, 1])[0]
-        
-        combined = pd.DataFrame({'vol': rank_vol, 'ret': rank_ret})
-        result = combined.rolling(self.window).apply(
-            lambda x: stats.pearsonr(x[:, 0], x[:, 1])[0] if len(x) >= self.window else np.nan,
-            raw=True
-        )['vol']
+        result = rank_vol.rolling(self.window).corr(rank_ret)
         
         return -result
 
@@ -171,17 +162,8 @@ class Alpha007Factor(RollingFactor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """(rank(correlation(high, volume, 5)))"""
-        def corr_func(x):
-            if len(x) < self.window:
-                return np.nan
-            return stats.pearsonr(x[:, 0], x[:, 1])[0]
-        
-        # 使用标准字段 volume
-        combined = pd.DataFrame({'high': df['high'], 'vol': df['volume']})
-        corr = combined.rolling(self.window).apply(
-            lambda x: stats.pearsonr(x[:, 0], x[:, 1])[0] if len(x) >= self.window else np.nan,
-            raw=True
-        )['high']
+        # 使用 pandas 的 corr 方法计算滚动相关性
+        corr = df['high'].rolling(self.window).corr(df['volume'])
         
         return corr.rank(pct=True)
 

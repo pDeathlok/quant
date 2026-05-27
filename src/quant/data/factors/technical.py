@@ -2301,7 +2301,386 @@ class IndustryDummy(Factor):
         return dummies
 
 
-# ==================== 别名定义（用于兼容 __init__.py 导入）====================
+# ==================== AKShare 数据源新因子 ====================
+# 基于 financial_yjbb_multi, balance_sheet_zcfz_multi, stocks_daily,
+# lhb_detail_multi_year, macro_cpi, bond_zh_us_rate 等 AKShare 数据
+
+# ---------- 财务因子 (AKShare yjbb 业绩报表) ----------
+
+class EPSFromReport(Factor):
+    """每股收益因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="EPSFromReport")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "每股收益" not in data.columns:
+            raise ValueError("缺少 '每股收益' 列")
+        return pd.to_numeric(data["每股收益"], errors="coerce")
+
+
+class BookValuePerShare(Factor):
+    """每股净资产因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="BookValuePerShare")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "每股净资产" not in data.columns:
+            raise ValueError("缺少 '每股净资产' 列")
+        return pd.to_numeric(data["每股净资产"], errors="coerce")
+
+
+class RevenueGrowth(Factor):
+    """营收同比增长率因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="RevenueGrowth")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "营业总收入-同比增长" not in data.columns:
+            raise ValueError("缺少 '营业总收入-同比增长' 列")
+        return pd.to_numeric(data["营业总收入-同比增长"], errors="coerce")
+
+
+class NetProfitGrowth(Factor):
+    """净利润同比增长率因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="NetProfitGrowth")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "净利润-同比增长" not in data.columns:
+            raise ValueError("缺少 '净利润-同比增长' 列")
+        return pd.to_numeric(data["净利润-同比增长"], errors="coerce")
+
+
+class OperatingCashFlowPerShare(Factor):
+    """每股经营现金流因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="OperatingCashFlowPerShare")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "每股经营现金流量" not in data.columns:
+            raise ValueError("缺少 '每股经营现金流量' 列")
+        return pd.to_numeric(data["每股经营现金流量"], errors="coerce")
+
+
+class RevenueQoQFromReport(Factor):
+    """营收环比增长率因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="RevenueQoQFromReport")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "营业总收入-季度环比增长" not in data.columns:
+            raise ValueError("缺少 '营业总收入-季度环比增长' 列")
+        return pd.to_numeric(data["营业总收入-季度环比增长"], errors="coerce")
+
+
+class NetProfitQoQFromReport(Factor):
+    """净利润环比增长率因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="NetProfitQoQFromReport")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "净利润-季度环比增长" not in data.columns:
+            raise ValueError("缺少 '净利润-季度环比增长' 列")
+        return pd.to_numeric(data["净利润-季度环比增长"], errors="coerce")
+
+
+class GrossProfitMarginFromReport(Factor):
+    """毛利率因子 (从 AKShare 业绩报表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="GrossProfitMarginFromReport")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "销售毛利率" not in data.columns:
+            raise ValueError("缺少 '销售毛利率' 列")
+        return pd.to_numeric(data["销售毛利率"], errors="coerce")
+
+
+class ROEFromReport(Factor):
+    """ROE因子 (从 AKShare 业绩报表直接取值，单位%)"""
+
+    def __init__(self):
+        super().__init__(name="ROEFromReport")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "净资产收益率" not in data.columns:
+            raise ValueError("缺少 '净资产收益率' 列")
+        return pd.to_numeric(data["净资产收益率"], errors="coerce")
+
+
+class IndustryFromReport(Factor):
+    """行业因子 (从 AKShare 业绩报表 '所处行业' 字段编码)"""
+
+    def __init__(self):
+        super().__init__(name="IndustryFromReport")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "所处行业" not in data.columns:
+            raise ValueError("缺少 '所处行业' 列")
+        return data["所处行业"].astype("category").cat.codes
+
+
+# ---------- 资产负债表因子 (AKShare zcfz) ----------
+
+class TotalAsset(Factor):
+    """总资产因子 (从 AKShare 资产负债表直接取值)"""
+
+    def __init__(self, log_transform: bool = True):
+        super().__init__(name="TotalAsset_Log" if log_transform else "TotalAsset",
+                         params={"log_transform": log_transform})
+        self.log_transform = log_transform
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "资产-总资产" not in data.columns:
+            raise ValueError("缺少 '资产-总资产' 列")
+        val = pd.to_numeric(data["资产-总资产"], errors="coerce")
+        if self.log_transform:
+            return np.log(val.replace(0, np.nan))
+        return val
+
+
+class TotalDebt(Factor):
+    """总负债因子 (从 AKShare 资产负债表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="TotalDebt")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "负债-总负债" not in data.columns:
+            raise ValueError("缺少 '负债-总负债' 列")
+        return pd.to_numeric(data["负债-总负债"], errors="coerce")
+
+
+class EquityRatio(Factor):
+    """股东权益因子 (从 AKShare 资产负债表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="EquityRatio")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "股东权益合计" not in data.columns:
+            raise ValueError("缺少 '股东权益合计' 列")
+        return pd.to_numeric(data["股东权益合计"], errors="coerce")
+
+
+class AssetGrowth(Factor):
+    """总资产同比增长率因子 (从 AKShare 资产负债表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="AssetGrowth")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "资产-总资产同比" not in data.columns:
+            raise ValueError("缺少 '资产-总资产同比' 列")
+        return pd.to_numeric(data["资产-总资产同比"], errors="coerce")
+
+
+class DebtToAssetRatio(Factor):
+    """资产负债率因子 (从 AKShare 资产负债表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="DebtToAssetRatio")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "资产负债率" not in data.columns:
+            raise ValueError("缺少 '资产负债率' 列")
+        return pd.to_numeric(data["资产负债率"], errors="coerce")
+
+
+class CashOnHand(Factor):
+    """货币资金因子 (从 AKShare 资产负债表直接取值)"""
+
+    def __init__(self):
+        super().__init__(name="CashOnHand")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "资产-货币资金" not in data.columns:
+            raise ValueError("缺少 '资产-货币资金' 列")
+        return pd.to_numeric(data["资产-货币资金"], errors="coerce")
+
+
+# ---------- 市场微结构因子 (基于 stocks_daily OHLCV + outstanding_share) ----------
+
+class LogMarketCap(RollingFactor):
+    """
+    对数流通市值因子
+    流通市值 = close * outstanding_share
+    """
+
+    def __init__(self, window: int = 1):
+        super().__init__(name=f"LogMarketCap_{window}", window=window)
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "close" not in data.columns:
+            raise ValueError("缺少 'close' 列")
+        if "outstanding_share" not in data.columns:
+            raise ValueError("缺少 'outstanding_share' 列")
+        mcap = data["close"] * data["outstanding_share"]
+        mcap_log = np.log(mcap.replace(0, np.nan))
+        if self.window > 1:
+            return mcap_log.rolling(window=self.window).mean()
+        return mcap_log
+
+
+class Amplitude(RollingFactor):
+    """
+    日内振幅因子 = (high - low) / 昨收 * 100
+    """
+
+    def __init__(self, window: int = 1):
+        super().__init__(name=f"Amplitude_{window}", window=window)
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "high" not in data.columns or "low" not in data.columns:
+            raise ValueError("缺少 'high' 或 'low' 列")
+        if "close" not in data.columns:
+            raise ValueError("缺少 'close' 列")
+        amp = (data["high"] - data["low"]) / data["close"].shift(1) * 100
+        if self.window > 1:
+            return amp.rolling(window=self.window).mean()
+        return amp
+
+
+class Amihud(RollingFactor):
+    """
+    Amihud 非流动性因子 = |收益率| / 成交额
+    衡量单位成交额的股价变动幅度
+    """
+
+    def __init__(self, window: int = 20):
+        super().__init__(name=f"Amihud_{window}", window=window)
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "close" not in data.columns:
+            raise ValueError("缺少 'close' 列")
+        if "turnover" not in data.columns:
+            raise ValueError("缺少 'turnover' 列")
+        ret = data["close"].pct_change().abs()
+        illiq = ret / (data["turnover"].replace(0, np.nan) + 1)
+        return illiq.rolling(window=self.window).mean()
+
+
+# ---------- 龙虎榜因子 (基于 lhb_detail_multi_year) ----------
+
+class LHBNetBuyRatio(Factor):
+    """
+    龙虎榜净买入比例 = 龙虎榜净买额 / 流通市值
+    正值表示游资净买入，负值表示净卖出
+    """
+
+    def __init__(self):
+        super().__init__(name="LHBNetBuyRatio")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "龙虎榜净买额" not in data.columns:
+            raise ValueError("缺少 '龙虎榜净买额' 列")
+        if "流通市值" not in data.columns:
+            raise ValueError("缺少 '流通市值' 列")
+        net_buy = pd.to_numeric(data["龙虎榜净买额"], errors="coerce")
+        float_cap = pd.to_numeric(data["流通市值"], errors="coerce").replace(0, np.nan)
+        return net_buy / float_cap
+
+
+class LHBAmountRatio(Factor):
+    """
+    龙虎榜成交额占比 = 龙虎榜成交额 / 市场总成交额
+    衡量龙虎榜交易活跃度
+    """
+
+    def __init__(self):
+        super().__init__(name="LHBAmountRatio")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "龙虎榜成交额" not in data.columns:
+            raise ValueError("缺少 '龙虎榜成交额' 列")
+        if "市场总成交额" not in data.columns:
+            raise ValueError("缺少 '市场总成交额' 列")
+        lhb_amt = pd.to_numeric(data["龙虎榜成交额"], errors="coerce")
+        total_amt = pd.to_numeric(data["市场总成交额"], errors="coerce").replace(0, np.nan)
+        return lhb_amt / total_amt
+
+
+class LHBPostReturn(Factor):
+    """
+    龙虎榜上榜后N日收益率因子
+    参数: days (默认1日)
+    """
+
+    def __init__(self, days: int = 1):
+        super().__init__(name=f"LHBPostReturn_{days}d", params={"days": days})
+        self.days = days
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        col = f"上榜后{self.days}日"
+        if col not in data.columns:
+            raise ValueError(f"缺少 '{col}' 列")
+        return pd.to_numeric(data[col], errors="coerce")
+
+
+# ---------- 宏观/利率因子 ----------
+
+class CPIMonthly(Factor):
+    """
+    CPI 同比增长率因子 (月度择时)
+    从 macro_cpi 数据中取 '全国-同比增长' 列
+    """
+
+    def __init__(self):
+        super().__init__(name="CPIMonthly")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "全国-同比增长" not in data.columns:
+            raise ValueError("缺少 '全国-同比增长' 列")
+        return pd.to_numeric(data["全国-同比增长"], errors="coerce")
+
+
+class BondSpread(Factor):
+    """
+    中美利差因子
+    从 bond_zh_us_rate 中提取中美 10 年期利差
+    利差扩大 = 经济预期改善（通常利好股市）
+    """
+
+    def __init__(self):
+        super().__init__(name="BondSpread")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        # bond_zh_us_rate 包含多列，取第2列和第3列为中美利率差
+        cols = data.columns
+        if len(cols) < 4:
+            raise ValueError("bond_zh_us_rate 数据列数不足")
+        # 通常第1列是日期，后续是利率值
+        # 取最后两列的差值作为利差
+        rate_a = pd.to_numeric(data.iloc[:, -1], errors="coerce")
+        rate_b = pd.to_numeric(data.iloc[:, -2], errors="coerce")
+        return rate_a - rate_b
+
+
+class LPRSpread(Factor):
+    """
+    LPR 利差因子 = LPR5Y - LPR1Y
+    利差收窄 = 经济预期改善
+    """
+
+    def __init__(self):
+        super().__init__(name="LPRSpread")
+
+    def compute(self, data: pd.DataFrame) -> pd.Series:
+        if "LPR1Y" not in data.columns:
+            raise ValueError("缺少 'LPR1Y' 列")
+        if "LPR5Y" not in data.columns:
+            raise ValueError("缺少 'LPR5Y' 列")
+        lpr1y = pd.to_numeric(data["LPR1Y"], errors="coerce")
+        lpr5y = pd.to_numeric(data["LPR5Y"], errors="coerce")
+        return lpr5y - lpr1y
+
 
 # 技术指标别名（仅为存在的类创建别名）
 MAFactor = MA
