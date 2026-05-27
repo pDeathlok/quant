@@ -22,6 +22,7 @@ from quant import (
     MeanReversionStrategy,
     B1Strategy,
     TemplateStrategy,
+    RightSideBottomFishingStrategy,
     BacktestEngine
 )
 
@@ -40,7 +41,7 @@ def main():
     parser.add_argument(
         "--strategy", "-s",
         required=True,
-        help="策略名称: dual_ma, momentum, breakout, mean_reversion, b1, template"
+        help="策略名称: dual_ma, momentum, breakout, mean_reversion, b1, template, right_side_bottom"
     )
     parser.add_argument(
         "--symbol", "-sym",
@@ -72,7 +73,8 @@ def main():
         "breakout": BreakoutStrategy,
         "mean_reversion": MeanReversionStrategy,
         "b1": B1Strategy,
-        "template": TemplateStrategy
+        "template": TemplateStrategy,
+        "right_side_bottom": RightSideBottomFishingStrategy
     }
     
     # 验证策略

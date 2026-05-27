@@ -10,8 +10,15 @@ __author__ = "Quant Team"
 # 导出核心模块
 from .strategies import *
 from .backtest import BacktestEngine, GridSearchOptimizer
-from .data import DataFetcher, DataStorage
+from .data import DataFetcher, DataStorage, TushareDataFetcher
 from .analysis import PerformanceAnalyzer, AttributionAnalyzer
+from .ml import (
+    MLDataSet,
+    ModelTrainer,
+    B1QualityLabelMaker,
+    B1ExitAwareLabelMaker,
+    create_b1_labels
+)
 
 __all__ = [
     # 策略
@@ -21,16 +28,26 @@ __all__ = [
     "BreakoutStrategy",
     "MeanReversionStrategy",
     "B1Strategy",
-    
+    "TemplateStrategy",
+    "RightSideBottomFishingStrategy",
+
     # 回测
     "BacktestEngine",
     "GridSearchOptimizer",
-    
+
     # 数据
     "DataFetcher",
     "DataStorage",
-    
+    "TushareDataFetcher",
+
     # 分析
     "PerformanceAnalyzer",
-    "AttributionAnalyzer"
+    "AttributionAnalyzer",
+
+    # 机器学习
+    "MLDataSet",
+    "ModelTrainer",
+    "B1QualityLabelMaker",
+    "B1ExitAwareLabelMaker",
+    "create_b1_labels"
 ]

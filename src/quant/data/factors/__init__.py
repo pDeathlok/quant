@@ -1,119 +1,329 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-因子模块导出
-
-包含所有可用的因子类
+因子库模块
 """
 
+# 基类
 from .base import Factor, RollingFactor
+
+# 技术指标因子
 from .technical import (
-    # 技术指标因子
-    MA, EMA, MACD, RSI, BollingerBands, ATR, VolumeRatio, ROC, Stochastic,
-    KDJ, WilliamsR, BIAS, Momentum, PSY, VR, OBV, CCI, DMI,
-    
-    # 盈利惊喜因子
-    NetProfitYoY, RevenueYoY, EPS, EarningsSurprise, RevenueSurprise,
-    NetProfitQoQ, RevenueQoQ, NonRecurringProfitYoY, EarningsQuality, PEG,
-    
-    # 市值因子
-    MarketCap, SizeDecile,
-    
-    # 价值因子
-    PERatio, PBRatio, PSRatio, PCFRatio, EVToEBITDA, DividendYield,
-    
-    # 动量因子
-    MomentumReturn, Reversal, IntermediateMomentum, RSTR,
-    
-    # 波动率因子
-    Volatility, IdiosyncraticVolatility, HighLowVolatilityRatio, DownsideVolatility,
-    
-    # 质量因子
-    ROE, ROA, ROIC, OperatingMargin, NetMargin, GrossProfitMargin,
-    
-    # 杠杆因子
-    DebtToEquity, InterestCoverage,
-    
-    # 流动性因子
-    TurnoverRatio, AmihudIlliquidity,
-    
-    # Rust 风格移动平均类
-    SMMA, VWAP, EMAVolume,
-    
-    # Rust 风格波动类指标
-    DonchianChannel, KeltnerChannel, MassIndex,
-    
-    # Rust 风格趋势类指标
-    ADX, ParabolicSAR, VortexIndicator,
-    
-    # Rust 风格量价类指标
-    ChaikinMoneyFlow, EaseOfMovement, VolumeWeightedMACD,
-    
-    # 成长因子扩展
-    GrowthScore, RevenueGrowthAcceleration, ProfitGrowthQuality,
-    
-    # 因子工具函数
-    winsorize_factor, standardize_factor, neutralize_factor,
-    
-    # 因子合成器
-    FactorComposite,
-    
-    # 行业因子
-    IndustryFactor, IndustryDummy
+    MAFactor,
+    EMAFactor,
+    MACDFactor,
+    RSIFactor,
+    ATRFactor,
+    BOLLFactor,
+    KDJFactor,
+    WilliamsRFactor,
+    BIASFactor,
+    PSYFactor,
+    VRFactor,
+    OBVFactor,
+    CCIFactor,
+    DMIFactor,
+    ADXFactor,
+    TRIXFactor,
+    MASSFactor,
+    VIDYAFactor,
+    EOMFactor,
+    KSTFactor,
+    STC_Factor,
+    DeMarkerFactor,
+    RAVI_Factor,
+    ADLIndicatorFactor,
+    ChaikinOscillatorFactor,
+    PriceVolumeTrendFactor,
+    AccumulationDistributionFactor,
+    OnBalanceVolumeFactor,
+    VolumeWeightedAveragePriceFactor,
+    AverageTrueRangeFactor,
+    BollingerBandsFactor,
+    DonchianChannelFactor,
+    KeltnerChannelFactor,
+    ParabolicSARFactor,
+    IchimokuCloudFactor,
+    EaseOfMovementFactor,
+    ForceIndexFactor,
+    ChandeMomentumOscillatorFactor,
+    UltimateOscillatorFactor,
+    StochasticRSIFactor,
+    WilliamsAccumulationDistributionFactor,
+    CoppockCurveFactor,
+    KnowSureThingFactor,
+    ElderRayIndexFactor,
+    HullMovingAverageFactor,
+    ZeroLagExponentialMovingAverageFactor,
+    VolumeWeightedMovingAverageFactor,
+    JurikMovingAverageFactor,
+    LeastSquaresMovingAverageFactor,
+    DoubleExponentialMovingAverageFactor,
+    TripleExponentialMovingAverageFactor,
+    VolumeRateOfChangeFactor,
+    PriceRateOfChangeFactor,
+    MassIndexFactor,
+    EhlerFisherTransformFactor,
+    InverseFisherTransformFactor,
+    RSI2Factor,
+    RSI7Factor,
+    RSI14Factor,
+    RSI21Factor,
+    BBANDSWidthFactor,
+    BBANDSPercentBFactor,
+    MACDSignalFactor,
+    MACDHistogramFactor,
+    MomentumFactor,
+    RateOfChangeFactor,
+    StochasticKFactor,
+    StochasticDFactor,
+    WilliamsPercentRFactor,
+    CommodityChannelIndexFactor,
+    AverageDirectionalIndexFactor,
+    DirectionalMovementIndexFactor,
+    ParabolicSARFactor,
+    ADLineFactor,
+    ChaikinMoneyFlowFactor,
+    EaseOfMovementValueFactor,
+    ForceIndexValueFactor,
+    ChandeMomentumFactor,
+    UltimateOscillatorValueFactor,
+    StochasticRSIValueFactor,
+    CoppockCurveValueFactor,
+    ElderRayBullPowerFactor,
+    ElderRayBearPowerFactor,
+    VolumeProfileHighFactor,
+    VolumeProfileLowFactor,
+    VolumeProfileVolumeFactor,
+    VolumeProfileValueAreaFactor,
+    VolumeProfilePOCFactor,
 )
 
+# 动量/反转因子
+from .momentum import (
+    ReturnFactor,
+    MomentumFactor,
+    MomentumSkip5Factor,
+    RiskAdjustedMomentumFactor,
+    ReversalFactor,
+    IndustryMomentumFactor,
+    CrossSectionalMomentumFactor,
+    PriceTrendFactor,
+    TrendStrengthFactor,
+    MovingAverageSlopeFactor,
+)
+
+# 波动率因子
+from .volatility import (
+    VolatilityFactor,
+    DownsideVolatilityFactor,
+    IdiosyncraticVolatilityFactor,
+    RealizedVolatilityFactor,
+    TailRiskFactor,
+    CVaRFactor,
+    KurtosisFactor,
+    SkewnessFactor,
+)
+
+# 质量因子
+from .quality import (
+    EarningsQualityFactor,
+    ROEStabilityFactor,
+    CashFlowCoverageFactor,
+    OperatingCashFlowFactor,
+    FreeCashFlowFactor,
+    ProfitabilityFactor,
+    QualityScoreFactor,
+)
+
+# Alpha101因子
+from .alpha101 import (
+    Alpha001Factor,
+    Alpha002Factor,
+    Alpha003Factor,
+    Alpha004Factor,
+    Alpha005Factor,
+    Alpha006Factor,
+    Alpha007Factor,
+    Alpha008Factor,
+    Alpha009Factor,
+    Alpha010Factor,
+)
+
+# Alpha191因子
+from .alpha191 import (
+    Alpha191_01Factor,
+    Alpha191_02Factor,
+    Alpha191_03Factor,
+    Alpha191_04Factor,
+    Alpha191_05Factor,
+    Alpha191_06Factor,
+    Alpha191_07Factor,
+    Alpha191_08Factor,
+    Alpha191_09Factor,
+    Alpha191_10Factor,
+    Alpha191_11Factor,
+    Alpha191_12Factor,
+    Alpha191_13Factor,
+    Alpha191_14Factor,
+    Alpha191_15Factor,
+)
+
+# 版本信息
+__version__ = "1.0.0"
+
+# 导出所有模块
 __all__ = [
     # 基类
-    "Factor", "RollingFactor",
+    'Factor',
+    'RollingFactor',
     
     # 技术指标因子
-    "MA", "EMA", "MACD", "RSI", "BollingerBands", "ATR", "VolumeRatio", "ROC", "Stochastic",
-    "KDJ", "WilliamsR", "BIAS", "Momentum", "PSY", "VR", "OBV", "CCI", "DMI",
+    'MAFactor',
+    'EMAFactor',
+    'MACDFactor',
+    'RSIFactor',
+    'ATRFactor',
+    'BOLLFactor',
+    'KDJFactor',
+    'WilliamsRFactor',
+    'BIASFactor',
+    'PSYFactor',
+    'VRFactor',
+    'OBVFactor',
+    'CCIFactor',
+    'DMIFactor',
+    'ADXFactor',
+    'TRIXFactor',
+    'MASSFactor',
+    'VIDYAFactor',
+    'EOMFactor',
+    'KSTFactor',
+    'STC_Factor',
+    'DeMarkerFactor',
+    'RAVI_Factor',
+    'ADLIndicatorFactor',
+    'ChaikinOscillatorFactor',
+    'PriceVolumeTrendFactor',
+    'AccumulationDistributionFactor',
+    'OnBalanceVolumeFactor',
+    'VolumeWeightedAveragePriceFactor',
+    'AverageTrueRangeFactor',
+    'BollingerBandsFactor',
+    'DonchianChannelFactor',
+    'KeltnerChannelFactor',
+    'ParabolicSARFactor',
+    'IchimokuCloudFactor',
+    'EaseOfMovementFactor',
+    'ForceIndexFactor',
+    'ChandeMomentumOscillatorFactor',
+    'UltimateOscillatorFactor',
+    'StochasticRSIFactor',
+    'WilliamsAccumulationDistributionFactor',
+    'CoppockCurveFactor',
+    'KnowSureThingFactor',
+    'ElderRayIndexFactor',
+    'HullMovingAverageFactor',
+    'ZeroLagExponentialMovingAverageFactor',
+    'VolumeWeightedMovingAverageFactor',
+    'JurikMovingAverageFactor',
+    'LeastSquaresMovingAverageFactor',
+    'DoubleExponentialMovingAverageFactor',
+    'TripleExponentialMovingAverageFactor',
+    'VolumeRateOfChangeFactor',
+    'PriceRateOfChangeFactor',
+    'MassIndexFactor',
+    'EhlerFisherTransformFactor',
+    'InverseFisherTransformFactor',
+    'RSI2Factor',
+    'RSI7Factor',
+    'RSI14Factor',
+    'RSI21Factor',
+    'BBANDSWidthFactor',
+    'BBANDSPercentBFactor',
+    'MACDSignalFactor',
+    'MACDHistogramFactor',
+    'MomentumFactor',
+    'RateOfChangeFactor',
+    'StochasticKFactor',
+    'StochasticDFactor',
+    'WilliamsPercentRFactor',
+    'CommodityChannelIndexFactor',
+    'AverageDirectionalIndexFactor',
+    'DirectionalMovementIndexFactor',
+    'ADLineFactor',
+    'ChaikinMoneyFlowFactor',
+    'EaseOfMovementValueFactor',
+    'ForceIndexValueFactor',
+    'ChandeMomentumFactor',
+    'UltimateOscillatorValueFactor',
+    'StochasticRSIValueFactor',
+    'CoppockCurveValueFactor',
+    'ElderRayBullPowerFactor',
+    'ElderRayBearPowerFactor',
+    'VolumeProfileHighFactor',
+    'VolumeProfileLowFactor',
+    'VolumeProfileVolumeFactor',
+    'VolumeProfileValueAreaFactor',
+    'VolumeProfilePOCFactor',
     
-    # 盈利惊喜因子
-    "NetProfitYoY", "RevenueYoY", "EPS", "EarningsSurprise", "RevenueSurprise",
-    "NetProfitQoQ", "RevenueQoQ", "NonRecurringProfitYoY", "EarningsQuality", "PEG",
-    
-    # 市值因子
-    "MarketCap", "SizeDecile",
-    
-    # 价值因子
-    "PERatio", "PBRatio", "PSRatio", "PCFRatio", "EVToEBITDA", "DividendYield",
-    
-    # 动量因子
-    "MomentumReturn", "Reversal", "IntermediateMomentum", "RSTR",
+    # 动量/反转因子
+    'ReturnFactor',
+    'MomentumFactor',
+    'MomentumSkip5Factor',
+    'RiskAdjustedMomentumFactor',
+    'ReversalFactor',
+    'IndustryMomentumFactor',
+    'CrossSectionalMomentumFactor',
+    'PriceTrendFactor',
+    'TrendStrengthFactor',
+    'MovingAverageSlopeFactor',
     
     # 波动率因子
-    "Volatility", "IdiosyncraticVolatility", "HighLowVolatilityRatio", "DownsideVolatility",
+    'VolatilityFactor',
+    'DownsideVolatilityFactor',
+    'IdiosyncraticVolatilityFactor',
+    'RealizedVolatilityFactor',
+    'TailRiskFactor',
+    'CVaRFactor',
+    'KurtosisFactor',
+    'SkewnessFactor',
     
     # 质量因子
-    "ROE", "ROA", "ROIC", "OperatingMargin", "NetMargin", "GrossProfitMargin",
+    'EarningsQualityFactor',
+    'ROEStabilityFactor',
+    'CashFlowCoverageFactor',
+    'OperatingCashFlowFactor',
+    'FreeCashFlowFactor',
+    'ProfitabilityFactor',
+    'QualityScoreFactor',
     
-    # 杠杆因子
-    "DebtToEquity", "InterestCoverage",
+    # Alpha101因子
+    'Alpha001Factor',
+    'Alpha002Factor',
+    'Alpha003Factor',
+    'Alpha004Factor',
+    'Alpha005Factor',
+    'Alpha006Factor',
+    'Alpha007Factor',
+    'Alpha008Factor',
+    'Alpha009Factor',
+    'Alpha010Factor',
     
-    # 流动性因子
-    "TurnoverRatio", "AmihudIlliquidity",
-    
-    # Rust 风格移动平均类
-    "SMMA", "VWAP", "EMAVolume",
-    
-    # Rust 风格波动类指标
-    "DonchianChannel", "KeltnerChannel", "MassIndex",
-    
-    # Rust 风格趋势类指标
-    "ADX", "ParabolicSAR", "VortexIndicator",
-    
-    # Rust 风格量价类指标
-    "ChaikinMoneyFlow", "EaseOfMovement", "VolumeWeightedMACD",
-    
-    # 成长因子扩展
-    "GrowthScore", "RevenueGrowthAcceleration", "ProfitGrowthQuality",
-    
-    # 因子工具函数
-    "winsorize_factor", "standardize_factor", "neutralize_factor",
-    
-    # 因子合成器
-    "FactorComposite",
-    
-    # 行业因子
-    "IndustryFactor", "IndustryDummy"
+    # Alpha191因子
+    'Alpha191_01Factor',
+    'Alpha191_02Factor',
+    'Alpha191_03Factor',
+    'Alpha191_04Factor',
+    'Alpha191_05Factor',
+    'Alpha191_06Factor',
+    'Alpha191_07Factor',
+    'Alpha191_08Factor',
+    'Alpha191_09Factor',
+    'Alpha191_10Factor',
+    'Alpha191_11Factor',
+    'Alpha191_12Factor',
+    'Alpha191_13Factor',
+    'Alpha191_14Factor',
+    'Alpha191_15Factor',
 ]

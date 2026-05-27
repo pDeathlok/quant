@@ -28,6 +28,10 @@ venv/
 data/cache/
 data/stocks/
 data/results/
+data/raw/
+data/stocks_daily/
+data/factors_raw/
+scripts/data/raw/
 
 # Reports
 *.html

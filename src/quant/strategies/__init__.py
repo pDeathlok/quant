@@ -14,7 +14,7 @@ from .momentum import DualMAStrategy, MomentumStrategy, BreakoutStrategy
 from .mean_reversion import MeanReversionStrategy
 
 # 用户自定义策略
-from .custom import B1Strategy, TemplateStrategy
+from .custom import B1Strategy, TemplateStrategy, RightSideBottomFishingStrategy
 
 __all__ = [
     # 基类
@@ -30,5 +30,6 @@ __all__ = [
 
     # 自定义策略
     "B1Strategy",
-    "TemplateStrategy"
+    "TemplateStrategy",
+    "RightSideBottomFishingStrategy"
 ]
