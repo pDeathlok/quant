@@ -17,6 +17,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import time
+from dotenv import load_dotenv
+load_dotenv()
 
 # 设置路径
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -28,8 +30,8 @@ PROCESSED_DIR = DATA_DIR / "processed"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-# Tushare Token
-TOKEN = "wwqxe0122b7c9829941beb898d20d5c19db0eb0c62ea8fee51c100qq"
+# Tushare Token（从环境变量读取）
+TOKEN = os.environ.get("TUSHARE_TOKEN", "")
 
 
 class FactorDataDownloader:

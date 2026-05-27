@@ -2,14 +2,14 @@
 Tushare数据获取测试脚本
 """
 
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 import pandas as pd
-
-# Tushare Token
-TUSHARE_TOKEN = "wwqxe0122b7c9829941beb898d20d5c19db0eb0c62ea8fee51c100qq"
+from dotenv import load_dotenv
+load_dotenv()
 
 
 def test_tushare_import():
@@ -28,7 +28,7 @@ def test_tushare_connection():
     from quant.data import TushareDataFetcher
     
     try:
-        fetcher = TushareDataFetcher(token=TUSHARE_TOKEN)
+        fetcher = TushareDataFetcher(token=os.environ.get("TUSHARE_TOKEN"))
         print("✅ Tushare连接成功")
         return fetcher
     except Exception as e:

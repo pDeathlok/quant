@@ -1251,7 +1251,7 @@ if __name__ == "__main__":
     parser.add_argument('--macro-dir', help='AKShare 宏观数据目录', default='/Users/didi/Project/quant/data/factors_raw')
     parser.add_argument('--sample', action='store_true', help='使用模拟数据进行测试')
     parser.add_argument('--n_days', type=int, default=200, help='模拟数据天数')
-    parser.add_argument('--n_stocks', type=int, default=1, help='模拟数据股票数量或加载数据数量')
+    parser.add_argument('--n_stocks', type=int, default=None, help='模拟数据股票数量或加载数据数量（不指定则加载全部）')
 
     args = parser.parse_args()
     

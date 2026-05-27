@@ -33,6 +33,11 @@ data/stocks_daily/
 data/factors_raw/
 scripts/data/raw/
 
+# Environment files (may contain secrets)
+.env
+.env.local
+.env.*.local
+
 # Reports
 *.html
 
