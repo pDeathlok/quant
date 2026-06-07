@@ -97,6 +97,7 @@ def stock_selector(
     strategies: str | None = None,
     signal_date: str | None = None,
     include_z_skill: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     try:
         if signal_date and date.fromisoformat(signal_date) < SELECTOR_REPLAY_MIN_DATE:
@@ -106,6 +107,7 @@ def stock_selector(
             strategies=selected,
             signal_date=signal_date,
             include_z_skill=include_z_skill,
+            use_cache=not refresh,
         )
     except HTTPException:
         raise

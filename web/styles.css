@@ -192,11 +192,55 @@ h3 {
 }
 
 .refresh-status {
+  align-items: center;
   color: var(--muted);
+  display: flex;
   font-size: 12px;
   grid-column: 1 / -1;
+  justify-content: flex-end;
+  gap: 12px;
   min-height: 18px;
   text-align: right;
+}
+
+.refresh-status strong {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.progress-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+  min-height: 24px;
+}
+
+.progress-step {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 22px;
+  padding: 0 9px;
+}
+
+.progress-step.running {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.progress-step.success {
+  border-color: #b8d8c4;
+  color: var(--good);
+}
+
+.progress-step.failed {
+  border-color: #e8b9aa;
+  color: var(--warn);
 }
 
 select,
@@ -539,6 +583,11 @@ th {
   }
 
   .refresh-status {
+    justify-content: flex-start;
     text-align: left;
+  }
+
+  .progress-steps {
+    justify-content: flex-start;
   }
 }

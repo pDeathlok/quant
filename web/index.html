@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略选股器</title>
-    <link rel="stylesheet" href="./styles.css?v=20260607-date-refresh" />
+    <link rel="stylesheet" href="./styles.css?v=20260607-progress-cache" />
   </head>
   <body>
     <div class="app selector-app">
@@ -39,7 +39,8 @@
             <button id="reloadButton" type="button">刷新当前日期</button>
             <button id="refreshLatestButton" type="button">更新最新数据</button>
           </div>
-          <p id="refreshStatus" class="refresh-status"></p>
+          <div id="refreshStatus" class="refresh-status"></div>
+          <div id="progressSteps" class="progress-steps"></div>
         </section>
 
         <section class="split">
@@ -88,6 +89,6 @@
         </section>
       </main>
     </div>
-    <script src="./app.js?v=20260607-date-refresh"></script>
+    <script src="./app.js?v=20260607-progress-cache"></script>
   </body>
 </html>

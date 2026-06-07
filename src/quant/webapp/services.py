@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 import threading
 import traceback
 from datetime import datetime
@@ -53,12 +54,17 @@ FAMILY_SIGNAL_COLUMNS = {
 DEFAULT_ACTION_LEVELS = {"可小仓实操", "谨慎实操"}
 DEFAULT_FAMILIES = {"B1", "B2", "B3", "SB1", "SUPER_B1", "YIDONG_DILIAN", "GOLDEN_BOWL", "KENGQI", "PINGHANG"}
 DEFAULT_SELECTOR_LIMIT = 50
+SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
+SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
 _REFRESH_LOCK = threading.Lock()
 _REFRESH_STATUS: dict[str, Any] = {
     "status": "idle",
     "started_at": None,
     "finished_at": None,
     "message": "尚未启动刷新任务",
+    "percent": 0,
+    "current_step": None,
+    "steps": [],
     "result": None,
     "error": None,
 }
@@ -68,6 +74,123 @@ def read_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(str(path))
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _selector_snapshot_key(
+    signal_date: str | None,
+    strategies: list[str] | None,
+    include_z_skill: bool,
+) -> tuple[str, str, str]:
+    strategy_key = ",".join(sorted({str(item).upper() for item in strategies or [] if item})) or "ALL"
+    date_key = signal_date or "LATEST"
+    raw = json.dumps(
+        {"signal_date": date_key, "strategies": strategy_key, "include_z_skill": include_z_skill},
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest(), date_key, strategy_key
+
+
+def _selector_snapshot_path(snapshot_key: str) -> Path:
+    return SELECTOR_SNAPSHOT_DIR / f"{snapshot_key}.json"
+
+
+def _read_selector_snapshot(
+    signal_date: str | None,
+    strategies: list[str] | None,
+    include_z_skill: bool,
+) -> dict[str, Any] | None:
+    snapshot_key, _, _ = _selector_snapshot_key(signal_date, strategies, include_z_skill)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if store.config.sql_url:
+        try:
+            from sqlalchemy import text
+
+            with store._engine().begin() as conn:
+                row = conn.execute(
+                    text(f"SELECT payload_json FROM {SELECTOR_SNAPSHOT_TABLE} WHERE snapshot_key = :snapshot_key"),
+                    {"snapshot_key": snapshot_key},
+                ).mappings().first()
+            if row and row.get("payload_json"):
+                payload = json.loads(row["payload_json"])
+                payload["cache"] = {"hit": True, "backend": "mysql", "snapshot_key": snapshot_key}
+                return payload
+        except Exception:
+            pass
+
+    path = _selector_snapshot_path(snapshot_key)
+    if path.exists():
+        try:
+            payload = read_json_file(path)
+            payload["cache"] = {"hit": True, "backend": "json", "snapshot_key": snapshot_key}
+            return payload
+        except Exception:
+            return None
+    return None
+
+
+def _write_selector_snapshot(
+    payload: dict[str, Any],
+    strategies: list[str] | None,
+    include_z_skill: bool,
+) -> None:
+    signal_date = str(payload.get("signal_date") or "")
+    snapshot_key, date_key, strategy_key = _selector_snapshot_key(signal_date, strategies, include_z_skill)
+    payload_to_store = dict(payload)
+    payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
+    payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    wrote_sql = False
+    if store.config.sql_url:
+        try:
+            from sqlalchemy import text
+
+            with store._engine().begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {SELECTOR_SNAPSHOT_TABLE} (
+                            snapshot_key VARCHAR(64) PRIMARY KEY,
+                            signal_date VARCHAR(16) NOT NULL,
+                            strategies_key VARCHAR(512) NOT NULL,
+                            include_z_skill BOOLEAN NOT NULL,
+                            generated_at VARCHAR(32) NOT NULL,
+                            stock_count INT NOT NULL,
+                            payload_json LONGTEXT NOT NULL,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        INSERT INTO {SELECTOR_SNAPSHOT_TABLE}
+                            (snapshot_key, signal_date, strategies_key, include_z_skill, generated_at, stock_count, payload_json)
+                        VALUES
+                            (:snapshot_key, :signal_date, :strategies_key, :include_z_skill, :generated_at, :stock_count, :payload_json)
+                        ON DUPLICATE KEY UPDATE
+                            generated_at = VALUES(generated_at),
+                            stock_count = VALUES(stock_count),
+                            payload_json = VALUES(payload_json)
+                        """
+                    ),
+                    {
+                        "snapshot_key": snapshot_key,
+                        "signal_date": date_key,
+                        "strategies_key": strategy_key,
+                        "include_z_skill": include_z_skill,
+                        "generated_at": str(payload.get("generated_at") or datetime.now().isoformat(timespec="seconds")),
+                        "stock_count": len(payload.get("stocks") or []),
+                        "payload_json": payload_json,
+                    },
+                )
+            wrote_sql = True
+        except Exception:
+            wrote_sql = False
+    if not wrote_sql:
+        SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        _selector_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
 
 
 def get_b1_plan(refresh: bool = False, signal_date: str | None = None) -> dict[str, Any]:
@@ -886,8 +1009,56 @@ def _clear_selector_caches() -> None:
             pass
 
 
+def _progress_steps() -> list[dict[str, Any]]:
+    return [
+        {"key": "refresh_data", "label": "拉取 Tushare 最新日线数据", "status": "pending", "percent": 10},
+        {"key": "daily_plan", "label": "生成最新 B1 每日计划", "status": "pending", "percent": 45},
+        {"key": "selector_core", "label": "计算 B1/B2/B3/SB1 股票池", "status": "pending", "percent": 65},
+        {"key": "selector_z_skill", "label": "计算 z-skill 全市场战法信号", "status": "pending", "percent": 82},
+        {"key": "snapshot", "label": "写入 MySQL 股票池快照", "status": "pending", "percent": 95},
+    ]
+
+
+def _set_refresh_progress(
+    *,
+    status: str = "running",
+    step_key: str | None = None,
+    message: str,
+    percent: int | None = None,
+    result: Any = None,
+    error: str | None = None,
+) -> None:
+    with _REFRESH_LOCK:
+        steps = list(_REFRESH_STATUS.get("steps") or _progress_steps())
+        if step_key:
+            seen_current = False
+            for step in steps:
+                if step["key"] == step_key:
+                    step["status"] = "running" if status == "running" else status
+                    seen_current = True
+                elif not seen_current and step["status"] in {"pending", "running"}:
+                    step["status"] = "success"
+            if status == "success":
+                for step in steps:
+                    if step["key"] == step_key:
+                        step["status"] = "success"
+        _REFRESH_STATUS.update(
+            {
+                "status": status,
+                "message": message,
+                "percent": percent if percent is not None else _REFRESH_STATUS.get("percent", 0),
+                "current_step": step_key,
+                "steps": steps,
+                "result": result,
+                "error": error,
+            }
+        )
+        if status in {"success", "failed"}:
+            _REFRESH_STATUS["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+
 def _run_latest_refresh_job() -> None:
-    from quant.routine.pipeline import run_daily_pipeline
+    from quant.routine.pipeline import generate_dashboard, generate_daily_plan, refresh_data
 
     with _REFRESH_LOCK:
         _REFRESH_STATUS.update(
@@ -895,35 +1066,66 @@ def _run_latest_refresh_job() -> None:
                 "status": "running",
                 "started_at": datetime.now().isoformat(timespec="seconds"),
                 "finished_at": None,
-                "message": "正在拉取 Tushare 最新日线数据，并重算每日股票池",
+                "message": "刷新任务已启动",
+                "percent": 1,
+                "current_step": "refresh_data",
+                "steps": _progress_steps(),
                 "result": None,
                 "error": None,
             }
         )
     try:
-        result = run_daily_pipeline(skip_data=False, skip_backtest=True)
+        results: dict[str, Any] = {}
+        _set_refresh_progress(step_key="refresh_data", message="正在拉取 Tushare 最新日线数据", percent=10)
+        results["refresh_data"] = refresh_data(dry_run=False)
+        if results["refresh_data"].get("status") == "failed":
+            raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
+
+        _set_refresh_progress(step_key="daily_plan", message="正在生成最新 B1 每日计划", percent=45)
+        results["generate_daily_plan"] = generate_daily_plan()
+        results["generate_dashboard"] = generate_dashboard()
         _clear_selector_caches()
+
+        _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=65)
+        core_payload = get_stock_selector_payload(use_cache=False)
+        results["selector_core"] = {
+            "status": "success",
+            "signal_date": core_payload.get("signal_date"),
+            "stocks": len(core_payload.get("stocks") or []),
+        }
+
+        _set_refresh_progress(step_key="selector_z_skill", message="正在计算 z-skill 全市场战法信号", percent=82)
+        full_payload = get_stock_selector_payload(signal_date=core_payload.get("signal_date"), include_z_skill=True, use_cache=False)
+        results["selector_z_skill"] = {
+            "status": "success",
+            "signal_date": full_payload.get("signal_date"),
+            "stocks": len(full_payload.get("stocks") or []),
+        }
+
+        _set_refresh_progress(step_key="snapshot", message="正在写入 MySQL 股票池快照", percent=95)
+        _write_selector_snapshot(full_payload, None, True)
+        results["snapshot"] = {
+            "status": "success",
+            "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
+        }
+
+        _set_refresh_progress(
+            status="success",
+            step_key="snapshot",
+            message="刷新任务完成，最新股票池已生成并写入快照",
+            percent=100,
+            result=results,
+        )
         with _REFRESH_LOCK:
-            _REFRESH_STATUS.update(
-                {
-                    "status": "success",
-                    "finished_at": datetime.now().isoformat(timespec="seconds"),
-                    "message": "刷新任务完成，页面可重新加载最新股票池",
-                    "result": result,
-                    "error": None,
-                }
-            )
+            for step in _REFRESH_STATUS["steps"]:
+                step["status"] = "success"
     except Exception as exc:
-        with _REFRESH_LOCK:
-            _REFRESH_STATUS.update(
-                {
-                    "status": "failed",
-                    "finished_at": datetime.now().isoformat(timespec="seconds"),
-                    "message": "刷新任务失败",
-                    "result": None,
-                    "error": f"{exc}\n{traceback.format_exc(limit=5)}",
-                }
-            )
+        _set_refresh_progress(
+            status="failed",
+            step_key=_REFRESH_STATUS.get("current_step"),
+            message="刷新任务失败",
+            error=f"{exc}\n{traceback.format_exc(limit=5)}",
+        )
 
 
 def start_latest_refresh() -> dict[str, Any]:
@@ -937,6 +1139,9 @@ def start_latest_refresh() -> dict[str, Any]:
                 "started_at": datetime.now().isoformat(timespec="seconds"),
                 "finished_at": None,
                 "message": "刷新任务已进入后台队列",
+                "percent": 0,
+                "current_step": None,
+                "steps": _progress_steps(),
                 "result": None,
                 "error": None,
             }
@@ -960,7 +1165,13 @@ def get_stock_selector_payload(
     strategies: list[str] | None = None,
     signal_date: str | None = None,
     include_z_skill: bool = False,
+    use_cache: bool = True,
 ) -> dict[str, Any]:
+    if use_cache:
+        cached = _read_selector_snapshot(signal_date, strategies, include_z_skill)
+        if cached is not None:
+            return cached
+
     plan = get_b1_plan(signal_date=signal_date)
     effective_signal_date = plan.get("signal_date") or signal_date
     stocks: dict[str, dict[str, Any]] = {}
@@ -1115,7 +1326,7 @@ def get_stock_selector_payload(
     )
     if not selected:
         rows = rows[:DEFAULT_SELECTOR_LIMIT]
-    return {
+    payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": plan.get("signal_date"),
         "execution_date": plan.get("execution_date"),
@@ -1139,3 +1350,6 @@ def get_stock_selector_payload(
             "z-skill 高频战法已完成模型版买点评估；异动地量、黄金碗当前标记为可小仓实操，呼吸结构谨慎实操，关键K和灾后重建先模型观察。",
         ],
     }
+    _write_selector_snapshot(payload, strategies, include_z_skill)
+    payload["cache"] = {"hit": False, "backend": "generated"}
+    return payload

@@ -59,6 +59,24 @@ MARKET_DATA_MIRROR_PARQUET=1
 src/quant/routine/data_refresh.py
 ```
 
+每日股票池快照也会通过 MySQL 缓存，表名为：
+
+```text
+selector_snapshots
+```
+
+缓存粒度为：
+
+```text
+signal_date + strategies + include_z_skill
+```
+
+用途：
+
+- 历史日期复盘优先读取 MySQL 快照，避免每次重新扫描全市场。
+- 最新数据刷新完成后，会重新计算最新日期股票池并写入快照。
+- 如果本地没有配置 `MARKET_DATA_SQL_URL`，开发环境会临时写入 `data/selector_snapshots/*.json`，但生产复盘应使用 MySQL。
+
 ## 为什么暂时保留 parquet 镜像
 
 部分研究脚本仍按目录扫描方式读取全市场日线或特征产物，例如：

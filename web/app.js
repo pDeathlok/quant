@@ -49,13 +49,14 @@ function selectedStrategyParam() {
   return Array.from(state.selectedStrategies).join(",");
 }
 
-async function loadSelector() {
+async function loadSelector(options = {}) {
   state.loading = true;
   render();
   const query = new URLSearchParams();
   const params = selectedStrategyParam();
   if (params) query.set("strategies", params);
   if (state.signalDate) query.set("signal_date", state.signalDate);
+  if (options.refresh) query.set("refresh", "true");
   const suffix = query.toString();
   const path = suffix ? `/selector/stocks?${suffix}` : "/selector/stocks";
   try {
@@ -262,7 +263,9 @@ document.querySelector("#reloadButton").addEventListener("click", async () => {
   button.disabled = true;
   button.textContent = "刷新中";
   try {
-    await loadSelector();
+    document.querySelector("#refreshStatus").textContent = "正在重算当前日期股票池，并写入快照缓存...";
+    await loadSelector({ refresh: true });
+    document.querySelector("#refreshStatus").textContent = "当前日期股票池已重算完成";
   } catch (error) {
     showError(error);
   } finally {
@@ -273,12 +276,21 @@ document.querySelector("#reloadButton").addEventListener("click", async () => {
 
 function setRefreshStatus(status) {
   const el = document.querySelector("#refreshStatus");
+  const stepsEl = document.querySelector("#progressSteps");
   if (!status) {
     el.textContent = "";
+    stepsEl.innerHTML = "";
     return;
   }
   const time = status.finished_at || status.started_at || "";
-  el.textContent = `${status.message || status.status}${time ? ` · ${time}` : ""}`;
+  const percent = Number(status.percent || 0);
+  el.innerHTML = `
+    <span>${status.message || status.status}${time ? ` · ${time}` : ""}</span>
+    <strong>${percent}%</strong>
+  `;
+  stepsEl.innerHTML = (status.steps || []).map((step) => `
+    <span class="progress-step ${step.status || "pending"}">${step.label}</span>
+  `).join("");
 }
 
 async function pollLatestRefresh() {
