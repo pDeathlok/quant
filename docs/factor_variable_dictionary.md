@@ -67,13 +67,13 @@ rolling_std(x, n) = n 日滚动标准差
 | `bbi` | 多空指标 BBI，综合 3/6/12/24 日均线观察短中期趋势 | 本地派生 | `(rolling_mean(C,3)+rolling_mean(C,6)+rolling_mean(C,12)+rolling_mean(C,24))/4` |
 | `bbi_ma60_diff` | BBI 与 60 日均线的价差，用于衡量 BBI 相对中期均线的位置 | 本地派生 | `bbi-ma_60` |
 | `bbi_ma60_ratio` | BBI 相对 60 日均线的比例，用于跨价格水平比较趋势强弱 | 本地派生 | `bbi/ma_60` |
-| `kdj_d_k` | 日线 KDJ 的 K 值 | 本地派生 | `RSV=(C-lowest(L,9))/(highest(H,9)-lowest(L,9))*100; K=ewm(RSV, alpha=1/3)` |
-| `kdj_d_d` | 日线 KDJ 的 D 值 | 本地派生 | `D=ewm(K, alpha=1/3)` |
-| `kdj_d_j` | 日线 KDJ 的 J 值，衡量日线超买超卖 | 本地派生 | `J=3*K-2*D` |
-| `kdj_w_k` | 周线 KDJ 的 K 值 | 本地派生 | 先按 `W-FRI` 聚合周 K 线：`O=first, H=max, L=min, C=last, V=sum`，再按 KDJ 公式计算，并向后对齐到每日 |
+| `kdj_d_k` | 日线 KDJ 的 K 值 | 本地派生 | 先用 `pre_close / 前一日 close` 将 OHLC 连续化，再计算 `RSV=(C-lowest(L,9))/(highest(H,9)-lowest(L,9))*100; K=ewm(RSV, alpha=1/3)` |
+| `kdj_d_d` | 日线 KDJ 的 D 值 | 本地派生 | 基于连续 OHLC 的 K 值计算 `D=ewm(K, alpha=1/3)` |
+| `kdj_d_j` | 日线 KDJ 的 J 值，衡量日线超买超卖 | 本地派生 | 基于连续 OHLC 计算 `J=3*K-2*D` |
+| `kdj_w_k` | 周线 KDJ 的 K 值 | 本地派生 | 先将日线 OHLC 连续化，再按 `W-FRI` 聚合周 K 线：`O=first, H=max, L=min, C=last, V=sum`，再按 KDJ 公式计算，并向后对齐到每日 |
 | `kdj_w_d` | 周线 KDJ 的 D 值 | 本地派生 | 周线 KDJ 的 `D=ewm(K, alpha=1/3)`，向后对齐到每日 |
 | `kdj_w_j` | 周线 KDJ 的 J 值，衡量中短周期超买超卖 | 本地派生 | 周线 KDJ 的 `J=3*K-2*D`，向后对齐到每日 |
-| `kdj_m_k` | 月线 KDJ 的 K 值 | 本地派生 | 先按月末聚合月 K 线：`O=first, H=max, L=min, C=last, V=sum`，再按 KDJ 公式计算，并向后对齐到每日 |
+| `kdj_m_k` | 月线 KDJ 的 K 值 | 本地派生 | 先将日线 OHLC 连续化，再按月末聚合月 K 线：`O=first, H=max, L=min, C=last, V=sum`，再按 KDJ 公式计算，并向后对齐到每日 |
 | `kdj_m_d` | 月线 KDJ 的 D 值 | 本地派生 | 月线 KDJ 的 `D=ewm(K, alpha=1/3)`，向后对齐到每日 |
 | `kdj_m_j` | 月线 KDJ 的 J 值，衡量更大周期超买超卖 | 本地派生 | 月线 KDJ 的 `J=3*K-2*D`，向后对齐到每日 |
 | `parabolic_sar` | 抛物线转向指标 | 本地派生 | 初始 `SAR=L[0]`，按趋势方向、极值点 EP、加速因子 AF=0.02 到 0.2 逐日递推 |

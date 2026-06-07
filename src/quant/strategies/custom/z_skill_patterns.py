@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant.features.variable_library import build_continuous_ohlc
+
 
 EXTENDED_STRATEGIES: list[dict[str, str]] = [
     {"key": "CHANGAN", "label": "长安战法", "status": "日线三日确认"},
@@ -140,6 +142,9 @@ def _normalize_daily(path: Path, signal_date: str | None) -> pd.DataFrame:
     if "pct_chg" not in out.columns:
         out["pct_chg"] = out["close"].pct_change() * 100
     out["pct_chg"] = out["pct_chg"].fillna(out["close"].pct_change() * 100).fillna(0)
+    price = build_continuous_ohlc(out)
+    out[["open", "high", "low", "close"]] = price[["open", "high", "low", "close"]]
+    out["pre_close"] = out["close"].shift(1).replace(0, np.nan).fillna(out["pre_close"])
     out["amplitude"] = (out["high"] - out["low"]) / out["pre_close"].replace(0, np.nan) * 100
     out["close_pos"] = (out["close"] - out["low"]) / (out["high"] - out["low"]).replace(0, np.nan)
     out["vol_ratio_5"] = out["volume"] / out["volume"].shift(1).rolling(5, min_periods=1).mean()

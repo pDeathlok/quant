@@ -1,8 +1,8 @@
 """B1/B2/B3/SB1/Super-B1 signal family.
 
-The rules in this module translate the zettaranc-skill B1 family into
-daily-data predicates that can be backtested without minute/L2 data. They are
-strategy-family signals, not production trading advice by themselves.
+The rules in this module translate the B1 family into daily-data predicates
+that can be backtested without minute/L2 data. They are strategy-family
+signals, not production trading advice by themselves.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from quant.features.variable_library import calculate_project_extra_features
+from quant.features.variable_library import build_continuous_ohlc, calculate_project_extra_features
 
 
 @dataclass(frozen=True)
@@ -56,10 +56,11 @@ def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_b1_family_signals(df: pd.DataFrame) -> pd.DataFrame:
     """Add zettaranc-inspired B1/B2/B3/SB1/Super-B1 signal columns."""
     out = _ensure_features(df).sort_values("date").reset_index(drop=True)
-    close = out["close"]
-    open_ = out["open"]
-    high = out["high"]
-    low = out["low"]
+    price = build_continuous_ohlc(out)
+    close = price["close"]
+    open_ = price["open"]
+    high = price["high"]
+    low = price["low"]
     pct_chg = out["pct_chg"] if "pct_chg" in out.columns else close.pct_change() * 100
     amplitude = (high - low) / close.shift(1).replace(0, np.nan) * 100
     is_yinxian = close < open_

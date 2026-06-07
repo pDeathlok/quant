@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Backtest B2/B3/SB1/Super-B1 rule families before modeling.
 
-The goal of this script is to answer whether each zettaranc-style tactic has a
+The goal of this script is to answer whether each B1-family tactic has a
 reasonable daily-rule threshold before creating dedicated ML labels/models.
 Intraday tactics are explicitly marked and evaluated with a daily approximation
 only, because real early/tail execution needs minute data.
@@ -20,7 +20,7 @@ import pandas as pd
 
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
-from quant.features.variable_library import calculate_project_extra_features
+from quant.features.variable_library import build_continuous_ohlc, calculate_project_extra_features
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -230,10 +230,11 @@ def compute_signal_flags(df: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = extra[col]
 
-    close = out["close"]
-    open_ = out["open"]
-    high = out["high"]
-    low = out["low"]
+    price = build_continuous_ohlc(out)
+    close = price["close"]
+    open_ = price["open"]
+    high = price["high"]
+    low = price["low"]
     pct = out["pct_chg"] if "pct_chg" in out.columns else close.pct_change() * 100
     prev_close = close.shift(1).replace(0, np.nan)
     amplitude = (high - low) / prev_close * 100
@@ -471,14 +472,16 @@ def evaluate(candidates: pd.DataFrame) -> pd.DataFrame:
                 if trades.empty:
                     continue
                 trades = trades.merge(entry_df[["date", "symbol", "split"]], on=["date", "symbol"], how="left")
-                raw_trades = len(trades)
-                trades = drop_overlapping_trades(trades)
-                skipped = raw_trades - len(trades)
+                raw_trades_all = trades
+                trades = drop_overlapping_trades(raw_trades_all)
                 for split in ["train", "test", "oot"]:
+                    raw_part = raw_trades_all[raw_trades_all["split"] == split]
                     part = trades[trades["split"] == split]
                     metrics = summarize_returns(part)
                     if not metrics:
                         continue
+                    raw_trades = len(raw_part)
+                    skipped = raw_trades - len(part)
                     rows.append(
                         {
                             "signal": signal_name,

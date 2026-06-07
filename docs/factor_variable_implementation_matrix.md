@@ -60,9 +60,9 @@ daily_basic 合并命中率：100.00%
 | `ema_5`, `ema_10`, `ema_20` | 不同周期收盘价指数均线 | 已实现-项目变量库 | `ewm_mean(close,span=n)` |
 | `bbi` | 多空指标 BBI | 已实现-项目变量库 | `(MA3+MA6+MA12+MA24)/4` |
 | `bbi_ma60_diff`, `bbi_ma60_ratio` | BBI 相对 MA60 的价差和比例 | 已实现-项目变量库 | `bbi-ma_60`、`bbi/ma_60` |
-| `kdj_d_k`, `kdj_d_d`, `kdj_d_j` | 日线 KDJ 的 K/D/J | 已实现-项目变量库 | 日线 high/low/close 计算 RSV、K、D、J |
-| `kdj_w_k`, `kdj_w_d`, `kdj_w_j` | 周线 KDJ 的 K/D/J | 已实现-项目变量库 | 日线聚合为周线后计算 KDJ，再对齐回日频 |
-| `kdj_m_k`, `kdj_m_d`, `kdj_m_j` | 月线 KDJ 的 K/D/J | 已实现-项目变量库 | 日线聚合为月线后计算 KDJ，再对齐回日频 |
+| `kdj_d_k`, `kdj_d_d`, `kdj_d_j` | 日线 KDJ 的 K/D/J | 已实现-项目变量库 | 先用 `pre_close / 前一日 close` 连续化 OHLC，再计算 RSV、K、D、J |
+| `kdj_w_k`, `kdj_w_d`, `kdj_w_j` | 周线 KDJ 的 K/D/J | 已实现-项目变量库 | 连续化 OHLC 后聚合为周线计算 KDJ，再对齐回日频 |
+| `kdj_m_k`, `kdj_m_d`, `kdj_m_j` | 月线 KDJ 的 K/D/J | 已实现-项目变量库 | 连续化 OHLC 后聚合为月线计算 KDJ，再对齐回日频 |
 | `macd_dif`, `macd_dea`, `macd_hist` | MACD 快慢线、信号线、柱状值 | 已实现-项目变量库 | `EMA12-EMA26`、DIF 的 EMA9、DIF-DEA |
 | `rsi_12` | 12 日 RSI | 已实现-项目变量库 | 12 日平均上涨 / 平均下跌计算 |
 | `bb_upper`, `bb_middle`, `bb_lower` | 布林带上中下轨 | 已实现-项目变量库 | 20 日均线 ± 2 倍标准差 |

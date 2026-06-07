@@ -410,7 +410,7 @@ def _metrics_text(metrics: dict[str, Any] | None) -> str:
         f"均值 {_fmt_pct(metrics.get('avg_return_pct'))}，"
         f"胜率 {_fmt_rate(metrics.get('win_rate'))}，"
         f"最大回撤 {_fmt_pct(metrics.get('max_drawdown_pct'))}，"
-        f"PF {float(metrics.get('profit_factor') or 0):.2f}"
+        f"PF {float(metrics.get('profit_factor') or 0):.2f}（复权口径待重算）"
     )
 
 
@@ -1440,6 +1440,7 @@ def get_stock_selector_payload(
         "stocks": rows,
         "notes": [
             "选股器按股票聚合命中策略家族；同一策略家族下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中仍按策略家族去重计算。",
+            "2026-06-08 已修复除权断点导致的 KDJ/价格滚动指标失真；完整回测和模型指标重算完成前，页面 OOT 指标仅作旧口径参考。",
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
             "历史均值是该股票命中策略在 OOT 回测中的平均单笔收益；PF 是总盈利除以总亏损，越高说明盈亏结构越好。",
             "股票池默认按综合分排序：综合考虑历史均值、胜率、PF、最大回撤、样本量可靠性、当前信号强度和多策略共振。",

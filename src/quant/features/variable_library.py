@@ -163,6 +163,49 @@ PROJECT_FACTOR_COLUMNS = [
     "ps_ttm_inv",
 ]
 
+
+def build_continuous_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """Return OHLC adjusted to a continuous current-price scale for indicators.
+
+    Tushare daily OHLC can contain ex-right price jumps while pct_chg/pre_close
+    remain continuous. Rolling technical indicators should use a continuous
+    price series; display and trade simulation can still use raw prices.
+    """
+    out = df.copy()
+    if not {"open", "high", "low", "close"} <= set(out.columns):
+        return out
+    if "pre_close" not in out.columns:
+        return out
+
+    if "date" in out.columns:
+        order = out.assign(_order_date=pd.to_datetime(out["date"], errors="coerce")).sort_values("_order_date").index
+    elif "trade_date" in out.columns:
+        trade_date = pd.to_datetime(out["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+        order = out.assign(_order_date=trade_date).sort_values("_order_date").index
+    else:
+        order = out.index
+
+    sorted_frame = out.loc[order].copy()
+    if len(sorted_frame) < 2:
+        return out
+
+    factor = pd.Series(1.0, index=sorted_frame.index, dtype=float)
+    close = pd.to_numeric(sorted_frame["close"], errors="coerce")
+    pre_close = pd.to_numeric(sorted_frame["pre_close"], errors="coerce")
+    for pos in range(len(sorted_frame) - 1, 0, -1):
+        idx = sorted_frame.index[pos]
+        prev_idx = sorted_frame.index[pos - 1]
+        prev_close = close.loc[prev_idx]
+        current_pre_close = pre_close.loc[idx]
+        ratio = current_pre_close / prev_close if pd.notna(current_pre_close) and pd.notna(prev_close) and prev_close else 1.0
+        if not np.isfinite(ratio) or ratio <= 0:
+            ratio = 1.0
+        factor.loc[prev_idx] = factor.loc[idx] * ratio
+
+    for col in ["open", "high", "low", "close"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce") * factor.reindex(out.index).fillna(1.0)
+    return out
+
 EXTRA_FEATURE_COLUMNS = [
     "kdj_d_k",
     "kdj_d_d",
@@ -343,18 +386,19 @@ def _align_weekly_ma(df: pd.DataFrame) -> pd.DataFrame:
 def calculate_project_extra_features(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate reusable project-level variables not covered by legacy factors."""
     out = pd.DataFrame(index=df.index)
-    close = df["close"]
+    price_df = build_continuous_ohlc(df)
+    close = price_df["close"]
     volume = df["volume"]
 
-    kdj_d = KDJ().compute(df)
+    kdj_d = KDJ().compute(price_df)
     out["kdj_d_k"] = kdj_d["K"]
     out["kdj_d_d"] = kdj_d["D"]
     out["kdj_d_j"] = kdj_d["J"]
     out = pd.concat([
         out,
-        _align_resampled_kdj(df, "W-FRI", "kdj_w"),
-        _align_resampled_kdj(df, "ME", "kdj_m"),
-        _align_weekly_ma(df),
+        _align_resampled_kdj(price_df, "W-FRI", "kdj_w"),
+        _align_resampled_kdj(price_df, "ME", "kdj_m"),
+        _align_weekly_ma(price_df),
     ], axis=1)
 
     bbi = calc_bbi(close)
