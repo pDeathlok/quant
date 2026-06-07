@@ -68,13 +68,13 @@ selector_snapshots
 缓存粒度为：
 
 ```text
-signal_date + strategies + include_z_skill
+signal_date + strategies + include_extended
 ```
 
 用途：
 
 - 历史日期复盘优先读取 MySQL 快照，避免每次重新扫描全市场。
-- 最新数据刷新完成后，会重新计算最新日期股票池并写入快照。
+- 最新数据刷新完成后，会重新计算最新日期全策略股票池，并拆分写入 ALL 和每个单独策略的股票池快照。
 - 如果本地没有配置 `MARKET_DATA_SQL_URL`，开发环境会临时写入 `data/selector_snapshots/*.json`，但生产复盘应使用 MySQL。
 
 ## 为什么暂时保留 parquet 镜像
@@ -83,8 +83,8 @@ signal_date + strategies + include_z_skill
 
 ```text
 scripts/research/train_b1_tushare_models.py
-scripts/research/train_z_skill_models_and_backtest.py
-src/quant/strategies/custom/z_skill_patterns.py
+scripts/research/train_z_skill_models_and_backtest.py  # 历史研究脚本，文件名暂保留兼容已有产物
+src/quant/strategies/custom/z_skill_patterns.py        # 扩展策略规则模块，文件名暂保留兼容已有研究脚本
 ```
 
 因此当前迁移策略是 MySQL 主存储 + parquet 镜像兼容。后续每次改造一个研究脚本，就把它从目录读取迁移到 `MarketDataStore.read_frame()` 或批量 SQL 查询。
@@ -94,7 +94,7 @@ src/quant/strategies/custom/z_skill_patterns.py
 前端复盘日期暂从 `2026-06-01` 开始。原因：
 
 - 当前应用阶段只需要验证 6 月以来每日候选池。
-- 更早历史复盘首次生成 z-skill 日线信号较慢。
+- 更早历史复盘首次生成全市场扩展策略日线信号较慢。
 - 后续会补日期级预计算缓存和收益曲线后再扩展日期范围。
 
 ## 提交安全要求

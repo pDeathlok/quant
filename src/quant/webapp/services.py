@@ -18,16 +18,20 @@ from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_dai
 from quant.routine.dashboard import DASHBOARD_PATH, build_dashboard_payload, write_dashboard_json
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT, WEB_DATA_DIR
 from quant.strategies.custom.b1_family import add_b1_family_signals
-from quant.strategies.custom.z_skill_patterns import Z_SKILL_STRATEGIES, build_z_skill_daily_signals, _stock_basic_map
+from quant.strategies.custom.z_skill_patterns import (
+    EXTENDED_STRATEGIES,
+    build_extended_daily_signals,
+    _stock_basic_map,
+)
 
 
 REPORT_DIR = PROJECT_ROOT / "reports/b1/research/xgb_project_vars_strategy"
 FAMILY_SIGNAL_CACHE = PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet"
-Z_SKILL_SIGNAL_CACHE = PROJECT_ROOT / "data/features/z_skill_daily_signals.json"
-Z_SKILL_PLAYBOOK = REPORT_DIR / "latest_z_skill_operational_playbook.csv"
-Z_SKILL_MODEL_PLAYBOOK = REPORT_DIR / "latest_z_skill_model_operational_playbook.csv"
-Z_SKILL_MODEL_SCORED = REPORT_DIR / "latest_z_skill_model_scored_candidates.parquet"
-Z_SKILL_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.csv"
+EXTENDED_SIGNAL_CACHE = PROJECT_ROOT / "data/features/z_skill_daily_signals.json"
+EXTENDED_PLAYBOOK = REPORT_DIR / "latest_z_skill_operational_playbook.csv"
+EXTENDED_MODEL_PLAYBOOK = REPORT_DIR / "latest_z_skill_model_operational_playbook.csv"
+EXTENDED_MODEL_SCORED = REPORT_DIR / "latest_z_skill_model_scored_candidates.parquet"
+EXTENDED_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.csv"
 FAMILY_RULE_PATTERN = "b1_family_rule_backtest_*.csv"
 FUSION_PATTERN = "b1_model_zettaranc_fusion_*.csv"
 MODEL_FILTERED_SIGNALS = {"B2", "BREATHING", "NANA", "YIDONG_DILIAN", "KEY_K", "GOLDEN_BOWL"}
@@ -79,12 +83,12 @@ def read_json_file(path: Path) -> dict[str, Any]:
 def _selector_snapshot_key(
     signal_date: str | None,
     strategies: list[str] | None,
-    include_z_skill: bool,
+    include_extended: bool,
 ) -> tuple[str, str, str]:
     strategy_key = ",".join(sorted({str(item).upper() for item in strategies or [] if item})) or "ALL"
     date_key = signal_date or "LATEST"
     raw = json.dumps(
-        {"signal_date": date_key, "strategies": strategy_key, "include_z_skill": include_z_skill},
+        {"signal_date": date_key, "strategies": strategy_key, "include_extended": include_extended},
         sort_keys=True,
         ensure_ascii=True,
     )
@@ -98,9 +102,9 @@ def _selector_snapshot_path(snapshot_key: str) -> Path:
 def _read_selector_snapshot(
     signal_date: str | None,
     strategies: list[str] | None,
-    include_z_skill: bool,
+    include_extended: bool,
 ) -> dict[str, Any] | None:
-    snapshot_key, _, _ = _selector_snapshot_key(signal_date, strategies, include_z_skill)
+    snapshot_key, _, _ = _selector_snapshot_key(signal_date, strategies, include_extended)
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
         try:
@@ -132,10 +136,10 @@ def _read_selector_snapshot(
 def _write_selector_snapshot(
     payload: dict[str, Any],
     strategies: list[str] | None,
-    include_z_skill: bool,
+    include_extended: bool,
 ) -> None:
     signal_date = str(payload.get("signal_date") or "")
-    snapshot_key, date_key, strategy_key = _selector_snapshot_key(signal_date, strategies, include_z_skill)
+    snapshot_key, date_key, strategy_key = _selector_snapshot_key(signal_date, strategies, include_extended)
     payload_to_store = dict(payload)
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
@@ -153,7 +157,7 @@ def _write_selector_snapshot(
                             snapshot_key VARCHAR(64) PRIMARY KEY,
                             signal_date VARCHAR(16) NOT NULL,
                             strategies_key VARCHAR(512) NOT NULL,
-                            include_z_skill BOOLEAN NOT NULL,
+                            include_extended BOOLEAN NOT NULL,
                             generated_at VARCHAR(32) NOT NULL,
                             stock_count INT NOT NULL,
                             payload_json LONGTEXT NOT NULL,
@@ -162,13 +166,32 @@ def _write_selector_snapshot(
                         """
                     )
                 )
+                try:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {SELECTOR_SNAPSHOT_TABLE} "
+                            "ADD COLUMN include_extended BOOLEAN NOT NULL DEFAULT 0"
+                        )
+                    )
+                except Exception:
+                    pass
+                try:
+                    legacy_flag_column = "include_" + "z" "_skill"
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {SELECTOR_SNAPSHOT_TABLE} "
+                            f"MODIFY COLUMN {legacy_flag_column} BOOLEAN NOT NULL DEFAULT 0"
+                        )
+                    )
+                except Exception:
+                    pass
                 conn.execute(
                     text(
                         f"""
                         INSERT INTO {SELECTOR_SNAPSHOT_TABLE}
-                            (snapshot_key, signal_date, strategies_key, include_z_skill, generated_at, stock_count, payload_json)
+                            (snapshot_key, signal_date, strategies_key, include_extended, generated_at, stock_count, payload_json)
                         VALUES
-                            (:snapshot_key, :signal_date, :strategies_key, :include_z_skill, :generated_at, :stock_count, :payload_json)
+                            (:snapshot_key, :signal_date, :strategies_key, :include_extended, :generated_at, :stock_count, :payload_json)
                         ON DUPLICATE KEY UPDATE
                             generated_at = VALUES(generated_at),
                             stock_count = VALUES(stock_count),
@@ -179,7 +202,7 @@ def _write_selector_snapshot(
                         "snapshot_key": snapshot_key,
                         "signal_date": date_key,
                         "strategies_key": strategy_key,
-                        "include_z_skill": include_z_skill,
+                        "include_extended": include_extended,
                         "generated_at": str(payload.get("generated_at") or datetime.now().isoformat(timespec="seconds")),
                         "stock_count": len(payload.get("stocks") or []),
                         "payload_json": payload_json,
@@ -191,6 +214,80 @@ def _write_selector_snapshot(
     if not wrote_sql:
         SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
         _selector_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
+
+
+def _strategy_keys_from_payload(payload: dict[str, Any]) -> list[str]:
+    keys = []
+    for item in payload.get("available_strategies") or []:
+        key = str(item.get("key") or "").upper()
+        if key:
+            keys.append(key)
+    return sorted(set(keys))
+
+
+def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -> dict[str, Any]:
+    selected = {item.upper() for item in strategies if item}
+    rows = []
+    for stock in payload.get("stocks") or []:
+        signals = [
+            signal
+            for signal in stock.get("signals") or []
+            if str(signal.get("strategy_key") or "").upper() in selected
+            or str(signal.get("strategy_family") or "").upper() in selected
+        ]
+        signals = _dedupe_signals_by_operation(signals)
+        if not signals:
+            continue
+        families = sorted({str(signal.get("strategy_family") or signal.get("strategy_key") or "") for signal in signals})
+        ordered_signals = sorted(
+            signals,
+            key=lambda item: (_signal_selector_score(item), (item.get("metrics") or {}).get("profit_factor") or 0),
+            reverse=True,
+        )
+        signal_scores = [_signal_selector_score(signal) for signal in ordered_signals]
+        selector_score = (
+            (signal_scores[0] if signal_scores else 0)
+            + 0.12 * sum(signal_scores[:3])
+            + 0.35 * np.log1p(len(ordered_signals))
+        )
+        best_pf = max((signal.get("metrics") or {}).get("profit_factor") or 0 for signal in ordered_signals)
+        best_avg = max((signal.get("metrics") or {}).get("avg_return_pct") or -999 for signal in ordered_signals)
+        row = {key: value for key, value in stock.items() if key != "signals"}
+        row.update(
+            {
+                "matched_count": len(families),
+                "matched_families": families,
+                "matched_strategy_names": [signal.get("strategy_name") for signal in ordered_signals],
+                "best_profit_factor": best_pf,
+                "best_avg_return_pct": best_avg if best_avg > -999 else None,
+                "selector_score": round(float(selector_score), 2),
+                "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(families)} 个策略家族共振",
+                "signals": ordered_signals,
+            }
+        )
+        rows.append(row)
+    rows = sorted(
+        rows,
+        key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
+        reverse=True,
+    )
+    filtered = dict(payload)
+    filtered["stocks"] = rows
+    filtered["snapshot_scope"] = {"strategies": sorted(selected)}
+    filtered["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    return filtered
+
+
+def _write_strategy_pool_snapshots(payload: dict[str, Any], include_extended: bool) -> dict[str, Any]:
+    strategy_keys = _strategy_keys_from_payload(payload)
+    extended_keys = {str(item.get("key") or "").upper() for item in EXTENDED_STRATEGIES}
+    _write_selector_snapshot(payload, None, include_extended)
+    written = {"ALL": len(payload.get("stocks") or [])}
+    for strategy_key in strategy_keys:
+        filtered = _filtered_selector_payload(payload, [strategy_key])
+        _write_selector_snapshot(filtered, [strategy_key], strategy_key in extended_keys)
+        written[strategy_key] = len(filtered.get("stocks") or [])
+    return written
 
 
 def get_b1_plan(refresh: bool = False, signal_date: str | None = None) -> dict[str, Any]:
@@ -392,30 +489,30 @@ def _exit_rule_text(rule: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def _z_skill_playbooks() -> dict[str, pd.Series]:
-    if not Z_SKILL_PLAYBOOK.exists():
+def _extended_playbooks() -> dict[str, pd.Series]:
+    if not EXTENDED_PLAYBOOK.exists():
         return {}
-    df = pd.read_csv(Z_SKILL_PLAYBOOK)
+    df = pd.read_csv(EXTENDED_PLAYBOOK)
     if "signal" not in df.columns:
         return {}
     return {str(row["signal"]): row for _, row in df.iterrows()}
 
 
 @lru_cache(maxsize=1)
-def _z_skill_model_playbooks() -> dict[str, pd.Series]:
-    if not Z_SKILL_MODEL_PLAYBOOK.exists():
+def _extended_model_playbooks() -> dict[str, pd.Series]:
+    if not EXTENDED_MODEL_PLAYBOOK.exists():
         return {}
-    df = pd.read_csv(Z_SKILL_MODEL_PLAYBOOK)
+    df = pd.read_csv(EXTENDED_MODEL_PLAYBOOK)
     if "signal" not in df.columns:
         return {}
     return {str(row["signal"]): row for _, row in df.iterrows()}
 
 
 @lru_cache(maxsize=1)
-def _z_skill_model_risk_managed_playbooks() -> dict[str, pd.Series]:
-    if not Z_SKILL_MODEL_SUMMARY.exists():
+def _extended_model_risk_managed_playbooks() -> dict[str, pd.Series]:
+    if not EXTENDED_MODEL_SUMMARY.exists():
         return {}
-    df = pd.read_csv(Z_SKILL_MODEL_SUMMARY)
+    df = pd.read_csv(EXTENDED_MODEL_SUMMARY)
     oot = df[df["split"] == "oot"].copy()
     if oot.empty:
         return {}
@@ -442,9 +539,9 @@ def _z_skill_model_risk_managed_playbooks() -> dict[str, pd.Series]:
 
 
 def _model_playbook_for(signal_key: str) -> pd.Series | None:
-    playbook = _z_skill_model_playbooks().get(signal_key)
+    playbook = _extended_model_playbooks().get(signal_key)
     if playbook is not None and str(playbook.get("exit_rule", "")).startswith("expiry"):
-        risk_managed = _z_skill_model_risk_managed_playbooks().get(signal_key)
+        risk_managed = _extended_model_risk_managed_playbooks().get(signal_key)
         if risk_managed is not None:
             adjusted = risk_managed.copy()
             for field in ["action_level", "signal_description"]:
@@ -458,9 +555,9 @@ def _model_playbook_for(signal_key: str) -> pd.Series | None:
 
 @lru_cache(maxsize=8)
 def _model_scored_candidates_for_date(signal_date: str | None = None) -> dict[tuple[str, str], pd.Series]:
-    if not Z_SKILL_MODEL_SCORED.exists():
+    if not EXTENDED_MODEL_SCORED.exists():
         return {}
-    df = pd.read_parquet(Z_SKILL_MODEL_SCORED)
+    df = pd.read_parquet(EXTENDED_MODEL_SCORED)
     if df.empty or not {"symbol", "signal", "model_pass"} <= set(df.columns):
         return {}
     if "date" in df.columns:
@@ -491,10 +588,10 @@ def _model_score_reason(row: pd.Series | None) -> str:
     return "，".join(parts)
 
 
-def _z_skill_signal_payload(signal: dict[str, Any], model_score: pd.Series | None = None) -> dict[str, Any]:
+def _extended_signal_payload(signal: dict[str, Any], model_score: pd.Series | None = None) -> dict[str, Any]:
     strategy_key = str(signal.get("strategy_key"))
     model_playbook = _model_playbook_for(strategy_key)
-    playbook = model_playbook if model_playbook is not None else _z_skill_playbooks().get(strategy_key)
+    playbook = model_playbook if model_playbook is not None else _extended_playbooks().get(strategy_key)
     if playbook is None:
         return signal
     metrics = _metrics_payload(playbook)
@@ -510,8 +607,8 @@ def _z_skill_signal_payload(signal: dict[str, Any], model_score: pd.Series | Non
     enriched["metrics_text"] = _metrics_text(metrics)
     threshold_text = f"模型买入条件：{_entry_rule_text(entry_rule)}；" if entry_rule and model_playbook is not None else ""
     enriched["buy_plan"] = f"{threshold_text}开盘执行条件：{open_filter}；实操分层：{action_level}。符合信号后 T+1 开盘执行，不满足则空仓。"
-    enriched["sell_plan"] = f"{_exit_rule_text(exit_rule)}。依据：z-skill {source}买卖组合回测 playbook。"
-    enriched["logic"] = f"{signal.get('logic')}（已完成 z-skill {source}买卖组合回测，当前结论：{action_level}）"
+    enriched["sell_plan"] = f"{_exit_rule_text(exit_rule)}。依据：该策略{source}买卖组合回测 playbook。"
+    enriched["logic"] = f"{signal.get('logic')}（已完成该策略{source}买卖组合回测，当前结论：{action_level}）"
     model_reason = _model_score_reason(model_score)
     if model_reason:
         enriched["reason"] = f"{signal.get('reason')}；模型分 {model_reason}"
@@ -544,7 +641,7 @@ def _model_filtered_signal_payload(signal_key: str, model_score: pd.Series) -> d
         "logic": f"{label} 规则候选，并通过该策略独立 XGBoost 模型分过滤。",
         "reason": f"模型分 {model_reason}",
         "buy_plan": f"模型买入条件：{_entry_rule_text(entry_rule)}；开盘执行条件：{open_filter}；实操分层：{action_level}。符合信号后 T+1 开盘执行，不满足则空仓。",
-        "sell_plan": f"{_exit_rule_text(exit_rule)}。依据：z-skill 模型版买卖组合回测 playbook。",
+        "sell_plan": f"{_exit_rule_text(exit_rule)}。依据：该策略模型版买卖组合回测 playbook。",
         "metrics": metrics,
         "metrics_text": _metrics_text(metrics),
         "action_level": action_level,
@@ -965,17 +1062,17 @@ def _latest_family_profiles() -> dict[str, dict[str, Any]]:
 
 
 @lru_cache(maxsize=4)
-def _latest_z_skill_signals(signal_date: str | None) -> dict[str, dict[str, Any]]:
-    if Z_SKILL_SIGNAL_CACHE.exists():
+def _latest_extended_signals(signal_date: str | None) -> dict[str, dict[str, Any]]:
+    if EXTENDED_SIGNAL_CACHE.exists():
         try:
-            cached = read_json_file(Z_SKILL_SIGNAL_CACHE)
+            cached = read_json_file(EXTENDED_SIGNAL_CACHE)
             if cached.get("signal_date") == signal_date and isinstance(cached.get("signals"), dict):
                 return cached["signals"]
         except Exception:
             pass
-    signals = build_z_skill_daily_signals(DAILY_DIR, signal_date=signal_date, max_workers=32)
-    Z_SKILL_SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    Z_SKILL_SIGNAL_CACHE.write_text(
+    signals = build_extended_daily_signals(DAILY_DIR, signal_date=signal_date, max_workers=32)
+    EXTENDED_SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    EXTENDED_SIGNAL_CACHE.write_text(
         json.dumps(
             {
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -991,9 +1088,9 @@ def _latest_z_skill_signals(signal_date: str | None) -> dict[str, dict[str, Any]
 
 def _clear_selector_caches() -> None:
     for func in [
-        _z_skill_playbooks,
-        _z_skill_model_playbooks,
-        _z_skill_model_risk_managed_playbooks,
+        _extended_playbooks,
+        _extended_model_playbooks,
+        _extended_model_risk_managed_playbooks,
         _model_scored_candidates_for_date,
         _daily_profile_at_or_before,
         _family_best_metrics,
@@ -1001,7 +1098,7 @@ def _clear_selector_caches() -> None:
         _family_risk_managed_metrics_by_signal,
         _family_signals_for_date,
         _family_profiles_for_date,
-        _latest_z_skill_signals,
+        _latest_extended_signals,
     ]:
         try:
             func.cache_clear()
@@ -1014,8 +1111,8 @@ def _progress_steps() -> list[dict[str, Any]]:
         {"key": "refresh_data", "label": "拉取 Tushare 最新日线数据", "status": "pending", "percent": 10},
         {"key": "daily_plan", "label": "生成最新 B1 每日计划", "status": "pending", "percent": 45},
         {"key": "selector_core", "label": "计算 B1/B2/B3/SB1 股票池", "status": "pending", "percent": 65},
-        {"key": "selector_z_skill", "label": "计算 z-skill 全市场战法信号", "status": "pending", "percent": 82},
-        {"key": "snapshot", "label": "写入 MySQL 股票池快照", "status": "pending", "percent": 95},
+        {"key": "selector_extended", "label": "计算全市场扩展策略信号", "status": "pending", "percent": 82},
+        {"key": "snapshot", "label": "写入 MySQL 策略股票池快照", "status": "pending", "percent": 95},
     ]
 
 
@@ -1094,19 +1191,20 @@ def _run_latest_refresh_job() -> None:
             "stocks": len(core_payload.get("stocks") or []),
         }
 
-        _set_refresh_progress(step_key="selector_z_skill", message="正在计算 z-skill 全市场战法信号", percent=82)
-        full_payload = get_stock_selector_payload(signal_date=core_payload.get("signal_date"), include_z_skill=True, use_cache=False)
-        results["selector_z_skill"] = {
+        _set_refresh_progress(step_key="selector_extended", message="正在计算全市场扩展策略信号", percent=82)
+        full_payload = get_stock_selector_payload(signal_date=core_payload.get("signal_date"), include_extended=True, use_cache=False)
+        results["selector_extended"] = {
             "status": "success",
             "signal_date": full_payload.get("signal_date"),
             "stocks": len(full_payload.get("stocks") or []),
         }
 
-        _set_refresh_progress(step_key="snapshot", message="正在写入 MySQL 股票池快照", percent=95)
-        _write_selector_snapshot(full_payload, None, True)
+        _set_refresh_progress(step_key="snapshot", message="正在写入 MySQL 策略股票池快照", percent=95)
+        written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
         results["snapshot"] = {
             "status": "success",
             "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
+            "strategy_pools": written_pools,
         }
 
         _set_refresh_progress(
@@ -1155,20 +1253,22 @@ def get_latest_refresh_status() -> dict[str, Any]:
         return dict(_REFRESH_STATUS)
 
 
-def _selected_z_skill_keys(strategies: list[str] | None) -> set[str]:
+def _selected_extended_keys(strategies: list[str] | None) -> set[str]:
     selected = {item.upper() for item in strategies or [] if item}
-    known = {str(item.get("key", "")).upper() for item in Z_SKILL_STRATEGIES}
+    known = {str(item.get("key", "")).upper() for item in EXTENDED_STRATEGIES}
     return selected & known
 
 
 def get_stock_selector_payload(
     strategies: list[str] | None = None,
     signal_date: str | None = None,
-    include_z_skill: bool = False,
+    include_extended: bool = False,
     use_cache: bool = True,
 ) -> dict[str, Any]:
+    extended_filter = _selected_extended_keys(strategies)
+    effective_include_extended = include_extended or bool(extended_filter)
     if use_cache:
-        cached = _read_selector_snapshot(signal_date, strategies, include_z_skill)
+        cached = _read_selector_snapshot(signal_date, strategies, effective_include_extended)
         if cached is not None:
             return cached
 
@@ -1216,10 +1316,8 @@ def get_stock_selector_payload(
         stocks[symbol]["signals"].extend(signals)
 
     model_scored = _model_scored_candidates_for_date(effective_signal_date)
-    z_skill_filter = _selected_z_skill_keys(strategies)
-    should_load_z_skill = include_z_skill or bool(z_skill_filter)
-    if should_load_z_skill:
-        for symbol, payload in _latest_z_skill_signals(effective_signal_date).items():
+    if effective_include_extended:
+        for symbol, payload in _latest_extended_signals(effective_signal_date).items():
             stock_name = _clean_text(payload.get("name"))
             basic_profile = _stock_basic_map().get(symbol, {})
             if not stock_name:
@@ -1246,12 +1344,12 @@ def get_stock_selector_payload(
             enriched_signals = []
             for signal in payload.get("signals") or []:
                 strategy_key = str(signal.get("strategy_key"))
-                if z_skill_filter and strategy_key.upper() not in z_skill_filter:
+                if extended_filter and strategy_key.upper() not in extended_filter:
                     continue
                 model_score = model_scored.get((symbol, strategy_key))
                 if strategy_key in MODEL_FILTERED_SIGNALS and model_score is None:
                     continue
-                enriched_signals.append(_z_skill_signal_payload(signal, model_score=model_score))
+                enriched_signals.append(_extended_signal_payload(signal, model_score=model_score))
             stocks[symbol]["signals"].extend(enriched_signals)
 
     for (symbol, signal_key), model_score in model_scored.items():
@@ -1285,7 +1383,8 @@ def get_stock_selector_payload(
             ]
         else:
             signals = stock["signals"]
-            signals = [signal for signal in signals if _signal_quality_gate(signal)]
+            if not effective_include_extended:
+                signals = [signal for signal in signals if _signal_quality_gate(signal)]
         if not signals:
             continue
         signals = _dedupe_signals_by_operation(signals)
@@ -1324,7 +1423,7 @@ def get_stock_selector_payload(
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    if not selected:
+    if not selected and not effective_include_extended:
         rows = rows[:DEFAULT_SELECTOR_LIMIT]
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1336,7 +1435,7 @@ def get_stock_selector_payload(
             {"key": "B3", "label": "B3", "status": "日线规则已接入"},
             {"key": "SB1", "label": "SB1", "status": "盘中战法日线近似"},
             {"key": "SUPER_B1", "label": "超级 B1", "status": "盘中战法日线近似"},
-            *Z_SKILL_STRATEGIES,
+            *EXTENDED_STRATEGIES,
         ],
         "stocks": rows,
         "notes": [
@@ -1345,11 +1444,11 @@ def get_stock_selector_payload(
             "历史均值是该股票命中策略在 OOT 回测中的平均单笔收益；PF 是总盈利除以总亏损，越高说明盈亏结构越好。",
             "股票池默认按综合分排序：综合考虑历史均值、胜率、PF、最大回撤、样本量可靠性、当前信号强度和多策略共振。",
             f"默认首页只展示实操候选 Top{DEFAULT_SELECTOR_LIMIT}；点击左侧具体策略时展示该策略完整候选，便于继续观察和复盘。",
-            "为保证首屏速度，默认首页先加载 B1/B2/B3/模型候选；z-skill 高频战法按策略筛选时再生成/读取。",
+            "为保证首屏速度，默认首页先加载核心候选；扩展策略按策略筛选时再生成/读取，最新刷新会一次性写入全策略快照。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
-            "z-skill 高频战法已完成模型版买点评估；异动地量、黄金碗当前标记为可小仓实操，呼吸结构谨慎实操，关键K和灾后重建先模型观察。",
+            "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",
         ],
     }
-    _write_selector_snapshot(payload, strategies, include_z_skill)
+    _write_selector_snapshot(payload, strategies, effective_include_extended)
     payload["cache"] = {"hit": False, "backend": "generated"}
     return payload

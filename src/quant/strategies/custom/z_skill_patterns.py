@@ -1,9 +1,9 @@
-"""Zettaranc-skill inspired daily pattern signals.
+"""Extended daily pattern signals.
 
-This module ports the z-skill discretionary patterns into self-contained
-daily-data rules for the selector. These are observation signals first: they
-use Tushare daily OHLCV fields and avoid minute/L2 assumptions unless the
-signal text explicitly says a later intraday confirmation is needed.
+This module ports multiple discretionary tactics into self-contained daily-data
+rules for the selector. These are observation signals first: they use Tushare
+daily OHLCV fields and avoid minute/L2 assumptions unless the signal text
+explicitly says a later intraday confirmation is needed.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 
-Z_SKILL_STRATEGIES: list[dict[str, str]] = [
+EXTENDED_STRATEGIES: list[dict[str, str]] = [
     {"key": "CHANGAN", "label": "长安战法", "status": "日线三日确认"},
     {"key": "PINGHANG", "label": "平行重炮", "status": "日线右侧确认"},
     {"key": "DOUBLE_GUN", "label": "双枪战法", "status": "日线右侧确认"},
@@ -196,7 +196,7 @@ def _signal(
         "buy_plan": buy_plan,
         "sell_plan": sell_plan,
         "metrics": None,
-        "metrics_text": "暂无本项目正式回测，先作为 z-skill 日线观察信号",
+        "metrics_text": "暂无本项目正式回测，先作为扩展策略日线观察信号",
         "strength_score": round(float(strength), 3),
     }
 
@@ -616,7 +616,7 @@ def build_z_skill_daily_signals(
     signal_date: str | None = None,
     max_workers: int = 24,
 ) -> dict[str, dict[str, Any]]:
-    """Scan raw daily files and return latest z-skill pattern hits by symbol."""
+    """Scan raw daily files and return latest extended pattern hits by symbol."""
     suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
     files = sorted(path for path in Path(daily_dir).glob("*.parquet") if path.name.endswith(suffixes))
     if not files:
@@ -632,3 +632,15 @@ def build_z_skill_daily_signals(
             symbol, payload = item
             results[symbol] = payload
     return results
+
+
+def build_extended_daily_signals(
+    daily_dir: Path,
+    signal_date: str | None = None,
+    max_workers: int = 24,
+) -> dict[str, dict[str, Any]]:
+    """Compatibility-friendly public name for selector strategy scans."""
+    return build_z_skill_daily_signals(daily_dir, signal_date=signal_date, max_workers=max_workers)
+
+
+Z_SKILL_STRATEGIES = EXTENDED_STRATEGIES

@@ -96,7 +96,7 @@ def b1_research(limit: int = Query(default=200, ge=1, le=2000)) -> dict[str, Any
 def stock_selector(
     strategies: str | None = None,
     signal_date: str | None = None,
-    include_z_skill: bool = False,
+    include_extended: bool = False,
     refresh: bool = False,
 ) -> dict[str, Any]:
     try:
@@ -106,7 +106,7 @@ def stock_selector(
         return get_stock_selector_payload(
             strategies=selected,
             signal_date=signal_date,
-            include_z_skill=include_z_skill,
+            include_extended=include_extended,
             use_cache=not refresh,
         )
     except HTTPException:

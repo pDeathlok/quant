@@ -1,6 +1,6 @@
 # Quant 策略选股器
 
-本项目已经从早期研究脚本整理为 Tushare-first 的量化策略工程。当前重点是策略选股器、例行数据刷新、B1/B2/B3/z-skill 系列策略复盘与每日候选池生成。
+本项目已经从早期研究脚本整理为 Tushare-first 的量化策略工程。当前重点是策略选股器、例行数据刷新、B1/B2/B3/扩展策略复盘与每日候选池生成。
 
 ## 当前主线
 
@@ -10,7 +10,7 @@ src/quant/webapp/                  # FastAPI 后端接口
 web/                               # 前端页面
 src/quant/data/market_data_store.py # MySQL/parquet 统一存储层
 src/quant/features/                # 项目级变量库
-src/quant/strategies/custom/       # B1 family 与 z-skill 规则
+src/quant/strategies/custom/       # B1 family 与扩展策略规则
 scripts/research/                  # 正式研究、训练、回测脚本
 configs/strategies/                # 已确认策略配置
 docs/strategies/                   # 策略制定档案与复盘记录
@@ -107,7 +107,7 @@ docs/factor_tushare_factor_system.md
 docs/factor_variable_implementation_matrix.md
 docs/factor_variable_dictionary.md
 docs/strategies/b1_selected_strategy_record.md
-docs/strategies/z_skill_model_strategy_record_20260607.md
+docs/strategies/extended_strategy_model_record_20260607.md
 ```
 
 ## 清理原则
