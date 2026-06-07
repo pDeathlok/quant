@@ -2,7 +2,7 @@
 因子基类定义
 
 所有因子都需要继承此基类并实现 compute 方法
-支持自动适配不同数据源（Tushare、AKShare）的字段命名
+支持自动适配 Tushare 标准字段和历史中文字段命名
 """
 
 from abc import ABC, abstractmethod
@@ -18,7 +18,7 @@ class Factor(ABC):
     
     所有自定义因子都需要继承此类并实现 compute 方法
     
-    支持自动适配不同数据源的字段命名（Tushare、AKShare等）
+    支持自动适配 Tushare 标准字段和历史中文字段命名
     通过数据适配器自动处理字段差异
     """
     
@@ -81,7 +81,7 @@ class Factor(ABC):
         """
         适配数据字段，统一不同数据源的字段命名
         
-        使用 FactorDataAdapter 进行自动适配，支持 Tushare 和 AKShare 数据
+        使用 FactorDataAdapter 进行自动适配，支持 Tushare 和历史中文字段数据
         
         Args:
             data: 原始数据

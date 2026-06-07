@@ -230,28 +230,14 @@ def get_data(symbol: str = "600000",
     Returns:
         包含历史行情的 DataFrame
     """
-    import akshare as ak
+    from quant.data import TushareDataFetcher
     
     print(f"正在获取 {symbol} 的历史数据...")
-    
-    # 根据代码判断市场
-    if symbol.startswith("6"):
-        market_symbol = f"sh{symbol}"
-    else:
-        market_symbol = f"sz{symbol}"
-    
-    # 获取前复权数据
-    df = ak.stock_zh_a_daily(
-        symbol=market_symbol,
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq"
-    )
+    fetcher = TushareDataFetcher()
+    df = fetcher.get_stock_daily(symbol=symbol, start_date=start_date, end_date=end_date, adjust="qfq")
     
     # 确保列名正确
     df["symbol"] = symbol
-    if "date" not in df.columns:
-        df = df.reset_index().rename(columns={"index": "date"})
     
     print(f"数据获取完成 - {len(df)} 条记录")
     return df

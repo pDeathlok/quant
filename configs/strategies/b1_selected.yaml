@@ -1,0 +1,55 @@
+# B1 selected production strategies.
+#
+# Strategy record:
+#   docs/strategies/b1_selected_strategy_record.md
+#
+# Summary:
+#   - B1 is a mean-reversion candidate signal with the old hard volume-increase
+#     condition removed.
+#   - Entry uses fixed thresholds instead of daily top-rank selection, so the
+#     routine can stay empty when no signal is good enough.
+#   - pred_up8_es controls upside elasticity.
+#   - pred_down3_es controls the risk of falling through the stop before rebound.
+#   - b1_stable is the current primary strategy.
+#   - b1_aggressive is retained as a stricter high-quality opportunity strategy.
+strategies:
+  - id: b1_stable
+    name: B1 稳健版
+    enabled: true
+    entry:
+      min_up8: 0.55
+      max_down3: 0.55
+    exit:
+      kind: trailing
+      hold_days: 6
+      take_profit: 0.04
+      stop_loss: 0.015
+      trail_drawdown: 0.02
+    description: pred_up8_es>=0.55 + pred_down3_es<=0.55 + 4%目标后2%回撤止盈 + 1.5%止损 + T+7到期
+
+  - id: b1_aggressive
+    name: B1 进攻版
+    enabled: true
+    entry:
+      min_up8: 0.65
+      max_down3: 0.50
+    exit:
+      kind: trailing
+      hold_days: 8
+      take_profit: 0.05
+      stop_loss: 0.015
+      trail_drawdown: 0.02
+    description: pred_up8_es>=0.65 + pred_down3_es<=0.50 + 5%目标后2%回撤止盈 + 1.5%止损 + T+9到期
+
+  - id: b1_baseline
+    name: B1 旧基准
+    enabled: true
+    entry:
+      min_up8: 0.55
+    exit:
+      kind: trailing
+      hold_days: 8
+      take_profit: 0.05
+      stop_loss: 0.02
+      trail_drawdown: 0.02
+    description: pred_up8_es>=0.55 + 5%目标后2%回撤止盈 + 2%止损 + T+9到期

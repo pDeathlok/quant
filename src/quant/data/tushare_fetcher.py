@@ -13,6 +13,8 @@ import pandas as pd
 from pathlib import Path
 import tushare as ts
 
+from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
+
 
 class TushareDataFetcher:
     """
@@ -44,6 +46,7 @@ class TushareDataFetcher:
         # 设置缓存
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.store = MarketDataStore(MarketDataStoreConfig.from_env(root=self.cache_dir))
         self._memory_cache: Dict[str, pd.DataFrame] = {}
     
     def get_stock_daily(
@@ -194,6 +197,92 @@ class TushareDataFetcher:
         self._memory_cache[cache_key] = df
         
         return df
+
+    def get_stock_minutes_history(
+        self,
+        symbol: str,
+        freq: str = "1min",
+        start_datetime: Optional[str] = None,
+        end_datetime: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取 A 股历史分钟行情。
+
+        Tushare 官方接口为 stk_mins，支持 1min/5min/15min/30min/60min。
+        适合补充 B1+1 开盘量比、9:33/9:37、14:55 等执行级回测。
+
+        Args:
+            symbol: 股票代码
+            freq: 频率，1min/5min/15min/30min/60min
+            start_datetime: 开始时间，如 2026-06-03 09:30:00
+            end_datetime: 结束时间，如 2026-06-03 15:00:00
+
+        Returns:
+            DataFrame 包含 trade_time/open/high/low/close/vol/amount
+        """
+        ts_code = self._normalize_symbol(symbol)
+        cache_key = f"tushare_stk_mins_{ts_code}_{freq}_{start_datetime}_{end_datetime}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        safe_start = str(start_datetime or "").replace(":", "").replace(" ", "_")
+        safe_end = str(end_datetime or "").replace(":", "").replace(" ", "_")
+        store_key = f"{ts_code}_{freq}_{safe_start}_{safe_end}"
+        if self.store.config.backend == "sql":
+            df = self.store.read_frame("tushare_stk_mins", store_key)
+            if not df.empty:
+                self._memory_cache[cache_key] = df
+                return df
+        file_path = self.cache_dir / f"tushare_stk_mins_{store_key}.parquet"
+        if self.store.config.backend != "sql" and file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        df = self.pro.stk_mins(
+            ts_code=ts_code,
+            freq=freq,
+            start_date=start_datetime,
+            end_date=end_datetime,
+        )
+        if df is None:
+            df = pd.DataFrame()
+        if not df.empty:
+            if "trade_time" in df.columns:
+                df["trade_time"] = pd.to_datetime(df["trade_time"])
+            elif "time" in df.columns:
+                df = df.rename(columns={"time": "trade_time"})
+                df["trade_time"] = pd.to_datetime(df["trade_time"])
+            if "vol" in df.columns and "volume" not in df.columns:
+                df["volume"] = df["vol"]
+            df = df.sort_values("trade_time").reset_index(drop=True)
+
+        if self.store.config.backend == "sql":
+            self.store.write_frame(df, "tushare_stk_mins", store_key)
+        else:
+            df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_realtime_minutes_daily(self, symbol: str, freq: str = "1MIN") -> pd.DataFrame:
+        """
+        获取当日开盘以来实时分钟行情，用于例行盘中监控。
+
+        官方接口为 rt_min_daily，freq 使用大写：1MIN/5MIN/15MIN/30MIN/60MIN。
+        """
+        ts_code = self._normalize_symbol(symbol)
+        df = self.pro.rt_min_daily(ts_code=ts_code, freq=freq)
+        if df is None:
+            return pd.DataFrame()
+        if not df.empty:
+            if "time" in df.columns and "trade_time" not in df.columns:
+                df = df.rename(columns={"time": "trade_time"})
+            if "vol" in df.columns and "volume" not in df.columns:
+                df["volume"] = df["vol"]
+            if "trade_time" in df.columns:
+                df["trade_time"] = pd.to_datetime(df["trade_time"])
+                df = df.sort_values("trade_time").reset_index(drop=True)
+        return df
     
     def get_index_daily(
         self,
@@ -274,6 +363,120 @@ class TushareDataFetcher:
         df.to_parquet(file_path, index=False)
         self._memory_cache[cache_key] = df
         
+        return df
+
+    def get_daily_basic(self, trade_date: str, fields: Optional[str] = None) -> pd.DataFrame:
+        """
+        获取 Tushare 每日指标数据。
+
+        Args:
+            trade_date: 交易日期，格式 YYYYMMDD
+            fields: Tushare fields 参数；为空时使用 B1 建模需要的常用字段
+
+        Returns:
+            DataFrame 包含换手率、量比、估值、市值、股本等每日指标
+        """
+        default_fields = (
+            "ts_code,trade_date,turnover_rate,turnover_rate_f,volume_ratio,"
+            "pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm,total_share,float_share,"
+            "free_share,total_mv,circ_mv"
+        )
+        fields = fields or default_fields
+        cache_key = f"tushare_daily_basic_{trade_date}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        file_path = self.cache_dir / f"{cache_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        df = self.pro.daily_basic(trade_date=trade_date, fields=fields)
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_moneyflow(self, trade_date: str, fields: Optional[str] = None) -> pd.DataFrame:
+        """
+        获取 Tushare 个股资金流向数据。
+
+        Args:
+            trade_date: 交易日期，格式 YYYYMMDD
+            fields: Tushare fields 参数；为空时使用策略研究常用字段
+
+        Returns:
+            DataFrame 包含大单/超大单净流入等资金流字段
+        """
+        default_fields = (
+            "ts_code,trade_date,buy_sm_vol,buy_sm_amount,sell_sm_vol,sell_sm_amount,"
+            "buy_md_vol,buy_md_amount,sell_md_vol,sell_md_amount,buy_lg_vol,"
+            "buy_lg_amount,sell_lg_vol,sell_lg_amount,buy_elg_vol,buy_elg_amount,"
+            "sell_elg_vol,sell_elg_amount,net_mf_vol,net_mf_amount"
+        )
+        fields = fields or default_fields
+        cache_key = f"tushare_moneyflow_{trade_date}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        file_path = self.cache_dir / f"{cache_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        df = self.pro.moneyflow(trade_date=trade_date, fields=fields)
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_limit_list(self, trade_date: str, fields: Optional[str] = None) -> pd.DataFrame:
+        """
+        获取涨跌停数据，用于涨停/跌停风险、连板和极端流动性过滤。
+        """
+        default_fields = (
+            "trade_date,ts_code,name,close,pct_chg,amp,fc_ratio,fl_ratio,"
+            "fd_amount,first_time,last_time,open_times,strth,limit"
+        )
+        fields = fields or default_fields
+        cache_key = f"tushare_limit_list_{trade_date}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        file_path = self.cache_dir / f"{cache_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        df = self.pro.limit_list_d(trade_date=trade_date, fields=fields)
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_top_list(self, trade_date: str, fields: Optional[str] = None) -> pd.DataFrame:
+        """
+        获取龙虎榜数据，用于后续游资接力、异常成交和事件型风险研究。
+        """
+        default_fields = (
+            "trade_date,ts_code,name,close,pct_change,turnover_rate,amount,"
+            "l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,float_values,"
+            "reason"
+        )
+        fields = fields or default_fields
+        cache_key = f"tushare_top_list_{trade_date}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        file_path = self.cache_dir / f"{cache_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        df = self.pro.top_list(trade_date=trade_date, fields=fields)
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
         return df
     
     def get_financial_report(self, symbol: str, year: int, quarter: int = 4) -> pd.DataFrame:
@@ -361,7 +564,9 @@ class TushareDataFetcher:
         """
         symbol = str(symbol).strip()
         
-        if symbol.startswith("sh"):
+        if "." in symbol:
+            return symbol
+        elif symbol.startswith("sh"):
             return f"{symbol[2:]}.SH"
         elif symbol.startswith("sz"):
             return f"{symbol[2:]}.SZ"
@@ -369,8 +574,6 @@ class TushareDataFetcher:
             return f"{symbol}.SH"
         elif symbol.startswith("0") or symbol.startswith("3"):
             return f"{symbol}.SZ"
-        elif "." in symbol:
-            return symbol
         else:
             return symbol
     
@@ -386,11 +589,13 @@ class TushareDataFetcher:
         """
         symbol = str(symbol).strip()
         
-        if symbol.startswith("sh"):
+        if "." in symbol:
+            return symbol
+        elif symbol.startswith("sh"):
             return f"{symbol[2:]}.SH"
         elif symbol.startswith("sz"):
             return f"{symbol[2:]}.SZ"
-        elif "." not in symbol:
+        else:
             if len(symbol) == 6:
                 if symbol.startswith("0"):
                     return f"{symbol}.SH"

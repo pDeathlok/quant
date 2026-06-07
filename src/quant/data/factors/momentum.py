@@ -42,7 +42,7 @@ class MomentumSkip5Factor(RollingFactor):
     
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """计算跳过最近5天的动量"""
-        return (df['close'].shift(5) / df['close'].shift(25)) - 1
+        return (df['close'].shift(5) / df['close'].shift(self.window + 5)) - 1
 
 
 class RiskAdjustedMomentumFactor(RollingFactor):

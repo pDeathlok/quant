@@ -9,33 +9,26 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 import pandas as pd
-import akshare as ak
 import numpy as np
 
+from quant.data.source_merge import normalize_ts_code, normalize_tushare_daily
+from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.ml import B1QualityLabelMaker, B1ExitAwareLabelMaker, create_b1_labels
 
 
 def load_test_data(symbol: str = "600000", days: int = 1000) -> pd.DataFrame:
-    """加载测试数据"""
+    """加载 Tushare 测试数据，优先使用本地例行任务产物。"""
     print(f"加载 {symbol} 测试数据...")
 
-    if symbol.startswith("6"):
-        market_symbol = f"sh{symbol}"
+    ts_code = normalize_ts_code(symbol)
+    root = Path(__file__).resolve().parents[2]
+    local_path = root / "data" / "raw" / "daily" / f"{ts_code}.parquet"
+    if local_path.exists():
+        df = pd.read_parquet(local_path)
     else:
-        market_symbol = f"sz{symbol}"
-
-    df = ak.stock_zh_a_daily(
-        symbol=market_symbol,
-        start_date="20150101",
-        end_date="20231231",
-        adjust="qfq"
-    )
-
-    if "date" not in df.columns:
-        df = df.reset_index().rename(columns={"index": "date"})
-
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+        fetcher = TushareDataFetcher(cache_dir=root / "data" / "cache" / "source_merge" / "tushare")
+        df = fetcher.get_stock_daily(ts_code, "20150101", "20231231", adjust=None)
+    df = normalize_tushare_daily(df, ts_code).tail(days).reset_index(drop=True)
 
     print(f"数据加载完成 - {len(df)} 条记录")
     return df

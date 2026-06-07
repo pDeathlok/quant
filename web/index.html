@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>策略选股器</title>
+    <link rel="stylesheet" href="./styles.css?v=20260607-date-refresh" />
+  </head>
+  <body>
+    <div class="app selector-app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="mark">Q</div>
+          <div>
+            <h1>策略选股器</h1>
+            <p id="generatedAt">加载中</p>
+          </div>
+        </div>
+        <div class="side-section">
+          <span>策略筛选</span>
+          <div id="strategyFilters" class="filter-list"></div>
+        </div>
+        <button id="clearFilters" class="secondary-button" type="button">清空筛选</button>
+      </aside>
+
+      <main class="main">
+        <section class="toolbar">
+          <div>
+            <p class="eyebrow">Strategy Stock Selector</p>
+            <h2>每日策略选股</h2>
+            <p class="subline"><span id="signalDate"></span> · <span id="executionDate"></span></p>
+          </div>
+          <div class="toolbar-actions">
+            <label class="date-control">
+              <span>复盘日期</span>
+              <input id="signalDateInput" type="date" min="2026-06-01" />
+            </label>
+            <input id="searchInput" type="search" placeholder="搜索股票 / 策略" />
+            <button id="reloadButton" type="button">刷新当前日期</button>
+            <button id="refreshLatestButton" type="button">更新最新数据</button>
+          </div>
+          <p id="refreshStatus" class="refresh-status"></p>
+        </section>
+
+        <section class="split">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>股票池</h3>
+              <span id="stockCount"></span>
+            </div>
+            <div class="table-wrap tall">
+              <table>
+                <thead>
+                  <tr>
+                    <th>股票</th>
+                    <th>行业</th>
+                    <th>收盘</th>
+                    <th>命中</th>
+                    <th>策略</th>
+                    <th>综合分</th>
+                    <th>历史均值</th>
+                    <th>PF</th>
+                    <th>日期</th>
+                  </tr>
+                </thead>
+                <tbody id="stockRows"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel detail-panel">
+            <div class="panel-head">
+              <div>
+                <h3 id="detailTitle">选择股票</h3>
+                <span id="detailMeta"></span>
+              </div>
+            </div>
+            <div id="signalCards" class="signal-cards"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>执行备注</h3>
+            <span>口径说明</span>
+          </div>
+          <ul id="notes" class="notes"></ul>
+        </section>
+      </main>
+    </div>
+    <script src="./app.js?v=20260607-date-refresh"></script>
+  </body>
+</html>

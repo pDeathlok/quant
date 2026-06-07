@@ -10,7 +10,7 @@ __author__ = "Quant Team"
 # 导出核心模块
 from .strategies import *
 from .backtest import BacktestEngine, GridSearchOptimizer
-from .data import DataFetcher, DataStorage, TushareDataFetcher
+from .data import DataStorage, TushareDataFetcher, MarketDataStore, MarketDataStoreConfig
 from .analysis import PerformanceAnalyzer, AttributionAnalyzer
 from .ml import (
     MLDataSet,
@@ -36,9 +36,10 @@ __all__ = [
     "GridSearchOptimizer",
 
     # 数据
-    "DataFetcher",
     "DataStorage",
     "TushareDataFetcher",
+    "MarketDataStore",
+    "MarketDataStoreConfig",
 
     # 分析
     "PerformanceAnalyzer",

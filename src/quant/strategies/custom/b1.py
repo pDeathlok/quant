@@ -6,8 +6,7 @@ B1 策略
 2. 涨跌幅在 -2% 到 +2% 之间
 3. 当日振幅小于 7%
 4. 当前的 BBI > 60日均线
-5. KDJ J值 < 10
-6. 成交量高于上一日
+5. KDJ J值 < 0
 """
 
 from ..base import BaseStrategy
@@ -25,8 +24,7 @@ class B1Strategy(BaseStrategy):
     - 当日涨跌幅: -2% <= pct_change <= +2%
     - 当日振幅: (high - low) / low < 7%
     - BBI > MA60
-    - KDJ J值 < -5
-    - 当日成交量 > 上一日成交量
+    - KDJ J值 < 0
 
     出场条件（按优先级）：
     1. 长上影线: (high - close) > (close - low) 且收盘价较昨日跌超 1%，当日收盘卖出
@@ -131,19 +129,12 @@ class B1Strategy(BaseStrategy):
         if not (bbi > ma60):
             return False
         
-        # 条件5: KDJ J值 < -5
+        # 条件5: KDJ J值 < 0
         kdj_result = self.kdj_factor.compute(df)
         j_value = kdj_result["J"].iloc[-1]
-        if not (j_value < -5):
+        if not (j_value < 0):
             return False
         
-        # 条件6: 成交量高于上一日
-        if len(df) >= 2:
-            current_volume = df.iloc[-1]["volume"]
-            prev_volume = df.iloc[-2]["volume"]
-            if not (current_volume > prev_volume):
-                return False
-
         return True
     
     def should_exit(self, bar, current_pos: int) -> bool:

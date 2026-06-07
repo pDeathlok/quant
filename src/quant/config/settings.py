@@ -12,7 +12,7 @@ class Settings:
     log_dir: Path = field(init=False)
     reports_dir: Path = field(init=False)
 
-    data_source: str = "akshare"
+    data_source: str = "tushare"
     default_commission: float = 0.0003
     default_slippage: float = 0.0
     default_initial_cash: float = 1000000.0

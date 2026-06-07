@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pytest
 import pandas as pd
@@ -25,28 +25,23 @@ def sample_data():
     return data
 
 
-class TestDataFetcher:
-    def test_fetcher_cache(self, sample_data):
-        from data import DataFetcher
+class TestMarketDataStore:
+    def test_parquet_store_roundtrip(self, sample_data, tmp_path):
+        from quant.data import MarketDataStore, MarketDataStoreConfig
 
-        fetcher = DataFetcher(cache_dir="./data/test_cache")
-        assert fetcher.cache_dir.exists()
+        store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=tmp_path))
+        store.write_frame(sample_data, "daily", "TEST")
+        loaded = store.read_frame("daily", "TEST")
 
-    def test_data_normalize(self, sample_data):
-        from data import DataFetcher
-
-        fetcher = DataFetcher()
-        normalized = fetcher._normalize(sample_data.copy(), "TEST")
-
-        assert "symbol" in normalized.columns
-        assert normalized["symbol"].iloc[0] == "TEST"
+        assert len(loaded) == len(sample_data)
+        assert list(loaded["symbol"].unique()) == ["TEST"]
 
 
 class TestTechnicalFactors:
     def test_ma_calculation(self, sample_data):
-        from data.factors import MA
+        from quant.data.factors import MA
 
-        ma5 = MA(period=5)
+        ma5 = MA(window=5)
         result = ma5.compute(sample_data)
 
         assert len(result) == len(sample_data)
@@ -54,10 +49,11 @@ class TestTechnicalFactors:
         assert result.iloc[4:].notna().all()
 
     def test_rsi_calculation(self, sample_data):
-        from data.factors import RSI
+        from quant.data.factors import RSI
 
-        rsi = RSI(period=14)
+        rsi = RSI(window=14)
         result = rsi.compute(sample_data)
+        result = result.dropna()
 
         assert result.min() >= 0
         assert result.max() <= 100
@@ -65,7 +61,7 @@ class TestTechnicalFactors:
 
 class TestStrategies:
     def test_momentum_strategy_init(self):
-        from strategies.examples import MomentumStrategy
+        from quant.strategies.momentum.momentum import MomentumStrategy
 
         strategy = MomentumStrategy(
             fast_ma_period=5,
@@ -80,8 +76,8 @@ class TestStrategies:
 
 class TestBacktestEngine:
     def test_engine_creation(self, sample_data):
-        from backtest import BacktestEngine
-        from strategies.examples import MomentumStrategy
+        from quant.backtest import BacktestEngine
+        from quant.strategies.momentum.momentum import MomentumStrategy
 
         strategy = MomentumStrategy()
         engine = BacktestEngine(
@@ -95,7 +91,7 @@ class TestBacktestEngine:
 
 class TestRiskManager:
     def test_risk_limits_creation(self):
-        from risk import RiskLimits, RiskManager
+        from quant.risk import RiskLimits, RiskManager
 
         limits = RiskLimits(
             max_position_size=0.1,
@@ -108,7 +104,7 @@ class TestRiskManager:
         assert manager.limits.max_drawdown == 0.2
 
     def test_order_rate_limit(self):
-        from risk import RiskManager
+        from quant.risk import RiskManager
 
         manager = RiskManager()
         manager.limits.max_orders_per_minute = 3

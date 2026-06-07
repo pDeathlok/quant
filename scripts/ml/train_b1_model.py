@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 import pandas as pd
 import numpy as np
-import akshare as ak
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import TimeSeriesSplit
@@ -30,6 +29,8 @@ from quant.ml import (
     create_b1_labels,
     MLDataSet
 )
+from quant.data.source_merge import normalize_ts_code, normalize_tushare_daily
+from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.factors import KDJ, MACD, BOLL, RSI, MA, Volume
 
 
@@ -40,27 +41,20 @@ FORWARD_DAYS = 5
 
 
 def load_data(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """加载股票数据"""
+    """加载 Tushare 日线数据，优先使用本地例行任务产物。"""
     print(f"正在加载 {symbol} 的数据...")
 
-    if symbol.startswith("6"):
-        market_symbol = f"sh{symbol}"
+    ts_code = normalize_ts_code(symbol)
+    local_path = Path(__file__).resolve().parents[2] / "data" / "raw" / "daily" / f"{ts_code}.parquet"
+    if local_path.exists():
+        df = pd.read_parquet(local_path)
     else:
-        market_symbol = f"sz{symbol}"
+        fetcher = TushareDataFetcher(cache_dir=Path(__file__).resolve().parents[2] / "data" / "cache" / "source_merge" / "tushare")
+        df = fetcher.get_stock_daily(ts_code, start_date, end_date, adjust=None)
 
-    df = ak.stock_zh_a_daily(
-        symbol=market_symbol,
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq"
-    )
-
-    df["symbol"] = symbol
-    if "date" not in df.columns:
-        df = df.reset_index().rename(columns={"index": "date"})
-
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+    df = normalize_tushare_daily(df, ts_code)
+    df = df[(df["trade_date"] >= start_date) & (df["trade_date"] <= end_date)].copy()
+    df["symbol"] = ts_code
 
     print(f"数据加载完成 - {len(df)} 条记录")
     return df

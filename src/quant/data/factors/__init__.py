@@ -3,19 +3,12 @@
 """
 因子库模块
 
-统一支持 Tushare 和 AKShare 数据源，通过数据适配器自动处理字段差异
+基于 Tushare 标准字段的因子计算模块。数据获取由 routine/data_refresh
+负责，因子库只保留字段适配与计算逻辑。
 """
 
 # 数据适配器
 from .data_adapter import FactorDataAdapter, FactorDataLoader
-
-# 数据源配置
-from .data_source import (
-    DataSourceConfig,
-    DataSourceManager,
-    get_data_source_manager,
-    init_data_source
-)
 
 # 基类
 from .base import Factor, RollingFactor
@@ -193,13 +186,9 @@ __version__ = "1.0.0"
 
 # 导出所有模块
 __all__ = [
-    # 数据适配器和数据源
+    # 数据适配器
     'FactorDataAdapter',
     'FactorDataLoader',
-    'DataSourceConfig',
-    'DataSourceManager',
-    'get_data_source_manager',
-    'init_data_source',
     
     # 基类
     'Factor',

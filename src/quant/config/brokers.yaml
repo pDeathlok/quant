@@ -9,6 +9,6 @@ broker:
 # 实盘券商配置 (示例)
 live_broker:
   name: "某券商"
-  account: "YOUR_ACCOUNT"
-  password: "YOUR_PASSWORD"
+  account_env: "BROKER_ACCOUNT"
+  password_env: "BROKER_PASSWORD"
   server: "交易服务器地址"

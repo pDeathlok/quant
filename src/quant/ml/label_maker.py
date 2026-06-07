@@ -33,11 +33,12 @@ class B1QualityLabelMaker:
         生成多层Label
 
         Args:
-            df: 包含 close, high, low, volume 的DataFrame
+            df: 包含 close, high, low, volume, open 的DataFrame
 
         Returns:
             包含各类Label的DataFrame
         """
+        # 基础未来收益和最高/最低价格计算
         future_price = df['close'].shift(-self.forward_days)
         future_return = (future_price / df['close'] - 1) * 100
 
@@ -99,7 +100,7 @@ class B1QualityLabelMaker:
         return max_ret
 
     def _calc_max_return(self, df: pd.DataFrame, days: int) -> pd.Series:
-        """计算持有期间最高收益"""
+        """计算持有期间最高收益（以收盘价买入，持有期间最高价卖出）"""
         max_price = df['close'].copy()
 
         for i in range(1, days + 1):
@@ -153,7 +154,6 @@ class B1QualityLabelMaker:
             return pd.Series(False, index=df.index)
 
         close = df['close']
-        volume = df['volume']
 
         ma3 = close.rolling(3).mean()
         ma6 = close.rolling(6).mean()
@@ -179,8 +179,7 @@ class B1QualityLabelMaker:
             (pct_change >= -2) & (pct_change <= 2) &
             (amplitude < 7) &
             (bbi > ma60) &
-            (j < -5) &
-            (volume > volume.shift(1))
+            (j < 0)
         )
 
         return mask
@@ -236,7 +235,94 @@ class B1ExitAwareLabelMaker(B1QualityLabelMaker):
         return labels
 
 
-def create_b1_labels(df: pd.DataFrame, forward_days: int = 5, exit_aware: bool = False) -> pd.DataFrame:
+class B1NewLabelMaker(B1ExitAwareLabelMaker):
+    """
+    B1策略新版LabelMaker
+
+    根据用户需求新增以下Label：
+    
+    1. T+1开盘买入，T+2到T+6最高点涨幅大于5%、8%、10%
+       - label_t1_open_max_high_5pct: T+2到T+6期间最高点相对于T+1开盘价涨幅>=5%
+       - label_t1_open_max_high_8pct: T+2到T+6期间最高点相对于T+1开盘价涨幅>=8%
+       - label_t1_open_max_high_10pct: T+2到T+6期间最高点相对于T+1开盘价涨幅>=10%
+    
+    2. T+1开盘买入，T+2到T+6盘中最低点低于T+0最低点2%、3%
+       - label_t1_open_min_low_2pct_below_t0_low: T+2到T+6期间盘中最低点低于T+0最低点2%
+       - label_t1_open_min_low_3pct_below_t0_low: T+2到T+6期间盘中最低点低于T+0最低点3%
+    
+    3. T+1开盘买入，T+2到T+6收盘最低点低于T+0最低点2%、3%
+       - label_t1_open_min_close_2pct_below_t0_low: T+2到T+6期间收盘最低点低于T+0最低点2%
+       - label_t1_open_min_close_3pct_below_t0_low: T+2到T+6期间收盘最低点低于T+0最低点3%
+    """
+
+    def __init__(self, forward_days: int = 5):
+        super().__init__(forward_days)
+
+    def make(self, df: pd.DataFrame) -> pd.DataFrame:
+        """生成包含新版Label的DataFrame"""
+        # 调用父类生成基础Label
+        labels = super().make(df)
+        
+        # 确保数据已按日期排序
+        if 'date' in df.columns:
+            df_sorted = df.sort_values('date').reset_index(drop=True)
+        else:
+            df_sorted = df.copy()
+        
+        # 获取T+0最低点
+        t0_low = df_sorted['low']
+        
+        # 获取T+1开盘价
+        t1_open = df_sorted['open'].shift(-1)
+        
+        # 计算T+2到T+6（即持有期第2到第5天）的最高点、盘中最低点、收盘最低点
+        # 注意：forward_days=5表示持有5天(T+1到T+5)，用户要求的是T+2到T+6，相当于持有期第2天到第6天
+        
+        # T+2到T+6的最高价（盘中高点）
+        t2_t6_highs = []
+        for i in range(2, self.forward_days + 2):  # i=2对应T+2, i=6对应T+6
+            t2_t6_highs.append(df_sorted['high'].shift(-i))
+        t2_t6_max_high = pd.concat(t2_t6_highs, axis=1).max(axis=1)
+        
+        # T+2到T+6的盘中最低价
+        t2_t6_lows = []
+        for i in range(2, self.forward_days + 2):
+            t2_t6_lows.append(df_sorted['low'].shift(-i))
+        t2_t6_min_low = pd.concat(t2_t6_lows, axis=1).min(axis=1)
+        
+        # T+2到T+6的收盘价最低点
+        t2_t6_closes = []
+        for i in range(2, self.forward_days + 2):
+            t2_t6_closes.append(df_sorted['close'].shift(-i))
+        t2_t6_min_close = pd.concat(t2_t6_closes, axis=1).min(axis=1)
+        
+        # 1. T+1开盘买入，T+2到T+6最高点涨幅
+        # 涨幅 = (最高点 - T+1开盘价) / T+1开盘价 * 100
+        t1_open_max_high_return = (t2_t6_max_high / t1_open - 1) * 100
+        labels['label_t1_open_max_high_5pct'] = (t1_open_max_high_return >= 5).astype(int)
+        labels['label_t1_open_max_high_8pct'] = (t1_open_max_high_return >= 8).astype(int)
+        labels['label_t1_open_max_high_10pct'] = (t1_open_max_high_return >= 10).astype(int)
+        
+        # 2. T+1开盘买入，T+2到T+6盘中最低点低于T+0最低点2%、3%
+        # 跌幅 = (T+0最低点 - 盘中最低点) / T+0最低点 * 100
+        t0_low_min_low_diff = (t0_low - t2_t6_min_low) / t0_low * 100
+        labels['label_t1_open_min_low_2pct_below_t0_low'] = (t0_low_min_low_diff >= 2).astype(int)
+        labels['label_t1_open_min_low_3pct_below_t0_low'] = (t0_low_min_low_diff >= 3).astype(int)
+        
+        # 3. T+1开盘买入，T+2到T+6收盘最低点低于T+0最低点2%、3%
+        t0_low_min_close_diff = (t0_low - t2_t6_min_close) / t0_low * 100
+        labels['label_t1_open_min_close_2pct_below_t0_low'] = (t0_low_min_close_diff >= 2).astype(int)
+        labels['label_t1_open_min_close_3pct_below_t0_low'] = (t0_low_min_close_diff >= 3).astype(int)
+        
+        # 添加一些辅助Label
+        labels['label_t1_open_return'] = t1_open_max_high_return
+        labels['label_t2_t6_min_low_vs_t0_low'] = t0_low_min_low_diff
+        labels['label_t2_t6_min_close_vs_t0_low'] = t0_low_min_close_diff
+        
+        return labels
+
+
+def create_b1_labels(df: pd.DataFrame, forward_days: int = 5, exit_aware: bool = False, use_new_labels: bool = False) -> pd.DataFrame:
     """
     便捷函数：创建B1策略Label
 
@@ -244,11 +330,14 @@ def create_b1_labels(df: pd.DataFrame, forward_days: int = 5, exit_aware: bool =
         df: K线数据
         forward_days: 持有天数（默认5天）
         exit_aware: 是否包含出场感知Label
+        use_new_labels: 是否使用新版Label定义
 
     Returns:
         包含Label的DataFrame
     """
-    if exit_aware:
+    if use_new_labels:
+        maker = B1NewLabelMaker(forward_days)
+    elif exit_aware:
         maker = B1ExitAwareLabelMaker(forward_days)
     else:
         maker = B1QualityLabelMaker(forward_days)
