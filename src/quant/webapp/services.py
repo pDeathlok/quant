@@ -58,6 +58,7 @@ FAMILY_SIGNAL_COLUMNS = {
 DEFAULT_ACTION_LEVELS = {"可小仓实操", "谨慎实操"}
 DEFAULT_FAMILIES = {"B1", "B2", "B3", "SB1", "SUPER_B1", "YIDONG_DILIAN", "GOLDEN_BOWL", "KENGQI", "PINGHANG"}
 DEFAULT_SELECTOR_LIMIT = 50
+DEFAULT_FAMILY_CAP = 12
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
 _REFRESH_LOCK = threading.Lock()
@@ -590,7 +591,7 @@ def _model_score_reason(row: pd.Series | None) -> str:
 
 def _extended_signal_payload(signal: dict[str, Any], model_score: pd.Series | None = None) -> dict[str, Any]:
     strategy_key = str(signal.get("strategy_key"))
-    model_playbook = _model_playbook_for(strategy_key)
+    model_playbook = _model_playbook_for(strategy_key) if model_score is not None else None
     playbook = model_playbook if model_playbook is not None else _extended_playbooks().get(strategy_key)
     if playbook is None:
         return signal
@@ -808,6 +809,37 @@ def _dedupe_signals_by_operation(signals: list[dict[str, Any]]) -> list[dict[str
     return list(best_by_operation.values())
 
 
+def _primary_family(row: dict[str, Any]) -> str:
+    signals = row.get("signals") or []
+    if signals:
+        return str(signals[0].get("strategy_family") or signals[0].get("strategy_key") or "")
+    families = row.get("matched_families") or []
+    return str(families[0]) if families else ""
+
+
+def _diversify_default_rows(rows: list[dict[str, Any]], limit: int = DEFAULT_SELECTOR_LIMIT) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    family_counts: dict[str, int] = {}
+    seen: set[str] = set()
+    for row in rows:
+        family = _primary_family(row)
+        if family_counts.get(family, 0) >= DEFAULT_FAMILY_CAP:
+            continue
+        selected.append(row)
+        seen.add(str(row.get("symbol") or ""))
+        family_counts[family] = family_counts.get(family, 0) + 1
+        if len(selected) >= limit:
+            return selected
+    for row in rows:
+        symbol = str(row.get("symbol") or "")
+        if symbol in seen:
+            continue
+        selected.append(row)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 @lru_cache(maxsize=1)
 def _family_best_metrics() -> dict[str, pd.Series]:
     path = latest_report_file("latest_b1_family_rule_backtest.csv") or latest_report_file(FAMILY_RULE_PATTERN)
@@ -915,7 +947,7 @@ def _b1_model_signal(row: dict[str, Any]) -> dict[str, Any]:
 def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score: pd.Series | None = None) -> dict[str, Any]:
     signal_column, family, name, logic = FAMILY_SIGNAL_COLUMNS[strategy_key]
     is_intraday_approx = family in {"SB1", "SUPER_B1"}
-    model_playbook = _model_playbook_for(family) if family in MODEL_FILTERED_SIGNALS else None
+    model_playbook = _model_playbook_for(family) if family in MODEL_FILTERED_SIGNALS and model_score is not None else None
     best = model_playbook if model_playbook is not None else _family_best_metrics_by_signal().get(signal_column)
     if best is None:
         best = _family_best_metrics().get(family)
@@ -946,6 +978,8 @@ def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score
         model_entry = f"模型买入条件：{_entry_rule_text(str(model_playbook.get('entry_rule') or ''))}；"
         if model_reason:
             strength_score += max(float(model_score.get("pred_up5") or 0) - float(model_score.get("pred_down3") or 0), 0) * 2
+    elif family in MODEL_FILTERED_SIGNALS:
+        model_entry = "模型分待按复权口径重算；当前先展示规则候选；"
     return {
         "strategy_key": strategy_key,
         "strategy_family": family,
@@ -990,8 +1024,6 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
                 if column in row.index and bool(row.get(column, False)):
                     family = FAMILY_SIGNAL_COLUMNS[key][1]
                     model_score = scored.get((symbol, family))
-                    if family in MODEL_FILTERED_SIGNALS and model_score is None:
-                        continue
                     signal_rows.setdefault(symbol, []).append(_family_signal_payload(key, row, model_score=model_score))
         return signal_rows
 
@@ -1019,8 +1051,6 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
             if int(row.get(column, 0) or 0) == 1:
                 family = FAMILY_SIGNAL_COLUMNS[key][1]
                 model_score = scored.get((str(symbol), family))
-                if family in MODEL_FILTERED_SIGNALS and model_score is None:
-                    continue
                 signal_rows.setdefault(str(symbol), []).append(_family_signal_payload(key, row, model_score=model_score))
     return signal_rows
 
@@ -1192,7 +1222,12 @@ def _run_latest_refresh_job() -> None:
         }
 
         _set_refresh_progress(step_key="selector_extended", message="正在计算全市场扩展策略信号", percent=82)
-        full_payload = get_stock_selector_payload(signal_date=core_payload.get("signal_date"), include_extended=True, use_cache=False)
+        full_payload = get_stock_selector_payload(
+            signal_date=core_payload.get("signal_date"),
+            include_extended=True,
+            use_cache=False,
+            full_snapshot=True,
+        )
         results["selector_extended"] = {
             "status": "success",
             "signal_date": full_payload.get("signal_date"),
@@ -1264,6 +1299,7 @@ def get_stock_selector_payload(
     signal_date: str | None = None,
     include_extended: bool = False,
     use_cache: bool = True,
+    full_snapshot: bool = False,
 ) -> dict[str, Any]:
     extended_filter = _selected_extended_keys(strategies)
     effective_include_extended = include_extended or bool(extended_filter)
@@ -1347,8 +1383,6 @@ def get_stock_selector_payload(
                 if extended_filter and strategy_key.upper() not in extended_filter:
                     continue
                 model_score = model_scored.get((symbol, strategy_key))
-                if strategy_key in MODEL_FILTERED_SIGNALS and model_score is None:
-                    continue
                 enriched_signals.append(_extended_signal_payload(signal, model_score=model_score))
             stocks[symbol]["signals"].extend(enriched_signals)
 
@@ -1383,7 +1417,7 @@ def get_stock_selector_payload(
             ]
         else:
             signals = stock["signals"]
-            if not effective_include_extended:
+            if not full_snapshot:
                 signals = [signal for signal in signals if _signal_quality_gate(signal)]
         if not signals:
             continue
@@ -1423,8 +1457,8 @@ def get_stock_selector_payload(
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    if not selected and not effective_include_extended:
-        rows = rows[:DEFAULT_SELECTOR_LIMIT]
+    if not selected and not full_snapshot:
+        rows = _diversify_default_rows(rows, DEFAULT_SELECTOR_LIMIT)
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": plan.get("signal_date"),
@@ -1444,7 +1478,7 @@ def get_stock_selector_payload(
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
             "历史均值是该股票命中策略在 OOT 回测中的平均单笔收益；PF 是总盈利除以总亏损，越高说明盈亏结构越好。",
             "股票池默认按综合分排序：综合考虑历史均值、胜率、PF、最大回撤、样本量可靠性、当前信号强度和多策略共振。",
-            f"默认首页只展示实操候选 Top{DEFAULT_SELECTOR_LIMIT}；点击左侧具体策略时展示该策略完整候选，便于继续观察和复盘。",
+            f"默认首页只展示通过质量门槛的实操候选 Top{DEFAULT_SELECTOR_LIMIT}，并限制单个策略家族过度霸榜；点击左侧具体策略时展示该策略完整规则候选，便于继续观察和复盘。",
             "为保证首屏速度，默认首页先加载核心候选；扩展策略按策略筛选时再生成/读取，最新刷新会一次性写入全策略快照。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",

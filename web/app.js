@@ -55,6 +55,7 @@ async function loadSelector(options = {}) {
   const query = new URLSearchParams();
   const params = selectedStrategyParam();
   if (params) query.set("strategies", params);
+  if (!params) query.set("include_extended", "true");
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
   const suffix = query.toString();
