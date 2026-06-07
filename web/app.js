@@ -5,6 +5,7 @@ const state = {
   query: "",
   signalDate: "",
   refreshPollId: null,
+  loading: false,
 };
 
 const API_BASE = "/api";
@@ -49,13 +50,19 @@ function selectedStrategyParam() {
 }
 
 async function loadSelector() {
+  state.loading = true;
+  render();
   const query = new URLSearchParams();
   const params = selectedStrategyParam();
   if (params) query.set("strategies", params);
   if (state.signalDate) query.set("signal_date", state.signalDate);
   const suffix = query.toString();
   const path = suffix ? `/selector/stocks?${suffix}` : "/selector/stocks";
-  state.payload = await fetchJson(path);
+  try {
+    state.payload = await fetchJson(path);
+  } finally {
+    state.loading = false;
+  }
   state.signalDate = state.payload.signal_date || state.signalDate;
   const dateInput = document.querySelector("#signalDateInput");
   if (dateInput && state.payload.signal_date) {
@@ -87,10 +94,10 @@ function selectedStock() {
 }
 
 function renderHeader() {
-  document.querySelector("#generatedAt").textContent = state.payload ? `更新于 ${state.payload.generated_at}` : "加载中";
+  document.querySelector("#generatedAt").textContent = state.loading ? "正在加载" : (state.payload ? `更新于 ${state.payload.generated_at}` : "加载中");
   document.querySelector("#signalDate").textContent = state.payload ? `${state.payload.signal_date} 收盘后选股` : "";
   document.querySelector("#executionDate").textContent = state.payload?.execution_date || "";
-  document.querySelector("#stockCount").textContent = `${filteredStocks().length} 只股票`;
+  document.querySelector("#stockCount").textContent = state.loading ? "加载中" : `${filteredStocks().length} 只股票`;
 }
 
 function renderStrategyFilters() {
@@ -120,6 +127,11 @@ function renderStrategyFilters() {
 function renderStockRows() {
   const rows = filteredStocks();
   const body = document.querySelector("#stockRows");
+  if (state.loading) {
+    body.innerHTML = `<tr><td colspan="9" class="empty-cell">正在加载股票池...</td></tr>`;
+    document.querySelector("#stockCount").textContent = "加载中";
+    return;
+  }
   if (!rows.length) {
     body.innerHTML = `<tr><td colspan="9" class="empty-cell">当前筛选条件下没有股票</td></tr>`;
     document.querySelector("#stockCount").textContent = "0 只股票";
@@ -159,7 +171,7 @@ function renderStockDetail() {
   if (!stock) {
     title.textContent = "未选择股票";
     meta.textContent = "";
-    body.innerHTML = `<div class="empty-state">请先选择一只股票</div>`;
+    body.innerHTML = `<div class="empty-state">${state.loading ? "正在加载股票池..." : "请先选择一只股票"}</div>`;
     return;
   }
   title.textContent = `${stock.symbol} ${stock.name || ""}`;

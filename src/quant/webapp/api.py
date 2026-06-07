@@ -93,12 +93,20 @@ def b1_research(limit: int = Query(default=200, ge=1, le=2000)) -> dict[str, Any
 
 
 @router.get("/selector/stocks")
-def stock_selector(strategies: str | None = None, signal_date: str | None = None) -> dict[str, Any]:
+def stock_selector(
+    strategies: str | None = None,
+    signal_date: str | None = None,
+    include_z_skill: bool = False,
+) -> dict[str, Any]:
     try:
         if signal_date and date.fromisoformat(signal_date) < SELECTOR_REPLAY_MIN_DATE:
             raise HTTPException(status_code=400, detail="复盘查询暂从 2026-06-01 开始")
         selected = [item.strip() for item in strategies.split(",")] if strategies else None
-        return get_stock_selector_payload(strategies=selected, signal_date=signal_date)
+        return get_stock_selector_payload(
+            strategies=selected,
+            signal_date=signal_date,
+            include_z_skill=include_z_skill,
+        )
     except HTTPException:
         raise
     except ValueError as exc:

@@ -950,7 +950,17 @@ def get_latest_refresh_status() -> dict[str, Any]:
         return dict(_REFRESH_STATUS)
 
 
-def get_stock_selector_payload(strategies: list[str] | None = None, signal_date: str | None = None) -> dict[str, Any]:
+def _selected_z_skill_keys(strategies: list[str] | None) -> set[str]:
+    selected = {item.upper() for item in strategies or [] if item}
+    known = {str(item.get("key", "")).upper() for item in Z_SKILL_STRATEGIES}
+    return selected & known
+
+
+def get_stock_selector_payload(
+    strategies: list[str] | None = None,
+    signal_date: str | None = None,
+    include_z_skill: bool = False,
+) -> dict[str, Any]:
     plan = get_b1_plan(signal_date=signal_date)
     effective_signal_date = plan.get("signal_date") or signal_date
     stocks: dict[str, dict[str, Any]] = {}
@@ -995,38 +1005,43 @@ def get_stock_selector_payload(strategies: list[str] | None = None, signal_date:
         stocks[symbol]["signals"].extend(signals)
 
     model_scored = _model_scored_candidates_for_date(effective_signal_date)
-    for symbol, payload in _latest_z_skill_signals(effective_signal_date).items():
-        stock_name = _clean_text(payload.get("name"))
-        basic_profile = _stock_basic_map().get(symbol, {})
-        if not stock_name:
-            stock_name = _clean_text(basic_profile.get("name"))
-        if "ST" in stock_name.upper() or "退" in stock_name:
-            continue
-        if symbol not in stocks:
-            stocks[symbol] = {
-                "symbol": symbol,
-                "name": stock_name,
-                "date": payload.get("date") or plan.get("signal_date"),
-                "close": payload.get("close"),
-                "industry": _clean_text(payload.get("industry")) or _clean_text(basic_profile.get("industry")),
-                "signals": [],
-            }
-            _fill_stock_profile(stocks[symbol], effective_signal_date)
-        else:
-            stock = stocks[symbol]
-            if not _clean_text(stock.get("industry")):
-                stock["industry"] = _clean_text(payload.get("industry")) or _clean_text(basic_profile.get("industry"))
-            if not _clean_text(stock.get("name")):
-                stock["name"] = stock_name
-            _fill_stock_profile(stock, effective_signal_date)
-        enriched_signals = []
-        for signal in payload.get("signals") or []:
-            strategy_key = str(signal.get("strategy_key"))
-            model_score = model_scored.get((symbol, strategy_key))
-            if strategy_key in MODEL_FILTERED_SIGNALS and model_score is None:
+    z_skill_filter = _selected_z_skill_keys(strategies)
+    should_load_z_skill = include_z_skill or bool(z_skill_filter)
+    if should_load_z_skill:
+        for symbol, payload in _latest_z_skill_signals(effective_signal_date).items():
+            stock_name = _clean_text(payload.get("name"))
+            basic_profile = _stock_basic_map().get(symbol, {})
+            if not stock_name:
+                stock_name = _clean_text(basic_profile.get("name"))
+            if "ST" in stock_name.upper() or "退" in stock_name:
                 continue
-            enriched_signals.append(_z_skill_signal_payload(signal, model_score=model_score))
-        stocks[symbol]["signals"].extend(enriched_signals)
+            if symbol not in stocks:
+                stocks[symbol] = {
+                    "symbol": symbol,
+                    "name": stock_name,
+                    "date": payload.get("date") or plan.get("signal_date"),
+                    "close": payload.get("close"),
+                    "industry": _clean_text(payload.get("industry")) or _clean_text(basic_profile.get("industry")),
+                    "signals": [],
+                }
+                _fill_stock_profile(stocks[symbol], effective_signal_date)
+            else:
+                stock = stocks[symbol]
+                if not _clean_text(stock.get("industry")):
+                    stock["industry"] = _clean_text(payload.get("industry")) or _clean_text(basic_profile.get("industry"))
+                if not _clean_text(stock.get("name")):
+                    stock["name"] = stock_name
+                _fill_stock_profile(stock, effective_signal_date)
+            enriched_signals = []
+            for signal in payload.get("signals") or []:
+                strategy_key = str(signal.get("strategy_key"))
+                if z_skill_filter and strategy_key.upper() not in z_skill_filter:
+                    continue
+                model_score = model_scored.get((symbol, strategy_key))
+                if strategy_key in MODEL_FILTERED_SIGNALS and model_score is None:
+                    continue
+                enriched_signals.append(_z_skill_signal_payload(signal, model_score=model_score))
+            stocks[symbol]["signals"].extend(enriched_signals)
 
     for (symbol, signal_key), model_score in model_scored.items():
         if signal_key not in MODEL_FILTERED_SIGNALS:
@@ -1119,6 +1134,7 @@ def get_stock_selector_payload(strategies: list[str] | None = None, signal_date:
             "历史均值是该股票命中策略在 OOT 回测中的平均单笔收益；PF 是总盈利除以总亏损，越高说明盈亏结构越好。",
             "股票池默认按综合分排序：综合考虑历史均值、胜率、PF、最大回撤、样本量可靠性、当前信号强度和多策略共振。",
             f"默认首页只展示实操候选 Top{DEFAULT_SELECTOR_LIMIT}；点击左侧具体策略时展示该策略完整候选，便于继续观察和复盘。",
+            "为保证首屏速度，默认首页先加载 B1/B2/B3/模型候选；z-skill 高频战法按策略筛选时再生成/读取。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "z-skill 高频战法已完成模型版买点评估；异动地量、黄金碗当前标记为可小仓实操，呼吸结构谨慎实操，关键K和灾后重建先模型观察。",
         ],
