@@ -28,6 +28,7 @@ import pandas as pd
 
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
+from quant.features.variable_library import build_continuous_ohlc
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -138,11 +139,12 @@ def _normalize_daily(path: Path, start_date: str) -> pd.DataFrame:
     out = out[~st_mask].reset_index(drop=True)
     if len(out) < 130:
         return pd.DataFrame()
-    out["pre_close"] = out.get("pre_close", out["close"].shift(1))
-    out["pre_close"] = out["pre_close"].replace(0, np.nan).fillna(out["close"].shift(1))
-    if "pct_chg" not in out.columns:
-        out["pct_chg"] = out["close"].pct_change() * 100
-    out["pct_chg"] = out["pct_chg"].fillna(out["close"].pct_change() * 100).fillna(0)
+    price = build_continuous_ohlc(out)
+    for col in ["open", "high", "low", "close"]:
+        out[col] = price[col]
+    out["pre_close"] = out["close"].shift(1)
+    out["pct_chg"] = out["close"].pct_change() * 100
+    out["pct_chg"] = out["pct_chg"].fillna(0)
     out["amplitude"] = (out["high"] - out["low"]) / out["pre_close"].replace(0, np.nan) * 100
     out["close_pos"] = (out["close"] - out["low"]) / (out["high"] - out["low"]).replace(0, np.nan)
     out["vol_ratio_prev"] = out["volume"] / out["volume"].shift(1).replace(0, np.nan)

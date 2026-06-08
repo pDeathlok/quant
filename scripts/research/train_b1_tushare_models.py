@@ -39,6 +39,7 @@ import build_training_data_parallel as btd
 from quant.data.source_merge import normalize_tushare_daily
 from quant.features.variable_library import (
     PROJECT_FACTOR_COLUMNS,
+    build_continuous_ohlc,
     calc_bbi as project_calc_bbi,
     calculate_project_extra_features,
     merge_daily_basic_features,
@@ -90,13 +91,14 @@ def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
         labels = create_b1_labels(df, forward_days=5, exit_aware=True, use_new_labels=True)
         result = pd.concat([df, factors, labels], axis=1)
 
-        pct_change = result["pct_chg"] if "pct_chg" in result.columns else result["close"].pct_change() * 100
-        amplitude = (result["high"] - result["low"]) / result["low"] * 100
+        price = build_continuous_ohlc(result)
+        pct_change = price["close"].pct_change() * 100
+        amplitude = (price["high"] - price["low"]) / price["low"].replace(0, np.nan) * 100
         b1_signal = (
             (pct_change >= -2)
             & (pct_change <= 2)
             & (amplitude < 7)
-            & (project_calc_bbi(result["close"]) > result["ma_60"])
+            & (project_calc_bbi(price["close"]) > price["close"].rolling(60, min_periods=20).mean())
             & (result["kdj_d_j"] < 0)
         )
         keep_cols = [

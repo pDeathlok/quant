@@ -25,6 +25,7 @@ import pandas as pd
 import build_training_data_parallel as btd
 from quant.features.variable_library import (
     EXTRA_FEATURE_COLUMNS,
+    build_continuous_ohlc,
     calc_bbi as project_calc_bbi,
     calculate_project_extra_features,
     merge_daily_basic_features,
@@ -493,9 +494,11 @@ def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: 
         daily = read_daily_file(daily_dir, symbol)
         if daily is None:
             continue
+        daily = build_continuous_ohlc(daily)
         keep_cols = ["symbol", "date", "open", "high", "low", "close"]
         daily = daily[keep_cols].copy()
         future = daily[["symbol", "date"]].copy()
+        future["_adjusted_signal_close"] = daily["close"]
         future["entry_open"] = daily["open"].shift(-1)
         future["date_t1"] = daily["date"].shift(-1)
         future["open_t1"] = daily["open"].shift(-1)
@@ -517,6 +520,9 @@ def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: 
 
     future_all = pd.concat(frames, ignore_index=True)
     merged = candidates.merge(future_all, on=["symbol", "date"], how="left")
+    if "_adjusted_signal_close" in merged.columns:
+        merged["close"] = merged["_adjusted_signal_close"].combine_first(merged.get("close"))
+        merged = merged.drop(columns=["_adjusted_signal_close"])
     return merged.dropna(subset=["entry_open"]).copy()
 
 

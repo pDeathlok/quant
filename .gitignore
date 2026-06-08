@@ -64,6 +64,7 @@ Thumbs.db
 # Logs
 *.log
 logs/*.log
+.run/
 
 # Claude
 .claude/

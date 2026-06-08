@@ -411,7 +411,7 @@ def _metrics_text(metrics: dict[str, Any] | None) -> str:
         f"均值 {_fmt_pct(metrics.get('avg_return_pct'))}，"
         f"胜率 {_fmt_rate(metrics.get('win_rate'))}，"
         f"最大回撤 {_fmt_pct(metrics.get('max_drawdown_pct'))}，"
-        f"PF {float(metrics.get('profit_factor') or 0):.2f}（复权口径待重算）"
+        f"PF {float(metrics.get('profit_factor') or 0):.2f}（连续复权口径）"
     )
 
 
@@ -979,7 +979,7 @@ def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score
         if model_reason:
             strength_score += max(float(model_score.get("pred_up5") or 0) - float(model_score.get("pred_down3") or 0), 0) * 2
     elif family in MODEL_FILTERED_SIGNALS:
-        model_entry = "模型分待按复权口径重算；当前先展示规则候选；"
+        model_entry = "模型分未覆盖或未通过；当前先展示规则候选；"
     return {
         "strategy_key": strategy_key,
         "strategy_family": family,
@@ -1139,9 +1139,11 @@ def _clear_selector_caches() -> None:
 def _progress_steps() -> list[dict[str, Any]]:
     return [
         {"key": "refresh_data", "label": "拉取 Tushare 最新日线数据", "status": "pending", "percent": 10},
-        {"key": "daily_plan", "label": "生成最新 B1 每日计划", "status": "pending", "percent": 45},
-        {"key": "selector_core", "label": "计算 B1/B2/B3/SB1 股票池", "status": "pending", "percent": 65},
-        {"key": "selector_extended", "label": "计算全市场扩展策略信号", "status": "pending", "percent": 82},
+        {"key": "daily_plan", "label": "生成最新策略每日计划", "status": "pending", "percent": 35},
+        {"key": "signal_cache", "label": "重建全市场策略规则信号", "status": "pending", "percent": 50},
+        {"key": "model_score", "label": "计算当日策略模型分", "status": "pending", "percent": 65},
+        {"key": "selector_core", "label": "计算 B1/B2/B3/SB1 股票池", "status": "pending", "percent": 75},
+        {"key": "selector_extended", "label": "计算全市场扩展策略信号", "status": "pending", "percent": 88},
         {"key": "snapshot", "label": "写入 MySQL 策略股票池快照", "status": "pending", "percent": 95},
     ]
 
@@ -1185,7 +1187,13 @@ def _set_refresh_progress(
 
 
 def _run_latest_refresh_job() -> None:
-    from quant.routine.pipeline import generate_dashboard, generate_daily_plan, refresh_data
+    from quant.routine.pipeline import (
+        generate_dashboard,
+        generate_daily_plan,
+        refresh_data,
+        refresh_strategy_signal_cache,
+        score_latest_models,
+    )
 
     with _REFRESH_LOCK:
         _REFRESH_STATUS.update(
@@ -1208,12 +1216,22 @@ def _run_latest_refresh_job() -> None:
         if results["refresh_data"].get("status") == "failed":
             raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
-        _set_refresh_progress(step_key="daily_plan", message="正在生成最新 B1 每日计划", percent=45)
+        _set_refresh_progress(step_key="daily_plan", message="正在生成最新策略每日计划", percent=35)
         results["generate_daily_plan"] = generate_daily_plan()
         results["generate_dashboard"] = generate_dashboard()
+
+        _set_refresh_progress(step_key="signal_cache", message="正在重建全市场策略规则信号", percent=50)
+        results["signal_cache"] = refresh_strategy_signal_cache()
+        if results["signal_cache"].get("status") == "failed":
+            raise RuntimeError(results["signal_cache"].get("stderr_tail") or "策略规则信号重建失败")
+
+        _set_refresh_progress(step_key="model_score", message="正在计算当日策略模型分", percent=65)
+        results["model_score"] = score_latest_models()
+        if results["model_score"].get("status") == "failed":
+            raise RuntimeError(results["model_score"].get("stderr_tail") or "当日策略模型分计算失败")
         _clear_selector_caches()
 
-        _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=65)
+        _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=75)
         core_payload = get_stock_selector_payload(use_cache=False)
         results["selector_core"] = {
             "status": "success",
@@ -1221,7 +1239,7 @@ def _run_latest_refresh_job() -> None:
             "stocks": len(core_payload.get("stocks") or []),
         }
 
-        _set_refresh_progress(step_key="selector_extended", message="正在计算全市场扩展策略信号", percent=82)
+        _set_refresh_progress(step_key="selector_extended", message="正在计算全市场扩展策略信号", percent=88)
         full_payload = get_stock_selector_payload(
             signal_date=core_payload.get("signal_date"),
             include_extended=True,
@@ -1474,7 +1492,7 @@ def get_stock_selector_payload(
         "stocks": rows,
         "notes": [
             "选股器按股票聚合命中策略家族；同一策略家族下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中仍按策略家族去重计算。",
-            "2026-06-08 已修复除权断点导致的 KDJ/价格滚动指标失真；完整回测和模型指标重算完成前，页面 OOT 指标仅作旧口径参考。",
+            "2026-06-08 已修复除权断点导致的 KDJ/价格滚动指标失真；模型训练、标签和策略回测已切换为连续复权价格口径。",
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
             "历史均值是该股票命中策略在 OOT 回测中的平均单笔收益；PF 是总盈利除以总亏损，越高说明盈亏结构越好。",
             "股票池默认按综合分排序：综合考虑历史均值、胜率、PF、最大回撤、样本量可靠性、当前信号强度和多策略共振。",

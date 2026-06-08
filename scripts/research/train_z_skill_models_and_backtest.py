@@ -17,7 +17,7 @@ import json
 import shutil
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +41,7 @@ from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exi
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from analyze_z_skill_entry_exit_backtest import OpenFilter, apply_open_filter, build_open_filters
 from quant.data.source_merge import normalize_tushare_daily
-from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, calculate_project_extra_features
+from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc, calculate_project_extra_features
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
 
@@ -274,7 +274,8 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
         factors = pd.concat([btd.calculate_factors_single_stock(daily), calculate_project_extra_features(daily)], axis=1)
         factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
         labels = create_b1_labels(daily, forward_days=5, exit_aware=True, use_new_labels=True)
-        close_pos = ((daily["close"] - daily["low"]) / (daily["high"] - daily["low"]).replace(0, np.nan)).rename("close_pos")
+        price = build_continuous_ohlc(daily)
+        close_pos = ((price["close"] - price["low"]) / (price["high"] - price["low"]).replace(0, np.nan)).rename("close_pos")
         result = pd.concat([daily, factors, labels, close_pos], axis=1)
         result = result.loc[:, ~result.columns.duplicated(keep="last")]
         result["symbol"] = result["symbol"].fillna(result.get("ts_code", path.stem)).astype(str)
@@ -307,7 +308,14 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
         return None
 
 
-def build_model_dataset(daily_dir: Path, signals: list[str], start_date: str, workers: int, force_refresh: bool) -> pd.DataFrame:
+def build_model_dataset(
+    daily_dir: Path,
+    signals: list[str],
+    start_date: str,
+    workers: int,
+    force_refresh: bool,
+    executor_type: str = "threads",
+) -> pd.DataFrame:
     if DATASET_PATH.exists() and not force_refresh:
         data = pd.read_parquet(DATASET_PATH)
         data["date"] = pd.to_datetime(data["date"])
@@ -322,7 +330,8 @@ def build_model_dataset(daily_dir: Path, signals: list[str], start_date: str, wo
     files = [path for path in sorted(daily_dir.glob("*.parquet")) if path.name.endswith(suffixes) and path.stem in by_symbol]
     frames: list[pd.DataFrame] = []
     started = perf_counter()
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+    executor_cls = ProcessPoolExecutor if executor_type == "processes" else ThreadPoolExecutor
+    with executor_cls(max_workers=max(1, workers)) as executor:
         futures = [executor.submit(_process_daily_for_dataset, (str(path), by_symbol[path.stem], signals, start_date)) for path in files]
         for n, future in enumerate(as_completed(futures), start=1):
             frame = future.result()
@@ -773,6 +782,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default="2020-01-01")
     parser.add_argument("--oot-start", default="2025-01-01")
     parser.add_argument("--workers", type=int, default=64)
+    parser.add_argument("--executor", choices=["threads", "processes"], default="threads")
     parser.add_argument("--force-dataset", action="store_true")
     parser.add_argument("--reuse-models", action="store_true")
     parser.add_argument("--focused-grid", action="store_true")
@@ -790,7 +800,7 @@ def main() -> None:
     signals = list(dict.fromkeys(args.signals))
     print(f"signals: {signals}", flush=True)
     print("building/loading model dataset", flush=True)
-    data = build_model_dataset(args.daily_dir, signals, args.start_date, args.workers, args.force_dataset)
+    data = build_model_dataset(args.daily_dir, signals, args.start_date, args.workers, args.force_dataset, args.executor)
     data = assign_splits(data, args.oot_start, random_state=42)
     print(f"model dataset rows={len(data):,} features={len(_feature_columns(data))}", flush=True)
 

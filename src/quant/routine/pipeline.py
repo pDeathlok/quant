@@ -71,6 +71,43 @@ def build_features() -> dict:
     }
 
 
+def refresh_strategy_signal_cache(workers: int = 96) -> dict:
+    command = [
+        sys.executable,
+        "scripts/research/rebuild_strategy_signal_cache.py",
+        "--workers",
+        str(workers),
+        "--force-refresh",
+    ]
+    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
+    return {
+        "status": "success" if result.returncode == 0 else "failed",
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout[-4000:],
+        "stderr_tail": result.stderr[-4000:],
+        "command": " ".join(command),
+    }
+
+
+def score_latest_models(workers: int = 96) -> dict:
+    command = [
+        sys.executable,
+        "scripts/research/score_latest_strategy_models.py",
+        "--workers",
+        str(workers),
+    ]
+    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
+    return {
+        "status": "success" if result.returncode == 0 else "failed",
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout[-4000:],
+        "stderr_tail": result.stderr[-4000:],
+        "command": " ".join(command),
+    }
+
+
 def run_selected_strategies() -> dict:
     command = [sys.executable, "scripts/research/analyze_b1_formal_combos.py"]
     result = subprocess.run(command, cwd=PROJECT_ROOT, check=False, capture_output=True, text=True)
@@ -121,6 +158,8 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
     results: dict[str, dict] = {}
     results["refresh_data"] = refresh_data(dry_run=skip_data)
     results["build_features"] = build_features()
+    results["refresh_strategy_signal_cache"] = refresh_strategy_signal_cache()
+    results["score_latest_models"] = score_latest_models()
     if skip_backtest:
         results["run_selected_strategies"] = {"status": "skipped", "reason": "skip_backtest=true"}
     else:

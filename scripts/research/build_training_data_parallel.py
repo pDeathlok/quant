@@ -49,6 +49,18 @@ from quant.data.factors.momentum import (
     ReturnFactor, MomentumSkip5Factor, RiskAdjustedMomentumFactor, ReversalFactor
 )
 from quant.ml.label_maker import create_b1_labels
+from quant.features.variable_library import build_continuous_ohlc
+
+
+def _continuous_price_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Use continuous OHLC for price-derived factors while keeping volume/fundamental fields."""
+    price = build_continuous_ohlc(df)
+    out = df.copy()
+    for col in ["open", "high", "low", "close"]:
+        out[col] = price[col]
+    out["pre_close"] = out["close"].shift(1)
+    out["pct_chg"] = out["close"].pct_change() * 100
+    return out
 
 
 def calculate_b1_signal_single_stock(df: pd.DataFrame) -> pd.Series:
@@ -59,13 +71,14 @@ def calculate_b1_signal_single_stock(df: pd.DataFrame) -> pd.Series:
     elif 'trade_date' in df.columns:
         df = df.sort_values('trade_date').reset_index(drop=True)
     
-    pct_change = df["close"].pct_change() * 100
+    price_df = _continuous_price_frame(df)
+    pct_change = price_df["close"].pct_change() * 100
     cond1 = (pct_change >= -3) & (pct_change <= 3)
     
-    amplitude = (df["high"] - df["low"]) / df["low"] * 100
+    amplitude = (price_df["high"] - price_df["low"]) / price_df["low"].replace(0, np.nan) * 100
     cond2 = amplitude < 10
     
-    kdj = KDJ().compute(df)
+    kdj = KDJ().compute(price_df)
     cond4 = kdj["J"] < 10
     
     cond5 = df["volume"] > df["volume"].shift(1) * 0.8
@@ -86,6 +99,7 @@ def calculate_factors_single_stock(df: pd.DataFrame) -> pd.DataFrame:
         df = df.sort_values('date').reset_index(drop=True)
     elif 'trade_date' in df.columns:
         df = df.sort_values('trade_date').reset_index(drop=True)
+    df = _continuous_price_frame(df)
     
     factors = pd.DataFrame(index=df.index)
     

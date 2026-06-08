@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
 
+from quant.features.variable_library import build_continuous_ohlc
+
 
 class B1QualityLabelMaker:
     """
@@ -38,12 +40,14 @@ class B1QualityLabelMaker:
         Returns:
             包含各类Label的DataFrame
         """
-        # 基础未来收益和最高/最低价格计算
-        future_price = df['close'].shift(-self.forward_days)
-        future_return = (future_price / df['close'] - 1) * 100
+        price_df = build_continuous_ohlc(df)
 
-        max_intraday = self._calc_max_intraday(df, self.forward_days)
-        max_return = self._calc_max_return(df, self.forward_days)
+        # 基础未来收益和最高/最低价格计算
+        future_price = price_df['close'].shift(-self.forward_days)
+        future_return = (future_price / price_df['close'] - 1) * 100
+
+        max_intraday = self._calc_max_intraday(price_df, self.forward_days)
+        max_return = self._calc_max_return(price_df, self.forward_days)
 
         labels = pd.DataFrame({
             'future_return': future_return,
@@ -199,10 +203,11 @@ class B1ExitAwareLabelMaker(B1QualityLabelMaker):
         """生成包含出场方式感知的Label"""
         labels = super().make(df)
 
+        price_df = build_continuous_ohlc(df)
         future_low = pd.concat([
-            df['low'].shift(-i) for i in range(1, self.forward_days + 1)
+            price_df['low'].shift(-i) for i in range(1, self.forward_days + 1)
         ], axis=1).min(axis=1)
-        min_return = (future_low / df['close'] - 1) * 100
+        min_return = (future_low / price_df['close'] - 1) * 100
 
         labels['min_return'] = min_return
 
@@ -263,11 +268,13 @@ class B1NewLabelMaker(B1ExitAwareLabelMaker):
         # 调用父类生成基础Label
         labels = super().make(df)
         
+        price_df = build_continuous_ohlc(df)
+
         # 确保数据已按日期排序
         if 'date' in df.columns:
-            df_sorted = df.sort_values('date').reset_index(drop=True)
+            df_sorted = price_df.sort_values('date').reset_index(drop=True)
         else:
-            df_sorted = df.copy()
+            df_sorted = price_df.copy()
         
         # 获取T+0最低点
         t0_low = df_sorted['low']
