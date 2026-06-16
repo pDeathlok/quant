@@ -564,7 +564,15 @@ def _detect_violence_k(df: pd.DataFrame) -> dict[str, Any] | None:
     body_pct = abs(_safe_float(today["close"]) - _safe_float(today["open"])) / max(_safe_float(today["pre_close"]), 1) * 100
     prev_bodies = (df["close"].tail(7).iloc[:-1] - df["open"].tail(7).iloc[:-1]).abs() / df["pre_close"].tail(7).iloc[:-1].replace(0, np.nan) * 100
     at_bottom = _safe_float(today["low"]) <= _safe_float(df["low"].tail(21).iloc[:-1].min()) * 1.05
-    if at_bottom and body_pct >= 5 and body_pct > _safe_float(prev_bodies.mean()) * 2 and _safe_float(today["vol_ratio_5"]) >= 2:
+    if (
+        at_bottom
+        and bool(today["is_rise"])
+        and _safe_float(today["pct_chg"]) > 0
+        and _safe_float(today["close_pos"]) >= 0.7
+        and body_pct >= 5
+        and body_pct > _safe_float(prev_bodies.mean()) * 2
+        and _safe_float(today["vol_ratio_5"]) >= 2
+    ):
         return _signal(
             "VIOLENCE_K",
             "暴力K",

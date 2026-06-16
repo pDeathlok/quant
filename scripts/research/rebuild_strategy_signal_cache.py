@@ -34,7 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--daily-dir", type=Path, default=DEFAULT_DAILY_DIR)
     parser.add_argument("--start-date", default="2020-01-01")
     parser.add_argument("--workers", type=int, default=96)
-    parser.add_argument("--force-refresh", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--force-refresh", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--incremental-start-date",
+        default=None,
+        help="只重建并替换该日期之后的缓存；不传则按 start-date 返回缓存。",
+    )
     return parser.parse_args()
 
 
@@ -54,8 +59,18 @@ def _summary(df: pd.DataFrame, signal_cols: list[str]) -> dict:
 
 def main() -> None:
     args = parse_args()
-    family = build_family_signals(force_refresh=args.force_refresh, workers=args.workers)
-    extended = build_extended_signals(args.daily_dir, args.start_date, args.force_refresh, args.workers)
+    rebuild_start = args.incremental_start_date or (args.start_date if args.force_refresh else None)
+    family = build_family_signals(
+        force_refresh=args.force_refresh,
+        workers=args.workers,
+        incremental_start_date=rebuild_start,
+    )
+    extended = build_extended_signals(
+        args.daily_dir,
+        rebuild_start or args.start_date,
+        args.force_refresh,
+        args.workers,
+    )
     family_cols = [col for col in family.columns if col.startswith(("b1_", "b2_", "b3_", "sb1_", "super_b1"))]
     extended_cols = [
         "CHANGAN",

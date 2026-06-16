@@ -10,6 +10,8 @@ from quant.webapp.services import (
     get_b1_plan,
     get_dashboard,
     get_latest_refresh_status,
+    get_long_stock_pool,
+    get_selector_calendar,
     get_research_index,
     get_stock_selector_payload,
     refresh_b1_plan,
@@ -19,7 +21,7 @@ from quant.webapp.services import (
 
 
 router = APIRouter()
-SELECTOR_REPLAY_MIN_DATE = date(2026, 6, 1)
+SELECTOR_REPLAY_MIN_DATE = date(2020, 1, 1)
 
 
 class RefreshPlanRequest(BaseModel):
@@ -92,6 +94,22 @@ def b1_research(limit: int = Query(default=200, ge=1, le=2000)) -> dict[str, Any
         raise HTTPException(status_code=500, detail=f"B1 研究结果读取失败: {exc}") from exc
 
 
+@router.get("/long/stock-pool")
+def long_stock_pool(
+    variant: str = Query(default="tea"),
+    signal_date: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        if signal_date:
+            date.fromisoformat(signal_date)
+        return get_long_stock_pool(variant=variant, signal_date=signal_date, refresh=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"长线策略参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"长线股票池生成失败: {exc}") from exc
+
+
 @router.get("/selector/stocks")
 def stock_selector(
     strategies: str | None = None,
@@ -115,6 +133,21 @@ def stock_selector(
         raise HTTPException(status_code=400, detail=f"日期格式错误: {signal_date}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"选股器生成失败: {exc}") from exc
+
+
+@router.get("/selector/calendar")
+def selector_calendar(
+    start: str = "2026-06-01",
+    end: str | None = None,
+) -> dict[str, Any]:
+    try:
+        if date.fromisoformat(start) < SELECTOR_REPLAY_MIN_DATE:
+            start = SELECTOR_REPLAY_MIN_DATE.isoformat()
+        return get_selector_calendar(start=start, end=end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期格式错误") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"交易日历读取失败: {exc}") from exc
 
 
 @router.post("/selector/refresh-latest")

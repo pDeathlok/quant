@@ -311,7 +311,15 @@ def compute_z_skill_flags(df: pd.DataFrame) -> pd.DataFrame:
 
     prev_body = body_pct.shift(1).rolling(5, min_periods=2).mean()
     at_bottom = low <= low20 * 1.05
-    flags["VIOLENCE_K"] = at_bottom & (body_pct >= 5) & (body_pct > prev_body * 2) & (out["vol_ratio_5"] >= 2)
+    flags["VIOLENCE_K"] = (
+        at_bottom
+        & out["is_rise"]
+        & (pct > 0)
+        & (close_pos >= 0.7)
+        & (body_pct >= 5)
+        & (body_pct > prev_body * 2)
+        & (out["vol_ratio_5"] >= 2)
+    )
 
     result_cols = ["symbol", "date", "open", "high", "low", "close", "pct_chg", "close_pos", "kdj_j"]
     result = out[result_cols].copy()
@@ -338,14 +346,24 @@ def process_file(path: Path, start_date: str) -> pd.DataFrame | None:
         return None
 
 
+def _parse_cache_start_date(value: str) -> pd.Timestamp:
+    if value.isdigit() and len(value) == 8:
+        return pd.to_datetime(value, format="%Y%m%d")
+    return pd.to_datetime(value)
+
+
 def build_signal_candidates(daily_dir: Path, start_date: str, force_refresh: bool, workers: int) -> pd.DataFrame:
+    start_ts = _parse_cache_start_date(start_date)
+    cached: pd.DataFrame | None = None
     if SIGNAL_CACHE.exists() and not force_refresh:
         cached = pd.read_parquet(SIGNAL_CACHE)
         cached["date"] = pd.to_datetime(cached["date"])
         expected = {spec.key for spec in build_signal_specs()}
         if expected <= set(cached.columns):
-            return cached[cached["date"] >= pd.Timestamp(start_date)].copy()
-        print("z-skill signal cache missing expected columns; rebuilding", flush=True)
+            cached = cached.dropna(subset=["symbol", "date"])
+        else:
+            print("z-skill signal cache missing expected columns; rebuilding", flush=True)
+            cached = None
 
     suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
     files = sorted(path for path in daily_dir.glob("*.parquet") if path.name.endswith(suffixes))
@@ -355,15 +373,26 @@ def build_signal_candidates(daily_dir: Path, start_date: str, force_refresh: boo
         for n, future in enumerate(as_completed(futures), start=1):
             result = future.result()
             if result is not None and not result.empty:
-                frames.append(result)
+                result = result[pd.to_datetime(result["date"]) >= start_ts].copy()
+                if not result.empty:
+                    frames.append(result)
             if n % 500 == 0 or n == len(futures):
                 print(f"  z-skill signals: {n}/{len(futures)} files", flush=True)
-    if not frames:
+    if cached is not None:
+        old = cached[pd.to_datetime(cached["date"]) < start_ts].copy()
+        if frames:
+            recent = pd.concat(frames, ignore_index=True)
+            combined = pd.concat([old, recent], ignore_index=True)
+        else:
+            combined = old
+    elif frames:
+        combined = pd.concat(frames, ignore_index=True)
+    else:
         raise RuntimeError("No z-skill signal candidates built")
-    combined = pd.concat(frames, ignore_index=True).sort_values(["symbol", "date"]).reset_index(drop=True)
+    combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
     SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(SIGNAL_CACHE, index=False)
-    return combined[combined["date"] >= pd.Timestamp(start_date)].copy()
+    return combined[combined["date"] >= start_ts].copy()
 
 
 def add_split(df: pd.DataFrame) -> pd.DataFrame:

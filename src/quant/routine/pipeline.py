@@ -4,6 +4,7 @@ import subprocess
 import sys
 import json
 import os
+import re
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -16,77 +17,223 @@ from quant.routine.paths import CONFIG_PATH, PROJECT_ROOT, ROUTINE_DIR
 from quant.routine.strategies import StrategyConfig, load_strategy_configs
 
 
-def refresh_data(dry_run: bool = True) -> dict:
+def _incremental_daily_start(lookback_days: int | None = None) -> str:
+    if lookback_days is None:
+        lookback_days = int(os.getenv("ROUTINE_DAILY_LOOKBACK_DAYS", "0"))
+    latest_dates: list[pd.Timestamp] = []
+    daily_dir = PROJECT_ROOT / "data/raw/daily"
+    if daily_dir.exists():
+        for path in daily_dir.glob("*.parquet"):
+            try:
+                frame = pd.read_parquet(path, columns=["trade_date"])
+            except Exception:
+                try:
+                    frame = pd.read_parquet(path, columns=["date"])
+                except Exception:
+                    continue
+            if frame.empty:
+                continue
+            if "trade_date" in frame.columns:
+                dates = pd.to_datetime(frame["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+            else:
+                dates = pd.to_datetime(frame["date"], errors="coerce")
+            latest = dates.max()
+            if pd.notna(latest):
+                latest_dates.append(latest)
+    if not latest_dates:
+        return "20100101"
+    start = max(latest_dates) - pd.Timedelta(days=lookback_days)
+    return start.strftime("%Y%m%d")
+
+
+def _incremental_feature_start() -> str:
+    dataset = PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet"
+    if not dataset.exists():
+        return "20200101"
+    try:
+        frame = pd.read_parquet(dataset, columns=["date"])
+    except Exception:
+        return "20200101"
+    if frame.empty:
+        return "20200101"
+    dates = pd.to_datetime(frame["date"], errors="coerce")
+    latest = dates.max()
+    if pd.isna(latest):
+        return "20200101"
+    return latest.strftime("%Y%m%d")
+
+
+def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
+    start_date = _incremental_daily_start()
+    workers = os.getenv("ROUTINE_DAILY_WORKERS", "16")
+    sleep_seconds = os.getenv("ROUTINE_DAILY_SLEEP", "0.08")
     command = [
         sys.executable,
         "-m",
         "quant.routine.data_refresh",
         "--start",
-        "20100101",
+        start_date,
         "--adjust",
         "none",
         "--output-dir",
         "data/raw/daily",
         "--workers",
-        "2",
+        workers,
         "--sleep",
-        "0.25",
+        sleep_seconds,
         "--retries",
         "3",
         "--retry-base-delay",
         "2",
         "--retry-max-delay",
         "60",
+        "--final-retry-rounds",
+        os.getenv("ROUTINE_DAILY_FINAL_RETRY_ROUNDS", "2"),
+        "--final-retry-workers",
+        os.getenv("ROUTINE_DAILY_FINAL_RETRY_WORKERS", "4"),
+        "--final-retry-sleep",
+        os.getenv("ROUTINE_DAILY_FINAL_RETRY_SLEEP", "0.8"),
     ]
     if dry_run:
         return {
             "status": "skipped",
             "reason": "dry_run=true；未访问外部数据源。正式刷新仅使用 Tushare 日线数据。",
             "command": " ".join(command),
+            "start_date": start_date,
         }
     env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")}
-    result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
+    process = subprocess.Popen(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout_lines: list[str] = []
+    progress_pattern = re.compile(r"refresh progress: (\d+)/(\d+) done, success=(\d+), failed=(\d+)")
+    assert process.stdout is not None
+    for line in process.stdout:
+        stdout_lines.append(line)
+        match = progress_pattern.search(line)
+        if match and progress_callback is not None:
+            done, total, ok, failed = map(int, match.groups())
+            ratio = done / total if total else 0
+            progress_callback(
+                percent=10 + int(ratio * 25),
+                message=f"正在拉取 Tushare 最新日线数据：{done}/{total}，成功 {ok}，失败 {failed}",
+            )
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    returncode = process.wait()
+    stdout = "".join(stdout_lines)
     return {
-        "status": "success" if result.returncode == 0 else "failed",
-        "returncode": result.returncode,
-        "stdout_tail": result.stdout[-4000:],
-        "stderr_tail": result.stderr[-4000:],
+        "status": "success" if returncode == 0 else "failed",
+        "returncode": returncode,
+        "stdout_tail": stdout[-4000:],
+        "stderr_tail": stderr[-4000:],
         "command": " ".join(command),
+        "start_date": start_date,
     }
 
 
-def build_features() -> dict:
+def build_features(progress_callback=None) -> dict:
+    start_date = _incremental_feature_start()
     command = [
         sys.executable,
-        "scripts/research/analyze_b1_entry_exit_grid.py",
-        "--candidate-mode",
-        "strict_no_volume",
-        "--entry-mode",
-        "threshold",
+        "scripts/research/refresh_b1_feature_cache.py",
+        "--incremental-start-date",
+        start_date,
+        "--workers",
+        os.getenv("ROUTINE_FEATURE_WORKERS", "96"),
     ]
+    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    process = subprocess.Popen(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout_lines: list[str] = []
+    progress_pattern = re.compile(r"processed (\d+)/(\d+) daily files, frames=(\d+)")
+    assert process.stdout is not None
+    for line in process.stdout:
+        stdout_lines.append(line)
+        match = progress_pattern.search(line)
+        if match and progress_callback is not None:
+            done, total, frames = map(int, match.groups())
+            ratio = done / total if total else 0
+            progress_callback(
+                percent=35 + int(ratio * 10),
+                message=f"正在增量构建 B1 特征：{done}/{total}，命中 {frames}",
+            )
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    returncode = process.wait()
+    stdout = "".join(stdout_lines)
     return {
-        "status": "planned",
-        "reason": "当前候选池已经存在；正式调度时执行该命令刷新 B1 候选与模型预测",
+        "status": "success" if returncode == 0 else "failed",
+        "returncode": returncode,
+        "stdout_tail": stdout[-4000:],
+        "stderr_tail": stderr[-4000:],
         "command": " ".join(command),
+        "start_date": start_date,
     }
 
 
-def refresh_strategy_signal_cache(workers: int = 96) -> dict:
+def refresh_strategy_signal_cache(workers: int = 96, progress_callback=None) -> dict:
+    start_date = _incremental_daily_start()
     command = [
         sys.executable,
         "scripts/research/rebuild_strategy_signal_cache.py",
         "--workers",
         str(workers),
-        "--force-refresh",
+        "--incremental-start-date",
+        start_date,
     ]
     env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
-    result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
+    process = subprocess.Popen(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout_lines: list[str] = []
+    progress_pattern = re.compile(r"(family|z-skill) signals: (\d+)/(\d+) files")
+    assert process.stdout is not None
+    for line in process.stdout:
+        stdout_lines.append(line)
+        match = progress_pattern.search(line)
+        if match and progress_callback is not None:
+            phase, done_text, total_text = match.groups()
+            done = int(done_text)
+            total = int(total_text)
+            ratio = done / total if total else 0
+            if phase == "family":
+                percent = 50 + int(ratio * 7)
+                label = "核心策略规则信号"
+            else:
+                percent = 57 + int(ratio * 8)
+                label = "扩展策略规则信号"
+            progress_callback(
+                percent=percent,
+                message=f"正在增量重建{label}：{done}/{total}",
+            )
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    returncode = process.wait()
+    stdout = "".join(stdout_lines)
     return {
-        "status": "success" if result.returncode == 0 else "failed",
-        "returncode": result.returncode,
-        "stdout_tail": result.stdout[-4000:],
-        "stderr_tail": result.stderr[-4000:],
+        "status": "success" if returncode == 0 else "failed",
+        "returncode": returncode,
+        "stdout_tail": stdout[-4000:],
+        "stderr_tail": stderr[-4000:],
         "command": " ".join(command),
+        "start_date": start_date,
     }
 
 

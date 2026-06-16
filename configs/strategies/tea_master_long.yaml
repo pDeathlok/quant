@@ -1,0 +1,66 @@
+# Tea Master independent long-term regime/grid strategy.
+#
+# Strategy documents:
+#   docs/strategies/tea_master_trading_strategy.md
+#   docs/strategies/tea_master_long_strategy_record.md
+strategies:
+  - id: tea_master_regime_grid
+    name: 茶大长线趋势网格策略
+    enabled: true
+    backtest:
+      script: scripts/research/backtest_tea_master_long.py
+      variant: core14_soft_plus
+      start: "20130101"
+      latest_report: reports/tea_master_long/optimization_summary.md
+      latest_summary: reports/tea_master_long/core14_soft_plus/tea_master_summary.json
+    data:
+      price_adjustment: qfq
+      benchmark: "000300.SH"
+      financial_asof: "ann_date <= signal_date"
+      analyst_asof: "report_date <= signal_date"
+    market_regime:
+      risk_on:
+        target_core_weight: 0.70
+        boosted_core_weight: 0.76
+        max_growth_sleeve_weight: 0.12
+      neutral:
+        target_core_weight: 0.60
+        growth_sleeve_weight: 0.0
+      risk_off:
+        defensive_core_weight: 0.25
+        growth_sleeve_weight: 0.0
+    position:
+      rebalance_frequency: monthly
+      max_core_positions: 14
+      max_growth_positions: 0
+      max_core_symbol_weight: 0.08
+      max_growth_symbol_weight: 0.0
+      stateful_hold: true
+    scoring:
+      dividend: 0.15
+      quality: 0.30
+      value: 0.20
+      trend: 0.20
+      risk: 0.15
+    t_overlay:
+      enabled: true
+      method: style_grid
+      defensive_value_core_ratio: 0.85
+      quality_core_core_ratio: 0.80
+      high_volatility_core_ratio: 0.70
+      growth_core_ratio: 0.70
+      risk_off_buyback: false
+    evaluated_results:
+      period: "2013-01-04 to 2026-06-12"
+      annual_return: 0.0713719705
+      max_drawdown: -0.3202007853
+      sharpe: 0.6083893244
+      average_positions: 8.4622930729
+      average_total_weight: 0.4926707086
+      benchmark_annual_return: 0.0507362146
+      benchmark_max_drawdown: -0.4669613510
+      conservative_variant:
+        variant: core14_soft_spread
+        annual_return: 0.066650
+        max_drawdown: -0.301020
+        sharpe: 0.606624

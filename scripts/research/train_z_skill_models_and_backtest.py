@@ -60,6 +60,10 @@ PRIORITY_SIGNALS = [
     "YIDONG_DILIAN",
     "KEY_K",
     "GOLDEN_BOWL",
+    "DUICHEN_VA",
+    "ZAIHOU",
+    "YUEYUE",
+    "VIOLENCE_K",
 ]
 
 RESEARCH_SIGNALS = [

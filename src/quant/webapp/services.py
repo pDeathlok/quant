@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import re
 import hashlib
+import importlib.util
+import sys
 import threading
 import traceback
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -34,7 +36,18 @@ EXTENDED_MODEL_SCORED = REPORT_DIR / "latest_z_skill_model_scored_candidates.par
 EXTENDED_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.csv"
 FAMILY_RULE_PATTERN = "b1_family_rule_backtest_*.csv"
 FUSION_PATTERN = "b1_model_zettaranc_fusion_*.csv"
-MODEL_FILTERED_SIGNALS = {"B2", "BREATHING", "NANA", "YIDONG_DILIAN", "KEY_K", "GOLDEN_BOWL"}
+MODEL_FILTERED_SIGNALS = {
+    "B2",
+    "BREATHING",
+    "NANA",
+    "YIDONG_DILIAN",
+    "KEY_K",
+    "GOLDEN_BOWL",
+    "DUICHEN_VA",
+    "ZAIHOU",
+    "YUEYUE",
+    "VIOLENCE_K",
+}
 MODEL_SIGNAL_LABELS = {
     "B2": "B2 模型分",
     "BREATHING": "呼吸结构",
@@ -42,7 +55,35 @@ MODEL_SIGNAL_LABELS = {
     "YIDONG_DILIAN": "异动地量",
     "KEY_K": "关键K",
     "GOLDEN_BOWL": "黄金碗",
+    "DUICHEN_VA": "对称VA",
+    "ZAIHOU": "灾后重建",
+    "YUEYUE": "跃跃欲试",
+    "VIOLENCE_K": "暴力K",
 }
+STRATEGY_GROUPS = [
+    {"key": "B1", "label": "B1", "status": "超跌反弹，模型+规则", "members": ["B1"]},
+    {"key": "B2", "label": "B2", "status": "B1后/独立右侧确认", "members": ["B2"]},
+    {"key": "B3", "label": "B3", "status": "B2后分歧转一致", "members": ["B3"]},
+    {"key": "SB1", "label": "SB1", "status": "横盘下破洗盘", "members": ["SB1"]},
+    {"key": "SUPER_B1", "label": "超级B1", "status": "放量下杀后企稳", "members": ["SUPER_B1"]},
+    {"key": "STRONG_K", "label": "强K/突破", "status": "关键K、暴力K", "members": ["KEY_K", "VIOLENCE_K"]},
+    {"key": "DOUBLE_YANG", "label": "双阳结构", "status": "平行重炮、双枪", "members": ["PINGHANG", "DOUBLE_GUN"]},
+    {"key": "LOW_PULLBACK", "label": "缩量回调低吸", "status": "异动地量、娜娜、对称VA", "members": ["YIDONG_DILIAN", "NANA", "DUICHEN_VA"]},
+    {"key": "SUPPORT_PULLBACK", "label": "支撑回踩", "status": "黄金碗、灾后重建", "members": ["GOLDEN_BOWL", "ZAIHOU"]},
+    {"key": "RHYTHM_PLATFORM", "label": "节奏/平台", "status": "呼吸结构、跃跃欲试", "members": ["BREATHING", "YUEYUE"]},
+    {"key": "CHANGAN", "label": "长安战法", "status": "日线三日确认", "members": ["CHANGAN"]},
+    {"key": "KENGQI", "label": "坑里起好货", "status": "日线填坑观察", "members": ["KENGQI"]},
+]
+STRATEGY_GROUP_MEMBERS = {
+    item["key"]: set(item["members"])
+    for item in STRATEGY_GROUPS
+}
+STRATEGY_MEMBER_TO_GROUP = {
+    member: item["key"]
+    for item in STRATEGY_GROUPS
+    for member in item["members"]
+}
+STRATEGY_GROUP_LABELS = {item["key"]: item["label"] for item in STRATEGY_GROUPS}
 FAMILY_SIGNAL_COLUMNS = {
     "B1_RULE": ("signal_b1", "B1", "B1 规则观察", "J<=-10、缩量回调、未连续四阴、接近 BBI/MA60 支撑"),
     "B2_ANY": ("b2_any_pchg4_vol15", "B2", "B2 独立右侧确认", "涨幅>=4%、5日量比>=1.5、收盘位置>=75%、J<80"),
@@ -56,11 +97,53 @@ FAMILY_SIGNAL_COLUMNS = {
     "SUPER_B1": ("super_washout_j10_closepos40", "SUPER_B1", "超级 B1", "近三日放量下杀，随后 J<-10 且收盘位置>=40%"),
 }
 DEFAULT_ACTION_LEVELS = {"可小仓实操", "谨慎实操"}
-DEFAULT_FAMILIES = {"B1", "B2", "B3", "SB1", "SUPER_B1", "YIDONG_DILIAN", "GOLDEN_BOWL", "KENGQI", "PINGHANG"}
+DEFAULT_FAMILIES = {
+    "B1",
+    "B2",
+    "B3",
+    "SB1",
+    "SUPER_B1",
+    "STRONG_K",
+    "DOUBLE_YANG",
+    "LOW_PULLBACK",
+    "SUPPORT_PULLBACK",
+    "RHYTHM_PLATFORM",
+    *MODEL_FILTERED_SIGNALS,
+}
 DEFAULT_SELECTOR_LIMIT = 50
 DEFAULT_FAMILY_CAP = 12
+SELECTOR_SNAPSHOT_SCHEMA_VERSION = "score_split_v1"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
+LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v1"
+LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
+LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
+REFRESH_STATUS_PATH = PROJECT_ROOT / "data/routine/latest_refresh_status.json"
+LONG_STATE_DIR = PROJECT_ROOT / "data/long_strategy_state"
+LONG_VARIANTS = {
+    "tea": "core14_soft_plus",
+    "tea_safe": "core14_soft_spread",
+    "v44": "v44_tea_master_defensive_neutral",
+    "v43": "v43_tea_master_core_only",
+    "v34": "v34_pit_universe_guarded_sleeve",
+    "v35": "v35_pit_universe_riskon_recovery_sleeve",
+    "v33": "v33_bull_boost_defensive_bear_sleeve",
+    "v31": "v31_bull_bear_exposure_sleeve",
+}
+LONG_VARIANT_LABELS = {
+    "tea": "茶大长线趋势网格",
+    "tea_safe": "茶大长线稳健网格",
+    "v44": "防守中性长期组合",
+    "v43": "核心质量长期组合",
+    "v34": "PIT 成长防守长期组合",
+    "v35": "PIT 趋势恢复长期组合",
+    "v33": "趋势增强长期组合",
+    "v31": "牛熊防守长期组合",
+}
+TEA_LONG_VARIANTS = {
+    "tea": "core14_soft_plus",
+    "tea_safe": "core14_soft_spread",
+}
 _REFRESH_LOCK = threading.Lock()
 _REFRESH_STATUS: dict[str, Any] = {
     "status": "idle",
@@ -75,10 +158,1066 @@ _REFRESH_STATUS: dict[str, Any] = {
 }
 
 
+def _persist_refresh_status_unlocked() -> None:
+    REFRESH_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REFRESH_STATUS_PATH.write_text(
+        json.dumps(_REFRESH_STATUS, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def _load_persisted_refresh_status() -> dict[str, Any] | None:
+    try:
+        if not REFRESH_STATUS_PATH.exists():
+            return None
+        payload = json.loads(REFRESH_STATUS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def read_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(str(path))
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=1)
+def _long_research_module():
+    path = PROJECT_ROOT / "scripts/research/backtest_long_dividend_quality.py"
+    module_name = "quant_long_dividend_quality_research"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载长线策略研究脚本: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@lru_cache(maxsize=1)
+def _tea_master_research_module():
+    path = PROJECT_ROOT / "scripts/research/backtest_tea_master_long.py"
+    module_name = "quant_tea_master_long_research"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    script_dir = str(path.parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载茶大长线策略脚本: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _safe_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not np.isfinite(numeric):
+        return default
+    return numeric
+
+
+def _safe_bool(value: Any) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return False
+    return str(value).lower() in {"1", "true", "yes", "y"}
+
+
+def _long_state_path(variant: str) -> Path:
+    return LONG_STATE_DIR / f"{variant}_latest_states.json"
+
+
+def _load_long_previous_states(variant: str) -> dict[str, dict[str, Any]]:
+    path = _long_state_path(variant)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    rows = payload.get("stocks", []) if isinstance(payload, dict) else []
+    return {
+        str(row.get("ts_code")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("ts_code")
+    }
+
+
+def _persist_long_states(variant: str, payload: dict[str, Any]) -> None:
+    LONG_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _long_state_path(variant).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def _long_snapshot_key(variant: str, signal_date: str | None) -> tuple[str, str]:
+    date_key = str(signal_date or "latest")
+    raw = f"{LONG_STOCK_POOL_SCHEMA_VERSION}|{variant}|{date_key}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24], date_key
+
+
+def _long_snapshot_path(snapshot_key: str) -> Path:
+    return LONG_STOCK_POOL_SNAPSHOT_DIR / f"{snapshot_key}.json"
+
+
+def _read_long_stock_pool_snapshot(variant: str, signal_date: str | None) -> dict[str, Any] | None:
+    snapshot_key, _ = _long_snapshot_key(variant, signal_date)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if store.config.sql_url:
+        try:
+            from sqlalchemy import text
+
+            with store._engine().begin() as conn:
+                row = conn.execute(
+                    text(f"SELECT payload_json FROM {LONG_STOCK_POOL_SNAPSHOT_TABLE} WHERE snapshot_key = :snapshot_key"),
+                    {"snapshot_key": snapshot_key},
+                ).mappings().first()
+            if row and row.get("payload_json"):
+                payload = json.loads(row["payload_json"])
+                payload["cache"] = {"hit": True, "backend": "mysql", "snapshot_key": snapshot_key}
+                return payload
+        except Exception:
+            pass
+
+    path = _long_snapshot_path(snapshot_key)
+    if path.exists():
+        try:
+            payload = read_json_file(path)
+            payload["cache"] = {"hit": True, "backend": "json", "snapshot_key": snapshot_key}
+            return payload
+        except Exception:
+            return None
+    return None
+
+
+def _long_stock_pool_snapshot_dates(variant: str) -> set[str]:
+    dates: set[str] = set()
+    if LONG_STOCK_POOL_SNAPSHOT_DIR.exists():
+        for path in LONG_STOCK_POOL_SNAPSHOT_DIR.glob("*.json"):
+            try:
+                payload = read_json_file(path)
+            except Exception:
+                continue
+            if payload.get("variant") == variant and payload.get("signal_date"):
+                dates.add(str(payload["signal_date"]))
+
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if store.config.sql_url:
+        try:
+            from sqlalchemy import text
+
+            with store._engine().begin() as conn:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT signal_date
+                        FROM {LONG_STOCK_POOL_SNAPSHOT_TABLE}
+                        WHERE variant = :variant
+                        """
+                    ),
+                    {"variant": variant},
+                ).mappings().all()
+            for row in rows:
+                if row.get("signal_date"):
+                    dates.add(str(row["signal_date"]))
+        except Exception:
+            pass
+    return dates
+
+
+def _write_long_stock_pool_snapshot(payload: dict[str, Any], variant: str, signal_date: str | None) -> None:
+    snapshot_key, date_key = _long_snapshot_key(variant, signal_date)
+    payload_to_store = dict(payload)
+    payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
+    payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    wrote_sql = False
+    if store.config.sql_url:
+        try:
+            from sqlalchemy import text
+
+            with store._engine().begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {LONG_STOCK_POOL_SNAPSHOT_TABLE} (
+                            snapshot_key VARCHAR(64) PRIMARY KEY,
+                            variant VARCHAR(32) NOT NULL,
+                            signal_date VARCHAR(16) NOT NULL,
+                            generated_at VARCHAR(32) NOT NULL,
+                            stock_count INT NOT NULL,
+                            payload_json LONGTEXT NOT NULL,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        INSERT INTO {LONG_STOCK_POOL_SNAPSHOT_TABLE}
+                            (snapshot_key, variant, signal_date, generated_at, stock_count, payload_json)
+                        VALUES
+                            (:snapshot_key, :variant, :signal_date, :generated_at, :stock_count, :payload_json)
+                        ON DUPLICATE KEY UPDATE
+                            generated_at = VALUES(generated_at),
+                            stock_count = VALUES(stock_count),
+                            payload_json = VALUES(payload_json)
+                        """
+                    ),
+                    {
+                        "snapshot_key": snapshot_key,
+                        "variant": variant,
+                        "signal_date": date_key,
+                        "generated_at": str(payload.get("generated_at") or datetime.now().isoformat(timespec="seconds")),
+                        "stock_count": len(payload.get("stocks") or []),
+                        "payload_json": payload_json,
+                    },
+                )
+            wrote_sql = True
+        except Exception:
+            wrote_sql = False
+    if not wrote_sql:
+        LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        _long_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
+
+
+def _long_entry_tranche(row: pd.Series, target_weight: float, regime: str) -> tuple[float, str]:
+    close = _safe_float(row.get("close"))
+    target_price = _safe_float(row.get("target_price"))
+    sleeve = str(row.get("sleeve", "core") or "core")
+    long_score = _safe_float(row.get("long_score"), 0.0) or 0.0
+    growth_score = _safe_float(row.get("growth_rank_score", row.get("growth_score")), 0.0) or 0.0
+
+    if sleeve == "growth":
+        tranche = 0.45 if regime == "risk_on" else 0.0
+    elif regime == "risk_on":
+        tranche = 0.60
+    elif regime == "risk_off":
+        tranche = 0.35
+    else:
+        tranche = 0.50
+
+    price_note = "按趋势分批建仓"
+    if close and target_price and target_price > 0:
+        ratio = close / target_price
+        if ratio <= 0.97:
+            tranche += 0.30
+            price_note = "价格低于目标区，首批可更积极"
+        elif ratio <= 1.00:
+            tranche += 0.20
+            price_note = "价格接近目标区，按计划分批"
+        elif ratio >= (1.06 if sleeve == "growth" else 1.08):
+            tranche = min(tranche, 0.25 if sleeve == "growth" else 0.30)
+            price_note = "价格偏高，只给观察/小仓"
+
+    if sleeve == "growth" and growth_score >= 85:
+        tranche += 0.10
+    elif sleeve != "growth" and long_score >= 82:
+        tranche += 0.10
+
+    tranche = float(np.clip(tranche, 0.20, 1.0))
+    return round(target_weight * tranche, 4), price_note
+
+
+def _long_price_levels(module: Any, row: pd.Series, regime: str) -> dict[str, Any]:
+    target_price = _safe_float(row.get("target_price"))
+    close = _safe_float(row.get("close"))
+    ma20 = _safe_float(row.get("ma_20"))
+    ma60 = _safe_float(row.get("ma_60"))
+    ma120 = _safe_float(row.get("ma_120"))
+    sleeve = str(row.get("sleeve", "core") or "core")
+
+    levels: dict[str, Any] = {
+        "current_price": round(close, 2) if close is not None else None,
+        "entry_target_price": round(target_price, 2) if target_price is not None else None,
+        "entry_aggressive_price": round(target_price * 0.97, 2) if target_price is not None else None,
+        "entry_small_position_price": round(target_price * (1.06 if sleeve == "growth" else 1.08), 2) if target_price is not None else None,
+        "reduce_ma60_price": round(ma60, 2) if ma60 is not None else None,
+        "exit_ma120_price": round(ma120 * (0.94 if regime == "risk_on" else 0.98), 2) if ma120 is not None else None,
+    }
+    if ma20 is None or ma60 is None or ma120 is None:
+        levels.update(
+            {
+                "t_buy_min_price": None,
+                "t_buy_max_price": None,
+                "t_sell_trigger_price": None,
+                "t_buy_text": "均线不足",
+                "t_sell_text": "均线不足",
+            }
+        )
+        return levels
+
+    params = module.style_grid_parameters(row.to_dict(), row, regime)
+    t_buy_min = ma120 * 0.98
+    t_buy_max = max(ma20 * float(params["buy_ma20"]), ma60 * float(params["buy_ma60"]))
+    t_sell_trigger = min(ma20 * float(params["sell_ma20"]), ma60 * float(params["sell_ma60"]))
+    t_buy_text = f"{t_buy_min:.2f}-{t_buy_max:.2f}" if t_buy_min <= t_buy_max else "无有效低吸区"
+    levels.update(
+        {
+            "t_buy_min_price": round(t_buy_min, 2),
+            "t_buy_max_price": round(t_buy_max, 2),
+            "t_sell_trigger_price": round(t_sell_trigger, 2),
+            "t_buy_text": t_buy_text,
+            "t_sell_text": f">= {t_sell_trigger:.2f}",
+        }
+    )
+    return levels
+
+
+def _long_t_action(module: Any, row: pd.Series, regime: str) -> tuple[str, str, str]:
+    close = _safe_float(row.get("close"))
+    ma20 = _safe_float(row.get("ma_20"))
+    ma60 = _safe_float(row.get("ma_60"))
+    ma120 = _safe_float(row.get("ma_120"))
+    if close is None or ma20 is None or ma60 is None or ma120 is None:
+        return "HOLD", "数据不足", "缺少均线数据，暂不做T"
+    params = module.style_grid_parameters(row.to_dict(), row, regime)
+    sell_signal = close > ma20 * float(params["sell_ma20"]) or close > ma60 * float(params["sell_ma60"])
+    buy_signal = (
+        regime != "risk_off"
+        and close >= ma120 * 0.98
+        and (close <= ma20 * float(params["buy_ma20"]) or close <= ma60 * float(params["buy_ma60"]))
+    )
+    if str(row.get("sleeve", "core")) == "growth":
+        buy_signal = buy_signal and (_safe_float(row.get("trend_score"), 0.0) or 0.0) >= 60
+    if sell_signal:
+        return "T_SELL", str(params["profile"]), "价格偏离短中期均线，允许高抛回到核心仓"
+    if buy_signal:
+        return "T_BUY", str(params["profile"]), "价格回到低吸区，允许补回机动仓"
+    return "HOLD", str(params["profile"]), "未触发网格/做T阈值"
+
+
+def _long_exit_reason(row: pd.Series, regime: str) -> tuple[bool, str]:
+    long_score = _safe_float(row.get("long_score"), 0.0) or 0.0
+    quality_score = _safe_float(row.get("quality_score"), 0.0) or 0.0
+    risk_score = _safe_float(row.get("risk_score"), 0.0) or 0.0
+    close = _safe_float(row.get("close"))
+    ma120 = _safe_float(row.get("ma_120"))
+    if long_score < 58:
+        return True, "长期评分跌破 58，基本面/趋势综合失效"
+    if close is not None and ma120 is not None and close < ma120 * (0.94 if regime == "risk_on" else 0.98):
+        return True, "价格跌破 MA120 风控线"
+    if regime == "risk_off" and quality_score < 55:
+        return True, "熊市中质量评分不足"
+    if regime == "risk_off" and risk_score < 35:
+        return True, "熊市中波动/下行风险过高"
+    return False, ""
+
+
+def _long_reduce_reason(row: pd.Series, regime: str) -> tuple[bool, str]:
+    long_score = _safe_float(row.get("long_score"), 0.0) or 0.0
+    close = _safe_float(row.get("close"))
+    ma60 = _safe_float(row.get("ma_60"))
+    pullback = _safe_bool(row.get("market_pullback_warning"))
+    negative = _safe_bool(row.get("analyst_negative_warning"))
+    if long_score < 68:
+        return True, "长期评分回落，进入降仓观察"
+    if close is not None and ma60 is not None and close < ma60:
+        return True, "价格跌破 MA60，趋势转弱"
+    if regime == "risk_off" or pullback:
+        return True, "市场风险升高，降低风险暴露"
+    if negative:
+        return True, "券商预测出现负面修正警告"
+    return False, ""
+
+
+def _long_status_row(
+    module: Any,
+    row: pd.Series,
+    *,
+    variant: str,
+    selected: bool,
+    target_weight: float,
+    previous: dict[str, Any] | None,
+    rank: int | None,
+) -> dict[str, Any]:
+    ts_code = str(row.get("ts_code"))
+    regime = str(row.get("market_regime", "neutral") or "neutral")
+    prev_state = str((previous or {}).get("state") or "WATCH")
+    long_score = _safe_float(row.get("long_score"), 0.0) or 0.0
+    trend_score = _safe_float(row.get("trend_score"), 0.0) or 0.0
+    ma120_slope = _safe_float(row.get("ma_120_slope_20d"), 0.0) or 0.0
+    close = _safe_float(row.get("close"))
+    ma120 = _safe_float(row.get("ma_120"))
+    target_price = _safe_float(row.get("target_price"))
+    target_upside = None
+    if close and target_price:
+        target_upside = target_price / close - 1.0
+
+    exit_signal, exit_reason = _long_exit_reason(row, regime)
+    reduce_signal, reduce_reason = _long_reduce_reason(row, regime)
+    t_action, t_profile, t_reason = _long_t_action(module, row, regime)
+    price_levels = _long_price_levels(module, row, regime)
+    entry_weight, entry_note = _long_entry_tranche(row, target_weight, regime)
+
+    if exit_signal:
+        state = "EXIT"
+        action = "清仓"
+        reason = exit_reason
+        target_weight = 0.0
+        entry_weight = 0.0
+    elif selected:
+        if prev_state in {"WATCH", "EXIT", "COOLDOWN"} and entry_weight < target_weight * 0.85:
+            state = "BUILDING"
+            action = "分批建仓"
+            reason = entry_note
+        elif reduce_signal:
+            state = "REDUCE"
+            action = "降仓观察"
+            reason = reduce_reason
+        elif t_action in {"T_SELL", "T_BUY"}:
+            state = "T_ACTIVE"
+            action = "高抛" if t_action == "T_SELL" else "低吸"
+            reason = t_reason
+        else:
+            state = "CORE"
+            action = "核心持有"
+            reason = "核心条件仍成立，按目标仓位持有"
+    else:
+        watch_condition = (
+            long_score >= 72
+            and close is not None
+            and ma120 is not None
+            and close > ma120
+            and ma120_slope >= -0.005
+        )
+        if reduce_signal and prev_state in {"CORE", "T_ACTIVE", "BUILDING", "REDUCE"}:
+            state = "REDUCE"
+            action = "降仓观察"
+            reason = reduce_reason
+        elif watch_condition and long_score >= 80 and trend_score >= 65:
+            state = "BUILDING"
+            action = "候选建仓"
+            reason = "长期评分和趋势满足建仓观察条件，等待更合适价格或席位"
+        elif watch_condition:
+            state = "WATCH"
+            action = "观察"
+            reason = "进入观察池，等待评分/趋势/价格进一步确认"
+        else:
+            state = "WATCH"
+            action = "弱观察"
+            reason = "未进入目标组合，仅保留低优先级观察"
+
+    return {
+        "ts_code": ts_code,
+        "name": row.get("name"),
+        "industry": row.get("industry"),
+        "variant": variant,
+        "rank": rank,
+        "state": state,
+        "previous_state": prev_state,
+        "action": action,
+        "reason": reason,
+        "sleeve": row.get("sleeve", "core"),
+        "t_action": t_action,
+        "t_profile": t_profile,
+        "t_reason": t_reason,
+        "market_regime": regime,
+        "target_weight": round(float(target_weight), 4),
+        "first_tranche_weight": round(float(entry_weight), 4),
+        "close": close,
+        "target_price": target_price,
+        "target_upside": round(target_upside, 4) if target_upside is not None else None,
+        "price_levels": price_levels,
+        "long_score": round(long_score, 2),
+        "growth_score": round(_safe_float(row.get("growth_score"), 0.0) or 0.0, 2),
+        "forecast_core_rank_score": round(_safe_float(row.get("forecast_core_rank_score"), long_score) or long_score, 2),
+        "quality_score": round(_safe_float(row.get("quality_score"), 0.0) or 0.0, 2),
+        "value_score": round(_safe_float(row.get("value_score"), 0.0) or 0.0, 2),
+        "trend_score": round(trend_score, 2),
+        "risk_score": round(_safe_float(row.get("risk_score"), 0.0) or 0.0, 2),
+        "dividend_score": round(_safe_float(row.get("dividend_score"), 0.0) or 0.0, 2),
+        "dv_ttm": round(_safe_float(row.get("dv_ttm"), 0.0) or 0.0, 2),
+        "pe_ttm": round(_safe_float(row.get("pe_ttm"), 0.0) or 0.0, 2),
+        "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
+        "analyst_report_count_180d": int(_safe_float(row.get("analyst_report_count_180d"), 0.0) or 0),
+        "analyst_org_count_180d": int(_safe_float(row.get("analyst_org_count_180d"), 0.0) or 0),
+        "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
+        "analyst_forward_growth_score": round(_safe_float(row.get("analyst_forward_growth_score"), 0.0) or 0.0, 2),
+        "analyst_target_upside_180d": round(_safe_float(row.get("analyst_target_upside_180d"), 0.0) or 0.0, 4),
+        "analyst_negative_warning": _safe_bool(row.get("analyst_negative_warning")),
+        "close_above_ma120": bool(close is not None and ma120 is not None and close > ma120),
+        "ma_120_slope_20d": round(ma120_slope, 4),
+    }
+
+
+def _tea_entry_tranche(row: pd.Series, target_weight: float, regime: str) -> tuple[float, str]:
+    close = _safe_float(row.get("close"))
+    target_price = _safe_float(row.get("target_price"))
+    tranche = 0.62 if regime == "risk_on" else (0.45 if regime == "risk_off" else 0.52)
+    note = "按茶大长线规则分批建仓"
+    if close and target_price:
+        ratio = close / target_price
+        if ratio <= 0.98:
+            tranche += 0.20
+            note = "价格在目标区下沿，首批可更积极"
+        elif ratio >= 1.08:
+            tranche = min(tranche, 0.30)
+            note = "价格高于目标区，只给观察/小仓"
+    return round(float(target_weight) * float(np.clip(tranche, 0.20, 1.0)), 4), note
+
+
+def _tea_price_levels(row: pd.Series) -> dict[str, Any]:
+    close = _safe_float(row.get("close"))
+    target_price = _safe_float(row.get("target_price"))
+    ma20 = _safe_float(row.get("ma_20"))
+    ma60 = _safe_float(row.get("ma_60"))
+    ma120 = _safe_float(row.get("ma_120"))
+    t_buy_min = ma120 * 0.98 if ma120 is not None else None
+    t_buy_max = max(ma20 * 1.015, ma60 * 1.035) if ma20 is not None and ma60 is not None else None
+    t_sell_trigger = min(ma20 * 1.12, ma60 * 1.18) if ma20 is not None and ma60 is not None else None
+    return {
+        "current_price": round(close, 2) if close is not None else None,
+        "entry_target_price": round(target_price, 2) if target_price is not None else None,
+        "entry_aggressive_price": round(target_price * 0.98, 2) if target_price is not None else None,
+        "entry_small_position_price": round(target_price * 1.08, 2) if target_price is not None else None,
+        "reduce_ma60_price": round(ma60, 2) if ma60 is not None else None,
+        "exit_ma120_price": round(ma120 * 0.96, 2) if ma120 is not None else None,
+        "t_buy_min_price": round(t_buy_min, 2) if t_buy_min is not None else None,
+        "t_buy_max_price": round(t_buy_max, 2) if t_buy_max is not None else None,
+        "t_sell_trigger_price": round(t_sell_trigger, 2) if t_sell_trigger is not None else None,
+        "t_buy_text": f"{t_buy_min:.2f}-{t_buy_max:.2f}" if t_buy_min is not None and t_buy_max is not None and t_buy_min <= t_buy_max else "无有效低吸区",
+        "t_sell_text": f">= {t_sell_trigger:.2f}" if t_sell_trigger is not None else "均线不足",
+    }
+
+
+def _tea_t_action(row: pd.Series, regime: str) -> tuple[str, str, str]:
+    close = _safe_float(row.get("close"))
+    ma20 = _safe_float(row.get("ma_20"))
+    ma60 = _safe_float(row.get("ma_60"))
+    ma120 = _safe_float(row.get("ma_120"))
+    if close is None or ma20 is None or ma60 is None or ma120 is None:
+        return "HOLD", "tea_grid", "缺少均线数据，暂不做T"
+    sell_signal = close > ma20 * 1.12 or close > ma60 * 1.18
+    buy_signal = regime != "risk_off" and close >= ma120 * 0.98 and (close <= ma20 * 1.015 or close <= ma60 * 1.035)
+    if sell_signal:
+        return "T_SELL", "tea_grid", "价格偏离短中期均线，允许高抛回到核心仓"
+    if buy_signal:
+        return "T_BUY", "tea_grid", "价格回到低吸区，允许补回机动仓"
+    return "HOLD", "tea_grid", "未触发茶大网格阈值"
+
+
+def _tea_exit_reason(row: pd.Series, regime: str) -> tuple[bool, str]:
+    tea_score = _safe_float(row.get("tea_score"), 0.0) or 0.0
+    trend_score = _safe_float(row.get("trend_score"), 0.0) or 0.0
+    risk_score = _safe_float(row.get("risk_score"), 0.0) or 0.0
+    close = _safe_float(row.get("close"))
+    ma120 = _safe_float(row.get("ma_120"))
+    ma120_slope = _safe_float(row.get("ma_120_slope_20d"), 0.0) or 0.0
+    if tea_score < 55:
+        return True, "茶大综合评分跌破清仓线"
+    if close is not None and ma120 is not None and close < ma120 * (0.94 if regime == "risk_on" else 0.98):
+        return True, "价格跌破年线防守区"
+    if ma120_slope < -0.04:
+        return True, "年线斜率明显转弱"
+    if regime == "risk_off" and risk_score < 35:
+        return True, "弱市且风险评分过低"
+    if regime != "risk_on" and (trend_score < 45 or (close is not None and ma120 is not None and close < ma120 * 1.01)):
+        return True, "非强势市场中趋势不再满足持仓条件"
+    return False, ""
+
+
+def _tea_reduce_reason(row: pd.Series, regime: str) -> tuple[bool, str]:
+    tea_score = _safe_float(row.get("tea_score"), 0.0) or 0.0
+    trend_score = _safe_float(row.get("trend_score"), 0.0) or 0.0
+    risk_score = _safe_float(row.get("risk_score"), 0.0) or 0.0
+    close = _safe_float(row.get("close"))
+    ma60 = _safe_float(row.get("ma_60"))
+    if tea_score < 68:
+        return True, "茶大评分回落，降仓观察"
+    if trend_score < 55:
+        return True, "趋势评分走弱，降低组合优先级"
+    if close is not None and ma60 is not None and close < ma60:
+        return True, "价格跌破 MA60，先降仓控制风险"
+    if regime == "risk_off" and risk_score < 55:
+        return True, "弱市风险评分不足，降低风险暴露"
+    return False, ""
+
+
+def _tea_status_row(
+    row: pd.Series,
+    *,
+    variant: str,
+    selected: bool,
+    target_weight: float,
+    previous_state: str | None,
+    rank: int | None,
+) -> dict[str, Any]:
+    regime = str(row.get("market_regime", "neutral") or "neutral")
+    tea_score = _safe_float(row.get("tea_score"), 0.0) or 0.0
+    trend_score = _safe_float(row.get("trend_score"), 0.0) or 0.0
+    close = _safe_float(row.get("close"))
+    target_price = _safe_float(row.get("target_price"))
+    target_upside = target_price / close - 1.0 if close and target_price else None
+    first_weight, entry_note = _tea_entry_tranche(row, target_weight, regime)
+    t_action, t_profile, t_reason = _tea_t_action(row, regime)
+    exit_signal, exit_reason = _tea_exit_reason(row, regime)
+    reduce_signal, reduce_reason = _tea_reduce_reason(row, regime)
+    prev_state = str(previous_state or "WATCH")
+
+    if exit_signal:
+        state = "EXIT"
+        action = "清仓"
+        reason = exit_reason
+        target_weight = 0.0
+        first_weight = 0.0
+    elif selected:
+        if prev_state in {"WATCH", "EXIT", "COOLDOWN"} and first_weight < target_weight * 0.85:
+            state = "BUILDING"
+            action = "分批建仓"
+            reason = entry_note
+        elif reduce_signal:
+            state = "REDUCE"
+            action = "降仓观察"
+            reason = reduce_reason
+        elif t_action in {"T_SELL", "T_BUY"}:
+            state = "T_ACTIVE"
+            action = "高抛" if t_action == "T_SELL" else "低吸"
+            reason = t_reason
+        else:
+            state = "CORE"
+            action = "核心持有"
+            reason = "茶大核心条件延续，按目标仓位持有"
+    elif reduce_signal or prev_state in {"CORE", "T_ACTIVE", "BUILDING", "REDUCE"}:
+        state = "REDUCE"
+        action = "降仓观察"
+        reason = reduce_reason or "上一期目标股已移出本期组合，先降仓并观察"
+        target_weight = 0.0
+        first_weight = 0.0
+    else:
+        state = "WATCH"
+        action = "观察"
+        reason = "进入茶大高分观察池，等待趋势/价格/席位确认"
+        target_weight = 0.0
+        first_weight = 0.0
+    return {
+        "ts_code": str(row.get("ts_code")),
+        "name": row.get("name"),
+        "industry": row.get("industry"),
+        "variant": variant,
+        "rank": rank,
+        "state": state,
+        "previous_state": prev_state,
+        "action": action,
+        "reason": reason,
+        "sleeve": row.get("sleeve", "core"),
+        "t_action": t_action,
+        "t_profile": t_profile,
+        "t_reason": t_reason,
+        "market_regime": regime,
+        "target_weight": round(float(target_weight), 4),
+        "first_tranche_weight": first_weight,
+        "close": close,
+        "target_price": target_price,
+        "target_upside": round(target_upside, 4) if target_upside is not None else None,
+        "price_levels": _tea_price_levels(row),
+        "long_score": round(tea_score, 2),
+        "growth_score": round(_safe_float(row.get("satellite_score"), 0.0) or 0.0, 2),
+        "forecast_core_rank_score": round(tea_score, 2),
+        "quality_score": round(_safe_float(row.get("quality_score"), 0.0) or 0.0, 2),
+        "value_score": round(_safe_float(row.get("value_score"), 0.0) or 0.0, 2),
+        "trend_score": round(trend_score, 2),
+        "risk_score": round(_safe_float(row.get("risk_score"), 0.0) or 0.0, 2),
+        "dividend_score": round(_safe_float(row.get("value_score"), 0.0) or 0.0, 2),
+        "dv_ttm": round(_safe_float(row.get("dv_ttm"), 0.0) or 0.0, 2),
+        "pe_ttm": round(_safe_float(row.get("pe_ttm"), 0.0) or 0.0, 2),
+        "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
+        "analyst_report_count_180d": 0,
+        "analyst_org_count_180d": 0,
+        "analyst_forward_years_180d": 0,
+        "analyst_forward_growth_score": 0.0,
+        "analyst_target_upside_180d": 0.0,
+        "analyst_negative_warning": False,
+        "close_above_ma120": bool(close is not None and _safe_float(row.get("ma_120")) is not None and close > float(row.get("ma_120"))),
+        "ma_120_slope_20d": round(_safe_float(row.get("ma_120_slope_20d"), 0.0) or 0.0, 4),
+    }
+
+
+@lru_cache(maxsize=8)
+def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | None) -> dict[str, Any]:
+    module = _tea_master_research_module()
+    config_name = TEA_LONG_VARIANTS.get(variant_key, variant_key)
+    config = next((item for item in module.CONFIGS if item.name == config_name), None)
+    if config is None:
+        raise ValueError(f"未知茶大长线策略版本: {variant_key}")
+    end_text = pd.to_datetime(signal_date).strftime("%Y%m%d") if signal_date else None
+    merged, _, _, coverage = module.prepare_data(end=end_text)
+    scored = module.build_tea_scores(merged)
+    targets = module.select_targets(scored, config)
+    if targets.empty:
+        raise RuntimeError("茶大长线策略没有生成候选股票")
+    if signal_date:
+        requested = pd.to_datetime(signal_date)
+        targets = targets[targets["rebalance_date"] <= requested].copy()
+    if targets.empty:
+        raise RuntimeError("所选日期之前没有茶大长线股票池")
+    signal_ts = pd.to_datetime(targets["rebalance_date"].max())
+    target_dates = sorted(pd.to_datetime(targets["rebalance_date"].dropna().unique()))
+    previous_dates = [item for item in target_dates if item < signal_ts]
+    previous_target_date = previous_dates[-1] if previous_dates else None
+    latest = targets[targets["rebalance_date"] == signal_ts].copy()
+    previous = targets[targets["rebalance_date"] == previous_target_date].copy() if previous_target_date is not None else pd.DataFrame()
+    latest = latest.sort_values(["target_weight", "tea_score", "trend_score"], ascending=False)
+    selected_codes = latest["ts_code"].astype(str).tolist()
+    selected_set = set(selected_codes)
+    previous_set = set(previous["ts_code"].astype(str).tolist()) if not previous.empty else set()
+    selected_order = {code: i + 1 for i, code in enumerate(selected_codes)}
+    target_map = latest.set_index("ts_code").to_dict(orient="index") if not latest.empty else {}
+
+    scored_date = scored[pd.to_datetime(scored["date"]) == signal_ts].copy()
+    if scored_date.empty:
+        scored_date = scored[pd.to_datetime(scored["date"]) <= signal_ts].sort_values("date").drop_duplicates("ts_code", keep="last").copy()
+    scored_by_symbol = scored_date.set_index("ts_code", drop=False)
+
+    rows: list[dict[str, Any]] = []
+    appended: set[str] = set()
+    for code in selected_codes:
+        if code not in scored_by_symbol.index:
+            continue
+        row = scored_by_symbol.loc[code]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        enriched = row.copy()
+        for key, value in target_map.get(code, {}).items():
+            enriched[key] = value
+        previous_state = "CORE" if code in previous_set else "WATCH"
+        rows.append(
+            _tea_status_row(
+                enriched,
+                variant=variant_key,
+                selected=True,
+                target_weight=float(target_map.get(code, {}).get("target_weight", 0.0) or 0.0),
+                previous_state=previous_state,
+                rank=selected_order.get(code),
+            )
+        )
+        appended.add(code)
+
+    removed_codes = [code for code in previous_set if code not in selected_set and code in scored_by_symbol.index]
+    for code in removed_codes:
+        row = scored_by_symbol.loc[code]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        rows.append(
+            _tea_status_row(
+                row,
+                variant=variant_key,
+                selected=False,
+                target_weight=0.0,
+                previous_state="CORE",
+                rank=None,
+            )
+        )
+        appended.add(code)
+
+    candidate = scored_date[~scored_date["ts_code"].astype(str).isin(appended)].copy()
+    watch_filter = (
+        (candidate["tea_score"] >= max(config.min_tea_score - 4, 62))
+        & (candidate["quality_score"] >= max(config.min_quality_score - 5, 55))
+        & (candidate["trend_score"] >= max(config.min_trend_score - 8, 45))
+        & (candidate["risk_score"] >= 25)
+    )
+    watch_rows = candidate[watch_filter].sort_values(
+        ["tea_score", "trend_score", "quality_score", "risk_score"],
+        ascending=False,
+    ).head(25)
+    for _, row in watch_rows.iterrows():
+        code = str(row.get("ts_code"))
+        if code in appended:
+            continue
+        rows.append(
+            _tea_status_row(
+                row,
+                variant=variant_key,
+                selected=False,
+                target_weight=0.0,
+                previous_state="WATCH",
+                rank=None,
+            )
+        )
+        appended.add(code)
+
+    state_order = {"CORE": 0, "T_ACTIVE": 1, "BUILDING": 2, "REDUCE": 3, "WATCH": 4, "EXIT": 5, "COOLDOWN": 6}
+    rows = sorted(
+        rows,
+        key=lambda item: (
+            state_order.get(str(item.get("state")), 99),
+            item.get("rank") or 999,
+            -(item.get("long_score") or 0),
+        ),
+    )
+    regime = str(latest["market_regime"].dropna().iloc[0]) if not latest["market_regime"].dropna().empty else "neutral"
+    state_counts = pd.Series([row["state"] for row in rows]).value_counts().to_dict()
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "signal_date": signal_ts.date().isoformat(),
+        "variant": variant_key,
+        "variant_id": config_name,
+        "variant_name": LONG_VARIANT_LABELS.get(variant_key, variant_key),
+        "market_regime": regime,
+        "coverage": coverage,
+        "state_counts": {str(k): int(v) for k, v in state_counts.items()},
+        "stocks": rows,
+        "notes": [
+            "茶大长线股票池使用独立策略脚本生成，不复用旧股息质量策略版本树。",
+            "行情使用本地前复权日线；财务指标按 ann_date <= signal_date 合并。",
+            "股票池包含目标持仓、上期移出后的降仓/清仓观察，以及高分观察池。",
+            "目标仓位是组合目标，first_tranche_weight 是新进标的更谨慎的首批建仓建议。",
+        ],
+    }
+
+
+@lru_cache(maxsize=8)
+def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, persist_state: bool) -> dict[str, Any]:
+    module = _long_research_module()
+    variant = LONG_VARIANTS.get(variant_key, variant_key)
+    if variant not in LONG_VARIANTS.values():
+        raise ValueError(f"未知长线策略版本: {variant_key}")
+
+    requested_end = pd.to_datetime(signal_date) if signal_date else None
+    config = module.BacktestConfig(variant=variant, start="20130101", end=None)
+    start = module.parse_date(config.start)
+    stock_basic = module.load_stock_basic()
+    daily_basic, coverage = module.load_daily_basic_monthly(start, requested_end)
+    if daily_basic.empty:
+        raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
+    if variant in getattr(module, "PIT_UNIVERSE_VARIANTS", set()):
+        candidate_symbols = None
+        coverage["point_in_time_universe"] = True
+    else:
+        candidate_symbols = module.select_candidate_symbols_from_daily_basic(daily_basic, stock_basic, config)
+        coverage["point_in_time_universe"] = False
+    features, _ = module.load_daily_monthly_features(
+        start,
+        requested_end,
+        stock_basic,
+        candidate_symbols=candidate_symbols,
+    )
+    if requested_end is not None:
+        features = features[features["date"] <= requested_end].copy()
+        daily_basic = daily_basic[daily_basic["date"] <= requested_end].copy()
+    common_dates = sorted(set(features["date"].dropna()) & set(daily_basic["date"].dropna()))
+    if not common_dates:
+        raise RuntimeError("日线特征与 daily_basic 没有共同信号日期")
+    signal_ts = common_dates[-1]
+    merged = pd.DataFrame()
+    for candidate_date in reversed(common_dates):
+        latest_features = features[features["date"] == candidate_date].copy()
+        latest_basic = daily_basic[daily_basic["date"] == candidate_date].copy()
+        latest_features = latest_features.sort_values(["date", "ts_code", "trade_date"]).drop_duplicates(["date", "ts_code"], keep="last")
+        latest_basic = latest_basic.sort_values(["date", "ts_code", "trade_date"]).drop_duplicates(["date", "ts_code"], keep="last")
+        if variant in getattr(module, "PIT_UNIVERSE_VARIANTS", set()):
+            latest_basic = module.filter_daily_basic_point_in_time(latest_basic, config)
+        candidate_merged = latest_features.merge(
+            latest_basic.drop(columns=["trade_date"]),
+            on=["date", "ts_code"],
+            how="inner",
+        )
+        if len(candidate_merged) >= 50:
+            signal_ts = candidate_date
+            merged = candidate_merged
+            break
+    if merged.empty:
+        raise RuntimeError("最近信号日无可用长线截面")
+    merged = module.load_financial_asof(merged)
+    if variant in module.GROWTH_VARIANTS:
+        merged = module.load_analyst_forecast_asof(merged)
+    else:
+        merged = module.add_empty_analyst_forecast_columns(merged)
+    market_regime = module.load_market_regime(signal_ts, signal_ts)
+    if market_regime.empty:
+        merged["market_regime"] = "neutral"
+        merged["index_ma_120_slope_20d"] = np.nan
+        merged["index_return_20d"] = np.nan
+        merged["index_return_60d"] = np.nan
+        merged["index_return_120d"] = np.nan
+        merged["index_drawdown_60d"] = np.nan
+        merged["index_overheat"] = False
+    else:
+        merged = merged.merge(market_regime, on="date", how="left")
+        merged["market_regime"] = merged["market_regime"].fillna("neutral")
+    merged["cashflow_quality"] = np.nan
+    scored = module.build_scores(merged, config)
+    targets = module.make_monthly_targets(scored, config)
+
+    selected_codes = set(targets["ts_code"].astype(str)) if not targets.empty else set()
+    target_map = targets.set_index("ts_code").to_dict(orient="index") if not targets.empty else {}
+    previous_states = _load_long_previous_states(variant_key)
+
+    rows: list[dict[str, Any]] = []
+    scored_by_symbol = scored.set_index("ts_code", drop=False)
+    selected_order = {code: i + 1 for i, code in enumerate(targets["ts_code"].astype(str).tolist())} if not targets.empty else {}
+    for code in selected_codes:
+        if code not in scored_by_symbol.index:
+            continue
+        row = scored_by_symbol.loc[code]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        target_info = target_map.get(code, {})
+        enriched = row.copy()
+        for key, value in target_info.items():
+            enriched[key] = value
+        rows.append(
+            _long_status_row(
+                module,
+                enriched,
+                variant=variant_key,
+                selected=True,
+                target_weight=float(target_info.get("target_weight", 0.0) or 0.0),
+                previous=previous_states.get(code),
+                rank=selected_order.get(code),
+            )
+        )
+
+    candidate = scored[~scored["ts_code"].astype(str).isin(selected_codes)].copy()
+    candidate["watch_rank_score"] = candidate.get("forecast_core_rank_score", candidate["long_score"]).fillna(candidate["long_score"])
+    watch_filter = (
+        (candidate["long_score"] >= 72)
+        & (candidate["close"] > candidate["ma_120"])
+        & (candidate["ma_120_slope_20d"] >= -0.005)
+    )
+    watch_rows = candidate[watch_filter].sort_values(
+        ["watch_rank_score", "long_score", "trend_score", "quality_score"],
+        ascending=False,
+    ).head(30)
+    reduce_filter = (
+        (candidate["long_score"].between(58, 72, inclusive="left"))
+        | (candidate["close"] < candidate["ma_60"])
+        | candidate.get("analyst_negative_warning", False).fillna(False)
+    )
+    reduce_rows = candidate[reduce_filter].sort_values(
+        ["long_score", "risk_score"],
+        ascending=[True, True],
+    ).head(15)
+    appended: set[str] = set(selected_codes)
+    for _, row in pd.concat([watch_rows, reduce_rows], ignore_index=True).iterrows():
+        code = str(row.get("ts_code"))
+        if code in appended:
+            continue
+        appended.add(code)
+        rows.append(
+            _long_status_row(
+                module,
+                row,
+                variant=variant_key,
+                selected=False,
+                target_weight=0.0,
+                previous=previous_states.get(code),
+                rank=None,
+            )
+        )
+
+    state_order = {"CORE": 0, "T_ACTIVE": 1, "BUILDING": 2, "REDUCE": 3, "WATCH": 4, "EXIT": 5, "COOLDOWN": 6}
+    rows = sorted(
+        rows,
+        key=lambda item: (
+            state_order.get(str(item.get("state")), 99),
+            item.get("rank") or 999,
+            -(item.get("long_score") or 0),
+        ),
+    )
+    regime = str(scored["market_regime"].dropna().iloc[0]) if "market_regime" in scored.columns and not scored["market_regime"].dropna().empty else "neutral"
+    state_counts = pd.Series([row["state"] for row in rows]).value_counts().to_dict()
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "signal_date": pd.Timestamp(signal_ts).date().isoformat(),
+        "variant": variant_key,
+        "variant_id": variant,
+        "variant_name": LONG_VARIANT_LABELS.get(variant_key, variant_key),
+        "market_regime": regime,
+        "coverage": coverage,
+        "state_counts": {str(k): int(v) for k, v in state_counts.items()},
+        "stocks": rows,
+        "notes": [
+            "长线股票池使用最新可用月度信号截面生成，券商预测严格按 report_date <= signal_date 合并。",
+            "状态机当前为策略状态建议，已读取上一轮信号快照；接入真实账户持仓后可升级为完整持仓状态机。",
+            "BUILDING 的 first_tranche_weight 是更谨慎的首批建仓建议，不等同于最终目标仓位。",
+        ],
+    }
+    if persist_state:
+        _persist_long_states(variant_key, payload)
+    return payload
+
+
+def get_long_stock_pool(
+    variant: str = "tea",
+    signal_date: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    variant_key = variant if variant in LONG_VARIANTS else next(
+        (key for key, value in LONG_VARIANTS.items() if value == variant),
+        variant,
+    )
+    if not refresh:
+        cached = _read_long_stock_pool_snapshot(variant_key, signal_date)
+        if cached is not None:
+            return cached
+    if variant_key in TEA_LONG_VARIANTS:
+        if refresh:
+            _build_tea_master_stock_pool_cached.cache_clear()
+        payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
+        _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
+        payload["cache"] = {"hit": False, "backend": "generated"}
+        return payload
+    if refresh:
+        _build_long_stock_pool_cached.cache_clear()
+    payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
+    _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
+    payload["cache"] = {"hit": False, "backend": "generated"}
+    return payload
+
+
+def _signal_group_key(signal: dict[str, Any]) -> str:
+    family = str(signal.get("strategy_family") or signal.get("strategy_key") or "").upper()
+    return str(signal.get("strategy_group") or STRATEGY_MEMBER_TO_GROUP.get(family, family))
+
+
+def _signal_group_label(signal: dict[str, Any]) -> str:
+    group = _signal_group_key(signal)
+    return STRATEGY_GROUP_LABELS.get(group, group)
+
+
+def _strategy_filter_members(strategies: list[str] | None) -> set[str]:
+    selected = {item.upper() for item in strategies or [] if item}
+    members: set[str] = set()
+    for item in selected:
+        members.update(STRATEGY_GROUP_MEMBERS.get(item, {item}))
+    return members
+
+
+def _strategy_filter_groups(strategies: list[str] | None) -> set[str]:
+    selected = {item.upper() for item in strategies or [] if item}
+    groups: set[str] = set()
+    for item in selected:
+        groups.add(item if item in STRATEGY_GROUP_MEMBERS else STRATEGY_MEMBER_TO_GROUP.get(item, item))
+    return groups
+
+
+def _signal_matches_filter(signal: dict[str, Any], selected_members: set[str], selected_groups: set[str]) -> bool:
+    strategy_key = str(signal.get("strategy_key") or "").upper()
+    family = str(signal.get("strategy_family") or strategy_key).upper()
+    group = _signal_group_key(signal).upper()
+    return strategy_key in selected_members or family in selected_members or group in selected_groups
+
+
+def _enrich_signal_group(signal: dict[str, Any]) -> dict[str, Any]:
+    out = dict(signal)
+    group = _signal_group_key(out)
+    out["strategy_group"] = group
+    out["strategy_group_label"] = STRATEGY_GROUP_LABELS.get(group, group)
+    return out
 
 
 def _selector_snapshot_key(
@@ -89,7 +1228,12 @@ def _selector_snapshot_key(
     strategy_key = ",".join(sorted({str(item).upper() for item in strategies or [] if item})) or "ALL"
     date_key = signal_date or "LATEST"
     raw = json.dumps(
-        {"signal_date": date_key, "strategies": strategy_key, "include_extended": include_extended},
+        {
+            "signal_date": date_key,
+            "strategies": strategy_key,
+            "include_extended": include_extended,
+            "schema_version": SELECTOR_SNAPSHOT_SCHEMA_VERSION,
+        },
         sort_keys=True,
         ensure_ascii=True,
     )
@@ -98,6 +1242,99 @@ def _selector_snapshot_key(
 
 def _selector_snapshot_path(snapshot_key: str) -> Path:
     return SELECTOR_SNAPSHOT_DIR / f"{snapshot_key}.json"
+
+
+def _selector_snapshot_dates(strategies: list[str] | None, include_extended: bool) -> list[str]:
+    _, _, strategy_key = _selector_snapshot_key(None, strategies, include_extended)
+    dates: set[str] = set()
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if store.config.sql_url:
+        try:
+            from sqlalchemy import text
+
+            with store._engine().begin() as conn:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT DISTINCT signal_date
+                        FROM {SELECTOR_SNAPSHOT_TABLE}
+                        WHERE signal_date <> 'LATEST'
+                          AND strategies_key = :strategies_key
+                          AND include_extended = :include_extended
+                        """
+                    ),
+                    {"strategies_key": strategy_key, "include_extended": include_extended},
+                ).mappings().all()
+            for row in rows:
+                value = row.get("signal_date")
+                parsed = pd.to_datetime(value, errors="coerce")
+                if pd.notna(parsed) and parsed.weekday() < 5:
+                    dates.add(parsed.strftime("%Y-%m-%d"))
+        except Exception:
+            pass
+
+    if SELECTOR_SNAPSHOT_DIR.exists():
+        for path in SELECTOR_SNAPSHOT_DIR.glob("*.json"):
+            try:
+                payload = read_json_file(path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            candidate_date = str(payload.get("signal_date") or "")
+            if not candidate_date or candidate_date == "LATEST":
+                continue
+            snapshot_key, date_key, key = _selector_snapshot_key(candidate_date, strategies, include_extended)
+            if key != strategy_key or snapshot_key != path.stem:
+                continue
+            parsed = pd.to_datetime(date_key, errors="coerce")
+            if pd.notna(parsed) and parsed.weekday() < 5:
+                dates.add(parsed.strftime("%Y-%m-%d"))
+    return sorted(dates)
+
+
+def _latest_selector_snapshot_date(strategies: list[str] | None, include_extended: bool) -> str | None:
+    dates = _selector_snapshot_dates(strategies, include_extended)
+    return dates[-1] if dates else None
+
+
+def _resolve_selector_signal_date(
+    signal_date: str | None,
+    strategies: list[str] | None,
+    include_extended: bool,
+) -> str | None:
+    snapshot_dates = _selector_snapshot_dates(strategies, include_extended)
+    if not signal_date:
+        return snapshot_dates[-1] if snapshot_dates else _latest_candidate_signal_date()
+    target = pd.to_datetime(signal_date, errors="raise")
+    if not snapshot_dates:
+        return signal_date
+    if target.weekday() < 5 and signal_date in snapshot_dates:
+        return signal_date
+    previous = [item for item in snapshot_dates if item <= signal_date]
+    return previous[-1] if previous else signal_date
+
+
+def _latest_candidate_signal_date() -> str | None:
+    """Latest date available from strategy candidate/model caches."""
+
+    latest_dates: list[pd.Timestamp] = []
+    parquet_paths = [FAMILY_SIGNAL_CACHE, PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet", EXTENDED_MODEL_SCORED]
+    for path in parquet_paths:
+        if not path.exists():
+            continue
+        try:
+            frame = pd.read_parquet(path, columns=["date"])
+        except Exception:
+            continue
+        if frame.empty:
+            continue
+        latest = pd.to_datetime(frame["date"], errors="coerce").max()
+        if pd.notna(latest):
+            latest_dates.append(latest)
+    if latest_dates:
+        return max(latest_dates).strftime("%Y-%m-%d")
+    return None
 
 
 def _read_selector_snapshot(
@@ -228,45 +1465,23 @@ def _strategy_keys_from_payload(payload: dict[str, Any]) -> list[str]:
 
 def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -> dict[str, Any]:
     selected = {item.upper() for item in strategies if item}
+    selected_members = _strategy_filter_members(strategies)
+    selected_groups = _strategy_filter_groups(strategies)
     rows = []
     for stock in payload.get("stocks") or []:
         signals = [
             signal
             for signal in stock.get("signals") or []
-            if str(signal.get("strategy_key") or "").upper() in selected
-            or str(signal.get("strategy_family") or "").upper() in selected
+            if _signal_matches_filter(signal, selected_members, selected_groups)
         ]
         signals = _dedupe_signals_by_operation(signals)
         if not signals:
             continue
-        families = sorted({str(signal.get("strategy_family") or signal.get("strategy_key") or "") for signal in signals})
-        ordered_signals = sorted(
-            signals,
-            key=lambda item: (_signal_selector_score(item), (item.get("metrics") or {}).get("profit_factor") or 0),
-            reverse=True,
-        )
-        signal_scores = [_signal_selector_score(signal) for signal in ordered_signals]
-        selector_score = (
-            (signal_scores[0] if signal_scores else 0)
-            + 0.12 * sum(signal_scores[:3])
-            + 0.35 * np.log1p(len(ordered_signals))
-        )
-        best_pf = max((signal.get("metrics") or {}).get("profit_factor") or 0 for signal in ordered_signals)
-        best_avg = max((signal.get("metrics") or {}).get("avg_return_pct") or -999 for signal in ordered_signals)
         row = {key: value for key, value in stock.items() if key != "signals"}
-        row.update(
-            {
-                "matched_count": len(families),
-                "matched_families": families,
-                "matched_strategy_names": [signal.get("strategy_name") for signal in ordered_signals],
-                "best_profit_factor": best_pf,
-                "best_avg_return_pct": best_avg if best_avg > -999 else None,
-                "selector_score": round(float(selector_score), 2),
-                "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(families)} 个策略家族共振",
-                "signals": ordered_signals,
-            }
-        )
-        rows.append(row)
+        row["signals"] = signals
+        built = build_selector_stock_row(row, signals, payload.get("signal_date"))
+        if built is not None:
+            rows.append(built)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -286,9 +1501,78 @@ def _write_strategy_pool_snapshots(payload: dict[str, Any], include_extended: bo
     written = {"ALL": len(payload.get("stocks") or [])}
     for strategy_key in strategy_keys:
         filtered = _filtered_selector_payload(payload, [strategy_key])
-        _write_selector_snapshot(filtered, [strategy_key], strategy_key in extended_keys)
+        members = STRATEGY_GROUP_MEMBERS.get(strategy_key, {strategy_key})
+        _write_selector_snapshot(filtered, [strategy_key], bool(members & extended_keys))
         written[strategy_key] = len(filtered.get("stocks") or [])
     return written
+
+
+def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELECTOR_LIMIT) -> dict[str, Any]:
+    rows = payload.get("stocks") or []
+    complete_total = int(payload.get("total_stock_count") or len(rows))
+    display_rows = [row for row in rows if _row_display_quality_gate(row)]
+    total = len(display_rows)
+    display = display_rows[:limit] if limit > 0 else display_rows
+    out = dict(payload)
+    out["stocks"] = display
+    out["total_stock_count"] = total
+    out["complete_stock_count"] = complete_total
+    out["display_limit"] = limit
+    out["is_truncated"] = total > len(display)
+    return out
+
+
+def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> dict[str, Any]:
+    start_date = date.fromisoformat(start)
+    snapshot_dates = set(_selector_snapshot_dates(None, True))
+    long_snapshot_dates = _long_stock_pool_snapshot_dates("tea")
+    latest_snapshot = max(snapshot_dates) if snapshot_dates else None
+    latest_long_snapshot = max(long_snapshot_dates) if long_snapshot_dates else None
+    if end:
+        end_date = date.fromisoformat(end)
+    elif latest_snapshot:
+        end_date = max(date.today(), date.fromisoformat(latest_snapshot) + timedelta(days=7))
+    else:
+        end_date = date.today()
+    if end_date < start_date:
+        end_date = start_date
+    days: list[dict[str, Any]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        iso = cursor.isoformat()
+        is_closed = cursor.weekday() >= 5
+        previous = sorted(item for item in snapshot_dates if item <= iso)
+        effective = previous[-1] if previous else None
+        if is_closed:
+            status = "closed"
+            label = "休市"
+        elif iso in snapshot_dates:
+            status = "ready"
+            label = "已生成"
+        else:
+            status = "open_missing_data"
+            label = "缺数据"
+        days.append(
+            {
+                "date": iso,
+                "status": status,
+                "label": label,
+                "is_open": not is_closed,
+                "has_selector_snapshot": iso in snapshot_dates,
+                "has_long_stock_pool_snapshot": iso in long_snapshot_dates,
+                "effective_signal_date": effective,
+                "disabled": is_closed,
+            }
+        )
+        cursor += timedelta(days=1)
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "start": start_date.isoformat(),
+        "end": end_date.isoformat(),
+        "latest_signal_date": latest_snapshot,
+        "latest_long_signal_date": latest_long_snapshot,
+        "days": days,
+    }
 
 
 def get_b1_plan(refresh: bool = False, signal_date: str | None = None) -> dict[str, Any]:
@@ -411,7 +1695,7 @@ def _metrics_text(metrics: dict[str, Any] | None) -> str:
         f"均值 {_fmt_pct(metrics.get('avg_return_pct'))}，"
         f"胜率 {_fmt_rate(metrics.get('win_rate'))}，"
         f"最大回撤 {_fmt_pct(metrics.get('max_drawdown_pct'))}，"
-        f"PF {float(metrics.get('profit_factor') or 0):.2f}（连续复权口径）"
+        f"PF {float(metrics.get('profit_factor') or 0):.2f}（前复权口径）"
     )
 
 
@@ -594,7 +1878,7 @@ def _extended_signal_payload(signal: dict[str, Any], model_score: pd.Series | No
     model_playbook = _model_playbook_for(strategy_key) if model_score is not None else None
     playbook = model_playbook if model_playbook is not None else _extended_playbooks().get(strategy_key)
     if playbook is None:
-        return signal
+        return _enrich_signal_group(signal)
     metrics = _metrics_payload(playbook)
     action_level = str(playbook.get("action_level") or "观察")
     entry_rule = str(playbook.get("entry_rule") or "")
@@ -622,7 +1906,7 @@ def _extended_signal_payload(signal: dict[str, Any], model_score: pd.Series | No
         enriched["strength_score"] = float(enriched.get("strength_score") or 0) + 1.5
     elif action_level in {"谨慎观察", "谨慎实操", "模型观察"}:
         enriched["strength_score"] = float(enriched.get("strength_score") or 0) + 0.4
-    return enriched
+    return _enrich_signal_group(enriched)
 
 
 def _model_filtered_signal_payload(signal_key: str, model_score: pd.Series) -> dict[str, Any]:
@@ -634,7 +1918,7 @@ def _model_filtered_signal_payload(signal_key: str, model_score: pd.Series) -> d
     exit_rule = str(playbook.get("exit_rule") or "按策略卖出") if playbook is not None else "按策略卖出"
     model_reason = _model_score_reason(model_score)
     label = MODEL_SIGNAL_LABELS.get(signal_key, signal_key)
-    return {
+    return _enrich_signal_group({
         "strategy_key": signal_key,
         "strategy_family": signal_key,
         "strategy_name": label,
@@ -653,7 +1937,7 @@ def _model_filtered_signal_payload(signal_key: str, model_score: pd.Series) -> d
             "pred_down3": float(model_score.get("pred_down3")) if pd.notna(model_score.get("pred_down3")) else None,
         },
         "strength_score": max(float(model_score.get("pred_up5") or 0) - float(model_score.get("pred_down3") or 0), 0) * 3 + 1.2,
-    }
+    })
 
 
 def _stock_basic_profile(symbol: str) -> dict[str, str]:
@@ -731,8 +2015,12 @@ def _latest_daily_profile(symbol: str) -> dict[str, Any]:
 def _signal_quality_gate(signal: dict[str, Any]) -> bool:
     """Keep the default selector focused on signals with usable OOT evidence."""
     family = str(signal.get("strategy_family") or "")
+    group = _signal_group_key(signal)
     if family == "B1":
         return True
+
+    if family in MODEL_FILTERED_SIGNALS and family != "B2" and signal.get("playbook_source") != "模型版":
+        return False
 
     metrics = signal.get("metrics") or {}
     trades = float(metrics.get("trades") or 0)
@@ -751,7 +2039,7 @@ def _signal_quality_gate(signal: dict[str, Any]) -> bool:
             and win_rate >= 0.33
         )
 
-    if family in DEFAULT_FAMILIES and action_level in DEFAULT_ACTION_LEVELS:
+    if group in DEFAULT_FAMILIES and action_level in DEFAULT_ACTION_LEVELS:
         return (
             trades >= 80
             and avg_return >= 0.8
@@ -762,25 +2050,120 @@ def _signal_quality_gate(signal: dict[str, Any]) -> bool:
     return False
 
 
+def _signal_model_edge_pct(signal: dict[str, Any]) -> float | None:
+    model_score = signal.get("model_score") or {}
+    try:
+        pred_up5 = float(model_score.get("pred_up5") or 0)
+        pred_up8 = float(model_score.get("pred_up8") or 0)
+        pred_up10 = float(model_score.get("pred_up10") or 0)
+        pred_down3 = float(model_score.get("pred_down3") or 0)
+        reason = str(signal.get("reason") or "")
+        if pred_up10 <= 0:
+            match = re.search(r"up10=([-+]?\d+(?:\.\d+)?)", reason)
+            pred_up10 = float(match.group(1)) if match else 0
+        if pred_down3 <= 0:
+            match = re.search(r"down3=([-+]?\d+(?:\.\d+)?)", reason)
+            pred_down3 = float(match.group(1)) if match else 0
+    except (TypeError, ValueError):
+        return None
+    if pred_up5 <= 0 and pred_up8 <= 0 and pred_up10 <= 0 and pred_down3 <= 0:
+        return None
+    return pred_up5 * 5.0 + pred_up8 * 8.0 + pred_up10 * 10.0 - pred_down3 * 3.0
+
+
 def _signal_selector_score(signal: dict[str, Any]) -> float:
-    """Rank a signal with OOT performance, sample reliability and current strength."""
+    """Rank by conservative expected return, then lightly reward risk quality."""
     metrics = signal.get("metrics") or {}
     trades = float(metrics.get("trades") or 0)
     avg_return = float(metrics.get("avg_return_pct") or 0)
-    win_rate = float(metrics.get("win_rate") or 0)
     max_drawdown = abs(float(metrics.get("max_drawdown_pct") or 0))
     profit_factor = float(metrics.get("profit_factor") or 0)
-    reliability = min(1.0, np.sqrt(max(trades, 0) / 80))
-    capped_pf = min(profit_factor, 4.0)
-    capped_avg = max(min(avg_return, 8.0), -8.0)
-    drawdown_penalty = min(max_drawdown, 40.0) / 20
-    historical_score = capped_avg * 0.35 + capped_pf * 1.2 + win_rate * 2.5 - drawdown_penalty
-    strength_score = float(signal.get("strength_score") or 0)
-    return historical_score * (0.45 + 0.55 * reliability) + strength_score
+    reliability = min(1.0, np.sqrt(max(trades, 0) / 240))
+    conservative_avg = max(min(avg_return, 10.0), -10.0) * reliability
+    model_edge = _signal_model_edge_pct(signal)
+    expected_return = conservative_avg * 0.85
+    if model_edge is not None:
+        expected_return += max(min(model_edge, 10.0), -10.0) * 0.20
+    elif str(signal.get("playbook_source") or "") != "模型版" and trades < 80:
+        expected_return *= 0.65
+    risk_penalty = min(max_drawdown, 40.0) * 0.05
+    pf_bonus = min(max(profit_factor - 1.0, 0.0), 3.0) * 0.15
+    return expected_return - risk_penalty + pf_bonus
+
+
+def _calibrated_signal_score(signal: dict[str, Any], *, model_weight: float) -> float:
+    """Historical-sample calibrated score used for stock-level display fields."""
+    metrics = signal.get("metrics") or {}
+    trades = float(metrics.get("trades") or 0)
+    avg_return = max(min(float(metrics.get("avg_return_pct") or 0), 10.0), -10.0)
+    max_drawdown = abs(float(metrics.get("max_drawdown_pct") or 0))
+    reliability = min(1.0, np.sqrt(max(trades, 0) / 240))
+    model_edge = _signal_model_edge_pct(signal) or 0.0
+    return (
+        avg_return * reliability * 1.05
+        + max(min(model_edge, 10.0), -10.0) * model_weight
+        - min(max_drawdown, 50.0) * 0.025
+    )
+
+
+def _aggregate_signal_scores(signal_scores: list[float], group_count: int, *, resonance_weight: float = 0.2) -> float:
+    if not signal_scores:
+        return 0.0
+    ordered = sorted(signal_scores, reverse=True)
+    best = ordered[0]
+    resonance = 0.08 * sum(max(score, 0) for score in ordered[1:3])
+    group_bonus = resonance_weight * np.log1p(group_count)
+    return float(best + resonance + group_bonus)
+
+
+def _score_interpretation(opportunity_score: float, holding_score: float) -> dict[str, str]:
+    """Coarse score bands from the full-history calibration pass.
+
+    Keep these deliberately coarse: the OOT test supports ranking by broad
+    buckets better than treating the raw decimal as a precise probability.
+    """
+    if opportunity_score >= 4.3:
+        band = "极高"
+        percentile = "约 Top 1%"
+        usage = "冲高机会很强，仍需按买入条件和止损执行"
+    elif opportunity_score >= 1.4:
+        band = "高"
+        percentile = "约 Top 5%"
+        usage = "优先观察，等待开盘条件确认"
+    elif opportunity_score >= 1.2:
+        band = "偏高"
+        percentile = "约 Top 10%"
+        usage = "可观察，不适合追高"
+    elif opportunity_score >= 0.1:
+        band = "中性"
+        percentile = "约 Top 25%"
+        usage = "只适合结合策略细节筛选"
+    else:
+        band = "低"
+        percentile = "低于主要观察区"
+        usage = "不建议仅因分数参与"
+
+    if opportunity_score >= 1.2 and holding_score < 0.1:
+        risk_note = "冲高分高但持有参考弱，偏短线冲高，不宜按 T+5 持有逻辑理解"
+    elif holding_score >= 1.2:
+        risk_note = "冲高与持有参考相对一致"
+    else:
+        risk_note = "持有参考偏弱，需重视回撤和卖出纪律"
+
+    return {
+        "score_band": band,
+        "score_percentile_label": percentile,
+        "score_usage_hint": usage,
+        "score_risk_note": risk_note,
+    }
+
+
+def _row_display_quality_gate(row: dict[str, Any]) -> bool:
+    return any(_signal_quality_gate(signal) for signal in row.get("signals") or [])
 
 
 def _signal_operation_key(signal: dict[str, Any]) -> str:
-    family = str(signal.get("strategy_family") or signal.get("strategy_key") or "")
+    family = _signal_group_key(signal)
     operation_key = str(signal.get("operation_key") or "")
     return f"{family}::{operation_key}" if operation_key else family
 
@@ -809,11 +2192,62 @@ def _dedupe_signals_by_operation(signals: list[dict[str, Any]]) -> list[dict[str
     return list(best_by_operation.values())
 
 
+def build_selector_stock_row(
+    stock: dict[str, Any],
+    signals: list[dict[str, Any]],
+    signal_date: str | None = None,
+) -> dict[str, Any] | None:
+    """Build the page-equivalent stock-level selector row from signal payloads."""
+    signals = _dedupe_signals_by_operation(signals)
+    if not signals:
+        return None
+    _fill_stock_profile(stock, signal_date)
+    groups = sorted({_signal_group_key(signal) for signal in signals})
+    group_labels = [STRATEGY_GROUP_LABELS.get(group, group) for group in groups]
+    best_pf = max((signal.get("metrics") or {}).get("profit_factor") or 0 for signal in signals)
+    best_avg = max((signal.get("metrics") or {}).get("avg_return_pct") or -999 for signal in signals)
+    ordered_signals = sorted(
+        signals,
+        key=lambda item: (_signal_selector_score(item), (item.get("metrics") or {}).get("profit_factor") or 0),
+        reverse=True,
+    )
+    signal_scores = [_signal_selector_score(signal) for signal in ordered_signals]
+    legacy_score = (signal_scores[0] if signal_scores else 0) + 0.08 * sum(max(score, 0) for score in signal_scores[1:3]) + 0.15 * np.log1p(len(groups))
+    opportunity_score = _aggregate_signal_scores(
+        [_calibrated_signal_score(signal, model_weight=0.4) for signal in ordered_signals],
+        len(groups),
+        resonance_weight=0.2,
+    )
+    holding_score = _aggregate_signal_scores(
+        [_calibrated_signal_score(signal, model_weight=0.2) for signal in ordered_signals],
+        len(groups),
+        resonance_weight=0.2,
+    )
+    score_info = _score_interpretation(float(opportunity_score), float(holding_score))
+    return {
+        **{key: value for key, value in stock.items() if key != "signals"},
+        "matched_count": len(groups),
+        "matched_families": group_labels,
+        "matched_groups": groups,
+        "matched_strategy_names": [signal.get("strategy_name") for signal in ordered_signals],
+        "best_profit_factor": best_pf,
+        "best_avg_return_pct": best_avg if best_avg > -999 else None,
+        "selector_score": round(float(opportunity_score), 2),
+        "opportunity_score": round(float(opportunity_score), 2),
+        "holding_score": round(float(holding_score), 2),
+        "legacy_selector_score": round(float(legacy_score), 2),
+        "score_target": "future_max_high_t5_pct",
+        **score_info,
+        "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(groups)} 个策略组共振；当前排序目标为 5 日内冲高机会",
+        "signals": ordered_signals,
+    }
+
+
 def _primary_family(row: dict[str, Any]) -> str:
     signals = row.get("signals") or []
     if signals:
-        return str(signals[0].get("strategy_family") or signals[0].get("strategy_key") or "")
-    families = row.get("matched_families") or []
+        return _signal_group_key(signals[0])
+    families = row.get("matched_groups") or row.get("matched_families") or []
     return str(families[0]) if families else ""
 
 
@@ -924,7 +2358,7 @@ def _b1_model_signal(row: dict[str, Any]) -> dict[str, Any]:
     )
     pred_up10 = float(row.get("pred_up10_es") or 0)
     pred_down3 = float(row.get("pred_down3_es") or 0)
-    return {
+    return _enrich_signal_group({
         "strategy_key": "B1_MODEL",
         "strategy_family": "B1",
         "strategy_name": row.get("strategy_name") or "B1 模型 Top20",
@@ -941,7 +2375,7 @@ def _b1_model_signal(row: dict[str, Any]) -> dict[str, Any]:
         "metrics": metrics,
         "metrics_text": _metrics_text(metrics),
         "strength_score": max(pred_up10 - pred_down3, 0) * 3,
-    }
+    })
 
 
 def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score: pd.Series | None = None) -> dict[str, Any]:
@@ -980,7 +2414,7 @@ def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score
             strength_score += max(float(model_score.get("pred_up5") or 0) - float(model_score.get("pred_down3") or 0), 0) * 2
     elif family in MODEL_FILTERED_SIGNALS:
         model_entry = "模型分未覆盖或未通过；当前先展示规则候选；"
-    return {
+    return _enrich_signal_group({
         "strategy_key": strategy_key,
         "strategy_family": family,
         "strategy_name": name,
@@ -999,7 +2433,7 @@ def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score
         "action_level": action_level,
         "playbook_source": "模型版" if model_playbook is not None else "规则版",
         "strength_score": strength_score,
-    }
+    })
 
 
 @lru_cache(maxsize=16)
@@ -1139,11 +2573,13 @@ def _clear_selector_caches() -> None:
 def _progress_steps() -> list[dict[str, Any]]:
     return [
         {"key": "refresh_data", "label": "拉取 Tushare 最新日线数据", "status": "pending", "percent": 10},
-        {"key": "daily_plan", "label": "生成最新策略每日计划", "status": "pending", "percent": 35},
-        {"key": "signal_cache", "label": "重建全市场策略规则信号", "status": "pending", "percent": 50},
-        {"key": "model_score", "label": "计算当日策略模型分", "status": "pending", "percent": 65},
-        {"key": "selector_core", "label": "计算 B1/B2/B3/SB1 股票池", "status": "pending", "percent": 75},
-        {"key": "selector_extended", "label": "计算全市场扩展策略信号", "status": "pending", "percent": 88},
+        {"key": "feature_cache", "label": "增量构建 B1 特征缓存", "status": "pending", "percent": 35},
+        {"key": "daily_plan", "label": "生成最新策略每日计划", "status": "pending", "percent": 45},
+        {"key": "signal_cache", "label": "重建全市场策略规则信号", "status": "pending", "percent": 56},
+        {"key": "model_score", "label": "计算当日策略模型分", "status": "pending", "percent": 70},
+        {"key": "selector_core", "label": "计算短线核心股票池", "status": "pending", "percent": 78},
+        {"key": "selector_extended", "label": "计算短线全策略股票池", "status": "pending", "percent": 88},
+        {"key": "long_stock_pool", "label": "计算长线策略股票池", "status": "pending", "percent": 94},
         {"key": "snapshot", "label": "写入 MySQL 策略股票池快照", "status": "pending", "percent": 95},
     ]
 
@@ -1184,10 +2620,12 @@ def _set_refresh_progress(
         )
         if status in {"success", "failed"}:
             _REFRESH_STATUS["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _persist_refresh_status_unlocked()
 
 
 def _run_latest_refresh_job() -> None:
     from quant.routine.pipeline import (
+        build_features,
         generate_dashboard,
         generate_daily_plan,
         refresh_data,
@@ -1212,26 +2650,50 @@ def _run_latest_refresh_job() -> None:
     try:
         results: dict[str, Any] = {}
         _set_refresh_progress(step_key="refresh_data", message="正在拉取 Tushare 最新日线数据", percent=10)
-        results["refresh_data"] = refresh_data(dry_run=False)
+        results["refresh_data"] = refresh_data(
+            dry_run=False,
+            progress_callback=lambda percent, message: _set_refresh_progress(
+                step_key="refresh_data",
+                message=message,
+                percent=percent,
+            ),
+        )
         if results["refresh_data"].get("status") == "failed":
             raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
-        _set_refresh_progress(step_key="daily_plan", message="正在生成最新策略每日计划", percent=35)
+        _set_refresh_progress(step_key="feature_cache", message="正在增量构建 B1 特征缓存", percent=35)
+        results["feature_cache"] = build_features(
+            progress_callback=lambda percent, message: _set_refresh_progress(
+                step_key="feature_cache",
+                message=message,
+                percent=percent,
+            ),
+        )
+        if results["feature_cache"].get("status") == "failed":
+            raise RuntimeError(results["feature_cache"].get("stderr_tail") or "B1 特征缓存刷新失败")
+
+        _set_refresh_progress(step_key="daily_plan", message="正在生成最新策略每日计划", percent=45)
         results["generate_daily_plan"] = generate_daily_plan()
         results["generate_dashboard"] = generate_dashboard()
 
-        _set_refresh_progress(step_key="signal_cache", message="正在重建全市场策略规则信号", percent=50)
-        results["signal_cache"] = refresh_strategy_signal_cache()
+        _set_refresh_progress(step_key="signal_cache", message="正在重建全市场策略规则信号", percent=56)
+        results["signal_cache"] = refresh_strategy_signal_cache(
+            progress_callback=lambda percent, message: _set_refresh_progress(
+                step_key="signal_cache",
+                message=message,
+                percent=max(56, min(69, percent)),
+            ),
+        )
         if results["signal_cache"].get("status") == "failed":
             raise RuntimeError(results["signal_cache"].get("stderr_tail") or "策略规则信号重建失败")
 
-        _set_refresh_progress(step_key="model_score", message="正在计算当日策略模型分", percent=65)
+        _set_refresh_progress(step_key="model_score", message="正在计算当日策略模型分", percent=70)
         results["model_score"] = score_latest_models()
         if results["model_score"].get("status") == "failed":
             raise RuntimeError(results["model_score"].get("stderr_tail") or "当日策略模型分计算失败")
         _clear_selector_caches()
 
-        _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=75)
+        _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
         core_payload = get_stock_selector_payload(use_cache=False)
         results["selector_core"] = {
             "status": "success",
@@ -1239,7 +2701,7 @@ def _run_latest_refresh_job() -> None:
             "stocks": len(core_payload.get("stocks") or []),
         }
 
-        _set_refresh_progress(step_key="selector_extended", message="正在计算全市场扩展策略信号", percent=88)
+        _set_refresh_progress(step_key="selector_extended", message="正在计算全市场扩展策略信号", percent=90)
         full_payload = get_stock_selector_payload(
             signal_date=core_payload.get("signal_date"),
             include_extended=True,
@@ -1252,18 +2714,42 @@ def _run_latest_refresh_job() -> None:
             "stocks": len(full_payload.get("stocks") or []),
         }
 
+        _build_tea_master_stock_pool_cached.cache_clear()
+        _build_long_stock_pool_cached.cache_clear()
+        _set_refresh_progress(step_key="long_stock_pool", message="正在计算长线策略股票池", percent=94)
+        long_variants = ["tea", "tea_safe", "v44"]
+        long_results = []
+        for variant in long_variants:
+            long_payload = get_long_stock_pool(
+                variant=variant,
+                signal_date=full_payload.get("signal_date"),
+                refresh=True,
+            )
+            long_results.append(
+                {
+                    "variant": variant,
+                    "signal_date": long_payload.get("signal_date"),
+                    "stocks": len(long_payload.get("stocks") or []),
+                }
+            )
+        results["long_stock_pool"] = {
+            "status": "success",
+            "variants": long_results,
+        }
+
         _set_refresh_progress(step_key="snapshot", message="正在写入 MySQL 策略股票池快照", percent=95)
         written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
         results["snapshot"] = {
             "status": "success",
             "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
             "strategy_pools": written_pools,
+            "long_stock_pools": long_results,
         }
 
         _set_refresh_progress(
             status="success",
             step_key="snapshot",
-            message="刷新任务完成，最新股票池已生成并写入快照",
+            message="刷新任务完成，短线与长线股票池已生成并写入快照",
             percent=100,
             result=results,
         )
@@ -1297,17 +2783,22 @@ def start_latest_refresh() -> dict[str, Any]:
                 "error": None,
             }
         )
+        _persist_refresh_status_unlocked()
         thread.start()
         return dict(_REFRESH_STATUS)
 
 
 def get_latest_refresh_status() -> dict[str, Any]:
     with _REFRESH_LOCK:
+        if _REFRESH_STATUS.get("status") == "idle":
+            persisted = _load_persisted_refresh_status()
+            if persisted and persisted.get("status") != "idle":
+                return persisted
         return dict(_REFRESH_STATUS)
 
 
 def _selected_extended_keys(strategies: list[str] | None) -> set[str]:
-    selected = {item.upper() for item in strategies or [] if item}
+    selected = _strategy_filter_members(strategies)
     known = {str(item.get("key", "")).upper() for item in EXTENDED_STRATEGIES}
     return selected & known
 
@@ -1321,13 +2812,21 @@ def get_stock_selector_payload(
 ) -> dict[str, Any]:
     extended_filter = _selected_extended_keys(strategies)
     effective_include_extended = include_extended or bool(extended_filter)
+    if not signal_date and not use_cache:
+        signal_date = _latest_candidate_signal_date()
+    elif signal_date and not use_cache:
+        parsed_signal_date = pd.to_datetime(signal_date, errors="raise")
+        if parsed_signal_date.weekday() >= 5:
+            signal_date = _resolve_selector_signal_date(signal_date, strategies, effective_include_extended)
+    else:
+        signal_date = _resolve_selector_signal_date(signal_date, strategies, effective_include_extended)
     if use_cache:
         cached = _read_selector_snapshot(signal_date, strategies, effective_include_extended)
         if cached is not None:
-            return cached
+            return cached if full_snapshot else _display_selector_payload(cached)
 
     plan = get_b1_plan(signal_date=signal_date)
-    effective_signal_date = plan.get("signal_date") or signal_date
+    effective_signal_date = signal_date or plan.get("signal_date")
     stocks: dict[str, dict[str, Any]] = {}
     for row in plan.get("plan_rows", []):
         symbol = str(row.get("symbol"))
@@ -1408,7 +2907,7 @@ def get_stock_selector_payload(
         if signal_key not in MODEL_FILTERED_SIGNALS:
             continue
         existing = stocks.get(symbol, {}).get("signals", [])
-        if any(signal.get("strategy_family") == signal_key for signal in existing):
+        if any(signal.get("strategy_family") == signal_key and signal.get("playbook_source") == "模型版" for signal in existing):
             continue
         row = latest.loc[symbol] if symbol in latest.index else {}
         if symbol not in stocks:
@@ -1425,13 +2924,15 @@ def get_stock_selector_payload(
         stocks[symbol]["signals"].append(_model_filtered_signal_payload(signal_key, model_score))
 
     selected = {item.upper() for item in strategies or [] if item}
+    selected_members = _strategy_filter_members(strategies)
+    selected_groups = _strategy_filter_groups(strategies)
     rows = []
     for stock in stocks.values():
         if selected:
             signals = [
                 signal
                 for signal in stock["signals"]
-                if signal["strategy_key"].upper() in selected or signal["strategy_family"].upper() in selected
+                if _signal_matches_filter(signal, selected_members, selected_groups)
             ]
         else:
             signals = stock["signals"]
@@ -1439,69 +2940,41 @@ def get_stock_selector_payload(
                 signals = [signal for signal in signals if _signal_quality_gate(signal)]
         if not signals:
             continue
-        signals = _dedupe_signals_by_operation(signals)
-        if not signals:
-            continue
-        _fill_stock_profile(stock, effective_signal_date)
-        families = sorted({signal["strategy_family"] for signal in signals})
-        best_pf = max((signal.get("metrics") or {}).get("profit_factor") or 0 for signal in signals)
-        best_avg = max((signal.get("metrics") or {}).get("avg_return_pct") or -999 for signal in signals)
-        ordered_signals = sorted(
-            signals,
-            key=lambda item: (_signal_selector_score(item), (item.get("metrics") or {}).get("profit_factor") or 0),
-            reverse=True,
-        )
-        signal_scores = [_signal_selector_score(signal) for signal in ordered_signals]
-        selector_score = (
-            (signal_scores[0] if signal_scores else 0)
-            + 0.12 * sum(signal_scores[:3])
-            + 0.35 * np.log1p(len(ordered_signals))
-        )
-        rows.append(
-            {
-                **{key: value for key, value in stock.items() if key != "signals"},
-                "matched_count": len(families),
-                "matched_families": families,
-                "matched_strategy_names": [signal["strategy_name"] for signal in signals],
-                "best_profit_factor": best_pf,
-                "best_avg_return_pct": best_avg if best_avg > -999 else None,
-                "selector_score": round(float(selector_score), 2),
-                "rank_reason": f"按 {ordered_signals[0]['strategy_name']} 领衔，叠加 {len(families)} 个策略家族共振",
-                "signals": ordered_signals,
-            }
-        )
+        row = build_selector_stock_row(stock, signals, effective_signal_date)
+        if row is not None:
+            rows.append(row)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    if not selected and not full_snapshot:
-        rows = _diversify_default_rows(rows, DEFAULT_SELECTOR_LIMIT)
+    if not selected:
+        rows = _diversify_default_rows(rows, len(rows) or DEFAULT_SELECTOR_LIMIT)
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "signal_date": plan.get("signal_date"),
+        "signal_date": effective_signal_date,
         "execution_date": plan.get("execution_date"),
         "available_strategies": [
-            {"key": "B1", "label": "B1", "status": "模型+规则"},
-            {"key": "B2", "label": "B2", "status": "日线规则已接入"},
-            {"key": "B3", "label": "B3", "status": "日线规则已接入"},
-            {"key": "SB1", "label": "SB1", "status": "盘中战法日线近似"},
-            {"key": "SUPER_B1", "label": "超级 B1", "status": "盘中战法日线近似"},
-            *EXTENDED_STRATEGIES,
+            {"key": item["key"], "label": item["label"], "status": item["status"], "members": item["members"]}
+            for item in STRATEGY_GROUPS
         ],
         "stocks": rows,
+        "total_stock_count": len(rows),
+        "display_limit": None if full_snapshot else DEFAULT_SELECTOR_LIMIT,
+        "is_truncated": False,
         "notes": [
-            "选股器按股票聚合命中策略家族；同一策略家族下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中仍按策略家族去重计算。",
-            "2026-06-08 已修复除权断点导致的 KDJ/价格滚动指标失真；模型训练、标签和策略回测已切换为连续复权价格口径。",
+            "选股器按合并后的策略组聚合命中；同一策略组下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中按策略组去重计算。",
+            "2026-06-14 已统一短线和长线为前复权价格口径；模型训练、标签、策略回测和页面价格展示使用同一套价格体系。",
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
-            "历史均值是该股票命中策略在 OOT 回测中的平均单笔收益；PF 是总盈利除以总亏损，越高说明盈亏结构越好。",
-            "股票池默认按综合分排序：综合考虑历史均值、胜率、PF、最大回撤、样本量可靠性、当前信号强度和多策略共振。",
-            f"默认首页只展示通过质量门槛的实操候选 Top{DEFAULT_SELECTOR_LIMIT}，并限制单个策略家族过度霸榜；点击左侧具体策略时展示该策略完整规则候选，便于继续观察和复盘。",
-            "为保证首屏速度，默认首页先加载核心候选；扩展策略按策略筛选时再生成/读取，最新刷新会一次性写入全策略快照。",
+            "当前默认排序分已临时改为冲高机会分，目标是 5 日内最大涨幅；2026 OOT Top20 平均最大涨幅约 6.48%，但高分分位仍不完全单调，不应理解为稳定收益概率。",
+            "持有参考分用于提示 T+5 收盘收益倾向；历史验证显示 T+5 收盘收益排序稳定性不足，当前只作为辅助风险提示。",
+            f"前端默认先过滤为可操作候选，再展示保守预期收益分 Top{DEFAULT_SELECTOR_LIMIT}；MySQL 快照仍保存完整规则全集，便于后续复盘和重新训练。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",
         ],
     }
-    _write_selector_snapshot(payload, strategies, effective_include_extended)
-    payload["cache"] = {"hit": False, "backend": "generated"}
-    return payload
+    if full_snapshot:
+        _write_selector_snapshot(payload, strategies, effective_include_extended)
+    out = payload if full_snapshot else _display_selector_payload(payload)
+    out["cache"] = {"hit": False, "backend": "generated"}
+    return out

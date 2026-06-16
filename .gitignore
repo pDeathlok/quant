@@ -65,6 +65,7 @@ Thumbs.db
 *.log
 logs/*.log
 .run/
+.playwright-cli/
 
 # Claude
 .claude/

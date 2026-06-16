@@ -403,14 +403,32 @@ def process_file(path: Path) -> pd.DataFrame | None:
         return None
 
 
-def build_signal_candidates(force_refresh: bool = False, workers: int = 32) -> pd.DataFrame:
+def _parse_start_date(value: str | None) -> pd.Timestamp | None:
+    if not value:
+        return None
+    if value.isdigit() and len(value) == 8:
+        return pd.to_datetime(value, format="%Y%m%d")
+    return pd.to_datetime(value)
+
+
+def build_signal_candidates(
+    force_refresh: bool = False,
+    workers: int = 32,
+    incremental_start_date: str | None = None,
+) -> pd.DataFrame:
+    incremental_start = _parse_start_date(incremental_start_date)
+    cached: pd.DataFrame | None = None
     if SIGNAL_CACHE.exists() and not force_refresh:
         cached = pd.read_parquet(SIGNAL_CACHE)
         cached["date"] = pd.to_datetime(cached["date"])
         expected = {spec.name for spec in build_signal_specs()}
         if expected <= set(cached.columns):
-            return cached.dropna(subset=["symbol", "date"])
-        print("signal cache is missing new columns; rebuilding", flush=True)
+            cached = cached.dropna(subset=["symbol", "date"])
+            if incremental_start is None:
+                return cached
+        else:
+            print("signal cache is missing new columns; rebuilding", flush=True)
+            cached = None
 
     files = sorted(DEFAULT_DAILY_DIR.glob("*.parquet"))
     frames = []
@@ -419,12 +437,24 @@ def build_signal_candidates(force_refresh: bool = False, workers: int = 32) -> p
         for n, future in enumerate(as_completed(futures), start=1):
             result = future.result()
             if result is not None and not result.empty:
-                frames.append(result)
+                if incremental_start is not None:
+                    result = result[pd.to_datetime(result["date"]) >= incremental_start].copy()
+                if not result.empty:
+                    frames.append(result)
             if n % 500 == 0 or n == len(futures):
                 print(f"  family signals: {n}/{len(futures)} files", flush=True)
-    if not frames:
+    if cached is not None and incremental_start is not None:
+        old = cached[pd.to_datetime(cached["date"]) < incremental_start].copy()
+        if frames:
+            recent = pd.concat(frames, ignore_index=True)
+            combined = pd.concat([old, recent], ignore_index=True)
+        else:
+            combined = old
+    elif frames:
+        combined = pd.concat(frames, ignore_index=True)
+    else:
         raise RuntimeError("No family signal candidates built")
-    combined = pd.concat(frames, ignore_index=True).sort_values(["symbol", "date"]).reset_index(drop=True)
+    combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
     SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(SIGNAL_CACHE, index=False)
     return combined

@@ -239,7 +239,12 @@ def build_daily_plan(signal_date: str | None = None, max_rows: int = 500) -> dic
     candidates = pd.read_parquet(FEATURE_PATH)
     candidates["date"] = pd.to_datetime(candidates["date"])
     if signal_date:
-        target_date = pd.to_datetime(signal_date)
+        requested_date = pd.to_datetime(signal_date)
+        available_dates = candidates.loc[candidates["date"] <= requested_date, "date"]
+        if available_dates.empty:
+            target_date = candidates["date"].max()
+        else:
+            target_date = available_dates.max()
     else:
         target_date = candidates["date"].max()
     latest = candidates[candidates["date"] == target_date].copy()

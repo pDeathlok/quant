@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>策略选股器</title>
-    <link rel="stylesheet" href="./styles.css?v=20260607-progress-cache" />
+    <title>策略工作台</title>
+    <link rel="stylesheet" href="./styles.css?v=20260615-tea-shared-date" />
   </head>
   <body>
     <div class="app selector-app">
@@ -12,18 +12,51 @@
         <div class="brand">
           <div class="mark">Q</div>
           <div>
-            <h1>策略选股器</h1>
+            <h1>策略工作台</h1>
             <p id="generatedAt">加载中</p>
           </div>
         </div>
-        <div class="side-section">
+        <div class="sidebar-brief">
+          <span>工作区</span>
+          <p>顶部 Tab 切换短线与长线。左侧区域跟随当前工作区显示对应策略选择。</p>
+        </div>
+        <div id="strategyFilterSection" class="side-section">
           <span>策略筛选</span>
           <div id="strategyFilters" class="filter-list"></div>
         </div>
         <button id="clearFilters" class="secondary-button" type="button">清空筛选</button>
+        <div id="longStrategySection" class="side-section hidden">
+          <span>长线组合</span>
+          <div class="long-variant-control" aria-label="长线策略版本">
+            <button class="long-variant-button active" type="button" data-long-variant="tea">
+              <strong>茶大长线趋势网格</strong>
+              <span>core14_soft_plus · 当前主推</span>
+            </button>
+            <button class="long-variant-button" type="button" data-long-variant="tea_safe">
+              <strong>茶大长线稳健网格</strong>
+              <span>core14_soft_spread · 保守备选</span>
+            </button>
+            <button class="long-variant-button" type="button" data-long-variant="v44">
+              <strong>旧防守中性长期组合</strong>
+              <span>v44 · 旧策略对照</span>
+            </button>
+          </div>
+          <button id="longPoolRefresh" class="secondary-button" type="button">刷新股票池</button>
+        </div>
       </aside>
 
-      <main class="main">
+      <main id="shortPage" class="main page-view active">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab active" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+        </nav>
+
         <section class="toolbar">
           <div>
             <p class="eyebrow">Strategy Stock Selector</p>
@@ -31,13 +64,30 @@
             <p class="subline"><span id="signalDate"></span> · <span id="executionDate"></span></p>
           </div>
           <div class="toolbar-actions">
-            <label class="date-control">
+            <div id="sharedDateControl" class="date-control">
               <span>复盘日期</span>
-              <input id="signalDateInput" type="date" min="2026-06-01" />
-            </label>
+              <div class="date-field">
+                <input id="signalDateInput" type="text" readonly aria-readonly="true" />
+                <button id="calendarToggle" class="calendar-toggle" type="button">选择日期</button>
+              </div>
+              <small id="dateStatus">选择已生成快照的交易日</small>
+              <div id="calendarPanel" class="calendar-panel">
+                <div class="calendar-panel-head">
+                  <button id="prevMonthButton" type="button" aria-label="上个月">‹</button>
+                  <strong id="calendarMonthLabel"></strong>
+                  <button id="nextMonthButton" type="button" aria-label="下个月">›</button>
+                </div>
+                <div class="calendar-legend">
+                  <span><i class="legend-dot ready"></i>已生成</span>
+                  <span><i class="legend-dot missing"></i>缺数据</span>
+                  <span><i class="legend-dot closed"></i>休市</span>
+                </div>
+                <div id="dateCalendar" class="date-calendar"></div>
+              </div>
+            </div>
             <input id="searchInput" type="search" placeholder="搜索股票 / 策略" />
             <button id="reloadButton" type="button">刷新当前日期</button>
-            <button id="refreshLatestButton" type="button">更新最新数据</button>
+            <button id="refreshLatestButton" type="button">更新长短线数据</button>
           </div>
           <div id="refreshStatus" class="refresh-status"></div>
           <div id="progressSteps" class="progress-steps"></div>
@@ -58,7 +108,8 @@
                     <th>收盘</th>
                     <th>命中</th>
                     <th>策略</th>
-                    <th>综合分</th>
+                    <th>冲高分</th>
+                    <th>持有参考</th>
                     <th>历史均值</th>
                     <th>PF</th>
                     <th>日期</th>
@@ -88,7 +139,120 @@
           <ul id="notes" class="notes"></ul>
         </section>
       </main>
+
+      <main id="longPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+        </nav>
+
+        <section class="toolbar long-toolbar">
+          <div>
+            <p class="eyebrow">Long Horizon Strategy</p>
+            <h2>长线策略候选</h2>
+            <p class="subline">2013-01-04 至 2026-06-12 回测 · 使用茶大独立长线策略与前复权数据</p>
+          </div>
+          <div class="long-toolbar-actions">
+            <div id="longDateSlot" class="long-date-slot"></div>
+            <button id="longRefreshLatestButton" type="button">更新长短线数据</button>
+            <div class="long-summary">
+              <span id="longSummaryLabel">主推荐</span>
+              <strong id="longSummaryName">茶大长线趋势网格</strong>
+            </div>
+          </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
+        </section>
+
+        <section class="long-overview-grid" aria-label="长线策略概览">
+          <article class="long-hero-panel">
+            <span id="longHeroTag" class="tag strong">当前推荐</span>
+            <h3 id="longHeroTitle">茶大长线趋势网格</h3>
+            <p id="longHeroDescription">独立于旧长线策略，使用茶大体系的年线趋势、核心底仓、行业上限、软刹车和日线做T。</p>
+            <p id="longHeroNote" class="long-execution-note">当前主推 core14_soft_plus：不使用成长卫星仓，保留约 14 个核心候选。</p>
+            <div class="long-metrics compact">
+              <div><span>年化收益</span><strong id="longMetricAnnual">5.62%</strong></div>
+              <div><span>最大回撤</span><strong id="longMetricDrawdown">-21.80%</strong></div>
+              <div><span>Sharpe</span><strong id="longMetricSharpe">0.616</strong></div>
+              <div><span>平均仓位</span><strong id="longMetricWeight">51.00%</strong></div>
+            </div>
+          </article>
+          <aside class="long-rule-panel">
+            <h3>阅读顺序</h3>
+            <ol>
+              <li>先看三套候选策略的定位差异</li>
+              <li>再看年度表现，判断收益来自哪些年份</li>
+              <li>最后看回撤来源和下一轮风控优化</li>
+            </ol>
+          </aside>
+        </section>
+
+        <section class="panel long-pool-panel">
+          <div class="panel-head">
+            <div>
+              <h3>当前长线股票池</h3>
+              <span id="longPoolMeta">等待加载</span>
+            </div>
+            <div id="longStateCounts" class="state-counts"></div>
+          </div>
+          <div class="table-wrap long-pool-table-wrap">
+            <table class="long-pool-table">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>股票</th>
+                  <th>行业</th>
+                  <th>动作</th>
+                  <th>仓位计划</th>
+                  <th>评分</th>
+                  <th>价格计划</th>
+                  <th>预测覆盖</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody id="longStockRows">
+                <tr><td colspan="9" class="empty-cell">切到长线策略后加载股票池</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel long-year-panel">
+          <div class="panel-head">
+            <h3>年度表现</h3>
+            <span>收益 / 年内最大回撤 / 平均仓位</span>
+          </div>
+          <div class="table-wrap long-table-wrap">
+            <table class="long-table">
+              <thead>
+                <tr>
+                  <th>年份</th>
+                  <th>策略年度表现</th>
+                </tr>
+              </thead>
+              <tbody id="longStrategyRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="long-notes">
+          <div class="note-block">
+            <span>组合定位</span>
+            <p>长线策略用于跨周期持仓、分批建仓和仓位管理，不替代每日短线选股。左侧切换后，本页概览、年度表现和股票池都会同步到当前策略。</p>
+          </div>
+          <div class="note-block">
+            <span>下一步优化</span>
+            <p>最大回撤主要来自 2015 股灾，后续可加入日级指数刹车和 pullback 禁止买回规则。</p>
+          </div>
+        </section>
+      </main>
     </div>
-    <script src="./app.js?v=20260607-progress-cache"></script>
+    <script src="./app.js?v=20260615-tea-shared-date"></script>
   </body>
 </html>

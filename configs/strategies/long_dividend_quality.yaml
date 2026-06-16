@@ -1,0 +1,287 @@
+# L1 long-term market-regime quality strategy.
+#
+# Strategy record:
+#   docs/strategies/long_dividend_quality_strategy_record.md
+#
+# Current research winner:
+#   v33_bull_boost_defensive_bear_sleeve
+# Optional T overlay:
+#   v7_t_overlay_light
+# Optional growth sleeve:
+#   built into v33 as a capped risk_on analyst/growth sleeve
+#
+# Design intent:
+#   - Long-term core holding system, not a short-term rebound strategy.
+#   - Market trend controls caution level and target portfolio exposure.
+#   - Dividend yield is a reference factor. Stable dividend yield improves score,
+#     but low dividend yield is not an automatic rejection when quality, value,
+#     trend, and risk are strong.
+#   - Growth exposure is allowed in risk_on markets through a capped sleeve,
+#     instead of weakening the defensive core rules.
+strategies:
+  - id: l1_market_regime_quality
+    name: L1 市场趋势质量长期版
+    enabled: true
+    backtest:
+      script: scripts/research/backtest_long_dividend_quality.py
+      variant: v33_bull_boost_defensive_bear_sleeve
+      start: "20130101"
+      latest_report: reports/long_dividend_quality/v33_bull_boost_defensive_bear_sleeve/l1_dividend_quality_backtest.md
+      latest_summary: reports/long_dividend_quality/v33_bull_boost_defensive_bear_sleeve/l1_dividend_quality_summary.json
+    universe:
+      exclude_st: true
+      min_listing_years: 2
+      min_total_mv: 800000
+      min_circ_mv: 500000
+      min_turnover_rate_ma20: 0.3
+      max_turnover_rate_ma20: 8.0
+      exclude_top_volatility_quantile_60d: 0.2
+      research_prefilter_min_dv_ttm: 0.5
+    market_regime:
+      benchmark: "000300.SH"
+      risk_on:
+        condition: "close > ma120 and ma120_slope_20d > 0 and return_60d > 0"
+        target_total_weight: 0.85
+        entry_min_long_score: 72
+        max_entry_price_to_target: 1.10
+      neutral:
+        condition: "not risk_on and not risk_off"
+        target_total_weight: 0.60
+        entry_min_long_score: 76
+        max_entry_price_to_target: 1.04
+      risk_off:
+        condition: "close < ma120 and ma120_slope_20d < 0"
+        target_total_weight: 0.30
+        entry_min_long_score: 84
+        require_dividend_score: 70
+        require_quality_score: 65
+        require_pullback_entry: true
+    scoring:
+      weights:
+        dividend: 0.15
+        quality: 0.30
+        value: 0.20
+        trend: 0.20
+        risk: 0.15
+      dividend:
+        score_inputs:
+          dv_ttm: 0.55
+          dv_ttm_stability_36m: 0.45
+        normal_low: 2.0
+        normal_high: 6.0
+        caution_high: 9.0
+        abnormal_high_penalty: true
+        hard_min_for_prefilter_only: 0.5
+      quality:
+        roe: 0.45
+        netprofit_margin: 0.25
+        or_yoy: 0.15
+        debt_to_assets_inverse: 0.15
+      value:
+        pe_ttm_inverse: 0.40
+        pb_inverse: 0.35
+        ps_ttm_inverse: 0.25
+      trend:
+        return_120d: 0.45
+        ma120_slope_20d: 0.35
+        close_above_ma120_bonus: 0.20
+      risk:
+        volatility_60d_inverse: 0.55
+        downside_volatility_60d_inverse: 0.45
+    entry:
+      target_price:
+        ma60_multiplier: 1.02
+        ma120_multiplier: 1.05
+        use_60d_median_close: true
+        method: min
+      risk_on_entry:
+        require_close_above_ma120: true
+        allow_ma120_slope_20d_min: -0.01
+      neutral_entry:
+        require_close_above_ma120: true
+        require_ma120_slope_20d_min: 0.0
+      risk_off_entry:
+        only_high_score_defensive_entries: true
+    position:
+      max_positions: 15
+      max_symbol_weight: 0.10
+      rebalance_frequency: monthly
+      stateful_hold: true
+      note: "Research v5 tested a hard 4-symbol industry cap; it reduced return and worsened drawdown, so it is not enabled."
+    t_overlay:
+      enabled: true
+      recommended_variant: v7_t_overlay_light
+      only_use_existing_positions: true
+      core_position_ratio: 0.80
+      trading_position_ratio: 0.20
+      sell:
+        ma20_extension: 1.12
+        ma60_extension: 1.18
+        action: reduce_to_core_position
+      buy_back:
+        ma20_buyback_extension: 1.015
+        ma60_buyback_extension: 1.03
+        require_close_above_ma120_multiplier: 0.98
+      forbidden:
+        market_regime: risk_off
+        action: only_sell_no_buyback
+    growth_sleeve:
+      enabled: true
+      recommended_variant: v33_bull_boost_defensive_bear_sleeve
+      use_case: "Enabled only in risk_on markets as a capped sleeve inside the long-term system."
+      risk_on:
+        max_positions: 4
+        target_total_weight: 0.15
+        max_symbol_weight: 0.05
+        min_growth_score: 78
+        min_roe: 10
+        min_revenue_yoy: 12
+        min_eps_yoy: 8
+        require_close_above_ma120: true
+        require_ma120_slope_positive: true
+      neutral:
+        target_total_weight: 0.0
+      risk_off:
+        target_total_weight: 0.0
+      score_inputs:
+        revenue_yoy: 0.30
+        eps_yoy: 0.25
+        roe: 0.20
+        return_120d: 0.15
+        ma120_slope_20d: 0.10
+      note: "Keep growth as a capped sleeve. v33 keeps the quality/growth framework but lets market trend drive exposure: healthy bull markets add weight, overheated markets throttle, and bear markets keep a defensive core instead of going fully empty."
+    analyst_forecast:
+      enabled: true
+      research_variant: v33_bull_boost_defensive_bear_sleeve
+      source:
+        canonical: data/raw/analyst_forecasts.parquet
+        tushare_raw: null
+      tushare_interface: "paused"
+      supplemental_sources:
+        akshare_em_snapshot:
+          interface: stock_profit_forecast_em
+          coverage: "All-market current consensus snapshot; one paged run fetched 2366 symbols."
+          time_rule: "Use fetch date as report_date; historical backtests before fetch date cannot see it."
+        akshare_em_research:
+          interface: stock_research_report_em
+          coverage: "Per-symbol historical Eastmoney research reports with publish date and EPS/PE fields."
+          time_rule: "Use report publish date as report_date."
+        akshare_cninfo_rating:
+          interface: stock_rank_forecast_cninfo
+          coverage: "Daily CNINFO investment rating and target-price records; sampled 232 rows across two dates."
+          time_rule: "Use publish date as report_date; provides target price/rating, not EPS."
+      time_safety:
+        publication_date_field: report_date
+        rule: "Only reports with report_date <= signal_date are visible."
+        window_days: 180
+        forbidden: "Do not align by forecast quarter/end year alone; that would leak future reports."
+      features:
+        report_count_180d: analyst_report_count_180d
+        org_count_180d: analyst_org_count_180d
+        eps_consensus: analyst_eps_mean_180d
+        pe_consensus: analyst_pe_mean_180d
+        eps_revision: analyst_eps_revision_180d
+        target_upside: analyst_target_upside_180d
+      note: "Datayes/Robo and AkShare are the active sources. Tushare report_rc refresh is temporarily stopped. Datayes consensus is useful for analyst coverage and quality/rank context, but current future-year consensus snapshots should not be treated as true historical forward forecasts before their report_date."
+    exit:
+      long_score_below: 58
+      risk_on_close_below_ma120_multiplier: 0.94
+      neutral_or_risk_off_close_below_ma120_multiplier: 0.98
+      risk_off_quality_score_below: 55
+      risk_off_risk_score_below: 35
+    evaluated_results:
+      period: "2013-01-04 to 2026-06-12"
+      final_equity: 3.7631
+      annual_return: 0.1037
+      max_drawdown: -0.2779
+      sharpe: 0.8645
+      average_positions: 10.4690
+      average_total_weight: 0.4906
+      benchmark: "沪深300"
+      benchmark_annual_return: 0.0507
+      benchmark_max_drawdown: -0.4670
+      t_overlay_light:
+        variant: v7_t_overlay_light
+        annual_return: 0.0874
+        max_drawdown: -0.2364
+        sharpe: 0.7594
+        overlay_trade_count: 275
+        overlay_total_turnover: 4.7826
+        overlay_total_cost: 0.0029
+        conclusion: "Improves drawdown and Sharpe with a small annual-return give-up; keep as optional overlay."
+      growth_sleeve_capped:
+        variant: v9_growth_sleeve_capped
+        annual_return: 0.1008
+        max_drawdown: -0.3298
+        sharpe: 0.7648
+        average_positions: 11.8988
+        average_total_weight: 0.5239
+        conclusion: "Best return among tested variants, but drawdown is much higher than v4/v7; use as an aggressive risk-on sleeve, not the stable default."
+      bluechip_growth_sleeve:
+        variant: v10_bluechip_growth_sleeve
+        annual_return: 0.0841
+        max_drawdown: -0.3409
+        sharpe: 0.6514
+        conclusion: "Rejected. Loosening growth rules for large-cap growth reduced return and increased drawdown."
+      analyst_growth_sleeve_partial:
+        variant: v11_analyst_growth_sleeve
+        data_status: "Superseded by Datayes-backed v15."
+        annual_return: 0.1020
+        max_drawdown: -0.2877
+        sharpe: 0.8158
+        conclusion: "Valid baseline for analyst growth sleeve; v15 slightly improves ranking without expanding growth exposure."
+      analyst_quality_rank_sleeve:
+        variant: v15_analyst_quality_rank_sleeve
+        data_status: "Uses analyst_forecasts as-of by report_date <= signal_date; Datayes consensus coverage is broad, Tushare report_rc remains rate-limited."
+        annual_return: 0.1039
+        max_drawdown: -0.2878
+        sharpe: 0.8286
+        conclusion: "Best pure monthly target version. Superseded by v19 after adding style-specific grid/T execution."
+      mega_rank_growth_sleeve:
+        variant: v16_mega_rank_growth_sleeve
+        annual_return: 0.0962
+        max_drawdown: -0.2873
+        sharpe: 0.7690
+        conclusion: "Rejected for automatic selection. It brings BYD/CATL into the portfolio, but lowers return and Sharpe."
+      staged_entry_sleeve:
+        variant: v17_staged_entry_sleeve
+        annual_return: 0.0779
+        max_drawdown: -0.2414
+        sharpe: 0.7749
+        conclusion: "Rejected as default. Slow staged entry lowers drawdown but leaves too much cash idle."
+      style_grid_full_entry_sleeve:
+        variant: v19_style_grid_full_entry_sleeve
+        annual_return: 0.1037
+        max_drawdown: -0.2779
+        sharpe: 0.8645
+        conclusion: "Current recommended execution version. Keeps v15 selection and full monthly entry, then applies style-specific grid/T overlay."
+      fast_staged_grid_sleeve:
+        variant: v20_fast_staged_grid_sleeve
+        annual_return: 0.0876
+        max_drawdown: -0.2498
+        sharpe: 0.8321
+        conclusion: "Useful for a more conservative account profile, but not the main version because return gives up too much."
+      forecast_dual_score_sleeve:
+        variant: v21_forecast_dual_score_sleeve
+        annual_return: 0.0724
+        max_drawdown: -0.2052
+        sharpe: 0.7354
+        conclusion: "Rejected as default. Directly putting forward forecast growth/value into core scoring makes the portfolio too narrow and underinvested."
+      forecast_dual_score_grid_sleeve:
+        variant: v22_forecast_dual_score_grid_sleeve
+        annual_return: 0.0717
+        max_drawdown: -0.2011
+        sharpe: 0.7509
+        conclusion: "Rejected as default. Adds grid/T to v21 but cannot recover the return lost from overly strict forecast-led selection."
+      forecast_rank_grid_sleeve:
+        variant: v23_forecast_rank_grid_sleeve
+        annual_return: 0.0769
+        max_drawdown: -0.2752
+        sharpe: 0.7075
+        conclusion: "Rejected. Forecast ranking weight was still too high and replaced too many proven v19 holdings."
+      forecast_tiebreak_grid_sleeve:
+        variant: v24_forecast_tiebreak_grid_sleeve
+        annual_return: 0.1037
+        max_drawdown: -0.2779
+        sharpe: 0.8645
+        conclusion: "Equivalent to v19 in selected holdings. Current strict as-of forward forecast coverage is too sparse for this signal to change the portfolio."

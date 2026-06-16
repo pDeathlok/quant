@@ -91,36 +91,24 @@ class TushareDataFetcher:
         if df.empty:
             raise ValueError(f"未获取到 {symbol} 的数据")
         
-        # 获取复权因子
-        if adjust == "qfq":
+        # 获取复权因子。Tushare adj_factor 是累计复权因子：
+        # qfq 需锚定到最新交易日，使最新价格等于真实交易价；
+        # hfq 需锚定到最早交易日，使历史价格等于当时交易价。
+        if adjust in {"qfq", "hfq"}:
             adj_factor = self.pro.adj_factor(
                 ts_code=ts_code,
                 start_date=start_date,
                 end_date=end_date
             )
             df = df.merge(adj_factor[['trade_date', 'adj_factor']], on='trade_date', how='left')
-            df['adj_factor'] = df['adj_factor'].fillna(1.0)
-            df['open'] = df['open'] * df['adj_factor']
-            df['close'] = df['close'] * df['adj_factor']
-            df['high'] = df['high'] * df['adj_factor']
-            df['low'] = df['low'] * df['adj_factor']
-        
-        elif adjust == "hfq":
-            adj_factor = self.pro.adj_factor(
-                ts_code=ts_code,
-                start_date=start_date,
-                end_date=end_date
-            )
-            df = df.merge(adj_factor[['trade_date', 'adj_factor']], on='trade_date', how='left')
-            df['adj_factor'] = df['adj_factor'].fillna(1.0)
-            
-            # 计算后复权因子（以最后一天为基准）
-            last_factor = df['adj_factor'].iloc[-1] if len(df) > 0 else 1.0
-            df['hfq_factor'] = last_factor / df['adj_factor']
-            df['open'] = df['open'] * df['hfq_factor']
-            df['close'] = df['close'] * df['hfq_factor']
-            df['high'] = df['high'] * df['hfq_factor']
-            df['low'] = df['low'] * df['hfq_factor']
+            df = df.sort_values('trade_date').reset_index(drop=True)
+            df['adj_factor'] = df['adj_factor'].ffill().bfill().fillna(1.0)
+            base_factor = df['adj_factor'].iloc[-1] if adjust == "qfq" else df['adj_factor'].iloc[0]
+            if pd.isna(base_factor) or base_factor == 0:
+                base_factor = 1.0
+            price_factor = df['adj_factor'] / base_factor
+            for column in ['open', 'close', 'high', 'low']:
+                df[column] = df[column] * price_factor
         
         # 标准化列名
         df = df.rename(columns={
