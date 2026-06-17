@@ -1518,10 +1518,36 @@ def _read_selector_snapshot(
                     text(f"SELECT payload_json FROM {SELECTOR_SNAPSHOT_TABLE} WHERE snapshot_key = :snapshot_key"),
                     {"snapshot_key": snapshot_key},
                 ).mappings().first()
+                if not row and signal_date:
+                    _, _, strategy_key = _selector_snapshot_key(signal_date, strategies, include_extended)
+                    row = conn.execute(
+                        text(
+                            f"""
+                            SELECT snapshot_key, payload_json
+                            FROM {SELECTOR_SNAPSHOT_TABLE}
+                            WHERE signal_date = :signal_date
+                              AND strategies_key = :strategies_key
+                              AND include_extended = :include_extended
+                            ORDER BY generated_at DESC
+                            LIMIT 1
+                            """
+                        ),
+                        {
+                            "signal_date": signal_date,
+                            "strategies_key": strategy_key,
+                            "include_extended": include_extended,
+                        },
+                    ).mappings().first()
             if row and row.get("payload_json"):
                 payload = json.loads(row["payload_json"])
                 if not signal_date or str(payload.get("signal_date") or "") == str(signal_date):
-                    payload["cache"] = {"hit": True, "backend": "mysql", "snapshot_key": snapshot_key}
+                    stored_key = str(row.get("snapshot_key") or snapshot_key)
+                    payload["cache"] = {
+                        "hit": True,
+                        "backend": "mysql",
+                        "snapshot_key": stored_key,
+                        "key_fallback": stored_key != snapshot_key,
+                    }
                     return payload
         except Exception:
             pass
