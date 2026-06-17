@@ -466,6 +466,280 @@ class TushareDataFetcher:
         df.to_parquet(file_path, index=False)
         self._memory_cache[cache_key] = df
         return df
+
+    def get_trade_calendar(
+        self,
+        start_date: str,
+        end_date: str,
+        exchange: str = "",
+        is_open: str = "1",
+    ) -> pd.DataFrame:
+        """
+        获取交易日历。
+
+        Args:
+            start_date: 开始日期，格式 YYYYMMDD
+            end_date: 结束日期，格式 YYYYMMDD
+            exchange: 交易所，空字符串表示全部
+            is_open: 是否开市，1 开市，0 休市
+        """
+        cache_key = f"tushare_trade_cal_{exchange}_{is_open}_{start_date}_{end_date}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        safe_exchange = exchange or "all"
+        file_path = (
+            self.cache_dir
+            / f"tushare_trade_cal_{safe_exchange}_{is_open}_{start_date}_{end_date}.parquet"
+        )
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        df = self.pro.trade_cal(
+            exchange=exchange,
+            start_date=start_date,
+            end_date=end_date,
+            is_open=is_open,
+        )
+        if df is None:
+            df = pd.DataFrame()
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_cb_basic(
+        self,
+        list_status: str = "L",
+        fields: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取可转债基础信息。
+
+        Args:
+            list_status: 上市状态，L 上市、D 退市、P 待上市，all 获取全部
+            fields: Tushare fields 参数；为空时使用选债策略常用字段
+
+        Returns:
+            DataFrame 包含债券代码、正股、规模、评级、转股价、到期日等字段
+        """
+        default_fields = (
+            "ts_code,bond_full_name,bond_short_name,stk_code,stk_short_name,"
+            "maturity,par,issue_size,remain_size,value_date,maturity_date,"
+            "list_date,delist_date,exchange,conv_start_date,conv_end_date,"
+            "first_conv_price,conv_price,rate,put_clause,call_clause,"
+            "reset_clause,issue_rating,newest_rating,rating_comp"
+        )
+        fields = fields or default_fields
+        cache_key = f"tushare_cb_basic_{list_status}_{fields}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        safe_status = str(list_status).replace("/", "_")
+        file_path = self.cache_dir / f"tushare_cb_basic_{safe_status}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        kwargs = {"fields": fields}
+        if list_status.lower() != "all":
+            kwargs["list_status"] = list_status
+        df = self.pro.cb_basic(**kwargs)
+        if df is None:
+            df = pd.DataFrame()
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_cb_issue(
+        self,
+        ts_code: Optional[str] = None,
+        ann_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        fields: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取可转债发行和原股东配售信息。
+
+        Tushare 不同版本的 cb_issue 字段可能有差异，因此默认不强行指定
+        fields，让本地环境返回它支持的字段，再由上层做字段别名归一化。
+        """
+        norm_code = self._normalize_cb_symbol(ts_code) if ts_code else ""
+        key_parts = [norm_code, ann_date or "", start_date or "", end_date or "", fields or "default"]
+        cache_key = f"tushare_cb_issue_{'_'.join(key_parts)}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        safe_key = "_".join(part or "all" for part in key_parts)
+        file_path = self.cache_dir / f"tushare_cb_issue_{safe_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        kwargs = {}
+        if fields:
+            kwargs["fields"] = fields
+        if norm_code:
+            kwargs["ts_code"] = norm_code
+        if ann_date:
+            kwargs["ann_date"] = ann_date
+        if start_date:
+            kwargs["start_date"] = start_date
+        if end_date:
+            kwargs["end_date"] = end_date
+        df = self.pro.cb_issue(**kwargs)
+        if df is None:
+            df = pd.DataFrame()
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_cb_daily(
+        self,
+        trade_date: Optional[str] = None,
+        ts_code: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        fields: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取可转债日行情。
+
+        Args:
+            trade_date: 单日交易日期，格式 YYYYMMDD
+            ts_code: 可转债代码，如 110059.SH
+            start_date: 区间开始日期，格式 YYYYMMDD
+            end_date: 区间结束日期，格式 YYYYMMDD
+            fields: Tushare fields 参数；为空时使用选债策略常用字段
+
+        Returns:
+            DataFrame 包含价格、成交、转股价值/溢价率等字段
+        """
+        default_fields = (
+            "ts_code,trade_date,pre_close,open,high,low,close,change,pct_chg,"
+            "vol,amount,bond_value,bond_over_rate,stock_price,stock_over_rate,"
+            "turnover_rate"
+        )
+        fields = fields or default_fields
+        norm_code = self._normalize_cb_symbol(ts_code) if ts_code else ""
+        key_parts = [trade_date or "", norm_code, start_date or "", end_date or ""]
+        cache_key = f"tushare_cb_daily_{'_'.join(key_parts)}_{fields}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        safe_key = "_".join(part or "all" for part in key_parts)
+        file_path = self.cache_dir / f"tushare_cb_daily_{safe_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        kwargs = {"fields": fields}
+        if trade_date:
+            kwargs["trade_date"] = trade_date
+        if norm_code:
+            kwargs["ts_code"] = norm_code
+        if start_date:
+            kwargs["start_date"] = start_date
+        if end_date:
+            kwargs["end_date"] = end_date
+        df = self.pro.cb_daily(**kwargs)
+        if df is None:
+            df = pd.DataFrame()
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_cb_call(
+        self,
+        ts_code: Optional[str] = None,
+        ann_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        fields: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取可转债赎回公告/状态，用于强赎风险过滤。
+        """
+        default_fields = (
+            "ts_code,ann_date,call_type,is_call,call_price,call_price_tax,"
+            "call_vol,call_amount,payment_date,call_reg_date"
+        )
+        fields = fields or default_fields
+        norm_code = self._normalize_cb_symbol(ts_code) if ts_code else ""
+        key_parts = [norm_code, ann_date or "", start_date or "", end_date or ""]
+        cache_key = f"tushare_cb_call_{'_'.join(key_parts)}_{fields}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        safe_key = "_".join(part or "all" for part in key_parts)
+        file_path = self.cache_dir / f"tushare_cb_call_{safe_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        kwargs = {"fields": fields}
+        if norm_code:
+            kwargs["ts_code"] = norm_code
+        if ann_date:
+            kwargs["ann_date"] = ann_date
+        if start_date:
+            kwargs["start_date"] = start_date
+        if end_date:
+            kwargs["end_date"] = end_date
+        df = self.pro.cb_call(**kwargs)
+        if df is None:
+            df = pd.DataFrame()
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
+
+    def get_cb_share(
+        self,
+        ts_code: Optional[str] = None,
+        ann_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        fields: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        获取可转债转股结果，用于跟踪剩余规模变化。
+        """
+        default_fields = "ts_code,ann_date,end_date,issue_size,convert_price,convert_amount,convert_ratio,remain_size"
+        fields = fields or default_fields
+        norm_code = self._normalize_cb_symbol(ts_code) if ts_code else ""
+        key_parts = [norm_code, ann_date or "", start_date or "", end_date or ""]
+        cache_key = f"tushare_cb_share_{'_'.join(key_parts)}_{fields}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        safe_key = "_".join(part or "all" for part in key_parts)
+        file_path = self.cache_dir / f"tushare_cb_share_{safe_key}.parquet"
+        if file_path.exists():
+            df = pd.read_parquet(file_path)
+            self._memory_cache[cache_key] = df
+            return df
+
+        kwargs = {"fields": fields}
+        if norm_code:
+            kwargs["ts_code"] = norm_code
+        if ann_date:
+            kwargs["ann_date"] = ann_date
+        if start_date:
+            kwargs["start_date"] = start_date
+        if end_date:
+            kwargs["end_date"] = end_date
+        df = self.pro.cb_share(**kwargs)
+        if df is None:
+            df = pd.DataFrame()
+        df.to_parquet(file_path, index=False)
+        self._memory_cache[cache_key] = df
+        return df
     
     def get_financial_report(self, symbol: str, year: int, quarter: int = 4) -> pd.DataFrame:
         """
@@ -590,6 +864,28 @@ class TushareDataFetcher:
                 else:
                     return f"{symbol}.SZ"
         
+        return symbol
+
+    def _normalize_cb_symbol(self, symbol: str) -> str:
+        """
+        标准化可转债代码为 Tushare 格式。
+
+        可转债常见代码段：
+        110/113/118 为上交所，123/127/128 为深交所。
+        """
+        symbol = str(symbol).strip()
+        if not symbol:
+            return symbol
+        if "." in symbol:
+            return symbol.upper()
+        if symbol.lower().startswith("sh"):
+            return f"{symbol[2:]}.SH"
+        if symbol.lower().startswith("sz"):
+            return f"{symbol[2:]}.SZ"
+        if symbol.startswith(("110", "113", "118")):
+            return f"{symbol}.SH"
+        if symbol.startswith(("123", "127", "128")):
+            return f"{symbol}.SZ"
         return symbol
     
     def clear_cache(self, symbol: Optional[str] = None):

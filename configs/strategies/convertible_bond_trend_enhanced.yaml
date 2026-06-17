@@ -1,0 +1,33 @@
+# 可转债趋势增强策略。
+#
+# 参考“均线系统 + 趋势强度 + 短期动量 + 六脉神剑 + 波段状态”的思路，
+# 用可从 Tushare cb_daily 复现的日线技术因子实现，区别于双低策略。
+strategy:
+  id: cb_trend_enhanced
+  name: 可转债趋势增强
+  enabled: true
+  top_n: 20
+  max_position_weight: 0.05
+  min_score: 0.0
+  rebalance_threshold: 0.01
+  min_trend_strength: 75.0
+  min_5d_return: 3.0
+  max_5d_return: 20.0
+  min_1d_return: 0.0
+  max_1d_return: 7.0
+  min_six_sword: 4
+  min_consecutive_six_sword: 1
+  require_band_buy: true
+  max_price_position_60d: 0.9
+  max_market_median_double_low: 150.0
+  min_market_trend_20d: -0.03
+  min_market_trend_breadth: 0.12
+  filter:
+    min_price: 100.0
+    max_price: 160.0
+    max_premium_rate: 45.0
+    min_amount: 1000.0
+    min_remaining_size: 1.0
+    min_credit_rating: AA-
+    exclude_call_risk: true
+    exclude_not_convertible: true

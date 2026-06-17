@@ -7,7 +7,10 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from quant.webapp.services import (
+    get_byd_daily_strategy,
     get_b1_plan,
+    get_convertible_bond_allotments,
+    get_convertible_bond_grid_plan,
     get_dashboard,
     get_latest_refresh_status,
     get_long_stock_pool,
@@ -31,6 +34,51 @@ class RefreshPlanRequest(BaseModel):
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "quant-webapp"}
+
+
+def _build_byd_daily_plan(
+    shares: int = Query(default=10500, ge=0, le=200000),
+    cost: float = Query(default=110.6061, gt=0),
+    sold_today_shares: int = Query(default=0, ge=0, le=50000),
+    sold_today_price: float | None = Query(default=None, gt=0),
+    open_t_shares: int = Query(default=0, ge=0, le=50000),
+    open_t_price: float | None = Query(default=None, gt=0),
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        return get_byd_daily_strategy(
+            shares=shares,
+            cost=cost,
+            refresh=refresh,
+            sold_today_shares=sold_today_shares,
+            sold_today_price=sold_today_price,
+            open_t_shares=open_t_shares,
+            open_t_price=open_t_price,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"BYD 日线计划生成失败: {exc}") from exc
+
+
+@router.get("/byd/daily-plan")
+def byd_daily_plan(
+    shares: int = Query(default=10500, ge=0, le=200000),
+    cost: float = Query(default=110.6061, gt=0),
+    sold_today_shares: int = Query(default=0, ge=0, le=50000),
+    sold_today_price: float | None = Query(default=None, gt=0),
+    open_t_shares: int = Query(default=0, ge=0, le=50000),
+    open_t_price: float | None = Query(default=None, gt=0),
+    refresh: bool = False,
+) -> dict[str, Any]:
+    return _build_byd_daily_plan(
+        shares=shares,
+        cost=cost,
+        sold_today_shares=sold_today_shares,
+        sold_today_price=sold_today_price,
+        open_t_shares=open_t_shares,
+        open_t_price=open_t_price,
+        refresh=refresh,
+    )
+
 
 
 @router.get("/b1/plan")
@@ -108,6 +156,40 @@ def long_stock_pool(
         raise HTTPException(status_code=400, detail=f"长线策略参数错误: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"长线股票池生成失败: {exc}") from exc
+
+
+@router.get("/convertible-bonds/plan")
+def convertible_bonds_plan(
+    trade_date: str | None = None,
+    limit: int = Query(default=18, ge=1, le=50),
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        return get_convertible_bond_grid_plan(trade_date=trade_date, limit=limit, refresh=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"可转债计划参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"可转债计划生成失败: {exc}") from exc
+
+
+@router.get("/convertible-bonds/allotments")
+def convertible_bond_allotments(
+    limit: int = Query(default=80, ge=1, le=300),
+    include_listed_days: int = Query(default=90, ge=0, le=2000),
+    refresh: bool = False,
+    stage_scope: Literal["pipeline", "all"] = Query(default="pipeline"),
+) -> dict[str, Any]:
+    try:
+        return get_convertible_bond_allotments(
+            limit=limit,
+            include_listed_days=include_listed_days,
+            refresh=refresh,
+            stage_scope=stage_scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"配债股参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"配债股数据生成失败: {exc}") from exc
 
 
 @router.get("/selector/stocks")

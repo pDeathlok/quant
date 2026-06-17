@@ -1,6 +1,6 @@
 const state = {
   payload: null,
-  activePage: window.location.hash === "#long" ? "long" : "short",
+  activePage: window.location.hash === "#long" ? "long" : window.location.hash === "#byd" ? "byd" : window.location.hash === "#cb-allotment" ? "cbAllotment" : window.location.hash === "#cb" ? "cb" : "short",
   selectedStrategies: new Set(),
   selectedSymbol: null,
   query: "",
@@ -13,6 +13,17 @@ const state = {
   longPayload: null,
   longVariant: "tea",
   longLoading: false,
+  bydPayload: null,
+  bydLoading: false,
+  bydLastNoticeKey: "",
+  cbPayload: null,
+  cbLoading: false,
+  selectedCbStrategy: null,
+  selectedCbCode: null,
+  cbAllotmentPayload: null,
+  cbAllotmentLoading: false,
+  cbAllotmentSort: null,
+  cbAllotmentStatusFilters: new Set(),
   loading: false,
 };
 
@@ -169,6 +180,33 @@ const fmtWeight = (value) => {
   if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
   return `${(Number(value) * 100).toFixed(1)}%`;
 };
+const fmtMoney = (value) => {
+  if (value == null || Number.isNaN(Number(value))) return "-";
+  return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+};
+const fmtRange = (range) => {
+  if (!range) return "-";
+  if (range.label) return range.label;
+  const low = fmtPrice(range.low);
+  const high = fmtPrice(range.high);
+  return low === high ? low : `${low}-${high}`;
+};
+const formatBuyPlanText = (text) => {
+  if (!text) return "";
+  let normalized = String(text)
+    .replaceAll("开盘执行条件：", "T+1 开盘执行条件：")
+    .replaceAll("符合信号后 T+1 开盘执行，不满足则空仓。", "不满足 T+1 开盘条件则空仓观察。");
+  normalized = normalized.replace(/T\+1 T\+1 开盘执行条件：/g, "T+1 开盘执行条件：");
+  return normalized.replace(/T\+1 开盘执行条件：([^。；]*信号日收盘位置[^。；]*)([。；])/g, (_match, conditions, suffix) => {
+    const parts = conditions.split(/[，,]/).map((part) => part.trim()).filter(Boolean);
+    const signalParts = parts.filter((part) => part.includes("信号日") || part.includes("收盘位置"));
+    const openParts = parts.filter((part) => !signalParts.includes(part));
+    const signalText = signalParts.length ? `信号确认条件（T日收盘后已确认）：${signalParts.join("；")}；` : "";
+    const openText = `T+1 开盘执行条件：${openParts.join("；") || "T+1 开盘观察"}`;
+    return `${signalText}${openText}${suffix}`;
+  });
+};
+const pageHash = (page) => page === "long" ? "#long" : page === "byd" ? "#byd" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
 const currentLongStrategy = () => longStrategies.find((item) => item.key === state.longVariant) || longStrategies[0];
 
 function longPositionPlan(item) {
@@ -270,6 +308,9 @@ function setRefreshMessage(message) {
 async function loadSelector(options = {}) {
   state.loading = true;
   render();
+  if (options.latest && state.calendar?.latest_signal_date) {
+    state.signalDate = state.calendar.latest_signal_date;
+  }
   state.signalDate = applySelectableSignalDate(state.signalDate);
   const requestedSignalDate = state.signalDate;
   const query = new URLSearchParams();
@@ -324,6 +365,198 @@ async function loadLongStockPool(options = {}) {
       renderLongStockPool();
     }
   }
+}
+
+async function loadBydMinuteStrategy(options = {}) {
+  state.bydLoading = true;
+  renderBydPage();
+  const shares = Number(document.querySelector("#bydSharesInput")?.value || 10500);
+  const cost = Number(document.querySelector("#bydCostInput")?.value || 110.6061);
+  const soldTodayShares = Number(document.querySelector("#bydSoldTodaySharesInput")?.value || 0);
+  const soldTodayPrice = Number(document.querySelector("#bydSoldTodayPriceInput")?.value || 0);
+  const openTShares = Number(document.querySelector("#bydOpenTInput")?.value || 0);
+  const openTPrice = Number(document.querySelector("#bydOpenTPriceInput")?.value || 0);
+  const query = new URLSearchParams();
+  query.set("shares", String(shares));
+  query.set("cost", String(cost));
+  if (soldTodayShares > 0) query.set("sold_today_shares", String(soldTodayShares));
+  if (soldTodayPrice > 0) query.set("sold_today_price", String(soldTodayPrice));
+  if (openTShares > 0) query.set("open_t_shares", String(openTShares));
+  if (openTPrice > 0) query.set("open_t_price", String(openTPrice));
+  if (options.refresh) query.set("refresh", "true");
+  try {
+    state.bydPayload = await fetchJson(`/byd/daily-plan?${query.toString()}`);
+    maybeShowBydTradeToast(state.bydPayload, options);
+  } catch (error) {
+    showError(error);
+    throw error;
+  } finally {
+    state.bydLoading = false;
+    renderBydPage();
+  }
+}
+
+async function loadConvertibleBondPlan(options = {}) {
+  state.cbLoading = true;
+  renderConvertibleBondPage();
+  const query = new URLSearchParams();
+  if (state.signalDate) query.set("trade_date", state.signalDate);
+  query.set("limit", "18");
+  if (options.refresh) query.set("refresh", "true");
+  try {
+    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`);
+    const plans = state.cbPayload.strategy_plans || [];
+    if (!state.selectedCbStrategy && plans.length) {
+      state.selectedCbStrategy = "all";
+    }
+    const groups = cbCandidateGroups(state.selectedCbStrategy || "all");
+    if (!state.selectedCbCode && groups.length) {
+      state.selectedCbCode = groups[0].ts_code;
+    }
+    if (state.selectedCbCode && !groups.some((item) => item.ts_code === state.selectedCbCode)) {
+      state.selectedCbCode = groups[0]?.ts_code || null;
+    }
+  } catch (error) {
+    showError(error);
+    throw error;
+  } finally {
+    state.cbLoading = false;
+    renderConvertibleBondPage();
+  }
+}
+
+async function loadConvertibleBondAllotments(options = {}) {
+  state.cbAllotmentLoading = true;
+  renderConvertibleBondAllotments();
+  const query = new URLSearchParams();
+  query.set("limit", "120");
+  query.set("include_listed_days", "180");
+  query.set("stage_scope", "pipeline");
+  if (options.refresh) query.set("refresh", "true");
+  try {
+    state.cbAllotmentPayload = await fetchJson(`/convertible-bonds/allotments?${query.toString()}`);
+  } catch (error) {
+    showError(error);
+    throw error;
+  } finally {
+    state.cbAllotmentLoading = false;
+    renderConvertibleBondAllotments();
+  }
+}
+
+function activeCbPlan() {
+  const payload = state.cbPayload;
+  if (!payload) return null;
+  const plans = payload.strategy_plans || [];
+  if (!plans.length) return payload;
+  if (state.selectedCbStrategy === "all") return payload;
+  const selected = plans.find((plan) => plan.strategy?.key === state.selectedCbStrategy);
+  return selected || plans[0];
+}
+
+function cbStrategyPlans() {
+  const payload = state.cbPayload;
+  if (!payload) return [];
+  return payload.strategy_plans?.length ? payload.strategy_plans : [payload];
+}
+
+function cbCandidateGroups(filterKey = "all") {
+  const groups = new Map();
+  cbStrategyPlans().forEach((plan) => {
+    const strategy = plan.strategy || {};
+    const include = filterKey === "all" || strategy.key === filterKey;
+    (plan.candidates || []).forEach((candidate) => {
+      const code = candidate.ts_code;
+      if (!code) return;
+      if (!groups.has(code)) {
+        groups.set(code, {
+          ...candidate,
+          strategies: [],
+          allStrategies: [],
+          strategyCandidates: [],
+        });
+      }
+      const group = groups.get(code);
+      const hit = {
+        key: strategy.key,
+        name: strategy.name || strategy.key || "-",
+        style: strategy.style || "策略",
+        candidate,
+        plan,
+      };
+      group.allStrategies.push(hit);
+      if (include) {
+        group.strategies.push(hit);
+        group.strategyCandidates.push(candidate);
+      }
+    });
+  });
+  return Array.from(groups.values())
+    .filter((group) => group.strategies.length)
+    .map((group) => {
+      const primary = group.strategyCandidates[0] || group.allStrategies[0]?.candidate || group;
+      return {
+        ...primary,
+        strategies: group.strategies,
+        allStrategies: group.allStrategies,
+      };
+    });
+}
+
+function bydNoticeKey(item, payload) {
+  return [
+    payload?.generated_at || "",
+    item?.action || "",
+    item?.kind || "",
+    item?.price_line || "",
+    item?.shares_delta || "",
+  ].join("|");
+}
+
+function dismissBydTradeToast(markSeen = false) {
+  const toast = document.querySelector("#bydTradeToast");
+  if (!toast) return;
+  if (markSeen) {
+    const key = toast.dataset.noticeKey || "";
+    if (key) state.bydLastNoticeKey = key;
+  }
+  toast.classList.remove("show", "sell", "buy");
+  toast.innerHTML = "";
+  toast.dataset.noticeKey = "";
+}
+
+function maybeShowBydTradeToast(payload, options = {}) {
+  if (state.activePage !== "byd" || !payload) return;
+  const toast = document.querySelector("#bydTradeToast");
+  if (!toast) return;
+  const triggered = (payload.alerts || []).filter((item) => item.triggered && Math.abs(Number(item.shares_delta || 0)) > 0);
+  if (!triggered.length) {
+    if (options.refresh) dismissBydTradeToast(false);
+    return;
+  }
+  const item = triggered[0];
+  const key = bydNoticeKey(item, payload);
+  if (key === state.bydLastNoticeKey && !options.forceNotice) return;
+  const isSell = item.action === "SELL";
+  const rangeText = fmtRange(item.price_range);
+  const direction = isSell ? "卖出提醒" : "买回提醒";
+  const sharesText = `${Number(item.shares_delta) > 0 ? "+" : ""}${item.shares_delta} 股`;
+  toast.dataset.noticeKey = key;
+  toast.classList.toggle("sell", isSell);
+  toast.classList.toggle("buy", !isSell);
+  toast.classList.add("show");
+  toast.innerHTML = `
+    <div class="byd-toast-copy">
+      <span>${direction} · ${payload.minute?.asof || payload.generated_at || "-"}</span>
+      <strong>${item.title || direction}</strong>
+      <p>${isSell ? "卖出区间" : "买回区间"} <b>${rangeText}</b> · 建议 ${sharesText}</p>
+      <em>${item.detail || ""}</em>
+    </div>
+    <div class="byd-toast-actions">
+      <button type="button" data-byd-toast-action="seen">已记录</button>
+      <button type="button" data-byd-toast-action="close" aria-label="关闭 BYD 交易提醒">关闭</button>
+    </div>
+  `;
 }
 
 async function loadCalendar() {
@@ -432,6 +665,9 @@ function renderCalendar() {
       if (state.activePage === "long") {
         state.longPayload = null;
         await loadLongStockPool().catch(showError);
+      } else if (state.activePage === "cb") {
+        state.cbPayload = null;
+        await loadConvertibleBondPlan().catch(showError);
       } else {
         await loadSelector().catch(showError);
       }
@@ -452,6 +688,8 @@ function renderDateStatus() {
   if (!day) {
     statusEl.textContent = state.activePage === "long"
       ? (selected ? `${selected} 长线股票池可按最近可用截面生成` : "选择长线股票池日期")
+      : state.activePage === "cb"
+      ? (selected ? `${selected} 可转债将使用本地最近可用行情` : "选择可转债计划日期")
       : "选择已生成快照的交易日";
     return;
   }
@@ -460,12 +698,16 @@ function renderDateStatus() {
     input.classList.add("date-missing");
     statusEl.textContent = state.activePage === "long"
       ? `${selected} 长线将使用该日之前最近可用截面`
+      : state.activePage === "cb"
+      ? `${selected} 可转债将回看最近可用行情`
       : `${selected} 为交易日，但暂未生成策略快照；将回看 ${day.effective_signal_date || "最近可用日"}`;
   } else if (day.status === "closed") {
     control.classList.add("date-closed");
     input.classList.add("date-closed");
     statusEl.textContent = state.activePage === "long"
       ? `${selected} 为休市日，长线将回看最近可用交易日`
+      : state.activePage === "cb"
+      ? `${selected} 为休市日，可转债将回看最近交易日`
       : `${selected} 为休市日`;
   } else {
     control.classList.add("date-ready");
@@ -474,6 +716,8 @@ function renderDateStatus() {
       statusEl.textContent = day.has_long_stock_pool_snapshot
         ? `${selected} 已有长线股票池快照`
         : `${selected} 长线将使用该日之前最近可用截面`;
+    } else if (state.activePage === "cb") {
+      statusEl.textContent = `${selected} 可生成可转债低位网格计划`;
     } else {
       statusEl.textContent = `${selected} 已有策略快照`;
     }
@@ -588,8 +832,8 @@ function renderStockDetail() {
             <p>${signal.reason}</p>
           </div>
           <div>
-            <span>买入观察</span>
-            <p>${signal.buy_plan}</p>
+            <span>T+1执行</span>
+            <p>${formatBuyPlanText(signal.buy_plan)}</p>
           </div>
           <div>
             <span>卖出策略</span>
@@ -614,21 +858,32 @@ function renderNotes() {
 function renderPageShell() {
   const shortPage = document.querySelector("#shortPage");
   const longPage = document.querySelector("#longPage");
+  const bydPage = document.querySelector("#bydPage");
+  const cbPage = document.querySelector("#cbPage");
+  const cbAllotmentPage = document.querySelector("#cbAllotmentPage");
   const filterSection = document.querySelector("#strategyFilterSection");
   const longStrategySection = document.querySelector("#longStrategySection");
+  const cbStrategySection = document.querySelector("#cbStrategySection");
   const clearButton = document.querySelector("#clearFilters");
   const dateControl = document.querySelector("#sharedDateControl");
   const longDateSlot = document.querySelector("#longDateSlot");
+  const cbDateSlot = document.querySelector("#cbDateSlot");
   const shortActions = document.querySelector("#searchInput")?.parentElement;
   const searchInput = document.querySelector("#searchInput");
   shortPage?.classList.toggle("active", state.activePage === "short");
   longPage?.classList.toggle("active", state.activePage === "long");
+  bydPage?.classList.toggle("active", state.activePage === "byd");
+  cbPage?.classList.toggle("active", state.activePage === "cb");
+  cbAllotmentPage?.classList.toggle("active", state.activePage === "cbAllotment");
   filterSection?.classList.toggle("hidden", state.activePage !== "short");
   clearButton?.classList.toggle("hidden", state.activePage !== "short");
   longStrategySection?.classList.toggle("hidden", state.activePage !== "long");
-  if (dateControl && longDateSlot && shortActions && searchInput) {
+  cbStrategySection?.classList.toggle("hidden", state.activePage !== "cb");
+  if (dateControl && longDateSlot && cbDateSlot && shortActions && searchInput) {
     if (state.activePage === "long") {
       longDateSlot.appendChild(dateControl);
+    } else if (state.activePage === "cb") {
+      cbDateSlot.appendChild(dateControl);
     } else if (dateControl.parentElement !== shortActions) {
       shortActions.insertBefore(dateControl, searchInput);
     }
@@ -779,18 +1034,600 @@ function renderLongStockPool() {
   `).join("");
 }
 
+function renderConvertibleBondPage() {
+  const rootPayload = state.cbPayload;
+  const payload = activeCbPlan();
+  const rows = document.querySelector("#cbRows");
+  const meta = document.querySelector("#cbPlanMeta");
+  const metrics = document.querySelector("#cbMetrics");
+  const strategyWrap = document.querySelector("#cbStrategyCards");
+  const detailTitle = document.querySelector("#cbDetailTitle");
+  const detailMeta = document.querySelector("#cbDetailMeta");
+  const detail = document.querySelector("#cbPlanDetail");
+  if (!rows || !meta || !metrics || !detail) return;
+  const generatedAt = document.querySelector("#generatedAt");
+  if (state.cbLoading) {
+    if (generatedAt) generatedAt.textContent = "正在加载可转债计划";
+    meta.textContent = "正在生成可转债计划...";
+    metrics.innerHTML = "";
+    if (strategyWrap) strategyWrap.innerHTML = "";
+    rows.innerHTML = `<tr><td colspan="11" class="empty-cell">正在按低位网格策略筛选可转债...</td></tr>`;
+    detail.innerHTML = `<div class="empty-state">正在生成分批买入和网格计划...</div>`;
+    return;
+  }
+  if (!rootPayload || !payload) {
+    if (generatedAt && state.activePage === "cb") generatedAt.textContent = "等待可转债计划";
+    meta.textContent = "等待加载";
+    metrics.innerHTML = "";
+    if (strategyWrap) strategyWrap.innerHTML = "";
+    rows.innerHTML = `<tr><td colspan="11" class="empty-cell">切到可转债页面后加载候选计划</td></tr>`;
+    detail.innerHTML = `<div class="empty-state">选择一只可转债查看操作计划</div>`;
+    return;
+  }
+  const plans = cbStrategyPlans();
+  const primaryPlan = plans[0] || payload;
+  const market = payload.market_state || primaryPlan.market_state || {};
+  if (!state.selectedCbStrategy && plans.length) state.selectedCbStrategy = "all";
+  const activeStrategyKey = state.selectedCbStrategy || "all";
+  const candidates = cbCandidateGroups(activeStrategyKey);
+  if (generatedAt && state.activePage === "cb") generatedAt.textContent = `更新于 ${rootPayload.generated_at || ""}`;
+  if (strategyWrap) {
+    const totalGroups = cbCandidateGroups("all");
+    const allCard = `
+        <button class="cb-strategy-card ${activeStrategyKey === "all" ? "active" : ""}" type="button" data-cb-strategy="all">
+          <span>全策略</span>
+          <strong>全部策略命中</strong>
+          <em>${totalGroups.length} 只去重候选 · 点击转债查看全部计划</em>
+        </button>
+      `;
+    strategyWrap.innerHTML = allCard + plans.map((plan) => {
+      const strategy = plan.strategy || {};
+      const bt2024 = strategy.backtest?.from_2024 || {};
+      const active = strategy.key === activeStrategyKey;
+      return `
+        <button class="cb-strategy-card ${active ? "active" : ""}" type="button" data-cb-strategy="${strategy.key || ""}">
+          <span>${strategy.style || "策略"}</span>
+          <strong>${strategy.name || strategy.key || "-"}</strong>
+          <em>${(plan.candidates || []).length} 只 · 2024+ 年化 ${fmtRate(bt2024.annual_return, 2)} · Sharpe ${bt2024.sharpe == null ? "-" : Number(bt2024.sharpe).toFixed(2)} · 回撤 ${fmtRate(bt2024.max_drawdown, 2)}</em>
+        </button>
+      `;
+    }).join("");
+    strategyWrap.querySelectorAll("[data-cb-strategy]").forEach((el) => {
+      el.addEventListener("click", () => {
+        state.selectedCbStrategy = el.dataset.cbStrategy;
+        const groups = cbCandidateGroups(state.selectedCbStrategy);
+        state.selectedCbCode = groups?.[0]?.ts_code || null;
+        renderConvertibleBondPage();
+      });
+    });
+  }
+  const strategyName = activeStrategyKey === "all" ? "全部可转债策略" : (payload.strategy?.name || "可转债策略");
+  meta.textContent = `${strategyName} · 信号日 ${payload.trade_date || rootPayload.trade_date} · ${market.entry_permission || "-"}`;
+  metrics.innerHTML = `
+    <div><span>去重候选</span><strong>${candidates.length} 只</strong></div>
+    <div><span>当前策略</span><strong>${activeStrategyKey === "all" ? `${plans.length} 套` : (payload.strategy?.name || "-")}</strong></div>
+    <div><span>2024+回撤</span><strong class="negative">${activeStrategyKey === "all" ? "-" : fmtRate(payload.strategy?.backtest?.from_2024?.max_drawdown, 2)}</strong></div>
+    <div><span>双低中位</span><strong>${Number(market.median_double_low || 0).toFixed(1)}</strong></div>
+    <div><span>20日趋势</span><strong class="${Number(market.trend_20d || 0) < 0 ? "negative" : "positive"}">${fmtRate(market.trend_20d, 3)}</strong></div>
+    <div><span>趋势广度</span><strong>${fmtRate(market.trend_breadth, 1)}</strong></div>
+    <div><span>执行状态</span><strong>${market.entry_permission || "-"}</strong><em>${market.existing_grid_permission || ""}</em></div>
+  `;
+  if (!candidates.length) {
+    rows.innerHTML = `<tr><td colspan="11" class="empty-cell">当前没有满足低位网格条件的可转债</td></tr>`;
+    detail.innerHTML = `<div class="empty-state">暂无可执行候选，等待低位条件或市场状态恢复</div>`;
+    return;
+  }
+  rows.innerHTML = candidates.map((item) => {
+    const plan = item.operation_plan || {};
+    const active = item.ts_code === state.selectedCbCode;
+    return `
+      <tr class="${active ? "selected-row" : ""}" data-cb-code="${item.ts_code}">
+        <td><strong>${item.ts_code}</strong></td>
+        <td>${item.bond_name || "-"}</td>
+        <td><strong>${item.stock_code || item.stk_code || "-"}</strong><span>${item.stock_name || "-"}</span></td>
+        <td>${fmtPrice(item.close)}</td>
+        <td>${Number(item.premium_rate || 0).toFixed(1)}%</td>
+        <td>${Number(item.double_low || 0).toFixed(1)}</td>
+        <td>${fmtRate(item.price_position_252, 1)}</td>
+        <td><strong>${item.risk_label || "-"}</strong><span>${plan.grid_step_pct || 0}% 网格</span></td>
+        <td><strong>${plan.max_parts || 0}份</strong><span>首批 ${plan.first_buy_parts || 0}份</span></td>
+        <td>${(item.allStrategies || item.strategies || []).map((hit) => `<span class="strategy-hit">${hit.name}</span>`).join("")}</td>
+        <td>${item.action || "-"}</td>
+      </tr>
+    `;
+  }).join("");
+  rows.querySelectorAll("[data-cb-code]").forEach((el) => {
+    el.addEventListener("click", () => {
+      state.selectedCbCode = el.dataset.cbCode;
+      renderConvertibleBondPage();
+    });
+  });
+  const selected = candidates.find((item) => item.ts_code === state.selectedCbCode) || candidates[0];
+  if (!selected) return;
+  state.selectedCbCode = selected.ts_code;
+  if (detailTitle) detailTitle.textContent = `${selected.ts_code} ${selected.bond_name || ""}`;
+  if (detailMeta) {
+    detailMeta.textContent = `${selected.stock_code || selected.stk_code || "-"} ${selected.stock_name || "-"} · ${selected.risk_label || "标准"} · 价格 ${fmtPrice(selected.close)} · 溢价 ${Number(selected.premium_rate || 0).toFixed(1)}% · 双低 ${Number(selected.double_low || 0).toFixed(1)}`;
+  }
+  detail.innerHTML = (selected.allStrategies || selected.strategies || []).map((hit) => {
+    const item = hit.candidate || selected;
+    const plan = item.operation_plan || {};
+    return `
+      <section class="cb-strategy-plan-block">
+        <div class="cb-strategy-plan-head">
+          <span>${hit.style}</span>
+          <strong>${hit.name}</strong>
+          <em>${item.action || "-"}</em>
+        </div>
+        <section class="cb-plan-summary">
+          <article>
+            <span>策略动作</span>
+            <strong>${item.action || "-"}</strong>
+            <p>${item.execution_enabled ? "可按计划分批执行" : "市场过滤为弱市，未成交网格暂停；已有实际持仓才继续管理"}</p>
+          </article>
+          <article>
+            <span>份数口径</span>
+            <strong>${plan.unit_definition || payload.unit_definition}</strong>
+            <p>最大 ${plan.max_parts || 0} 份；首批 ${plan.first_buy_parts || 0} 份</p>
+          </article>
+          <article>
+            <span>网格大小</span>
+            <strong>${plan.grid_step_pct || 0}%</strong>
+            <p>约 ${fmtPrice(plan.grid_step_price)} 元/格，以当前参考价动态折算</p>
+          </article>
+          <article>
+            <span>趋势过滤</span>
+            <strong>${item.trend_strength == null ? "-" : Number(item.trend_strength).toFixed(0)} / ${item.six_sword_daily == null ? "-" : Number(item.six_sword_daily).toFixed(0)}</strong>
+            <p>5日 ${fmtPct(item.return_5d, 2)} · 1日 ${fmtPct(item.return_1d, 2)} · 60日位置 ${fmtRate(item.price_position_60d, 1)}</p>
+          </article>
+        </section>
+        <section class="cb-grid-columns">
+          <div>
+            <h4>买入网格</h4>
+            ${(plan.buy_levels || []).map((level) => `
+              <article class="cb-level-card">
+                <span>第 ${level.level} 格 · ${level.trigger_pct}%</span>
+                <strong>${fmtPrice(level.trigger_price)}</strong>
+                <p>买入 ${level.buy_parts} 份，持仓增至 ${level.target_total_parts} 份</p>
+                <em>${level.condition}</em>
+              </article>
+            `).join("") || `<div class="empty-state">没有加仓网格</div>`}
+          </div>
+          <div>
+            <h4>止盈网格</h4>
+            ${(plan.sell_levels || []).map((level) => `
+              <article class="cb-level-card sell">
+                <span>第 ${level.level} 档 · +${level.trigger_pct}%</span>
+                <strong>${fmtPrice(level.trigger_price)}</strong>
+                <p>卖出 ${level.sell_parts} 份，剩余 ${level.target_remaining_parts} 份</p>
+                <em>${level.condition}</em>
+              </article>
+            `).join("") || `<div class="empty-state">没有止盈网格</div>`}
+          </div>
+          <div>
+            <h4>风控</h4>
+            ${(plan.risk_controls || []).map((risk) => `
+              <article class="cb-level-card risk">
+                <span>${risk.name}</span>
+                <strong>${risk.trigger_price ? fmtPrice(risk.trigger_price) : "事件触发"}</strong>
+                <p>${risk.action}</p>
+              </article>
+            `).join("") || `<div class="empty-state">没有风控规则</div>`}
+          </div>
+        </section>
+      </section>
+    `;
+  }).join("");
+}
+
+function allotmentStatusClass(stage) {
+  if (["registered", "exchange_approved"].includes(stage)) return "ready";
+  if (["accepted", "shareholder_approved", "board_plan"].includes(stage)) return "pipeline";
+  if (stage === "issuing") return "watching";
+  if (stage === "delisted") return "delisted";
+  return "listed";
+}
+
+const allotmentSortConfig = {
+  rights_value_pct: { type: "number", defaultDirection: "desc" },
+  kdj_daily_j: { type: "number", defaultDirection: "desc" },
+  kdj_weekly_j: { type: "number", defaultDirection: "desc" },
+  kdj_monthly_j: { type: "number", defaultDirection: "desc" },
+  announce_date: { type: "date", defaultDirection: "asc" },
+  record_date: { type: "date", defaultDirection: "asc" },
+  pay_date: { type: "date", defaultDirection: "asc" },
+  issue_date: { type: "date", defaultDirection: "asc" },
+};
+const allotmentStageFlow = [
+  { stage: "board_plan", status: "董事会预案" },
+  { stage: "shareholder_approved", status: "股东大会通过" },
+  { stage: "accepted", status: "交易所受理" },
+  { stage: "exchange_approved", status: "上市委通过" },
+  { stage: "registered", status: "同意注册" },
+  { stage: "issuing", status: "发行公告" },
+];
+
+function allotmentSortValue(item, key, type) {
+  const value = item?.[key];
+  if (value === null || value === undefined || value === "") return null;
+  if (type === "date") {
+    const time = new Date(value).getTime();
+    return Number.isFinite(time) ? time : null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sortedAllotmentRecords(records) {
+  const sort = state.cbAllotmentSort;
+  if (!sort?.key) return records;
+  const config = allotmentSortConfig[sort.key];
+  if (!config) return records;
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return [...records].sort((a, b) => {
+    const av = allotmentSortValue(a, sort.key, config.type);
+    const bv = allotmentSortValue(b, sort.key, config.type);
+    if (av === null && bv === null) return 0;
+    if (av === null) return 1;
+    if (bv === null) return -1;
+    if (av === bv) return 0;
+    return av > bv ? direction : -direction;
+  });
+}
+
+function allotmentStatusOptions(records) {
+  const counts = records.reduce((map, item) => {
+    const stage = item.stage || "";
+    if (!stage) return map;
+    map.set(stage, (map.get(stage) || 0) + 1);
+    return map;
+  }, new Map());
+  const ordered = allotmentStageFlow
+    .filter((item) => counts.has(item.stage))
+    .map((item) => ({ ...item, count: counts.get(item.stage) || 0 }));
+  const configured = new Set(ordered.map((item) => item.stage));
+  const extras = [...counts.keys()]
+    .filter((stage) => !configured.has(stage))
+    .sort()
+    .map((stage) => {
+      const sample = records.find((item) => item.stage === stage);
+      return {
+        stage,
+        status: sample?.status || stage || "未知状态",
+        count: counts.get(stage) || 0,
+      };
+    });
+  return [...ordered, ...extras];
+}
+
+function filteredAllotmentRecords(records) {
+  const selected = state.cbAllotmentStatusFilters;
+  if (!selected?.size) return records;
+  return records.filter((item) => selected.has(item.stage));
+}
+
+function renderAllotmentStatusFilters(options) {
+  const container = document.querySelector("#allotmentStatusFilters");
+  if (!container) return;
+  const validStages = new Set(options.map((item) => item.stage));
+  state.cbAllotmentStatusFilters = new Set(
+    [...state.cbAllotmentStatusFilters].filter((stage) => validStages.has(stage))
+  );
+  const selected = state.cbAllotmentStatusFilters;
+  container.innerHTML = `
+    <span>状态筛选</span>
+    <div class="allotment-status-filter-options">
+      <label class="allotment-status-filter-option">
+        <input type="checkbox" data-allotment-status-filter="all" ${selected.size === 0 ? "checked" : ""} />
+        <span>全部</span>
+      </label>
+      ${options.map((item) => `
+        <label class="allotment-status-filter-option">
+          <input type="checkbox" data-allotment-status-filter="${item.stage}" ${selected.has(item.stage) ? "checked" : ""} />
+          <span>${item.status}${item.count == null ? "" : ` ${item.count}`}</span>
+        </label>
+      `).join("")}
+    </div>
+  `;
+  container.querySelectorAll("[data-allotment-status-filter]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const stage = input.dataset.allotmentStatusFilter;
+      if (stage === "all") {
+        state.cbAllotmentStatusFilters.clear();
+      } else if (input.checked) {
+        state.cbAllotmentStatusFilters.add(stage);
+      } else {
+        state.cbAllotmentStatusFilters.delete(stage);
+      }
+      renderConvertibleBondAllotments();
+    });
+  });
+}
+
+function bindAllotmentSortHeaders() {
+  document.querySelectorAll("[data-allotment-sort]").forEach((button) => {
+    const key = button.dataset.allotmentSort;
+    const config = allotmentSortConfig[key];
+    const active = state.cbAllotmentSort?.key === key;
+    const direction = active ? state.cbAllotmentSort.direction : config?.defaultDirection;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-sort", active ? (direction === "asc" ? "ascending" : "descending") : "none");
+    button.dataset.direction = active ? direction : "";
+    button.onclick = () => {
+      const current = state.cbAllotmentSort;
+      const nextDirection = current?.key === key
+        ? (current.direction === "asc" ? "desc" : "asc")
+        : config.defaultDirection;
+      state.cbAllotmentSort = { key, direction: nextDirection };
+      renderConvertibleBondAllotments();
+    };
+  });
+}
+
+function renderConvertibleBondAllotments() {
+  const summary = document.querySelector("#allotmentSummary");
+  const rows = document.querySelector("#allotmentRows");
+  if (!summary || !rows) return;
+  const generatedAt = document.querySelector("#generatedAt");
+  bindAllotmentSortHeaders();
+  if (state.cbAllotmentLoading) {
+    if (generatedAt) generatedAt.textContent = "正在加载配债股数据";
+    summary.innerHTML = `
+      <span>数据状态</span>
+      <strong>正在加载</strong>
+      <em>正在读取可转债基础资料和发行配售数据</em>
+      <button id="cbAllotmentRefreshButton" class="secondary-button" type="button" disabled>刷新中</button>
+    `;
+    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">正在加载配债股跟踪数据...</td></tr>`;
+    return;
+  }
+  const payload = state.cbAllotmentPayload;
+  if (!payload) {
+    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">切到配债股页面后加载后端数据</td></tr>`;
+    return;
+  }
+  if (generatedAt && state.activePage === "cbAllotment") generatedAt.textContent = `更新于 ${payload.generated_at || ""}`;
+  const source = payload.data_sources || {};
+  const basicRows = source.basic?.rows ?? 0;
+  const issueRows = source.issue?.rows ?? 0;
+  const issueAvailable = Boolean(source.issue?.available);
+  const allRecords = payload.records || [];
+  const statusOptions = allotmentStatusOptions(allRecords);
+  renderAllotmentStatusFilters(statusOptions);
+  const filteredRecords = filteredAllotmentRecords(allRecords);
+  summary.innerHTML = `
+    <span>数据状态</span>
+    <strong>${filteredRecords.length} / ${allRecords.length} 条前置阶段</strong>
+    <em>六阶段队列 ${source.pipeline?.rows ?? 0} 行 · 发行明细 ${source.cninfo_issue?.rows ?? 0} 行 · cb_issue ${issueAvailable ? `${issueRows} 行` : "未可用"}</em>
+    <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">刷新配债数据</button>
+  `;
+  document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", async () => {
+    const button = document.querySelector("#cbAllotmentRefreshButton");
+    button.disabled = true;
+    button.textContent = "刷新中";
+    try {
+      await loadConvertibleBondAllotments({ refresh: true });
+    } catch (error) {
+      showError(error);
+    }
+  });
+  const records = sortedAllotmentRecords(filteredRecords);
+  if (!records.length) {
+    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">当前状态下暂无配债股；可切换状态或点击刷新配债数据</td></tr>`;
+    return;
+  }
+  rows.innerHTML = records.map((item) => `
+    <tr>
+      <td><span class="allotment-status ${allotmentStatusClass(item.stage)}">${item.status || "-"}</span></td>
+      <td><strong>${item.stock_code || "--"}</strong><em>${item.stock_name || "--"}</em></td>
+      <td><strong>${fmtPrice(item.stock_price)}</strong><em>${item.stock_price_date || "--"}</em></td>
+      <td>${fmtPrice(item.kdj_daily_j)}</td>
+      <td>${fmtPrice(item.kdj_weekly_j)}</td>
+      <td>${fmtPrice(item.kdj_monthly_j)}</td>
+      <td>${fmtPct(item.rights_value_pct)}</td>
+      <td>${item.shares_for_one_lot || item.shares_for_10_bonds || "--"}</td>
+      <td>${item.announce_date || "--"}</td>
+      <td>${item.record_date || "--"}</td>
+      <td>${item.pay_date || "--"}</td>
+      <td>${item.issue_date || "--"}</td>
+      <td><strong>${item.bond_code || "--"}</strong><em>${item.bond_name || item.announcement_title || "--"} · ${item.rating || "未评级"}</em></td>
+      <td><strong>${item.allot_code || "--"}</strong><em>${item.allot_name || "等待公告"}</em></td>
+      <td><strong>${item.list_date || "--"}</strong><em>转股 ${item.convert_start_date || "--"} 至 ${item.convert_end_date || "--"}</em></td>
+      <td><strong>${item.allotment_note || "--"}</strong><em>${item.risk_note || "--"}</em></td>
+    </tr>
+  `).join("");
+}
+
+function renderBydPage() {
+  const payload = state.bydPayload;
+  const status = document.querySelector("#bydDataStatus");
+  const subline = document.querySelector("#bydSubline");
+  const primary = document.querySelector("#bydPrimaryAction");
+  const metrics = document.querySelector("#bydPositionMetrics");
+  const stageLabel = document.querySelector("#bydStageLabel");
+  const ladder = document.querySelector("#bydPriceLadder");
+  const intradayZones = document.querySelector("#bydIntradayZones");
+  const alerts = document.querySelector("#bydAlerts");
+  const alertCount = document.querySelector("#bydAlertCount");
+  const playbook = document.querySelector("#bydPlaybook");
+  if (!primary || !metrics || !ladder || !alerts || !playbook) return;
+  if (state.bydLoading) {
+    if (status) status.textContent = "正在刷新日线计划...";
+    primary.innerHTML = `<div class="empty-state">正在生成 BYD 日线做T计划...</div>`;
+    metrics.innerHTML = "";
+    ladder.innerHTML = "";
+    if (intradayZones) intradayZones.innerHTML = "";
+    alerts.innerHTML = "";
+    playbook.innerHTML = "";
+    return;
+  }
+  if (!payload) {
+    if (status) status.textContent = "等待加载";
+    primary.innerHTML = `<div class="empty-state">切到 BYD 做T页面后加载日线计划</div>`;
+    metrics.innerHTML = "";
+    ladder.innerHTML = "";
+    if (intradayZones) intradayZones.innerHTML = "";
+    alerts.innerHTML = "";
+    playbook.innerHTML = "";
+    return;
+  }
+  const holding = payload.holding || {};
+  const minute = payload.minute || {};
+  const levels = payload.daily_levels || {};
+  const intraday = payload.intraday_levels || {};
+  const plan = payload.planned_t || {};
+  const dynamic = payload.intraday_dynamic || {};
+  const action = payload.primary_action || {};
+  const triggered = (payload.alerts || []).filter((item) => item.triggered);
+  if (status) status.textContent = `${payload.data_status || "-"} · ${payload.generated_at || ""}`;
+  if (stageLabel) stageLabel.textContent = payload.stage?.label || "-";
+  if (subline) {
+    subline.textContent = `${holding.shares || 0} 股 · 成本 ${fmtPrice(holding.cost)} · 最新 ${fmtPrice(minute.last)} · ${minute.asof || ""}`;
+  }
+  const actionClass = triggered.length ? "triggered" : "waiting";
+  primary.innerHTML = `
+    <div class="byd-action-card ${actionClass}">
+      <span>${action.action || "-"}</span>
+      <strong>${action.title || "-"}</strong>
+      <p>${action.detail || ""}</p>
+      <div>
+        <em>建议股数 ${Number(action.shares_delta || 0) > 0 ? "+" : ""}${action.shares_delta || 0}</em>
+        <em>箱体位置 ${fmtPct(payload.range_position_pct, 1)}</em>
+        <em>日线计划</em>
+      </div>
+    </div>
+  `;
+  metrics.innerHTML = `
+    <div><span>持仓</span><strong>${holding.shares || 0} 股</strong></div>
+    <div><span>库存比例</span><strong>${fmtPct((holding.inventory_ratio || 0) * 100, 1)}</strong></div>
+    <div><span>浮动盈亏</span><strong class="${Number(holding.unrealized_pnl || 0) < 0 ? "negative" : "positive"}">${fmtMoney(holding.unrealized_pnl)}</strong></div>
+    <div><span>盈亏率</span><strong class="${Number(holding.unrealized_pnl_pct || 0) < 0 ? "negative" : "positive"}">${fmtPct(holding.unrealized_pnl_pct, 2)}</strong></div>
+    <div><span>阶段目标</span><strong>${payload.stage?.goal_shares || "-"} 股</strong></div>
+    <div><span>模式</span><strong>${payload.stage?.mode || "-"}</strong></div>
+  `;
+  if (intradayZones) {
+    const sellZones = plan.sell_zones || [];
+    const buybackZones = plan.buyback_zones || [];
+    if (sellZones.length) {
+      intradayZones.innerHTML = `
+        <article class="basis-zone">
+          <span>计划依据</span>
+          <strong>${fmtPrice(plan.reference_close)}</strong>
+          <em>ATR ${fmtPrice(plan.atr14)} · ${fmtPct(plan.atr14_pct, 2)}</em>
+        </article>
+        <article class="no-sell-zone">
+          <span>${plan.no_sell_zone?.label || "低位不追卖区"}</span>
+          <strong>${fmtRange(plan.no_sell_zone?.range)}</strong>
+          <em>${plan.no_sell_zone?.action || "等待反弹"}</em>
+        </article>
+        ${sellZones.map((zone) => `
+          <article class="sell-zone">
+            <span>${zone.label}</span>
+            <strong>${fmtRange(zone.range)}</strong>
+            <em>${Number(zone.shares) > 0 ? "+" : ""}${zone.shares} 股 · ${zone.condition}</em>
+          </article>
+        `).join("")}
+        ${buybackZones.map((zone) => `
+          <article class="buyback-zone">
+            <span>${zone.label}</span>
+            <strong>${fmtRange(zone.buy_range)}</strong>
+            <em>买回 ${zone.shares} 股 · 对应卖出 ${fmtRange(zone.sell_range)}</em>
+          </article>
+        `).join("")}
+        <article class="risk-zone">
+          <span>${plan.risk_zone?.label || "下破风控区"}</span>
+          <strong>${fmtRange(plan.risk_zone?.range)}</strong>
+          <em>${plan.risk_zone?.action || "风控减仓"}</em>
+        </article>
+      `;
+    } else if (dynamic.available) {
+      intradayZones.innerHTML = `
+        <article>
+          <span>日内状态</span>
+          <strong>${dynamic.state || "-"}</strong>
+          <em>区间位置 ${fmtPct(dynamic.current_position_pct, 1)}</em>
+        </article>
+        <article>
+          <span>今日低位区</span>
+          <strong>${fmtRange(dynamic.low_zone)}</strong>
+          <em>低位不追卖，只等反抽</em>
+        </article>
+        <article>
+          <span>反抽卖出一档</span>
+          <strong>${fmtPrice(dynamic.rebound_sell_1)}</strong>
+          <em>从低点反抽 38.2%</em>
+        </article>
+        <article>
+          <span>反抽卖出二档</span>
+          <strong>${fmtPrice(dynamic.rebound_sell_2)}</strong>
+          <em>从低点反抽 50%</em>
+        </article>
+        <article>
+          <span>反抽卖出三档</span>
+          <strong>${fmtPrice(dynamic.rebound_sell_3)}</strong>
+          <em>从低点反抽 61.8%</em>
+        </article>
+        <article>
+          <span>今日高位区</span>
+          <strong>${fmtRange(dynamic.high_zone)}</strong>
+          <em>靠近这里优先降仓</em>
+        </article>
+      `;
+    } else {
+      intradayZones.innerHTML = `
+        <article>
+          <span>计划区间</span>
+          <strong>暂无计划数据</strong>
+          <em>当前只能使用前复权日线兜底价位</em>
+        </article>
+      `;
+    }
+  }
+  ladder.innerHTML = `
+    <div><span>下破风险线</span><strong>${fmtPrice(levels.support_break)}</strong><em>跌破卖 1000-1500 股</em></div>
+    <div><span>箱体下沿</span><strong>${fmtPrice(levels.range_low)}</strong><em>满仓不买，降仓后才买回</em></div>
+    <div><span>兜底一档</span><strong>${fmtPrice(intraday.micro_sell_1)}</strong><em>无计划数据时使用</em></div>
+    <div><span>兜底二档</span><strong>${fmtPrice(intraday.micro_sell_2)}</strong><em>无计划数据时使用</em></div>
+    <div><span>兜底三档</span><strong>${fmtPrice(intraday.micro_sell_3)}</strong><em>无计划数据时使用</em></div>
+    <div><span>中位减仓线</span><strong>${fmtPrice(levels.mid_trim)}</strong><em>高仓先卖 300-500 股</em></div>
+    <div><span>中上沿线</span><strong>${fmtPrice(levels.weak_trim)}</strong><em>动能转弱卖 400-700 股</em></div>
+    <div><span>强减仓线</span><strong>${fmtPrice(levels.strong_trim)}</strong><em>上沿卖 600-1000 股</em></div>
+    <div><span>箱体上沿</span><strong>${fmtPrice(levels.range_high)}</strong><em>保留突破观察，不机械卖飞</em></div>
+  `;
+  if (alertCount) alertCount.textContent = `${triggered.length} 条触发 / ${(payload.alerts || []).length} 条计划`;
+  alerts.innerHTML = (payload.alerts || []).map((item) => `
+    <article class="byd-alert ${item.triggered ? "triggered" : ""}">
+      <div>
+        <span>${item.action}</span>
+        <strong>${item.title}</strong>
+        <p>${item.detail}</p>
+      </div>
+      <aside>
+        <strong>${fmtRange(item.price_range) || fmtPrice(item.price_line)}</strong>
+        <em>${Number(item.shares_delta) > 0 ? "+" : ""}${item.shares_delta} 股</em>
+      </aside>
+    </article>
+  `).join("");
+  playbook.innerHTML = (payload.playbook || []).map((item) => `<li>${item}</li>`).join("");
+}
+
 function render() {
   renderPageShell();
-  renderHeader();
+  if (state.activePage === "short") {
+    renderHeader();
+    renderStrategyFilters();
+    renderStockRows();
+    renderStockDetail();
+    renderNotes();
+  }
   renderCalendar();
   renderDateStatus();
-  renderStrategyFilters();
-  renderStockRows();
-  renderStockDetail();
-  renderNotes();
   renderLongOverview();
   renderLongStrategies();
   renderLongStockPool();
+  renderConvertibleBondPage();
+  renderConvertibleBondAllotments();
+  renderBydPage();
 }
 
 function showError(error) {
@@ -906,7 +1743,7 @@ function setRefreshStatus(status) {
 function setRefreshButtonRunning(isRunning) {
   document.querySelectorAll("#refreshLatestButton, #longRefreshLatestButton").forEach((button) => {
     button.disabled = isRunning;
-    button.textContent = isRunning ? "更新中" : "更新长短线数据";
+    button.textContent = isRunning ? "更新中" : "一键更新数据";
   });
 }
 
@@ -933,6 +1770,9 @@ async function pollLatestRefresh() {
     await loadCalendar().catch(showError);
     if (state.activePage === "long") {
       await loadLongStockPool();
+    } else if (state.activePage === "cb") {
+      state.cbPayload = null;
+      await loadConvertibleBondPlan();
     } else {
       await loadSelector();
     }
@@ -988,22 +1828,66 @@ document.querySelectorAll("#refreshLatestButton, #longRefreshLatestButton").forE
 document.querySelectorAll(".page-tab").forEach((button) => {
   button.addEventListener("click", () => {
     state.activePage = button.dataset.page || "short";
-    const nextHash = state.activePage === "long" ? "#long" : "#short";
+    const nextHash = pageHash(state.activePage);
     if (window.location.hash !== nextHash) {
       window.location.hash = nextHash;
     }
     render();
     if (state.activePage === "long" && !state.longPayload && !state.longLoading) {
       loadLongStockPool().catch(showError);
+    } else if (state.activePage === "cb" && !state.cbPayload && !state.cbLoading) {
+      loadConvertibleBondPlan().catch(showError);
+    } else if (state.activePage === "cbAllotment" && !state.cbAllotmentPayload && !state.cbAllotmentLoading) {
+      loadConvertibleBondAllotments().catch(showError);
+    } else if (state.activePage === "byd" && !state.bydPayload && !state.bydLoading) {
+      loadBydMinuteStrategy().catch(showError);
+    } else if (state.activePage === "short" && !state.payload && !state.loading) {
+      loadSelector({ latest: true }).catch(showError);
     }
   });
 });
 
 window.addEventListener("hashchange", () => {
-  state.activePage = window.location.hash === "#long" ? "long" : "short";
+  state.activePage = window.location.hash === "#long" ? "long" : window.location.hash === "#byd" ? "byd" : window.location.hash === "#cb-allotment" ? "cbAllotment" : window.location.hash === "#cb" ? "cb" : "short";
   render();
   if (state.activePage === "long" && !state.longPayload && !state.longLoading) {
     loadLongStockPool().catch(showError);
+  } else if (state.activePage === "cb" && !state.cbPayload && !state.cbLoading) {
+    loadConvertibleBondPlan().catch(showError);
+  } else if (state.activePage === "cbAllotment" && !state.cbAllotmentPayload && !state.cbAllotmentLoading) {
+    loadConvertibleBondAllotments().catch(showError);
+  } else if (state.activePage === "byd" && !state.bydPayload && !state.bydLoading) {
+    loadBydMinuteStrategy().catch(showError);
+  } else if (state.activePage === "short" && !state.payload && !state.loading) {
+    loadSelector({ latest: true }).catch(showError);
+  }
+});
+
+document.querySelector("#cbRefreshButton")?.addEventListener("click", async () => {
+  const button = document.querySelector("#cbRefreshButton");
+  button.disabled = true;
+  button.textContent = "刷新中";
+  try {
+    await loadConvertibleBondPlan({ refresh: true });
+  } catch (error) {
+    showError(error);
+  } finally {
+    button.disabled = false;
+    button.textContent = "刷新计划";
+  }
+});
+
+document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", async () => {
+  const button = document.querySelector("#cbAllotmentRefreshButton");
+  button.disabled = true;
+  button.textContent = "刷新中";
+  try {
+    await loadConvertibleBondAllotments({ refresh: true });
+  } catch (error) {
+    showError(error);
+  } finally {
+    button.disabled = false;
+    button.textContent = "刷新配债数据";
   }
 });
 
@@ -1032,6 +1916,34 @@ document.querySelector("#longPoolRefresh").addEventListener("click", async () =>
   }
 });
 
+document.querySelector("#bydRefreshButton")?.addEventListener("click", async () => {
+  const button = document.querySelector("#bydRefreshButton");
+  button.disabled = true;
+  button.textContent = "刷新中";
+  try {
+    await loadBydMinuteStrategy({ refresh: true });
+  } catch (error) {
+    showError(error);
+  } finally {
+    button.disabled = false;
+    button.textContent = "刷新日线计划";
+  }
+});
+
+document.querySelector("#bydTradeToast")?.addEventListener("click", (event) => {
+  const action = event.target?.dataset?.bydToastAction;
+  if (!action) return;
+  dismissBydTradeToast(action === "seen");
+});
+
+document.querySelectorAll("#bydSharesInput, #bydCostInput, #bydSoldTodaySharesInput, #bydSoldTodayPriceInput, #bydOpenTInput, #bydOpenTPriceInput").forEach((input) => {
+  input.addEventListener("change", () => {
+    if (state.activePage === "byd") {
+      loadBydMinuteStrategy().catch(showError);
+    }
+  });
+});
+
 const initialDateInput = document.querySelector("#signalDateInput");
 if (initialDateInput) initialDateInput.value = "";
 state.signalDate = "";
@@ -1042,6 +1954,12 @@ restoreLatestRefreshStatus().catch(showError);
 loadCalendar().catch(showError).finally(() => {
   if (state.activePage === "long") {
     loadLongStockPool().catch(showError);
+  } else if (state.activePage === "cb") {
+    loadConvertibleBondPlan().catch(showError);
+  } else if (state.activePage === "cbAllotment") {
+    loadConvertibleBondAllotments().catch(showError);
+  } else if (state.activePage === "byd") {
+    loadBydMinuteStrategy().catch(showError);
   } else {
     loadSelector({ latest: true }).catch(showError);
   }

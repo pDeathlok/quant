@@ -164,6 +164,19 @@ def _symbol_refresh_start(existing: pd.DataFrame, requested_start: str) -> str:
     return _format_trade_date(min(requested, next_missing))
 
 
+def _latest_existing_trade_date(existing: pd.DataFrame) -> pd.Timestamp | None:
+    if existing.empty:
+        return None
+    if "trade_date" in existing.columns:
+        dates = pd.to_datetime(existing["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    elif "date" in existing.columns:
+        dates = pd.to_datetime(existing["date"], errors="coerce")
+    else:
+        return None
+    latest = dates.max()
+    return None if pd.isna(latest) else latest
+
+
 _TRADE_CAL_CACHE: dict[tuple[str, str], set[str]] = {}
 
 
@@ -222,6 +235,22 @@ def _refresh_one_symbol_once(
     dataset = output_dir.name
     key = normalize_ts_code(symbol)
     existing = store.read_frame(dataset, key)
+    requested = _parse_trade_date(start_date)
+    end = _parse_trade_date(end_date)
+    latest_existing = _latest_existing_trade_date(existing)
+    if (
+        requested is not None
+        and end is not None
+        and latest_existing is not None
+        and latest_existing >= end
+        and requested >= latest_existing
+    ):
+        return _status_audit(
+            symbol,
+            "up_to_date",
+            f"本地数据已覆盖到 {end_date}，跳过重复刷新",
+            attempts=0,
+        )
     effective_start = _symbol_refresh_start(existing, start_date)
     try:
         ts_df = tushare.get_stock_daily(symbol, effective_start, end_date, adjust=adjust)

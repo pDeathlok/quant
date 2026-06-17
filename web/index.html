@@ -4,7 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
-    <link rel="stylesheet" href="./styles.css?v=20260615-tea-shared-date" />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css?v=20260617-cb-overlay-v1" />
   </head>
   <body>
     <div class="app selector-app">
@@ -17,8 +18,8 @@
           </div>
         </div>
         <div class="sidebar-brief">
-          <span>工作区</span>
-          <p>顶部 Tab 切换短线与长线。左侧区域跟随当前工作区显示对应策略选择。</p>
+            <span>工作区</span>
+          <p>顶部 Tab 切换短线、长线、可转债、配债股与 BYD 做T。左侧区域跟随当前工作区显示对应策略选择。</p>
         </div>
         <div id="strategyFilterSection" class="side-section">
           <span>策略筛选</span>
@@ -43,6 +44,11 @@
           </div>
           <button id="longPoolRefresh" class="secondary-button" type="button">刷新股票池</button>
         </div>
+        <div id="cbStrategySection" class="side-section hidden">
+          <span>可转债策略</span>
+          <div id="cbStrategyCards" class="cb-strategy-cards"></div>
+          <button id="cbRefreshButton" class="secondary-button" type="button">刷新计划</button>
+        </div>
       </aside>
 
       <main id="shortPage" class="main page-view active">
@@ -54,6 +60,18 @@
           <button class="page-tab" type="button" data-page="long">
             <strong>长线策略</strong>
             <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>日线计划 / 降仓路线</span>
           </button>
         </nav>
 
@@ -87,7 +105,7 @@
             </div>
             <input id="searchInput" type="search" placeholder="搜索股票 / 策略" />
             <button id="reloadButton" type="button">刷新当前日期</button>
-            <button id="refreshLatestButton" type="button">更新长短线数据</button>
+            <button id="refreshLatestButton" type="button">一键更新数据</button>
           </div>
           <div id="refreshStatus" class="refresh-status"></div>
           <div id="progressSteps" class="progress-steps"></div>
@@ -150,6 +168,18 @@
             <strong>长线策略</strong>
             <span>组合候选 / 仓位择时</span>
           </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>日线计划 / 降仓路线</span>
+          </button>
         </nav>
 
         <section class="toolbar long-toolbar">
@@ -160,7 +190,7 @@
           </div>
           <div class="long-toolbar-actions">
             <div id="longDateSlot" class="long-date-slot"></div>
-            <button id="longRefreshLatestButton" type="button">更新长短线数据</button>
+            <button id="longRefreshLatestButton" type="button">一键更新数据</button>
             <div class="long-summary">
               <span id="longSummaryLabel">主推荐</span>
               <strong id="longSummaryName">茶大长线趋势网格</strong>
@@ -251,8 +281,324 @@
             <p>最大回撤主要来自 2015 股灾，后续可加入日级指数刹车和 pullback 禁止买回规则。</p>
           </div>
         </section>
+
+      </main>
+
+      <main id="cbPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>日线计划 / 降仓路线</span>
+          </button>
+        </nav>
+
+        <section class="toolbar cb-toolbar">
+          <div>
+            <p class="eyebrow">Convertible Bond Grid</p>
+            <h2>可转债低位网格计划</h2>
+            <p id="cbPlanMeta" class="subline">等待加载</p>
+          </div>
+          <div class="toolbar-actions">
+            <div id="cbDateSlot"></div>
+          </div>
+        </section>
+
+        <section id="cbMetrics" class="metrics-grid cb-metrics"></section>
+
+        <section class="split cb-split">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>候选可转债</h3>
+              <span>1份 = 账户权益1%</span>
+            </div>
+            <div class="table-wrap cb-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>转债代码</th>
+                    <th>转债名称</th>
+                    <th>正股</th>
+                    <th>价格</th>
+                    <th>溢价</th>
+                    <th>双低</th>
+                    <th title="当前价格在近252日价格区间中的位置，越低代表越接近一年低位">252日位置</th>
+                    <th>风险</th>
+                    <th>份数</th>
+                    <th>命中策略</th>
+                    <th>动作</th>
+                  </tr>
+                </thead>
+                <tbody id="cbRows">
+                  <tr><td colspan="11" class="empty-cell">切到可转债页面后加载候选计划</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel detail-panel">
+            <div class="panel-head">
+              <div>
+                <h3 id="cbDetailTitle">选择可转债</h3>
+                <span id="cbDetailMeta"></span>
+              </div>
+            </div>
+            <div id="cbPlanDetail" class="cb-plan-detail"></div>
+          </div>
+        </section>
+      </main>
+
+      <main id="cbAllotmentPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>日线计划 / 降仓路线</span>
+          </button>
+        </nav>
+
+        <section class="toolbar cb-allotment-toolbar">
+          <div>
+            <p class="eyebrow">Convertible Bond Allotment</p>
+            <h2>可转债配债股观察台</h2>
+            <p class="subline">集中展示正股、转债、配债代码、发行公告、登记缴款、上市和转股关键节点。</p>
+          </div>
+          <div id="allotmentSummary" class="allotment-summary">
+            <span>数据状态</span>
+            <strong>等待加载</strong>
+            <em>切到配债股页签后读取后端数据</em>
+            <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">刷新配债数据</button>
+          </div>
+        </section>
+
+        <section class="panel allotment-table-panel">
+          <div class="panel-head">
+            <div>
+              <h3>配债股跟踪</h3>
+              <span>流程节点统一展示在表格内，以交易所公告和券商账户为准</span>
+            </div>
+            <div id="allotmentStatusFilters" class="allotment-status-filters" aria-label="筛选配债股状态"></div>
+          </div>
+          <div class="table-wrap allotment-table-wrap">
+            <table class="allotment-table">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>正股</th>
+                  <th>股价</th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="kdj_daily_j">日线J</button></th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="kdj_weekly_j">周线J</button></th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="kdj_monthly_j">月线J</button></th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="rights_value_pct">含权量</button></th>
+                  <th>配一手股数</th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="announce_date">发行公告</button></th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="record_date">股权登记日</button></th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="pay_date">缴款日</button></th>
+                  <th><button class="sort-header" type="button" data-allotment-sort="issue_date">申购日</button></th>
+                  <th>转债</th>
+                  <th>配债</th>
+                  <th>上市/转股</th>
+                  <th>配售与风险</th>
+                </tr>
+              </thead>
+              <tbody id="allotmentRows">
+                <tr><td colspan="16" class="empty-cell">切到配债股页面后加载后端数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel allotment-process-panel">
+          <div class="panel-head">
+            <div>
+              <h3>配债流程参考</h3>
+              <span>时间为常见区间，实际以交易所审核进度、同意注册和发行公告为准</span>
+            </div>
+          </div>
+          <div class="allotment-process-grid">
+            <article>
+              <span>1</span>
+              <strong>董事会预案</strong>
+              <em>提前 6-18 个月</em>
+              <p>披露可转债预案、募资用途和发行规模，适合先放入观察池。</p>
+            </article>
+            <article>
+              <span>2</span>
+              <strong>股东大会通过</strong>
+              <em>预案后 2-8 周</em>
+              <p>股东大会授权发行，后续进入申报受理和交易所审核排队。</p>
+            </article>
+            <article>
+              <span>3</span>
+              <strong>交易所受理</strong>
+              <em>约 2-8 个月</em>
+              <p>受理后会经历问询、回复和申请文件更新，是前置跟踪的主要阶段。</p>
+            </article>
+            <article>
+              <span>4</span>
+              <strong>上市委通过</strong>
+              <em>受理后约 1-6 个月</em>
+              <p>上市委审议通过后，通常进入证监会注册环节。</p>
+            </article>
+            <article>
+              <span>5</span>
+              <strong>同意注册</strong>
+              <em>批复有效期内择机发行</em>
+              <p>拿到注册批复后，重点等待发行公告和配债代码。</p>
+            </article>
+            <article>
+              <span>6</span>
+              <strong>发行公告</strong>
+              <em>登记日前约 1-3 个交易日</em>
+              <p>公告明确配债代码、股权登记日、申购日、缴款日和配售比例。</p>
+            </article>
+          </div>
+        </section>
+      </main>
+
+      <main id="bydPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>日线计划 / 降仓路线</span>
+          </button>
+        </nav>
+
+        <section class="toolbar byd-toolbar">
+          <div>
+            <p class="eyebrow">BYD Inventory Desk</p>
+            <h2>比亚迪日线做T计划</h2>
+            <p id="bydSubline" class="subline">10500 股 · 成本 110.6061 · 等待日线计划</p>
+          </div>
+          <div class="byd-toolbar-actions">
+            <label>
+              <span>持仓股数</span>
+              <input id="bydSharesInput" type="number" min="0" step="100" value="10500" />
+            </label>
+            <label>
+              <span>成本价</span>
+              <input id="bydCostInput" type="number" min="0" step="0.0001" value="110.6061" />
+            </label>
+            <label>
+              <span>今日已卖</span>
+              <input id="bydSoldTodaySharesInput" type="number" min="0" step="100" value="0" />
+            </label>
+            <label>
+              <span>今日卖价</span>
+              <input id="bydSoldTodayPriceInput" type="number" min="0" step="0.01" value="" />
+            </label>
+            <label>
+              <span>待买回股数</span>
+              <input id="bydOpenTInput" type="number" min="0" step="100" value="0" />
+            </label>
+            <label>
+              <span>待买回卖价</span>
+              <input id="bydOpenTPriceInput" type="number" min="0" step="0.01" value="" />
+            </label>
+            <button id="bydRefreshButton" type="button">刷新日线计划</button>
+          </div>
+        </section>
+
+        <section class="panel byd-range-panel">
+          <div class="panel-head">
+            <div>
+              <h3>核心做T区间</h3>
+              <span>前复权日线 + ATR + 箱体分位</span>
+            </div>
+          </div>
+          <div id="bydIntradayZones" class="byd-dynamic-zones"></div>
+        </section>
+
+        <section class="byd-grid">
+          <article class="panel byd-primary-panel">
+            <div class="panel-head">
+              <h3>当前操作单</h3>
+              <span id="bydDataStatus">等待加载</span>
+            </div>
+            <div id="bydPrimaryAction" class="byd-primary-action"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <h3>持仓状态</h3>
+              <span id="bydStageLabel">-</span>
+            </div>
+            <div id="bydPositionMetrics" class="byd-metrics"></div>
+          </article>
+        </section>
+
+        <section class="panel byd-ladder-panel">
+          <div class="panel-head">
+            <h3>辅助价位</h3>
+            <span>风控线 / 兜底线 / 箱体边界</span>
+          </div>
+          <div id="bydPriceLadder" class="byd-ladder"></div>
+        </section>
+
+        <section class="split byd-split">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>计划提醒</h3>
+              <span id="bydAlertCount">-</span>
+            </div>
+            <div id="bydAlerts" class="byd-alerts"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <h3>执行路线</h3>
+              <span>先反T，后正T</span>
+            </div>
+            <ol id="bydPlaybook" class="byd-playbook"></ol>
+          </div>
+        </section>
       </main>
     </div>
-    <script src="./app.js?v=20260615-tea-shared-date"></script>
+    <div id="bydTradeToast" class="byd-trade-toast" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script src="./app.js?v=20260617-t1-execution-v14"></script>
   </body>
 </html>

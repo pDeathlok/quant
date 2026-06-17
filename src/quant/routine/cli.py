@@ -5,6 +5,7 @@ import json
 
 from quant.routine.dashboard import write_dashboard_json
 from quant.routine.b1_daily_plan import write_daily_plan
+from quant.routine.convertible_bond_plan import write_convertible_bond_plan
 from quant.routine.pipeline import run_daily_pipeline
 
 
@@ -12,9 +13,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run routine B1 strategy operations.")
     parser.add_argument(
         "command",
-        choices=["daily", "dashboard", "plan"],
-        help="daily runs the routine pipeline; dashboard regenerates dashboard.json; plan generates next-day B1 plan",
+        choices=["daily", "dashboard", "plan", "cb-plan"],
+        help="daily runs the routine pipeline; dashboard regenerates dashboard.json; plan generates next-day B1 plan; cb-plan generates convertible-bond plan",
     )
+    parser.add_argument("--trade-date", help="Trade date in YYYYMMDD format for cb-plan.")
     parser.add_argument("--refresh-data", action="store_true", help="Actually run the data refresh script.")
     parser.add_argument("--skip-backtest", action="store_true", help="Skip formal combo backtest and only refresh dashboard.")
     args = parser.parse_args()
@@ -26,6 +28,13 @@ def main() -> None:
 
     if args.command == "plan":
         output = write_daily_plan()
+        print(json.dumps({"status": "success", "output": str(output)}, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "cb-plan":
+        if not args.trade_date:
+            raise SystemExit("--trade-date is required for cb-plan")
+        output = write_convertible_bond_plan(trade_date=args.trade_date)
         print(json.dumps({"status": "success", "output": str(output)}, ensure_ascii=False, indent=2))
         return
 

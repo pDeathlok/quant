@@ -4,9 +4,11 @@ import json
 import re
 import hashlib
 import importlib.util
+import os
 import sys
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -15,10 +17,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_daily_plan, write_daily_plan
+from quant.routine.convertible_bond_allotment import build_convertible_bond_allotment_payload
+from quant.routine.convertible_bond_grid_plan import build_convertible_bond_grid_plan, refresh_convertible_bond_daily
 from quant.routine.dashboard import DASHBOARD_PATH, build_dashboard_payload, write_dashboard_json
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT, WEB_DATA_DIR
+from quant.strategies.custom.byd_minute_t import BydHolding, build_minute_payload, load_daily_qfq
 from quant.strategies.custom.b1_family import add_b1_family_signals
 from quant.strategies.custom.z_skill_patterns import (
     EXTENDED_STRATEGIES,
@@ -60,6 +66,7 @@ MODEL_SIGNAL_LABELS = {
     "YUEYUE": "跃跃欲试",
     "VIOLENCE_K": "暴力K",
 }
+_TEA_MASTER_MODULE_LOCK = threading.Lock()
 STRATEGY_GROUPS = [
     {"key": "B1", "label": "B1", "status": "超跌反弹，模型+规则", "members": ["B1"]},
     {"key": "B2", "label": "B2", "status": "B1后/独立右侧确认", "members": ["B2"]},
@@ -119,6 +126,7 @@ LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v1"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
 REFRESH_STATUS_PATH = PROJECT_ROOT / "data/routine/latest_refresh_status.json"
+REFRESH_RUNNING_STALE_SECONDS = 6 * 60 * 60
 LONG_STATE_DIR = PROJECT_ROOT / "data/long_strategy_state"
 LONG_VARIANTS = {
     "tea": "core14_soft_plus",
@@ -176,10 +184,149 @@ def _load_persisted_refresh_status() -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _is_refresh_status_stale(status: dict[str, Any]) -> bool:
+    if status.get("status") not in {"running", "queued"}:
+        return False
+    started_at = pd.to_datetime(status.get("started_at"), errors="coerce")
+    if pd.isna(started_at):
+        return True
+    started = started_at.to_pydatetime()
+    if started.tzinfo is not None:
+        started = started.replace(tzinfo=None)
+    return (datetime.now() - started).total_seconds() > REFRESH_RUNNING_STALE_SECONDS
+
+
+def _expire_stale_refresh_status_unlocked(status: dict[str, Any]) -> dict[str, Any]:
+    if not _is_refresh_status_stale(status):
+        return status
+    expired = dict(status)
+    expired.update(
+        {
+            "status": "failed",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "message": "上一次刷新任务已超时，请重新触发更新",
+            "error": f"刷新任务超过 {REFRESH_RUNNING_STALE_SECONDS // 3600} 小时仍未完成，已标记为过期。",
+        }
+    )
+    steps = []
+    for step in expired.get("steps") or []:
+        step_copy = dict(step)
+        if step_copy.get("status") == "running":
+            step_copy["status"] = "failed"
+        steps.append(step_copy)
+    expired["steps"] = steps
+    _REFRESH_STATUS.update(expired)
+    _persist_refresh_status_unlocked()
+    return expired
+
+
+def _expire_interrupted_refresh_status_unlocked(status: dict[str, Any]) -> dict[str, Any]:
+    if status.get("status") not in {"running", "queued"}:
+        return status
+    interrupted = dict(status)
+    interrupted.update(
+        {
+            "status": "failed",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "message": "上一次刷新任务已随服务重启中断，请重新触发更新",
+            "error": "检测到服务重启后仍残留 running/queued 状态；后台线程已不存在，已自动解锁一键更新按钮。",
+        }
+    )
+    steps = []
+    for step in interrupted.get("steps") or []:
+        step_copy = dict(step)
+        if step_copy.get("status") == "running":
+            step_copy["status"] = "failed"
+        steps.append(step_copy)
+    interrupted["steps"] = steps
+    _REFRESH_STATUS.update(interrupted)
+    _persist_refresh_status_unlocked()
+    return interrupted
+
+
 def read_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(str(path))
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_project_env() -> None:
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def get_byd_daily_strategy(
+    shares: int = 10500,
+    cost: float = 110.6061,
+    refresh: bool = False,
+    sold_today_shares: int = 0,
+    sold_today_price: float | None = None,
+    open_t_shares: int = 0,
+    open_t_price: float | None = None,
+) -> dict[str, Any]:
+    """Return BYD single-stock daily range T playbook and alerts."""
+    daily = _load_byd_daily_frame()
+    holding = BydHolding(shares=max(int(shares), 0), cost=float(cost), full_shares=10500)
+    return build_minute_payload(
+        daily=daily,
+        minutes=pd.DataFrame(),
+        holding=holding,
+        data_status="daily_plan",
+        sold_today_shares=sold_today_shares,
+        sold_today_price=sold_today_price,
+        open_t_shares=open_t_shares,
+        open_t_price=open_t_price,
+    )
+
+
+def _load_byd_daily_frame() -> pd.DataFrame:
+    """Prefer the refreshed daily store so one-click updates advance BYD plans."""
+    try:
+        store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+        daily = store.read_frame(DAILY_DIR.name, "002594.SZ")
+        normalized = _normalize_byd_daily_frame(daily)
+        if not normalized.empty:
+            return normalized
+    except Exception:
+        pass
+    return load_daily_qfq(PROJECT_ROOT / "data/cache")
+
+
+def _normalize_byd_daily_frame(daily: pd.DataFrame) -> pd.DataFrame:
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    out = daily.copy()
+    parsed_date = pd.Series(pd.NaT, index=out.index)
+    if "date" in out.columns:
+        parsed_date = pd.to_datetime(out["date"], errors="coerce")
+    if "trade_date" in out.columns:
+        trade_date = pd.to_datetime(out["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+        parsed_date = parsed_date.fillna(trade_date)
+    out["date"] = parsed_date
+    if "vol" in out.columns and "volume" not in out.columns:
+        out["volume"] = out["vol"]
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    required = ["date", "open", "high", "low", "close"]
+    if any(col not in out.columns for col in required):
+        return pd.DataFrame()
+    return (
+        out.dropna(subset=required)
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
 
 
 @lru_cache(maxsize=1)
@@ -201,18 +348,22 @@ def _long_research_module():
 def _tea_master_research_module():
     path = PROJECT_ROOT / "scripts/research/backtest_tea_master_long.py"
     module_name = "quant_tea_master_long_research"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    script_dir = str(path.parent)
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"无法加载茶大长线策略脚本: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    with _TEA_MASTER_MODULE_LOCK:
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "CONFIGS"):
+            return module
+        if module is not None:
+            sys.modules.pop(module_name, None)
+        script_dir = str(path.parent)
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"无法加载茶大长线策略脚本: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -693,6 +844,17 @@ def _tea_price_levels(row: pd.Series) -> dict[str, Any]:
     }
 
 
+def _attach_analyst_forecast_for_display(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    module = _long_research_module()
+    out = frame.drop(columns=[col for col in frame.columns if col.startswith("analyst_")], errors="ignore")
+    try:
+        return module.load_analyst_forecast_asof(out)
+    except Exception:
+        return module.add_empty_analyst_forecast_columns(out)
+
+
 def _tea_t_action(row: pd.Series, regime: str) -> tuple[str, str, str]:
     close = _safe_float(row.get("close"))
     ma20 = _safe_float(row.get("ma_20"))
@@ -834,12 +996,12 @@ def _tea_status_row(
         "dv_ttm": round(_safe_float(row.get("dv_ttm"), 0.0) or 0.0, 2),
         "pe_ttm": round(_safe_float(row.get("pe_ttm"), 0.0) or 0.0, 2),
         "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
-        "analyst_report_count_180d": 0,
-        "analyst_org_count_180d": 0,
-        "analyst_forward_years_180d": 0,
-        "analyst_forward_growth_score": 0.0,
-        "analyst_target_upside_180d": 0.0,
-        "analyst_negative_warning": False,
+        "analyst_report_count_180d": int(_safe_float(row.get("analyst_report_count_180d"), 0.0) or 0),
+        "analyst_org_count_180d": int(_safe_float(row.get("analyst_org_count_180d"), 0.0) or 0),
+        "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
+        "analyst_forward_growth_score": round(_safe_float(row.get("analyst_forward_growth_score"), 0.0) or 0.0, 2),
+        "analyst_target_upside_180d": round(_safe_float(row.get("analyst_target_upside_180d"), 0.0) or 0.0, 4),
+        "analyst_negative_warning": _safe_bool(row.get("analyst_negative_warning")),
         "close_above_ma120": bool(close is not None and _safe_float(row.get("ma_120")) is not None and close > float(row.get("ma_120"))),
         "ma_120_slope_20d": round(_safe_float(row.get("ma_120_slope_20d"), 0.0) or 0.0, 4),
     }
@@ -879,6 +1041,7 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     scored_date = scored[pd.to_datetime(scored["date"]) == signal_ts].copy()
     if scored_date.empty:
         scored_date = scored[pd.to_datetime(scored["date"]) <= signal_ts].sort_values("date").drop_duplicates("ts_code", keep="last").copy()
+    scored_date = _attach_analyst_forecast_for_display(scored_date)
     scored_by_symbol = scored_date.set_index("ts_code", drop=False)
 
     rows: list[dict[str, Any]] = []
@@ -891,6 +1054,8 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
             row = row.iloc[-1]
         enriched = row.copy()
         for key, value in target_map.get(code, {}).items():
+            if str(key).startswith("analyst_"):
+                continue
             enriched[key] = value
         previous_state = "CORE" if code in previous_set else "WATCH"
         rows.append(
@@ -1355,8 +1520,9 @@ def _read_selector_snapshot(
                 ).mappings().first()
             if row and row.get("payload_json"):
                 payload = json.loads(row["payload_json"])
-                payload["cache"] = {"hit": True, "backend": "mysql", "snapshot_key": snapshot_key}
-                return payload
+                if not signal_date or str(payload.get("signal_date") or "") == str(signal_date):
+                    payload["cache"] = {"hit": True, "backend": "mysql", "snapshot_key": snapshot_key}
+                    return payload
         except Exception:
             pass
 
@@ -1604,6 +1770,34 @@ def get_dashboard() -> dict[str, Any]:
         }
 
 
+def get_convertible_bond_grid_plan(
+    trade_date: str | None = None,
+    limit: int = 18,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    refresh_result = None
+    if refresh and trade_date:
+        refresh_result = refresh_convertible_bond_daily(trade_date=trade_date)
+    payload = build_convertible_bond_grid_plan(trade_date=trade_date, limit=limit)
+    if refresh_result is not None:
+        payload["data_refresh"] = refresh_result
+    return payload
+
+
+def get_convertible_bond_allotments(
+    limit: int = 80,
+    include_listed_days: int = 90,
+    refresh: bool = False,
+    stage_scope: str = "pipeline",
+) -> dict[str, Any]:
+    return build_convertible_bond_allotment_payload(
+        limit=limit,
+        include_listed_days=include_listed_days,
+        refresh=refresh,
+        stage_scope=stage_scope,
+    )
+
+
 def refresh_dashboard() -> dict[str, Any]:
     output_path = write_dashboard_json()
     return read_json_file(output_path)
@@ -1713,6 +1907,38 @@ def _entry_rule_text(rule: str) -> str:
     if down3:
         parts.append(f"模型判断跌破风险概率 <= {float(down3.group(1)):.0%}")
     return "；".join(parts) if parts else rule
+
+
+def _split_signal_and_open_filters(text: str) -> tuple[str, str]:
+    if not text:
+        return "", "T+1 开盘观察"
+    parts = [part.strip() for part in re.split(r"[，,；;]", text) if part.strip()]
+    signal_parts = [
+        part for part in parts
+        if "信号日" in part or ("收盘位置" in part and "T+1" not in part)
+    ]
+    open_parts = [part for part in parts if part not in signal_parts]
+    return "；".join(signal_parts), "；".join(open_parts) if open_parts else text
+
+
+def _buy_plan_text(
+    open_filter: str,
+    *,
+    prefix: str = "",
+    action_level: str = "",
+    intraday_approx: bool = False,
+) -> str:
+    signal_filter, execution_filter = _split_signal_and_open_filters(open_filter)
+    parts: list[str] = []
+    if prefix:
+        parts.append(prefix.rstrip("；"))
+    if signal_filter:
+        parts.append(f"信号确认条件（T日收盘后已确认）：{signal_filter}")
+    parts.append(f"T+1 开盘执行条件：{execution_filter}")
+    if action_level:
+        parts.append(f"实操分层：{action_level}")
+    suffix = "当前页面只给出日线观察名单，正式买点需要分钟级确认。" if intraday_approx else "不满足开盘条件则空仓观察。"
+    return "；".join(parts) + f"。{suffix}"
 
 
 def _exit_rule_text(rule: str) -> str:
@@ -1890,8 +2116,8 @@ def _extended_signal_payload(signal: dict[str, Any], model_score: pd.Series | No
     enriched["action_level"] = action_level
     enriched["playbook_source"] = source
     enriched["metrics_text"] = _metrics_text(metrics)
-    threshold_text = f"模型买入条件：{_entry_rule_text(entry_rule)}；" if entry_rule and model_playbook is not None else ""
-    enriched["buy_plan"] = f"{threshold_text}开盘执行条件：{open_filter}；实操分层：{action_level}。符合信号后 T+1 开盘执行，不满足则空仓。"
+    threshold_text = f"模型买入条件：{_entry_rule_text(entry_rule)}" if entry_rule and model_playbook is not None else ""
+    enriched["buy_plan"] = _buy_plan_text(open_filter, prefix=threshold_text, action_level=action_level)
     enriched["sell_plan"] = f"{_exit_rule_text(exit_rule)}。依据：该策略{source}买卖组合回测 playbook。"
     enriched["logic"] = f"{signal.get('logic')}（已完成该策略{source}买卖组合回测，当前结论：{action_level}）"
     model_reason = _model_score_reason(model_score)
@@ -1925,7 +2151,11 @@ def _model_filtered_signal_payload(signal_key: str, model_score: pd.Series) -> d
         "timeframe": "日线级，收盘确认，T+1 开盘观察",
         "logic": f"{label} 规则候选，并通过该策略独立 XGBoost 模型分过滤。",
         "reason": f"模型分 {model_reason}",
-        "buy_plan": f"模型买入条件：{_entry_rule_text(entry_rule)}；开盘执行条件：{open_filter}；实操分层：{action_level}。符合信号后 T+1 开盘执行，不满足则空仓。",
+        "buy_plan": _buy_plan_text(
+            open_filter,
+            prefix=f"模型买入条件：{_entry_rule_text(entry_rule)}",
+            action_level=action_level,
+        ),
         "sell_plan": f"{_exit_rule_text(exit_rule)}。依据：该策略模型版买卖组合回测 playbook。",
         "metrics": metrics,
         "metrics_text": _metrics_text(metrics),
@@ -2426,7 +2656,12 @@ def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score
             f"收盘={_fmt_price(latest_row.get('close'))}"
             + (f"；模型分 {model_reason}" if model_reason else "")
         ),
-        "buy_plan": f"{model_entry}开盘执行条件：{buy}。{('当前页面只给出日线观察名单，正式买点需要分钟级确认。' if is_intraday_approx else '不满足开盘条件则空仓观察。')}",
+        "buy_plan": _buy_plan_text(
+            buy,
+            prefix=model_entry,
+            action_level=action_level,
+            intraday_approx=is_intraday_approx,
+        ),
         "sell_plan": sell,
         "metrics": metrics,
         "metrics_text": _metrics_text(metrics),
@@ -2579,8 +2814,11 @@ def _progress_steps() -> list[dict[str, Any]]:
         {"key": "model_score", "label": "计算当日策略模型分", "status": "pending", "percent": 70},
         {"key": "selector_core", "label": "计算短线核心股票池", "status": "pending", "percent": 78},
         {"key": "selector_extended", "label": "计算短线全策略股票池", "status": "pending", "percent": 88},
-        {"key": "long_stock_pool", "label": "计算长线策略股票池", "status": "pending", "percent": 94},
-        {"key": "snapshot", "label": "写入 MySQL 策略股票池快照", "status": "pending", "percent": 95},
+        {"key": "long_stock_pool", "label": "计算长线策略股票池", "status": "pending", "percent": 92},
+        {"key": "convertible_bond_plan", "label": "刷新可转债策略计划", "status": "pending", "percent": 94},
+        {"key": "convertible_bond_allotment", "label": "刷新配债股数据", "status": "pending", "percent": 96},
+        {"key": "byd_daily_plan", "label": "刷新 BYD 做T日线计划", "status": "pending", "percent": 97},
+        {"key": "snapshot", "label": "写入策略股票池快照", "status": "pending", "percent": 98},
     ]
 
 
@@ -2588,10 +2826,12 @@ def _set_refresh_progress(
     *,
     status: str = "running",
     step_key: str | None = None,
+    step_status: str | None = None,
     message: str,
     percent: int | None = None,
     result: Any = None,
     error: str | None = None,
+    complete_previous: bool = True,
 ) -> None:
     with _REFRESH_LOCK:
         steps = list(_REFRESH_STATUS.get("steps") or _progress_steps())
@@ -2599,19 +2839,22 @@ def _set_refresh_progress(
             seen_current = False
             for step in steps:
                 if step["key"] == step_key:
-                    step["status"] = "running" if status == "running" else status
+                    step["status"] = step_status or ("running" if status == "running" else status)
                     seen_current = True
-                elif not seen_current and step["status"] in {"pending", "running"}:
+                elif complete_previous and not seen_current and step["status"] in {"pending", "running"}:
                     step["status"] = "success"
-            if status == "success":
+            if step_status == "success":
                 for step in steps:
                     if step["key"] == step_key:
                         step["status"] = "success"
+        next_percent = percent if percent is not None else _REFRESH_STATUS.get("percent", 0)
+        if status == "running":
+            next_percent = max(int(_REFRESH_STATUS.get("percent", 0) or 0), int(next_percent or 0))
         _REFRESH_STATUS.update(
             {
                 "status": status,
                 "message": message,
-                "percent": percent if percent is not None else _REFRESH_STATUS.get("percent", 0),
+                "percent": next_percent,
                 "current_step": step_key,
                 "steps": steps,
                 "result": result,
@@ -2621,6 +2864,34 @@ def _set_refresh_progress(
         if status in {"success", "failed"}:
             _REFRESH_STATUS["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _persist_refresh_status_unlocked()
+
+
+def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> dict[str, Any]:
+    variant_key = variant if variant in LONG_VARIANTS else next(
+        (key for key, value in LONG_VARIANTS.items() if value == variant),
+        variant,
+    )
+    if variant_key in TEA_LONG_VARIANTS:
+        payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
+    else:
+        payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
+    _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
+    return {
+        "variant": variant_key,
+        "signal_date": payload.get("signal_date"),
+        "stocks": len(payload.get("stocks") or []),
+    }
+
+
+def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | None) -> list[dict[str, Any]]:
+    with ThreadPoolExecutor(max_workers=max(1, len(variants))) as executor:
+        results = [
+            future.result()
+            for future in as_completed(
+                [executor.submit(_refresh_long_stock_pool_variant, variant, signal_date) for variant in variants]
+            )
+        ]
+    return sorted(results, key=lambda item: variants.index(item["variant"]))
 
 
 def _run_latest_refresh_job() -> None:
@@ -2661,31 +2932,94 @@ def _run_latest_refresh_job() -> None:
         if results["refresh_data"].get("status") == "failed":
             raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
-        _set_refresh_progress(step_key="feature_cache", message="正在增量构建 B1 特征缓存", percent=35)
-        results["feature_cache"] = build_features(
-            progress_callback=lambda percent, message: _set_refresh_progress(
-                step_key="feature_cache",
-                message=message,
-                percent=percent,
-            ),
+        _set_refresh_progress(
+            step_key="refresh_data",
+            step_status="success",
+            message="Tushare 最新日线数据已拉取完成",
+            percent=35,
+            complete_previous=False,
         )
-        if results["feature_cache"].get("status") == "failed":
-            raise RuntimeError(results["feature_cache"].get("stderr_tail") or "B1 特征缓存刷新失败")
 
-        _set_refresh_progress(step_key="daily_plan", message="正在生成最新策略每日计划", percent=45)
-        results["generate_daily_plan"] = generate_daily_plan()
-        results["generate_dashboard"] = generate_dashboard()
-
-        _set_refresh_progress(step_key="signal_cache", message="正在重建全市场策略规则信号", percent=56)
-        results["signal_cache"] = refresh_strategy_signal_cache(
-            progress_callback=lambda percent, message: _set_refresh_progress(
-                step_key="signal_cache",
-                message=message,
-                percent=max(56, min(69, percent)),
-            ),
+        _set_refresh_progress(
+            step_key="feature_cache",
+            message="正在并行增量构建 B1 特征缓存与全市场规则信号",
+            percent=35,
+            complete_previous=False,
         )
-        if results["signal_cache"].get("status") == "failed":
-            raise RuntimeError(results["signal_cache"].get("stderr_tail") or "策略规则信号重建失败")
+        _set_refresh_progress(
+            step_key="signal_cache",
+            message="正在并行增量构建 B1 特征缓存与全市场规则信号",
+            percent=35,
+            complete_previous=False,
+        )
+        daily_plan_ready = False
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(
+                    build_features,
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="feature_cache",
+                        message=message,
+                        percent=percent,
+                        complete_previous=False,
+                    ),
+                ): ("feature_cache", "B1 特征缓存刷新失败"),
+                executor.submit(
+                    refresh_strategy_signal_cache,
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="signal_cache",
+                        message=message,
+                        percent=max(46, min(68, percent)),
+                        complete_previous=False,
+                    ),
+                ): ("signal_cache", "策略规则信号重建失败"),
+            }
+            for future in as_completed(futures):
+                result_key, failure_message = futures[future]
+                results[result_key] = future.result()
+                if results[result_key].get("status") == "failed":
+                    raise RuntimeError(results[result_key].get("stderr_tail") or failure_message)
+                _set_refresh_progress(
+                    step_key=result_key,
+                    step_status="success",
+                    message=f"{failure_message.removesuffix('失败')}完成",
+                    percent=45 if result_key == "feature_cache" else 68,
+                    complete_previous=False,
+                )
+                if result_key == "feature_cache" and not daily_plan_ready:
+                    _set_refresh_progress(
+                        step_key="daily_plan",
+                        message="正在生成最新策略每日计划",
+                        percent=46,
+                        complete_previous=False,
+                    )
+                    results["generate_daily_plan"] = generate_daily_plan()
+                    results["generate_dashboard"] = generate_dashboard()
+                    _set_refresh_progress(
+                        step_key="daily_plan",
+                        step_status="success",
+                        message="最新策略每日计划已生成",
+                        percent=50,
+                        complete_previous=False,
+                    )
+                    daily_plan_ready = True
+
+        if not daily_plan_ready:
+            _set_refresh_progress(
+                step_key="daily_plan",
+                message="正在生成最新策略每日计划",
+                percent=50,
+                complete_previous=False,
+            )
+            results["generate_daily_plan"] = generate_daily_plan()
+            results["generate_dashboard"] = generate_dashboard()
+            _set_refresh_progress(
+                step_key="daily_plan",
+                step_status="success",
+                message="最新策略每日计划已生成",
+                percent=50,
+                complete_previous=False,
+            )
 
         _set_refresh_progress(step_key="model_score", message="正在计算当日策略模型分", percent=70)
         results["model_score"] = score_latest_models()
@@ -2713,43 +3047,121 @@ def _run_latest_refresh_job() -> None:
             "signal_date": full_payload.get("signal_date"),
             "stocks": len(full_payload.get("stocks") or []),
         }
+        _set_refresh_progress(
+            step_key="selector_extended",
+            step_status="success",
+            message="全市场扩展策略信号已计算完成",
+            percent=90,
+            complete_previous=False,
+        )
 
         _build_tea_master_stock_pool_cached.cache_clear()
         _build_long_stock_pool_cached.cache_clear()
-        _set_refresh_progress(step_key="long_stock_pool", message="正在计算长线策略股票池", percent=94)
         long_variants = ["tea", "tea_safe", "v44"]
-        long_results = []
-        for variant in long_variants:
-            long_payload = get_long_stock_pool(
-                variant=variant,
-                signal_date=full_payload.get("signal_date"),
-                refresh=True,
-            )
-            long_results.append(
-                {
-                    "variant": variant,
-                    "signal_date": long_payload.get("signal_date"),
-                    "stocks": len(long_payload.get("stocks") or []),
-                }
-            )
-        results["long_stock_pool"] = {
-            "status": "success",
-            "variants": long_results,
-        }
+        signal_date = full_payload.get("signal_date")
+        trade_date = str(signal_date).replace("-", "") if signal_date else None
+        _set_refresh_progress(
+            step_key="long_stock_pool",
+            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            percent=92,
+            complete_previous=False,
+        )
+        _set_refresh_progress(
+            step_key="convertible_bond_plan",
+            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            percent=92,
+            complete_previous=False,
+        )
+        _set_refresh_progress(
+            step_key="convertible_bond_allotment",
+            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            percent=92,
+            complete_previous=False,
+        )
+        _set_refresh_progress(
+            step_key="byd_daily_plan",
+            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            percent=92,
+            complete_previous=False,
+        )
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = {
+                executor.submit(_refresh_long_stock_pool_variants, long_variants, signal_date): (
+                    "long_stock_pool",
+                    "长线策略股票池生成失败",
+                ),
+                executor.submit(get_convertible_bond_grid_plan, trade_date, 18, bool(trade_date)): (
+                    "convertible_bond_plan",
+                    "可转债策略计划刷新失败",
+                ),
+                executor.submit(get_convertible_bond_allotments, 80, 90, True, "pipeline"): (
+                    "convertible_bond_allotment",
+                    "配债股数据刷新失败",
+                ),
+                executor.submit(get_byd_daily_strategy): ("byd_daily_plan", "BYD 做T日线计划刷新失败"),
+            }
+            for future in as_completed(futures):
+                result_key, failure_message = futures[future]
+                try:
+                    payload = future.result()
+                except Exception as exc:
+                    _set_refresh_progress(
+                        status="failed",
+                        step_key=result_key,
+                        step_status="failed",
+                        message="刷新任务失败",
+                        error=f"{failure_message}: {exc}\n{traceback.format_exc(limit=5)}",
+                        complete_previous=False,
+                    )
+                    raise
+                if result_key == "long_stock_pool":
+                    results[result_key] = {"status": "success", "variants": payload}
+                elif result_key == "convertible_bond_plan":
+                    results[result_key] = {
+                        "status": "success",
+                        "trade_date": payload.get("trade_date") or signal_date,
+                        "candidates": len(payload.get("candidates") or payload.get("items") or []),
+                        "data_refresh": payload.get("data_refresh"),
+                    }
+                elif result_key == "convertible_bond_allotment":
+                    results[result_key] = {
+                        "status": "success",
+                        "asof": payload.get("asof"),
+                        "records": len(payload.get("records") or []),
+                    }
+                else:
+                    planned_t = payload.get("planned_t") or {}
+                    results[result_key] = {
+                        "status": "success",
+                        "signal_date": planned_t.get("signal_date"),
+                        "alerts": len(payload.get("alerts") or []),
+                    }
+                _set_refresh_progress(
+                    step_key=result_key,
+                    step_status="success",
+                    message=f"{failure_message.removesuffix('失败')}完成",
+                    percent={
+                        "long_stock_pool": 94,
+                        "convertible_bond_plan": 95,
+                        "convertible_bond_allotment": 96,
+                        "byd_daily_plan": 97,
+                    }[result_key],
+                    complete_previous=False,
+                )
 
-        _set_refresh_progress(step_key="snapshot", message="正在写入 MySQL 策略股票池快照", percent=95)
+        _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
         written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
         results["snapshot"] = {
             "status": "success",
             "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
             "strategy_pools": written_pools,
-            "long_stock_pools": long_results,
+            "long_stock_pools": results["long_stock_pool"]["variants"],
         }
 
         _set_refresh_progress(
             status="success",
             step_key="snapshot",
-            message="刷新任务完成，短线与长线股票池已生成并写入快照",
+            message="刷新任务完成，所有工作区数据与策略结果已生成",
             percent=100,
             result=results,
         )
@@ -2793,7 +3205,11 @@ def get_latest_refresh_status() -> dict[str, Any]:
         if _REFRESH_STATUS.get("status") == "idle":
             persisted = _load_persisted_refresh_status()
             if persisted and persisted.get("status") != "idle":
-                return persisted
+                if persisted.get("status") in {"running", "queued"}:
+                    return dict(_expire_interrupted_refresh_status_unlocked(persisted))
+                return dict(_expire_stale_refresh_status_unlocked(persisted))
+        if _is_refresh_status_stale(_REFRESH_STATUS):
+            return dict(_expire_stale_refresh_status_unlocked(_REFRESH_STATUS))
         return dict(_REFRESH_STATUS)
 
 
