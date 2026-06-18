@@ -40,6 +40,8 @@ EXTENDED_PLAYBOOK = REPORT_DIR / "latest_z_skill_operational_playbook.csv"
 EXTENDED_MODEL_PLAYBOOK = REPORT_DIR / "latest_z_skill_model_operational_playbook.csv"
 EXTENDED_MODEL_SCORED = REPORT_DIR / "latest_z_skill_model_scored_candidates.parquet"
 EXTENDED_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.csv"
+SELECTOR_HISTORY_SIGNAL_SAMPLES = PROJECT_ROOT / "data/research/selector_history_full/selector_signal_history_samples.parquet"
+SELECTOR_BUY_HOLD_SCORE_CALIBRATION = PROJECT_ROOT / "config/selector_buy_hold_score_calibration.json"
 FAMILY_RULE_PATTERN = "b1_family_rule_backtest_*.csv"
 FUSION_PATTERN = "b1_model_zettaranc_fusion_*.csv"
 MODEL_FILTERED_SIGNALS = {
@@ -119,12 +121,14 @@ DEFAULT_FAMILIES = {
 }
 DEFAULT_SELECTOR_LIMIT = 50
 DEFAULT_FAMILY_CAP = 12
-SELECTOR_SNAPSHOT_SCHEMA_VERSION = "score_split_v1"
+SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v4"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
 LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v1"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
+WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION = "workspace_payload_v1"
+WEB_WORKSPACE_SNAPSHOT_TABLE = "web_workspace_snapshots"
 REFRESH_STATUS_PATH = PROJECT_ROOT / "data/routine/latest_refresh_status.json"
 REFRESH_RUNNING_STALE_SECONDS = 6 * 60 * 60
 LONG_STATE_DIR = PROJECT_ROOT / "data/long_strategy_state"
@@ -275,9 +279,21 @@ def get_byd_daily_strategy(
     open_t_price: float | None = None,
 ) -> dict[str, Any]:
     """Return BYD single-stock daily range T playbook and alerts."""
+    params = {
+        "shares": int(shares),
+        "cost": round(float(cost), 6),
+        "sold_today_shares": int(sold_today_shares),
+        "sold_today_price": sold_today_price,
+        "open_t_shares": int(open_t_shares),
+        "open_t_price": open_t_price,
+    }
+    if not refresh:
+        cached = _read_workspace_snapshot("byd_daily_plan", params=params)
+        if cached is not None:
+            return cached
     daily = _load_byd_daily_frame()
     holding = BydHolding(shares=max(int(shares), 0), cost=float(cost), full_shares=10500)
-    return build_minute_payload(
+    payload = build_minute_payload(
         daily=daily,
         minutes=pd.DataFrame(),
         holding=holding,
@@ -287,6 +303,10 @@ def get_byd_daily_strategy(
         open_t_shares=open_t_shares,
         open_t_price=open_t_price,
     )
+    planned_t = payload.get("planned_t") or {}
+    snapshot_date = planned_t.get("signal_date") or payload.get("asof") or payload.get("trade_date")
+    _write_workspace_snapshot("byd_daily_plan", snapshot_date, payload, params=params)
+    return payload
 
 
 def _load_byd_daily_frame() -> pd.DataFrame:
@@ -542,6 +562,150 @@ def _write_long_stock_pool_snapshot(payload: dict[str, Any], variant: str, signa
     if not wrote_sql:
         LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
         _long_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
+
+
+def _workspace_params_key(params: dict[str, Any] | None = None) -> str:
+    params = params or {}
+    raw = json.dumps(params, ensure_ascii=True, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _workspace_snapshot_key(workspace: str, snapshot_date: str, params_key: str) -> str:
+    raw = json.dumps(
+        {
+            "schema_version": WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+            "workspace": workspace,
+            "snapshot_date": snapshot_date,
+            "params_key": params_key,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _read_workspace_snapshot(
+    workspace: str,
+    snapshot_date: str | None = None,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if not store.config.sql_url:
+        return None
+    params_key = _workspace_params_key(params)
+    try:
+        from sqlalchemy import text
+
+        with store._engine().begin() as conn:
+            if snapshot_date:
+                snapshot_key = _workspace_snapshot_key(workspace, str(snapshot_date), params_key)
+                row = conn.execute(
+                    text(
+                        f"""
+                        SELECT snapshot_key, snapshot_date, payload_json
+                        FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
+                        WHERE snapshot_key = :snapshot_key
+                        """
+                    ),
+                    {"snapshot_key": snapshot_key},
+                ).mappings().first()
+            else:
+                row = conn.execute(
+                    text(
+                        f"""
+                        SELECT snapshot_key, snapshot_date, payload_json
+                        FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
+                        WHERE workspace = :workspace
+                          AND params_key = :params_key
+                        ORDER BY snapshot_date DESC, updated_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"workspace": workspace, "params_key": params_key},
+                ).mappings().first()
+        if not row or not row.get("payload_json"):
+            return None
+        payload = json.loads(row["payload_json"])
+        payload["cache"] = {
+            "hit": True,
+            "backend": "mysql",
+            "workspace": workspace,
+            "snapshot_key": str(row.get("snapshot_key") or ""),
+            "snapshot_date": str(row.get("snapshot_date") or ""),
+        }
+        return payload
+    except Exception:
+        return None
+
+
+def _write_workspace_snapshot(
+    workspace: str,
+    snapshot_date: str | None,
+    payload: dict[str, Any],
+    params: dict[str, Any] | None = None,
+) -> None:
+    snapshot_date = str(snapshot_date or "latest")
+    params = params or {}
+    params_key = _workspace_params_key(params)
+    snapshot_key = _workspace_snapshot_key(workspace, snapshot_date, params_key)
+    payload_to_store = dict(payload)
+    payload_to_store["cache"] = {
+        "hit": False,
+        "backend": "generated",
+        "workspace": workspace,
+        "snapshot_key": snapshot_key,
+        "snapshot_date": snapshot_date,
+    }
+    payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if not store.config.sql_url:
+        return
+    try:
+        from sqlalchemy import text
+
+        with store._engine().begin() as conn:
+            conn.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {WEB_WORKSPACE_SNAPSHOT_TABLE} (
+                        snapshot_key VARCHAR(64) PRIMARY KEY,
+                        workspace VARCHAR(64) NOT NULL,
+                        snapshot_date VARCHAR(32) NOT NULL,
+                        params_key VARCHAR(64) NOT NULL,
+                        params_json TEXT NOT NULL,
+                        generated_at VARCHAR(32) NOT NULL,
+                        payload_json LONGTEXT NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        KEY idx_workspace_latest (workspace, params_key, snapshot_date)
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    f"""
+                    INSERT INTO {WEB_WORKSPACE_SNAPSHOT_TABLE}
+                        (snapshot_key, workspace, snapshot_date, params_key, params_json, generated_at, payload_json)
+                    VALUES
+                        (:snapshot_key, :workspace, :snapshot_date, :params_key, :params_json, :generated_at, :payload_json)
+                    ON DUPLICATE KEY UPDATE
+                        generated_at = VALUES(generated_at),
+                        params_json = VALUES(params_json),
+                        payload_json = VALUES(payload_json)
+                    """
+                ),
+                {
+                    "snapshot_key": snapshot_key,
+                    "workspace": workspace,
+                    "snapshot_date": snapshot_date,
+                    "params_key": params_key,
+                    "params_json": json.dumps(params, ensure_ascii=False, sort_keys=True, default=str),
+                    "generated_at": str(payload.get("generated_at") or datetime.now().isoformat(timespec="seconds")),
+                    "payload_json": payload_json,
+                },
+            )
+    except Exception:
+        return
 
 
 def _long_entry_tranche(row: pd.Series, target_weight: float, regime: str) -> tuple[float, str]:
@@ -1542,6 +1706,8 @@ def _read_selector_snapshot(
                 payload = json.loads(row["payload_json"])
                 if not signal_date or str(payload.get("signal_date") or "") == str(signal_date):
                     stored_key = str(row.get("snapshot_key") or snapshot_key)
+                    if stored_key != snapshot_key and payload.get("selector_snapshot_schema_version") != SELECTOR_SNAPSHOT_SCHEMA_VERSION:
+                        return None
                     payload["cache"] = {
                         "hit": True,
                         "backend": "mysql",
@@ -1571,6 +1737,7 @@ def _write_selector_snapshot(
     signal_date = str(payload.get("signal_date") or "")
     snapshot_key, date_key, strategy_key = _selector_snapshot_key(signal_date, strategies, include_extended)
     payload_to_store = dict(payload)
+    payload_to_store["selector_snapshot_schema_version"] = SELECTOR_SNAPSHOT_SCHEMA_VERSION
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
@@ -1674,6 +1841,12 @@ def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -
         built = build_selector_stock_row(row, signals, payload.get("signal_date"))
         if built is not None:
             rows.append(built)
+    rows = sorted(
+        rows,
+        key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
+        reverse=True,
+    )
+    rows = _apply_current_score_normalization(rows)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -1801,12 +1974,23 @@ def get_convertible_bond_grid_plan(
     limit: int = 18,
     refresh: bool = False,
 ) -> dict[str, Any]:
+    params = {"limit": int(limit)}
+    if not refresh:
+        cached = _read_workspace_snapshot("convertible_bond_grid_plan", snapshot_date=trade_date, params=params)
+        if cached is not None:
+            return cached
     refresh_result = None
     if refresh and trade_date:
         refresh_result = refresh_convertible_bond_daily(trade_date=trade_date)
     payload = build_convertible_bond_grid_plan(trade_date=trade_date, limit=limit)
     if refresh_result is not None:
         payload["data_refresh"] = refresh_result
+    _write_workspace_snapshot(
+        "convertible_bond_grid_plan",
+        payload.get("trade_date") or trade_date,
+        payload,
+        params=params,
+    )
     return payload
 
 
@@ -1816,12 +2000,28 @@ def get_convertible_bond_allotments(
     refresh: bool = False,
     stage_scope: str = "pipeline",
 ) -> dict[str, Any]:
-    return build_convertible_bond_allotment_payload(
+    params = {
+        "limit": int(limit),
+        "include_listed_days": int(include_listed_days),
+        "stage_scope": str(stage_scope),
+    }
+    if not refresh:
+        cached = _read_workspace_snapshot("convertible_bond_allotments", params=params)
+        if cached is not None:
+            return cached
+    payload = build_convertible_bond_allotment_payload(
         limit=limit,
         include_listed_days=include_listed_days,
         refresh=refresh,
         stage_scope=stage_scope,
     )
+    _write_workspace_snapshot(
+        "convertible_bond_allotments",
+        payload.get("asof") or payload.get("trade_date") or payload.get("generated_at"),
+        payload,
+        params=params,
+    )
+    return payload
 
 
 def refresh_dashboard() -> dict[str, Any]:
@@ -2327,6 +2527,206 @@ def _signal_model_edge_pct(signal: dict[str, Any]) -> float | None:
     return pred_up5 * 5.0 + pred_up8 * 8.0 + pred_up10 * 10.0 - pred_down3 * 3.0
 
 
+def _signal_dynamic_strength(signal: dict[str, Any]) -> float:
+    """Per-candidate shape/model strength used to break ties inside a strategy."""
+    strength = _safe_float(signal.get("strength_score"), 0.0) or 0.0
+    model_edge = _signal_model_edge_pct(signal)
+    if model_edge is not None:
+        strength += max(min(model_edge, 10.0), -10.0) / 10.0
+
+    reason = str(signal.get("reason") or "")
+    j_match = re.search(r"J=([-+]?\d+(?:\.\d+)?)", reason)
+    if j_match:
+        try:
+            j_value = float(j_match.group(1))
+            if j_value < 0:
+                strength += min(abs(j_value), 40.0) / 40.0
+            elif j_value < 35:
+                strength += (35.0 - j_value) / 70.0
+        except ValueError:
+            pass
+    return float(np.clip(strength, -2.0, 4.0))
+
+
+@lru_cache(maxsize=1)
+def _selector_buy_hold_score_artifact() -> dict[str, Any]:
+    if not SELECTOR_BUY_HOLD_SCORE_CALIBRATION.exists():
+        return {}
+    try:
+        payload = json.loads(SELECTOR_BUY_HOLD_SCORE_CALIBRATION.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if payload.get("schema_version") != "selector_buy_hold_score_calibration_v1":
+        return {}
+    return payload
+
+
+def _score_mode_config(mode: str) -> dict[str, Any]:
+    payload = _selector_buy_hold_score_artifact()
+    modes = payload.get("modes") if isinstance(payload, dict) else {}
+    config = modes.get(mode) if isinstance(modes, dict) else None
+    return config if isinstance(config, dict) else {}
+
+
+def _fallback_score_weights(mode: str) -> dict[str, float]:
+    if mode == "hold":
+        return {
+            "avg_weight": 1.05,
+            "model_weight": 0.18,
+            "drawdown_penalty": 0.055,
+            "pf_weight": 0.90,
+            "win_weight": 2.20,
+            "group_weight": 0.0,
+            "sample_scale": 240.0,
+        }
+    return {
+        "avg_weight": 0.95,
+        "model_weight": 0.45,
+        "drawdown_penalty": 0.035,
+        "pf_weight": 0.80,
+        "win_weight": 2.00,
+        "group_weight": 0.0,
+        "sample_scale": 240.0,
+    }
+
+
+def _score_mode_weights(mode: str) -> dict[str, float]:
+    config = _score_mode_config(mode)
+    weights = config.get("weights") if isinstance(config, dict) else None
+    defaults = _fallback_score_weights(mode)
+    if not isinstance(weights, dict):
+        return defaults
+    return {
+        "avg_weight": float(weights.get("avg_weight", defaults["avg_weight"])),
+        "model_weight": float(weights.get("model_weight", defaults["model_weight"])),
+        "drawdown_penalty": float(weights.get("drawdown_penalty", defaults["drawdown_penalty"])),
+        "pf_weight": float(weights.get("pf_weight", defaults["pf_weight"])),
+        "win_weight": float(weights.get("win_weight", defaults["win_weight"])),
+        "group_weight": float(weights.get("group_weight", defaults["group_weight"])),
+        "sample_scale": float(weights.get("sample_scale", defaults["sample_scale"]) or defaults["sample_scale"]),
+    }
+
+
+def _score_group_edge(mode: str, group: str) -> float:
+    config = _score_mode_config(mode)
+    edges = config.get("group_edges") if isinstance(config, dict) else None
+    if not isinstance(edges, dict):
+        return 0.0
+    return _safe_float(edges.get(group), 0.0) or 0.0
+
+
+def _score_mode_resonance_weight(mode: str) -> float:
+    config = _score_mode_config(mode)
+    weights = config.get("weights") if isinstance(config, dict) else None
+    if isinstance(weights, dict):
+        value = _safe_float(weights.get("resonance_weight"), None)
+        if value is not None:
+            return value
+    return 0.1 if mode == "hold" else 0.2
+
+
+def _signal_raw_score(signal: dict[str, Any], *, mode: str) -> float:
+    metrics = signal.get("metrics") or {}
+    weights = _score_mode_weights(mode)
+    trades = _safe_float(metrics.get("trades"), 0.0) or 0.0
+    avg_return = float(np.clip(_safe_float(metrics.get("avg_return_pct"), 0.0) or 0.0, -10.0, 10.0))
+    win_rate = _safe_float(metrics.get("win_rate"), 0.0) or 0.0
+    max_drawdown = abs(_safe_float(metrics.get("max_drawdown_pct"), 0.0) or 0.0)
+    profit_factor = _safe_float(metrics.get("profit_factor"), 0.0) or 0.0
+    reliability = min(1.0, np.sqrt(max(trades, 0.0) / max(weights["sample_scale"], 1.0)))
+    model_edge = float(np.clip(_signal_model_edge_pct(signal) or 0.0, -10.0, 10.0))
+    pf_bonus = min(max(profit_factor - 1.0, 0.0), 4.0)
+    win_bonus = max(win_rate - 0.35, 0.0)
+    group_edge = _score_group_edge(mode, _signal_group_key(signal))
+    return (
+        avg_return * reliability * weights["avg_weight"]
+        + model_edge * weights["model_weight"]
+        + pf_bonus * weights["pf_weight"]
+        + win_bonus * weights["win_weight"]
+        + group_edge * weights["group_weight"]
+        - min(max_drawdown, 50.0) * weights["drawdown_penalty"]
+    )
+
+
+def _sample_raw_scores(frame: pd.DataFrame, *, mode: str) -> pd.Series:
+    weights = _score_mode_weights(mode)
+    trades = pd.to_numeric(frame.get("metrics_trades"), errors="coerce").fillna(0)
+    avg_return = pd.to_numeric(frame.get("metrics_avg_return_pct"), errors="coerce").fillna(0).clip(-10, 10)
+    win_rate = pd.to_numeric(frame.get("metrics_win_rate"), errors="coerce").fillna(0)
+    drawdown = pd.to_numeric(frame.get("metrics_max_drawdown_pct"), errors="coerce").fillna(0).abs().clip(upper=50)
+    pf = pd.to_numeric(frame.get("metrics_profit_factor"), errors="coerce").fillna(0).clip(upper=5)
+    pred_up5 = pd.to_numeric(frame.get("pred_up5"), errors="coerce").fillna(0)
+    pred_up8 = pd.to_numeric(frame.get("pred_up8"), errors="coerce").fillna(0)
+    pred_up10 = pd.to_numeric(frame.get("pred_up10"), errors="coerce").fillna(0)
+    pred_down3 = pd.to_numeric(frame.get("pred_down3"), errors="coerce").fillna(0)
+    groups = frame.get("strategy_group")
+    if groups is None:
+        group_edge = pd.Series(0.0, index=frame.index)
+    else:
+        group_edge = groups.astype(str).map(lambda group: _score_group_edge(mode, group)).fillna(0.0)
+    reliability = np.minimum(1.0, np.sqrt(np.maximum(trades, 0) / max(weights["sample_scale"], 1.0)))
+    model_edge = (pred_up5 * 5.0 + pred_up8 * 8.0 + pred_up10 * 10.0 - pred_down3 * 3.0).clip(-10, 10)
+    pf_bonus = np.maximum(pf - 1.0, 0).clip(upper=4)
+    win_bonus = np.maximum(win_rate - 0.35, 0)
+    return (
+        avg_return * reliability * weights["avg_weight"]
+        + model_edge * weights["model_weight"]
+        + pf_bonus * weights["pf_weight"]
+        + win_bonus * weights["win_weight"]
+        + group_edge * weights["group_weight"]
+        - drawdown * weights["drawdown_penalty"]
+    )
+
+
+@lru_cache(maxsize=1)
+def _selector_score_calibration() -> dict[str, Any]:
+    if not SELECTOR_HISTORY_SIGNAL_SAMPLES.exists():
+        return {}
+    try:
+        frame = pd.read_parquet(SELECTOR_HISTORY_SIGNAL_SAMPLES)
+    except Exception:
+        return {}
+    if frame.empty or "strategy_group" not in frame.columns:
+        return {}
+    calibration: dict[str, Any] = {"global": {}, "group": {}}
+    for mode in ["buy", "hold"]:
+        scored = frame[["strategy_group"]].copy()
+        scored["raw"] = _sample_raw_scores(frame, mode=mode)
+        raw = pd.to_numeric(scored["raw"], errors="coerce").dropna().sort_values().to_numpy()
+        if len(raw):
+            calibration["global"][mode] = raw
+        groups: dict[str, np.ndarray] = {}
+        for group, part in scored.groupby("strategy_group"):
+            values = pd.to_numeric(part["raw"], errors="coerce").dropna().sort_values().to_numpy()
+            if len(values) >= 20:
+                groups[str(group)] = values
+        calibration["group"][mode] = groups
+    return calibration
+
+
+def _percentile_rank(value: float, distribution: np.ndarray | None) -> float | None:
+    if distribution is None or len(distribution) == 0:
+        return None
+    return float(np.searchsorted(distribution, value, side="right") / len(distribution))
+
+
+def _normalized_signal_score(signal: dict[str, Any], *, mode: str) -> float:
+    raw = _signal_raw_score(signal, mode=mode)
+    calibration = _selector_score_calibration()
+    group = _signal_group_key(signal)
+    global_pct = _percentile_rank(raw, (calibration.get("global") or {}).get(mode))
+    group_pct = _percentile_rank(raw, ((calibration.get("group") or {}).get(mode) or {}).get(group))
+    if global_pct is None and group_pct is None:
+        return float(np.clip(50.0 + raw * 8.0, 0.0, 100.0))
+    if global_pct is None:
+        blended = group_pct
+    elif group_pct is None:
+        blended = global_pct
+    else:
+        blended = 0.55 * group_pct + 0.45 * global_pct
+    return float(np.clip((blended or 0.0) * 100.0, 0.0, 100.0))
+
+
 def _signal_selector_score(signal: dict[str, Any]) -> float:
     """Rank by conservative expected return, then lightly reward risk quality."""
     metrics = signal.get("metrics") or {}
@@ -2349,17 +2749,8 @@ def _signal_selector_score(signal: dict[str, Any]) -> float:
 
 def _calibrated_signal_score(signal: dict[str, Any], *, model_weight: float) -> float:
     """Historical-sample calibrated score used for stock-level display fields."""
-    metrics = signal.get("metrics") or {}
-    trades = float(metrics.get("trades") or 0)
-    avg_return = max(min(float(metrics.get("avg_return_pct") or 0), 10.0), -10.0)
-    max_drawdown = abs(float(metrics.get("max_drawdown_pct") or 0))
-    reliability = min(1.0, np.sqrt(max(trades, 0) / 240))
-    model_edge = _signal_model_edge_pct(signal) or 0.0
-    return (
-        avg_return * reliability * 1.05
-        + max(min(model_edge, 10.0), -10.0) * model_weight
-        - min(max_drawdown, 50.0) * 0.025
-    )
+    mode = "buy" if model_weight >= 0.3 else "hold"
+    return _normalized_signal_score(signal, mode=mode)
 
 
 def _aggregate_signal_scores(signal_scores: list[float], group_count: int, *, resonance_weight: float = 0.2) -> float:
@@ -2367,9 +2758,56 @@ def _aggregate_signal_scores(signal_scores: list[float], group_count: int, *, re
         return 0.0
     ordered = sorted(signal_scores, reverse=True)
     best = ordered[0]
-    resonance = 0.08 * sum(max(score, 0) for score in ordered[1:3])
+    resonance = 0.08 * sum(max(score - 50.0, 0.0) for score in ordered[1:3])
+    group_bonus = 2.5 * resonance_weight * np.log1p(group_count)
+    return float(np.clip(best + resonance + group_bonus, 0.0, 100.0))
+
+
+def _aggregate_raw_scores(signal_scores: list[float], group_count: int, *, resonance_weight: float = 0.2) -> float:
+    if not signal_scores:
+        return 0.0
+    ordered = sorted(signal_scores, reverse=True)
+    best = ordered[0]
+    resonance = 0.08 * sum(max(score, 0.0) for score in ordered[1:3])
     group_bonus = resonance_weight * np.log1p(group_count)
     return float(best + resonance + group_bonus)
+
+
+def _rank_percentiles(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    series = pd.Series(values, dtype="float64")
+    if series.nunique(dropna=True) <= 1:
+        return [0.5 for _ in values]
+    return series.rank(method="average", pct=True).fillna(0.5).tolist()
+
+
+def _apply_current_score_normalization(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    for score_name, raw_name, historical_name in [
+        ("opportunity_score", "buy_raw_score", "historical_buy_score"),
+        ("holding_score", "hold_raw_score", "historical_hold_score"),
+    ]:
+        raw_values = [float(row.get(raw_name) or 0.0) for row in rows]
+        global_pct = _rank_percentiles(raw_values)
+        group_pct: list[float] = [0.5 for _ in rows]
+        by_group: dict[str, list[int]] = {}
+        for index, row in enumerate(rows):
+            by_group.setdefault(_primary_family(row), []).append(index)
+        for indexes in by_group.values():
+            ranked = _rank_percentiles([raw_values[index] for index in indexes])
+            for index, pct in zip(indexes, ranked):
+                group_pct[index] = pct
+        for index, row in enumerate(rows):
+            historical = _safe_float(row.get(historical_name), 50.0) or 50.0
+            score = historical * 0.45 + group_pct[index] * 35.0 + global_pct[index] * 20.0
+            row[score_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
+    for row in rows:
+        row["selector_score"] = row["opportunity_score"]
+        row["score_target"] = "buy_score_normalized"
+        row.update(_score_interpretation(float(row["opportunity_score"]), float(row["holding_score"])))
+    return rows
 
 
 def _score_interpretation(opportunity_score: float, holding_score: float) -> dict[str, str]:
@@ -2378,19 +2816,19 @@ def _score_interpretation(opportunity_score: float, holding_score: float) -> dic
     Keep these deliberately coarse: the OOT test supports ranking by broad
     buckets better than treating the raw decimal as a precise probability.
     """
-    if opportunity_score >= 4.3:
+    if opportunity_score >= 85:
         band = "极高"
         percentile = "约 Top 1%"
-        usage = "冲高机会很强，仍需按买入条件和止损执行"
-    elif opportunity_score >= 1.4:
+        usage = "买入条件质量很强，仍需按开盘条件和止损执行"
+    elif opportunity_score >= 70:
         band = "高"
         percentile = "约 Top 5%"
         usage = "优先观察，等待开盘条件确认"
-    elif opportunity_score >= 1.2:
+    elif opportunity_score >= 60:
         band = "偏高"
         percentile = "约 Top 10%"
         usage = "可观察，不适合追高"
-    elif opportunity_score >= 0.1:
+    elif opportunity_score >= 45:
         band = "中性"
         percentile = "约 Top 25%"
         usage = "只适合结合策略细节筛选"
@@ -2399,12 +2837,12 @@ def _score_interpretation(opportunity_score: float, holding_score: float) -> dic
         percentile = "低于主要观察区"
         usage = "不建议仅因分数参与"
 
-    if opportunity_score >= 1.2 and holding_score < 0.1:
-        risk_note = "冲高分高但持有参考弱，偏短线冲高，不宜按 T+5 持有逻辑理解"
-    elif holding_score >= 1.2:
-        risk_note = "冲高与持有参考相对一致"
+    if opportunity_score >= 70 and holding_score < 45:
+        risk_note = "买入分高但持有分弱，偏短线机会，不宜按 T+5 持有逻辑理解"
+    elif holding_score >= 70:
+        risk_note = "买入与持有评分相对一致"
     else:
-        risk_note = "持有参考偏弱，需重视回撤和卖出纪律"
+        risk_note = "持有分偏弱，需重视回撤和卖出纪律"
 
     return {
         "score_band": band,
@@ -2469,17 +2907,27 @@ def build_selector_stock_row(
     )
     signal_scores = [_signal_selector_score(signal) for signal in ordered_signals]
     legacy_score = (signal_scores[0] if signal_scores else 0) + 0.08 * sum(max(score, 0) for score in signal_scores[1:3]) + 0.15 * np.log1p(len(groups))
-    opportunity_score = _aggregate_signal_scores(
+    historical_buy_score = _aggregate_signal_scores(
         [_calibrated_signal_score(signal, model_weight=0.4) for signal in ordered_signals],
         len(groups),
-        resonance_weight=0.2,
+        resonance_weight=_score_mode_resonance_weight("buy"),
     )
-    holding_score = _aggregate_signal_scores(
+    historical_hold_score = _aggregate_signal_scores(
         [_calibrated_signal_score(signal, model_weight=0.2) for signal in ordered_signals],
         len(groups),
-        resonance_weight=0.2,
+        resonance_weight=_score_mode_resonance_weight("hold"),
     )
-    score_info = _score_interpretation(float(opportunity_score), float(holding_score))
+    buy_raw_score = _aggregate_raw_scores(
+        [_signal_raw_score(signal, mode="buy") for signal in ordered_signals],
+        len(groups),
+        resonance_weight=_score_mode_resonance_weight("buy"),
+    )
+    hold_raw_score = _aggregate_raw_scores(
+        [_signal_raw_score(signal, mode="hold") for signal in ordered_signals],
+        len(groups),
+        resonance_weight=_score_mode_resonance_weight("hold"),
+    )
+    score_info = _score_interpretation(float(historical_buy_score), float(historical_hold_score))
     return {
         **{key: value for key, value in stock.items() if key != "signals"},
         "matched_count": len(groups),
@@ -2488,13 +2936,17 @@ def build_selector_stock_row(
         "matched_strategy_names": [signal.get("strategy_name") for signal in ordered_signals],
         "best_profit_factor": best_pf,
         "best_avg_return_pct": best_avg if best_avg > -999 else None,
-        "selector_score": round(float(opportunity_score), 2),
-        "opportunity_score": round(float(opportunity_score), 2),
-        "holding_score": round(float(holding_score), 2),
+        "selector_score": round(float(historical_buy_score), 1),
+        "opportunity_score": round(float(historical_buy_score), 1),
+        "holding_score": round(float(historical_hold_score), 1),
+        "historical_buy_score": round(float(historical_buy_score), 1),
+        "historical_hold_score": round(float(historical_hold_score), 1),
+        "buy_raw_score": round(float(buy_raw_score), 4),
+        "hold_raw_score": round(float(hold_raw_score), 4),
         "legacy_selector_score": round(float(legacy_score), 2),
-        "score_target": "future_max_high_t5_pct",
+        "score_target": "buy_score_normalized",
         **score_info,
-        "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(groups)} 个策略组共振；当前排序目标为 5 日内冲高机会",
+        "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(groups)} 个策略组共振；当前买入分按未来 5 日冲高目标做历史校准",
         "signals": ordered_signals,
     }
 
@@ -3124,7 +3576,7 @@ def _run_latest_refresh_job() -> None:
                     "convertible_bond_allotment",
                     "配债股数据刷新失败",
                 ),
-                executor.submit(get_byd_daily_strategy): ("byd_daily_plan", "BYD 做T日线计划刷新失败"),
+                executor.submit(get_byd_daily_strategy, refresh=True): ("byd_daily_plan", "BYD 做T日线计划刷新失败"),
             }
             for future in as_completed(futures):
                 result_key, failure_message = futures[future]
@@ -3390,6 +3842,12 @@ def get_stock_selector_payload(
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
+    rows = _apply_current_score_normalization(rows)
+    rows = sorted(
+        rows,
+        key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
+        reverse=True,
+    )
     if not selected:
         rows = _diversify_default_rows(rows, len(rows) or DEFAULT_SELECTOR_LIMIT)
     payload = {
@@ -3408,8 +3866,8 @@ def get_stock_selector_payload(
             "选股器按合并后的策略组聚合命中；同一策略组下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中按策略组去重计算。",
             "2026-06-14 已统一短线和长线为前复权价格口径；模型训练、标签、策略回测和页面价格展示使用同一套价格体系。",
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
-            "当前默认排序分已临时改为冲高机会分，目标是 5 日内最大涨幅；2026 OOT Top20 平均最大涨幅约 6.48%，但高分分位仍不完全单调，不应理解为稳定收益概率。",
-            "持有参考分用于提示 T+5 收盘收益倾向；历史验证显示 T+5 收盘收益排序稳定性不足，当前只作为辅助风险提示。",
+            "买入分为 0-100 历史归一化评分，按未来 5 日最大冲高收益和冲高 >=5% 概率校准，并混合同策略内分位和全策略分位。",
+            "持有分为 0-100 保守辅助评分，按未来 5 日收盘收益和正收益概率校准；当前历史验证显示持有目标预测较弱，不等同于收益承诺。",
             f"前端默认先过滤为可操作候选，再展示保守预期收益分 Top{DEFAULT_SELECTOR_LIMIT}；MySQL 快照仍保存完整规则全集，便于后续复盘和重新训练。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",

@@ -773,13 +773,13 @@ function renderStockRows() {
       <td>${item.matched_families.map((family) => `<span class="tag">${family}</span>`).join("")}</td>
       <td>
         <span class="score-stack">
-          <strong>${Number(item.opportunity_score ?? item.selector_score ?? 0).toFixed(2)}</strong>
+          <strong>${Number(item.opportunity_score ?? item.selector_score ?? 0).toFixed(1)}</strong>
           <em>${item.score_band || ""} ${item.score_percentile_label || ""}</em>
         </span>
       </td>
       <td>
         <span class="score-stack">
-          <strong>${Number(item.holding_score ?? 0).toFixed(2)}</strong>
+          <strong>${Number(item.holding_score ?? 0).toFixed(1)}</strong>
           <em>${item.score_risk_note || ""}</em>
         </span>
       </td>
@@ -810,7 +810,7 @@ function renderStockDetail() {
     return;
   }
   title.textContent = `${stock.symbol} ${stock.name || ""}`;
-  meta.textContent = `行业 ${stock.industry || "-"} · 收盘 ${fmtPrice(stock.close)} · 冲高分 ${Number(stock.opportunity_score ?? stock.selector_score ?? 0).toFixed(2)}（${stock.score_band || "-"}，${stock.score_percentile_label || "-"}） · 持有参考 ${Number(stock.holding_score ?? 0).toFixed(2)} · ${stock.score_usage_hint || ""} · ${stock.score_risk_note || ""} · 命中 ${stock.matched_count} 个策略组 · ${stock.matched_families.join(" / ")} · ${stock.rank_reason || ""}`;
+  meta.textContent = `行业 ${stock.industry || "-"} · 收盘 ${fmtPrice(stock.close)} · 买入分 ${Number(stock.opportunity_score ?? stock.selector_score ?? 0).toFixed(1)}（${stock.score_band || "-"}，${stock.score_percentile_label || "-"}） · 持有分 ${Number(stock.holding_score ?? 0).toFixed(1)} · ${stock.score_usage_hint || ""} · ${stock.score_risk_note || ""} · 命中 ${stock.matched_count} 个策略组 · ${stock.matched_families.join(" / ")} · ${stock.rank_reason || ""}`;
   body.innerHTML = stock.signals.map((signal) => {
     const metrics = signal.metrics || {};
     return `

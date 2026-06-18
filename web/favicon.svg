@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="策略工作台">
+  <rect width="64" height="64" rx="12" fill="#1c2430"/>
+  <path d="M14 43l11-12 9 7 16-19" fill="none" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="31" cy="31" r="15" fill="none" stroke="#ffffff" stroke-width="5"/>
+  <path d="M40 40l8 8" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+</svg>

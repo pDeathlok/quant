@@ -1,0 +1,124 @@
+{
+  "schema_version": "selector_buy_hold_score_calibration_v1",
+  "generated_at": "2026-06-18T08:43:55",
+  "train_window": ["2025-01-01", "2025-12-31"],
+  "valid_window": ["2026-01-01", "2026-12-31"],
+  "targets": {
+    "buy": {
+      "target": "future_max_high_t5_pct",
+      "hit_threshold": 5.0,
+      "hit_label": "future_max_high_t5_pct >= 5%"
+    },
+    "hold": {
+      "target": "future_return_t5_pct",
+      "hit_threshold": 0.0,
+      "hit_label": "future_return_t5_pct > 0"
+    }
+  },
+  "modes": {
+    "buy": {
+      "weights": {
+        "avg_weight": 1.25,
+        "model_weight": 0.0,
+        "drawdown_penalty": 0.025,
+        "pf_weight": 0.0,
+        "win_weight": 0.5,
+        "group_weight": 1.0,
+        "resonance_weight": 0.2,
+        "sample_scale": 240.0
+      },
+      "group_edges": {
+        "B1": -0.2187076211534017,
+        "B2": -0.01659590744927331,
+        "B3": -0.01272682627226976,
+        "CHANGAN": -0.13515777617164554,
+        "DOUBLE_YANG": 0.4275012668529427,
+        "KENGQI": -0.031618434995645116,
+        "LOW_PULLBACK": -0.1532498002720786,
+        "RHYTHM_PLATFORM": 0.03520563795668633,
+        "SB1": 0.05166581892883576,
+        "STRONG_K": 0.24842693434903704,
+        "SUPER_B1": -0.29534001820771705,
+        "SUPPORT_PULLBACK": -0.04219540137434505
+      },
+      "train_metrics": {
+        "rows": 137484,
+        "days": 243,
+        "spearman": 0.10131972338047177,
+        "top20": {
+          "rows": 4860,
+          "days": 243,
+          "avg_return": 7.702612054523406,
+          "hit_rate": 0.5002057613168724
+        },
+        "decile_spread": 2.333387199635653,
+        "hit_spread": 0.13433704269401409
+      },
+      "valid_metrics": {
+        "rows": 55761,
+        "days": 104,
+        "spearman": 0.09910760826511203,
+        "top20": {
+          "rows": 2080,
+          "days": 104,
+          "avg_return": 7.06349047689433,
+          "hit_rate": 0.4889423076923077
+        },
+        "decile_spread": 1.6352826197858876,
+        "hit_spread": 0.10605295267584197
+      }
+    },
+    "hold": {
+      "weights": {
+        "avg_weight": 1.25,
+        "model_weight": 0.15,
+        "drawdown_penalty": 0.065,
+        "pf_weight": 0.0,
+        "win_weight": 0.0,
+        "group_weight": 0.0,
+        "resonance_weight": 0.1,
+        "sample_scale": 240.0
+      },
+      "group_edges": {
+        "B1": 0.09182122677368909,
+        "B2": 0.09052416432789716,
+        "B3": 0.09162285517804332,
+        "CHANGAN": -0.08009805766747485,
+        "DOUBLE_YANG": 0.15053413101630753,
+        "KENGQI": 0.17647900901610944,
+        "LOW_PULLBACK": -0.009388752873485607,
+        "RHYTHM_PLATFORM": -0.014568082951962236,
+        "SB1": 0.12034677930801188,
+        "STRONG_K": 0.02016087907945568,
+        "SUPER_B1": -0.5249999999999999,
+        "SUPPORT_PULLBACK": -0.002471880128245002
+      },
+      "train_metrics": {
+        "rows": 137484,
+        "days": 243,
+        "spearman": 0.01835083377584205,
+        "top20": {
+          "rows": 4860,
+          "days": 243,
+          "avg_return": 1.084391950313286,
+          "hit_rate": 0.5004115226337449
+        },
+        "decile_spread": 0.35318247154920146,
+        "hit_spread": 0.008655174921812558
+      },
+      "valid_metrics": {
+        "rows": 53660,
+        "days": 100,
+        "spearman": 0.0030295044346171796,
+        "top20": {
+          "rows": 2000,
+          "days": 100,
+          "avg_return": 0.04627308511623869,
+          "hit_rate": 0.4415
+        },
+        "decile_spread": -0.17472232456373246,
+        "hit_spread": -0.01770406261647406
+      }
+    }
+  }
+}
