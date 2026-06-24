@@ -65,7 +65,7 @@ def _incremental_feature_start() -> str:
 
 def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
     start_date = _incremental_daily_start()
-    workers = os.getenv("ROUTINE_DAILY_WORKERS", "16")
+    workers = os.getenv("ROUTINE_DAILY_WORKERS", "4")
     sleep_seconds = os.getenv("ROUTINE_DAILY_SLEEP", "0.08")
     command = [
         sys.executable,
@@ -145,7 +145,8 @@ def build_features(progress_callback=None) -> dict:
         "--incremental-start-date",
         start_date,
         "--workers",
-        os.getenv("ROUTINE_FEATURE_WORKERS", "96"),
+        os.getenv("ROUTINE_FEATURE_WORKERS", "8"),
+        "--no-adaptive-workers",
     ]
     env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
     process = subprocess.Popen(
@@ -183,7 +184,7 @@ def build_features(progress_callback=None) -> dict:
     }
 
 
-def refresh_strategy_signal_cache(workers: int = 96, progress_callback=None) -> dict:
+def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> dict:
     start_date = _incremental_daily_start()
     command = [
         sys.executable,
@@ -237,7 +238,7 @@ def refresh_strategy_signal_cache(workers: int = 96, progress_callback=None) -> 
     }
 
 
-def score_latest_models(workers: int = 96) -> dict:
+def score_latest_models(workers: int = 8) -> dict:
     command = [
         sys.executable,
         "scripts/research/score_latest_strategy_models.py",

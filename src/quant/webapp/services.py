@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import ast
 import hashlib
 import importlib.util
 import os
 import sys
 import threading
 import traceback
+from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -26,6 +28,7 @@ from quant.routine.dashboard import DASHBOARD_PATH, build_dashboard_payload, wri
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT, WEB_DATA_DIR
 from quant.strategies.custom.byd_minute_t import BydHolding, build_minute_payload, load_daily_qfq
 from quant.strategies.custom.b1_family import add_b1_family_signals
+from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
 from quant.strategies.custom.z_skill_patterns import (
     EXTENDED_STRATEGIES,
     build_extended_daily_signals,
@@ -40,6 +43,7 @@ EXTENDED_PLAYBOOK = REPORT_DIR / "latest_z_skill_operational_playbook.csv"
 EXTENDED_MODEL_PLAYBOOK = REPORT_DIR / "latest_z_skill_model_operational_playbook.csv"
 EXTENDED_MODEL_SCORED = REPORT_DIR / "latest_z_skill_model_scored_candidates.parquet"
 EXTENDED_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.csv"
+VEGAS_TUNNEL_REPORT_DIR = PROJECT_ROOT / "reports/vegas_tunnel"
 SELECTOR_HISTORY_SIGNAL_SAMPLES = PROJECT_ROOT / "data/research/selector_history_full/selector_signal_history_samples.parquet"
 SELECTOR_BUY_HOLD_SCORE_CALIBRATION = PROJECT_ROOT / "config/selector_buy_hold_score_calibration.json"
 FAMILY_RULE_PATTERN = "b1_family_rule_backtest_*.csv"
@@ -82,6 +86,8 @@ STRATEGY_GROUPS = [
     {"key": "RHYTHM_PLATFORM", "label": "节奏/平台", "status": "呼吸结构、跃跃欲试", "members": ["BREATHING", "YUEYUE"]},
     {"key": "CHANGAN", "label": "长安战法", "status": "日线三日确认", "members": ["CHANGAN"]},
     {"key": "KENGQI", "label": "坑里起好货", "status": "日线填坑观察", "members": ["KENGQI"]},
+    {"key": "VEGAS", "label": "维加斯隧道", "status": "趋势回踩右侧确认", "members": ["VEGAS"]},
+    {"key": "TRIPLE_VOLUME_BREAKOUT", "label": "三倍量突破", "status": "缩量盘整后右侧突破", "members": ["TRIPLE_VOLUME_BREAKOUT"]},
 ]
 STRATEGY_GROUP_MEMBERS = {
     item["key"]: set(item["members"])
@@ -104,6 +110,8 @@ FAMILY_SIGNAL_COLUMNS = {
     "B3_SMALL": ("b3_small_pos_amp7", "B3", "B3 标准小阳延续", "标准 B2 后三日内小阳，涨幅0%-2%、振幅<7%"),
     "SB1": ("sb1_range10_vol12", "SB1", "SB1 洗盘观察", "前三日横盘区间<10%、放量阴线下破、J<0"),
     "SUPER_B1": ("super_washout_j10_closepos40", "SUPER_B1", "超级 B1", "近三日放量下杀，随后 J<-10 且收盘位置>=40%"),
+    "VEGAS_TUNNEL": ("signal_vegas_tunnel", "VEGAS", "维加斯隧道", "EMA144/169 隧道上行，EMA10>EMA20>隧道上沿，近8日回踩2.5%范围后收阳放量站上EMA10"),
+    "TRIPLE_VOLUME_BREAKOUT": ("signal_tvb_merged", "TRIPLE_VOLUME_BREAKOUT", "三倍量缩量盘整突破", "2.5倍量扩展候选池，3倍量命中提升为保守主策略；突破日前平均缩量，MA5>MA10>MA20且MA20上行"),
 }
 DEFAULT_ACTION_LEVELS = {"可小仓实操", "谨慎实操"}
 DEFAULT_FAMILIES = {
@@ -117,11 +125,13 @@ DEFAULT_FAMILIES = {
     "LOW_PULLBACK",
     "SUPPORT_PULLBACK",
     "RHYTHM_PLATFORM",
+    "VEGAS",
+    "TRIPLE_VOLUME_BREAKOUT",
     *MODEL_FILTERED_SIGNALS,
 }
 DEFAULT_SELECTOR_LIMIT = 50
 DEFAULT_FAMILY_CAP = 12
-SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v4"
+SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v5"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
 LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v1"
@@ -168,6 +178,58 @@ _REFRESH_STATUS: dict[str, Any] = {
     "result": None,
     "error": None,
 }
+REFRESH_SCOPE_LABELS = {
+    "all": "全部工作区",
+    "short": "短线策略",
+    "long": "长线策略",
+    "cb": "可转债策略",
+    "cbAllotment": "配债股",
+    "byd": "BYD 做T",
+}
+REFRESH_SCOPE_STEPS = {
+    "all": [
+        "refresh_data",
+        "feature_cache",
+        "daily_plan",
+        "signal_cache",
+        "model_score",
+        "selector_core",
+        "selector_extended",
+        "long_stock_pool",
+        "convertible_bond_plan",
+        "convertible_bond_allotment",
+        "byd_daily_plan",
+        "snapshot",
+    ],
+    "short": [
+        "refresh_data",
+        "feature_cache",
+        "daily_plan",
+        "signal_cache",
+        "model_score",
+        "selector_core",
+        "selector_extended",
+        "snapshot",
+    ],
+    "long": ["refresh_data", "long_stock_pool"],
+    "cb": ["refresh_data", "convertible_bond_plan"],
+    "cbAllotment": ["refresh_data", "convertible_bond_allotment"],
+    "byd": ["refresh_data", "byd_daily_plan"],
+}
+REFRESH_STEP_DEFINITIONS = {
+    "refresh_data": {"label": "拉取 Tushare 最新日线数据", "percent": 10},
+    "feature_cache": {"label": "增量构建 B1 特征缓存", "percent": 35},
+    "daily_plan": {"label": "生成最新策略每日计划", "percent": 45},
+    "signal_cache": {"label": "重建全市场策略规则信号", "percent": 56},
+    "model_score": {"label": "计算当日策略模型分", "percent": 70},
+    "selector_core": {"label": "计算短线核心股票池", "percent": 78},
+    "selector_extended": {"label": "计算短线全策略股票池", "percent": 88},
+    "long_stock_pool": {"label": "计算长线策略股票池", "percent": 92},
+    "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
+    "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
+    "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
+    "snapshot": {"label": "写入策略股票池快照", "percent": 98},
+}
 
 
 def _persist_refresh_status_unlocked() -> None:
@@ -185,7 +247,20 @@ def _load_persisted_refresh_status() -> dict[str, Any] | None:
         payload = json.loads(REFRESH_STATUS_PATH.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    return _ensure_refresh_scope(payload)
+
+
+def _ensure_refresh_scope(status: dict[str, Any]) -> dict[str, Any]:
+    scoped = dict(status)
+    try:
+        scope = _normalize_refresh_scope(scoped.get("scope"))
+    except ValueError:
+        scope = "all"
+    scoped["scope"] = scope
+    scoped["scope_label"] = REFRESH_SCOPE_LABELS[scope]
+    return scoped
 
 
 def _is_refresh_status_stale(status: dict[str, Any]) -> bool:
@@ -2034,6 +2109,11 @@ def latest_report_file(pattern: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def latest_vegas_report_file(pattern: str) -> Path | None:
+    candidates = sorted(VEGAS_TUNNEL_REPORT_DIR.glob(pattern))
+    return candidates[-1] if candidates else None
+
+
 def dataframe_records(path: Path, limit: int = 200) -> list[dict[str, Any]]:
     df = pd.read_csv(path)
     df = df.replace([float("inf"), float("-inf")], pd.NA)
@@ -2396,6 +2476,79 @@ def _model_filtered_signal_payload(signal_key: str, model_score: pd.Series) -> d
     })
 
 
+@lru_cache(maxsize=1)
+def _vegas_tunnel_best_metrics() -> pd.Series | None:
+    path = latest_vegas_report_file("vegas_tunnel_param_grid_summary_*.csv")
+    if path is None:
+        path = latest_vegas_report_file("vegas_tunnel_summary_*.csv")
+    if path is None:
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    part = df[df["period"].astype(str) == "all"].copy() if "period" in df.columns else df.copy()
+    if part.empty:
+        part = df.copy()
+    if "trades" in part.columns:
+        liquid = part[pd.to_numeric(part["trades"], errors="coerce").fillna(0) >= 20].copy()
+        if not liquid.empty:
+            part = liquid
+    if "rank_score" not in part.columns:
+        part["rank_score"] = (
+            part["daily_sharpe"].fillna(0)
+            + 0.20 * part["avg_return_pct"].fillna(0)
+            + 0.02 * part["max_drawdown_pct"].fillna(0)
+            + part["profit_factor"].fillna(0) * 0.30
+        )
+    return part.sort_values(["rank_score", "daily_sharpe", "avg_return_pct"], ascending=False).iloc[0]
+
+
+def _vegas_tunnel_signal_payload(latest_row: pd.Series) -> dict[str, Any]:
+    best = _vegas_tunnel_best_metrics()
+    metrics = _metrics_payload(best) if best is not None else {
+        "trades": 42,
+        "avg_return_pct": 1.52,
+        "win_rate": 0.4524,
+        "max_drawdown_pct": -31.18,
+        "profit_factor": 1.7853,
+    }
+    exit_rule = str(best.get("exit_rule") if best is not None else "fixed_tp16%_sl8%_T9")
+    param_text = ""
+    if best is not None and "fast_span" in best.index:
+        param_text = (
+            f"参数：EMA{int(best['fast_span'])}/EMA{int(best['momentum_span'])}，"
+            f"隧道EMA{int(best['tunnel_short_span'])}/{int(best['tunnel_long_span'])}，"
+            f"回踩{float(best['near_tunnel_pct']):.1%}，窗口{int(best['pullback_window'])}日。"
+        )
+    distance = _safe_float(latest_row.get("vegas_tunnel_distance"), 0.0) or 0.0
+    slope = _safe_float(latest_row.get("vegas_tunnel_slope_20d"), 0.0) or 0.0
+    volume_strength = _safe_float(latest_row.get("vegas_volume_strength"), 0.0) or 0.0
+    score = _safe_float(latest_row.get("vegas_candidate_score"), 0.0) or 0.0
+    return _enrich_signal_group({
+        "strategy_key": "VEGAS_TUNNEL",
+        "strategy_family": "VEGAS",
+        "strategy_name": "维加斯隧道",
+        "timeframe": "日线级，收盘确认，T+1 开盘观察",
+        "logic": f"EMA144/169 形成上行隧道，EMA10>EMA20>隧道上沿；近8日回踩或贴近隧道2.5%范围后，当日收阳放量重新站上 EMA10。{param_text}",
+        "reason": (
+            f"距隧道上沿={distance:.2%}，"
+            f"隧道20日斜率={slope:.2%}，"
+            f"量能强度={volume_strength:.2%}，"
+            f"候选分={score:.3f}"
+        ),
+        "buy_plan": "T+1 开盘观察；高开过大不追，优先选择开盘不显著脱离确认日收盘且不跌破确认日低点的标的。",
+        "sell_plan": f"{_exit_rule_text(exit_rule)}。依据：维加斯隧道策略多卖出计划回测。",
+        "metrics": metrics,
+        "metrics_text": _metrics_text(metrics),
+        "action_level": "谨慎实操",
+        "playbook_source": "规则版",
+        "strength_score": 1.0 + min(max(score, 0.0), 1.0),
+    })
+
+
 def _stock_basic_profile(symbol: str) -> dict[str, str]:
     basic = _stock_basic_map().get(symbol, {})
     return {
@@ -2493,6 +2646,24 @@ def _signal_quality_gate(signal: dict[str, Any]) -> bool:
             and profit_factor >= 1.8
             and max_drawdown >= -15
             and win_rate >= 0.33
+        )
+
+    if family == "VEGAS":
+        return (
+            trades >= 20
+            and avg_return >= 1.0
+            and profit_factor >= 1.5
+            and max_drawdown >= -35
+            and win_rate >= 0.35
+        )
+
+    if family == "TRIPLE_VOLUME_BREAKOUT":
+        return (
+            trades >= 15
+            and avg_return >= 1.2
+            and profit_factor >= 2.5
+            and max_drawdown >= -18
+            and win_rate >= 0.55
         )
 
     if group in DEFAULT_FAMILIES and action_level in DEFAULT_ACTION_LEVELS:
@@ -3088,6 +3259,10 @@ def _b1_model_signal(row: dict[str, Any]) -> dict[str, Any]:
 
 def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score: pd.Series | None = None) -> dict[str, Any]:
     signal_column, family, name, logic = FAMILY_SIGNAL_COLUMNS[strategy_key]
+    if family == "VEGAS":
+        return _vegas_tunnel_signal_payload(latest_row)
+    if family == "TRIPLE_VOLUME_BREAKOUT":
+        return _triple_volume_breakout_signal_payload(latest_row)
     is_intraday_approx = family in {"SB1", "SUPER_B1"}
     model_playbook = _model_playbook_for(family) if family in MODEL_FILTERED_SIGNALS and model_score is not None else None
     best = model_playbook if model_playbook is not None else _family_best_metrics_by_signal().get(signal_column)
@@ -3149,6 +3324,73 @@ def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score
     })
 
 
+def _triple_volume_breakout_signal_payload(row: pd.Series) -> dict[str, Any]:
+    metrics = _parse_tvb_metrics(row.get("tvb_metrics"))
+    tier = str(row.get("tvb_tier") or "expanded")
+    variant_name = str(row.get("tvb_variant_name") or "三倍量缩量盘整突破")
+    volume_multiple = _safe_float(row.get("tvb_volume_multiple"), 0.0) or 0.0
+    score = _safe_float(row.get("tvb_score"), 78.0) or 78.0
+    action_level = "可小仓实操" if tier == "conservative" else "谨慎实操"
+    position = "小仓到标准短线仓" if tier == "conservative" else "观察到小仓"
+    days_since = _safe_float(row.get("days_since_triple_volume"), None)
+    consolidation = _safe_float(row.get("consolidation_range"), None)
+    breakout_pct = _safe_float(row.get("breakout_pct"), None)
+    volume_dryness = _safe_float(row.get("volume_dryness"), None)
+    details = []
+    if days_since is not None:
+        details.append(f"三倍量后第 {days_since:.0f} 天")
+    if consolidation is not None:
+        details.append(f"盘整振幅 {((consolidation - 1) * 100):.1f}%")
+    if breakout_pct is not None:
+        details.append(f"突破幅度 {_fmt_pct(breakout_pct * 100)}")
+    if volume_dryness is not None:
+        details.append(f"缩量强度 {_fmt_pct(volume_dryness * 100)}")
+    reason = "，".join(details) if details else "命中三倍量缩量盘整突破合并策略"
+    metrics_text = _metrics_text(metrics)
+    return _enrich_signal_group({
+        "strategy_key": "TRIPLE_VOLUME_BREAKOUT",
+        "strategy_family": "TRIPLE_VOLUME_BREAKOUT",
+        "strategy_name": variant_name,
+        "operation_key": f"TVB_{tier}_{volume_multiple:g}x",
+        "timeframe": "日线级，收盘确认，T+1 开盘观察",
+        "logic": str(row.get("tvb_description") or "缩量盘整后右侧突破"),
+        "reason": reason,
+        "buy_plan": f"{row.get('tvb_buy_plan') or 'T+1 开盘观察'}；建议仓位：{position}。",
+        "sell_plan": str(row.get("tvb_sell_plan") or "固定止盈5%，硬止损2.5%，最长T+9。"),
+        "metrics": metrics,
+        "metrics_text": metrics_text,
+        "action_level": action_level,
+        "playbook_source": "保守主策略" if tier == "conservative" else "扩展候选池",
+        "strength_score": (score - 70.0) / 10.0,
+    })
+
+
+def _parse_tvb_metrics(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return {
+            "trades": 35,
+            "avg_return_pct": 1.845164,
+            "win_rate": 0.628571,
+            "max_drawdown_pct": -14.194666,
+            "profit_factor": 3.014726,
+        }
+    try:
+        parsed = ast.literal_eval(str(raw))
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {
+        "trades": 35,
+        "avg_return_pct": 1.845164,
+        "win_rate": 0.628571,
+        "max_drawdown_pct": -14.194666,
+        "profit_factor": 3.014726,
+    }
+
+
 @lru_cache(maxsize=16)
 def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[dict[str, Any]]]:
     scored = _model_scored_candidates_for_date(signal_date)
@@ -3188,6 +3430,10 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
     for symbol, group in features.groupby("symbol", sort=False):
         try:
             enriched = add_b1_family_signals(group)
+            triple_volume = add_triple_volume_strategy_pool_signals(group)
+            for col in triple_volume.columns:
+                if col not in enriched.columns:
+                    enriched[col] = triple_volume[col]
         except Exception:
             continue
         latest = enriched[enriched["date"] == latest_date]
@@ -3273,6 +3519,7 @@ def _clear_selector_caches() -> None:
         _family_best_metrics,
         _family_best_metrics_by_signal,
         _family_risk_managed_metrics_by_signal,
+        _vegas_tunnel_best_metrics,
         _family_signals_for_date,
         _family_profiles_for_date,
         _latest_extended_signals,
@@ -3283,20 +3530,32 @@ def _clear_selector_caches() -> None:
             pass
 
 
-def _progress_steps() -> list[dict[str, Any]]:
+def _normalize_refresh_scope(scope: str | None = None) -> str:
+    if not scope:
+        return "all"
+    value = str(scope).strip()
+    aliases = {
+        "cb-allotment": "cbAllotment",
+        "allotment": "cbAllotment",
+        "convertible_bond": "cb",
+        "convertible-bond": "cb",
+    }
+    normalized = aliases.get(value, value)
+    if normalized not in REFRESH_SCOPE_STEPS:
+        raise ValueError(f"未知刷新范围: {scope}")
+    return normalized
+
+
+def _progress_steps(scope: str | None = None) -> list[dict[str, Any]]:
+    normalized = _normalize_refresh_scope(scope)
     return [
-        {"key": "refresh_data", "label": "拉取 Tushare 最新日线数据", "status": "pending", "percent": 10},
-        {"key": "feature_cache", "label": "增量构建 B1 特征缓存", "status": "pending", "percent": 35},
-        {"key": "daily_plan", "label": "生成最新策略每日计划", "status": "pending", "percent": 45},
-        {"key": "signal_cache", "label": "重建全市场策略规则信号", "status": "pending", "percent": 56},
-        {"key": "model_score", "label": "计算当日策略模型分", "status": "pending", "percent": 70},
-        {"key": "selector_core", "label": "计算短线核心股票池", "status": "pending", "percent": 78},
-        {"key": "selector_extended", "label": "计算短线全策略股票池", "status": "pending", "percent": 88},
-        {"key": "long_stock_pool", "label": "计算长线策略股票池", "status": "pending", "percent": 92},
-        {"key": "convertible_bond_plan", "label": "刷新可转债策略计划", "status": "pending", "percent": 94},
-        {"key": "convertible_bond_allotment", "label": "刷新配债股数据", "status": "pending", "percent": 96},
-        {"key": "byd_daily_plan", "label": "刷新 BYD 做T日线计划", "status": "pending", "percent": 97},
-        {"key": "snapshot", "label": "写入策略股票池快照", "status": "pending", "percent": 98},
+        {
+            "key": key,
+            "label": REFRESH_STEP_DEFINITIONS[key]["label"],
+            "status": "pending",
+            "percent": REFRESH_STEP_DEFINITIONS[key]["percent"],
+        }
+        for key in REFRESH_SCOPE_STEPS[normalized]
     ]
 
 
@@ -3349,10 +3608,12 @@ def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> d
         (key for key, value in LONG_VARIANTS.items() if value == variant),
         variant,
     )
-    if variant_key in TEA_LONG_VARIANTS:
-        payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
-    else:
-        payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with redirect_stdout(sink), redirect_stderr(sink):
+            if variant_key in TEA_LONG_VARIANTS:
+                payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
+            else:
+                payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
     _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
     return {
         "variant": variant_key,
@@ -3362,17 +3623,14 @@ def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> d
 
 
 def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | None) -> list[dict[str, Any]]:
-    with ThreadPoolExecutor(max_workers=max(1, len(variants))) as executor:
-        results = [
-            future.result()
-            for future in as_completed(
-                [executor.submit(_refresh_long_stock_pool_variant, variant, signal_date) for variant in variants]
-            )
-        ]
+    results = [
+        _refresh_long_stock_pool_variant(variant, signal_date)
+        for variant in variants
+    ]
     return sorted(results, key=lambda item: variants.index(item["variant"]))
 
 
-def _run_latest_refresh_job() -> None:
+def _run_latest_refresh_job(scope: str = "all") -> None:
     from quant.routine.pipeline import (
         build_features,
         generate_dashboard,
@@ -3382,23 +3640,27 @@ def _run_latest_refresh_job() -> None:
         score_latest_models,
     )
 
+    refresh_scope = _normalize_refresh_scope(scope)
+    refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
     with _REFRESH_LOCK:
         _REFRESH_STATUS.update(
             {
                 "status": "running",
                 "started_at": datetime.now().isoformat(timespec="seconds"),
                 "finished_at": None,
-                "message": "刷新任务已启动",
+                "message": f"{refresh_label}刷新任务已启动",
                 "percent": 1,
                 "current_step": "refresh_data",
-                "steps": _progress_steps(),
+                "steps": _progress_steps(refresh_scope),
+                "scope": refresh_scope,
+                "scope_label": refresh_label,
                 "result": None,
                 "error": None,
             }
         )
     try:
         results: dict[str, Any] = {}
-        _set_refresh_progress(step_key="refresh_data", message="正在拉取 Tushare 最新日线数据", percent=10)
+        _set_refresh_progress(step_key="refresh_data", message=f"{refresh_label}：正在共享拉取 Tushare 最新日线数据", percent=10)
         results["refresh_data"] = refresh_data(
             dry_run=False,
             progress_callback=lambda percent, message: _set_refresh_progress(
@@ -3417,6 +3679,83 @@ def _run_latest_refresh_job() -> None:
             percent=35,
             complete_previous=False,
         )
+
+        if refresh_scope not in {"all", "short"}:
+            signal_date = _latest_candidate_signal_date()
+            trade_date = str(signal_date).replace("-", "") if signal_date else None
+            if refresh_scope == "long":
+                _build_tea_master_stock_pool_cached.cache_clear()
+                _build_long_stock_pool_cached.cache_clear()
+                _set_refresh_progress(step_key="long_stock_pool", message="正在计算长线策略股票池", percent=92)
+                variants = _refresh_long_stock_pool_variants(["tea", "tea_safe", "v44"], signal_date)
+                results["long_stock_pool"] = {"status": "success", "variants": variants}
+                _set_refresh_progress(
+                    step_key="long_stock_pool",
+                    step_status="success",
+                    message="长线策略股票池生成完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "cb":
+                _set_refresh_progress(step_key="convertible_bond_plan", message="正在刷新可转债策略计划", percent=92)
+                payload = get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date))
+                results["convertible_bond_plan"] = {
+                    "status": "success",
+                    "trade_date": payload.get("trade_date") or signal_date,
+                    "candidates": len(payload.get("candidates") or payload.get("items") or []),
+                    "data_refresh": payload.get("data_refresh"),
+                }
+                _set_refresh_progress(
+                    step_key="convertible_bond_plan",
+                    step_status="success",
+                    message="可转债策略计划刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "cbAllotment":
+                _set_refresh_progress(step_key="convertible_bond_allotment", message="正在刷新配债股数据", percent=92)
+                payload = get_convertible_bond_allotments(80, 90, True, "pipeline")
+                results["convertible_bond_allotment"] = {
+                    "status": "success",
+                    "asof": payload.get("asof"),
+                    "records": len(payload.get("records") or []),
+                }
+                _set_refresh_progress(
+                    step_key="convertible_bond_allotment",
+                    step_status="success",
+                    message="配债股数据刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "byd":
+                _set_refresh_progress(step_key="byd_daily_plan", message="正在刷新 BYD 做T日线计划", percent=92)
+                payload = get_byd_daily_strategy(refresh=True)
+                planned_t = payload.get("planned_t") or {}
+                results["byd_daily_plan"] = {
+                    "status": "success",
+                    "signal_date": planned_t.get("signal_date"),
+                    "alerts": len(payload.get("alerts") or []),
+                }
+                _set_refresh_progress(
+                    step_key="byd_daily_plan",
+                    step_status="success",
+                    message="BYD 做T日线计划刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+
+            _set_refresh_progress(
+                status="success",
+                step_key=_REFRESH_STATUS.get("current_step"),
+                message=f"{refresh_label}刷新完成，共享数据与本页策略结果已生成",
+                percent=100,
+                result=results,
+            )
+            with _REFRESH_LOCK:
+                for step in _REFRESH_STATUS["steps"]:
+                    step["status"] = "success"
+                _persist_refresh_status_unlocked()
+            return
 
         _set_refresh_progress(
             step_key="feature_cache",
@@ -3532,6 +3871,27 @@ def _run_latest_refresh_job() -> None:
             percent=90,
             complete_previous=False,
         )
+
+        if refresh_scope == "short":
+            _set_refresh_progress(step_key="snapshot", message="正在写入短线策略股票池快照", percent=98)
+            written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+            results["snapshot"] = {
+                "status": "success",
+                "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
+                "strategy_pools": written_pools,
+            }
+            _set_refresh_progress(
+                status="success",
+                step_key="snapshot",
+                message="短线策略刷新完成，共享数据与本页策略结果已生成",
+                percent=100,
+                result=results,
+            )
+            with _REFRESH_LOCK:
+                for step in _REFRESH_STATUS["steps"]:
+                    step["status"] = "success"
+                _persist_refresh_status_unlocked()
+            return
 
         _build_tea_master_stock_pool_cached.cache_clear()
         _build_long_stock_pool_cached.cache_clear()
@@ -3655,20 +4015,29 @@ def _run_latest_refresh_job() -> None:
         )
 
 
-def start_latest_refresh() -> dict[str, Any]:
+def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
+    refresh_scope = _normalize_refresh_scope(scope)
+    refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
     with _REFRESH_LOCK:
         if _REFRESH_STATUS.get("status") == "running":
             return dict(_REFRESH_STATUS)
-        thread = threading.Thread(target=_run_latest_refresh_job, name="quant-latest-refresh", daemon=True)
+        thread = threading.Thread(
+            target=_run_latest_refresh_job,
+            args=(refresh_scope,),
+            name=f"quant-{refresh_scope}-refresh",
+            daemon=True,
+        )
         _REFRESH_STATUS.update(
             {
                 "status": "queued",
                 "started_at": datetime.now().isoformat(timespec="seconds"),
                 "finished_at": None,
-                "message": "刷新任务已进入后台队列",
+                "message": f"{refresh_label}刷新任务已进入后台队列",
                 "percent": 0,
                 "current_step": None,
-                "steps": _progress_steps(),
+                "steps": _progress_steps(refresh_scope),
+                "scope": refresh_scope,
+                "scope_label": refresh_label,
                 "result": None,
                 "error": None,
             }
@@ -3688,7 +4057,7 @@ def get_latest_refresh_status() -> dict[str, Any]:
                 return dict(_expire_stale_refresh_status_unlocked(persisted))
         if _is_refresh_status_stale(_REFRESH_STATUS):
             return dict(_expire_stale_refresh_status_unlocked(_REFRESH_STATUS))
-        return dict(_REFRESH_STATUS)
+        return _ensure_refresh_scope(_REFRESH_STATUS)
 
 
 def _selected_extended_keys(strategies: list[str] | None) -> set[str]:

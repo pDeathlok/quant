@@ -21,6 +21,8 @@ import pandas as pd
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from quant.features.variable_library import build_continuous_ohlc, calculate_project_extra_features
+from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
+from quant.strategies.custom.vegas_tunnel import OPTIMIZED_VEGAS_TUNNEL_PARAMS, add_vegas_tunnel_signals
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -182,6 +184,22 @@ def build_signal_specs() -> list[SignalSpec]:
             "放量下杀后尾盘收回，次日早盘确认",
             "日线收盘信号，T+1 开盘近似买入",
             "近三日放量下杀，随后J<-10且收盘位置>=40%",
+        ),
+        SignalSpec(
+            "signal_vegas_tunnel",
+            "VEGAS",
+            "日线级",
+            "维加斯隧道回踩后右侧确认，收盘确认",
+            "T+1 开盘买入",
+            "EMA144/169 维加斯隧道上行，EMA10>EMA20>隧道上沿，近8日回踩2.5%范围后收阳放量站上EMA10",
+        ),
+        SignalSpec(
+            "signal_tvb_merged",
+            "TRIPLE_VOLUME_BREAKOUT",
+            "日线级",
+            "缩量盘整后右侧突破，收盘确认",
+            "T+1 开盘买入",
+            "2.5倍量扩展候选池，3倍量命中提升为保守主策略；突破日前平均缩量，MA5>MA10>MA20且MA20上行",
         ),
     ]
 
@@ -376,9 +394,57 @@ def compute_signal_flags(df: pd.DataFrame) -> pd.DataFrame:
         & (close_pos >= 0.40)
     )
 
+    try:
+        vegas = add_vegas_tunnel_signals(out, **OPTIMIZED_VEGAS_TUNNEL_PARAMS)
+        flags["signal_vegas_tunnel"] = vegas["signal_vegas_tunnel"].astype(bool)
+    except Exception:
+        vegas = pd.DataFrame(index=out.index)
+        flags["signal_vegas_tunnel"] = False
+
+    try:
+        triple_volume = add_triple_volume_strategy_pool_signals(out)
+        flags["signal_tvb_merged"] = triple_volume["signal_tvb_merged"].astype(bool)
+        flags["signal_tvb_conservative"] = triple_volume["signal_tvb_conservative"].astype(bool)
+        flags["signal_tvb_expanded"] = triple_volume["signal_tvb_expanded"].astype(bool)
+    except Exception:
+        triple_volume = pd.DataFrame(index=out.index)
+        flags["signal_tvb_merged"] = False
+        flags["signal_tvb_conservative"] = False
+        flags["signal_tvb_expanded"] = False
+
     result = out[["symbol", "date", "open", "high", "low", "close", "pct_chg", "kdj_d_j"]].copy()
     if "name" in out.columns:
         result["name"] = out["name"]
+    for col in [
+        "vegas_tunnel_upper",
+        "vegas_tunnel_distance",
+        "vegas_tunnel_slope_20d",
+        "vegas_fast_spread",
+        "vegas_volume_strength",
+        "vegas_candidate_score",
+    ]:
+        if col in vegas.columns:
+            result[col] = vegas[col]
+    for col in [
+        "tvb_variant_id",
+        "tvb_variant_name",
+        "tvb_tier",
+        "tvb_score",
+        "tvb_volume_multiple",
+        "tvb_buy_plan",
+        "tvb_sell_plan",
+        "tvb_description",
+        "tvb_metrics",
+        "days_since_triple_volume",
+        "triple_volume_price",
+        "consolidation_range",
+        "breakout_pct",
+        "volume_dryness",
+        "volume_recovery",
+        "ma20_slope_5d",
+    ]:
+        if col in triple_volume.columns:
+            result[col] = triple_volume[col]
     for col in flags.columns:
         result[col] = flags[col].fillna(False).astype(bool)
     return result

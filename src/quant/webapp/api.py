@@ -31,6 +31,10 @@ class RefreshPlanRequest(BaseModel):
     signal_date: str | None = None
 
 
+class RefreshLatestRequest(BaseModel):
+    scope: str = "all"
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "quant-webapp"}
@@ -233,9 +237,12 @@ def selector_calendar(
 
 
 @router.post("/selector/refresh-latest")
-def selector_refresh_latest() -> dict[str, Any]:
+def selector_refresh_latest(body: RefreshLatestRequest | None = None) -> dict[str, Any]:
     try:
-        return start_latest_refresh()
+        payload = body or RefreshLatestRequest()
+        return start_latest_refresh(scope=payload.scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"最新数据刷新启动失败: {exc}") from exc
 

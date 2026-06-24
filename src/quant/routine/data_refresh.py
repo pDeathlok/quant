@@ -234,10 +234,9 @@ def _refresh_one_symbol_once(
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
     dataset = output_dir.name
     key = normalize_ts_code(symbol)
-    existing = store.read_frame(dataset, key)
     requested = _parse_trade_date(start_date)
     end = _parse_trade_date(end_date)
-    latest_existing = _latest_existing_trade_date(existing)
+    latest_existing = store.latest_trade_date(dataset, key)
     if (
         requested is not None
         and end is not None
@@ -251,6 +250,8 @@ def _refresh_one_symbol_once(
             f"本地数据已覆盖到 {end_date}，跳过重复刷新",
             attempts=0,
         )
+    existing = store.read_frame(dataset, key)
+    latest_existing = _latest_existing_trade_date(existing)
     effective_start = _symbol_refresh_start(existing, start_date)
     try:
         ts_df = tushare.get_stock_daily(symbol, effective_start, end_date, adjust=adjust)
@@ -550,7 +551,7 @@ def refresh_daily_data(
         "success": int((audit_df["status"] != "failed").sum()),
         "failed": int((audit_df["status"] == "failed").sum()),
         "suspended_no_data": int((audit_df["status"] == SUSPENDED_STATUS).sum()),
-        "retried_symbols": int((audit_df["attempts"] > 1).sum()),
+        "retried_symbols": int(((audit_df["attempts"] > 1) & (audit_df["status"] != "failed")).sum()),
     }
     manifest_path = audit_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

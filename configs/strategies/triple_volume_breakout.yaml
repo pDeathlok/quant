@@ -1,0 +1,53 @@
+# 三倍量缩量盘整突破合并短线策略
+#
+# Research record:
+#   reports/triple_volume_breakout/volume_multiple_comparison_20260623.csv
+#
+# Design:
+#   - 扩展候选池使用 2.5 倍量锚点，覆盖更多机会。
+#   - 保守主策略使用 3.0 倍量锚点，是扩展候选池中的高质量子层。
+#   - 同一股票同日同时命中时，以保守主策略的分数和操作计划为准。
+strategy:
+  id: triple_volume_breakout
+  name: 三倍量缩量盘整突破
+  group: TRIPLE_VOLUME_BREAKOUT
+  enabled: true
+  timeframe: 日线级，收盘确认，T+1 开盘观察
+  merged_signal: signal_tvb_merged
+  score_column: tvb_score
+  conservative_signal: signal_tvb_conservative
+  expanded_signal: signal_tvb_expanded
+  variants:
+    - id: tvb_conservative_v3_bull_no60
+      name: 保守主策略
+      tier: conservative
+      volume_multiple: 3.0
+      signal_mode: avg_pre_shrink_bull_no60
+      base_score: 92
+      position_hint: 小仓到标准短线仓，优先级高于扩展候选
+      buy_plan: T+1 开盘观察；若高开过大或跌破信号日低点则放弃，优先小仓试错。
+      sell_plan: 固定止盈 5%；盘中硬止损 2.5%；最长持有到 T+9；若提前跌破信号日突破结构则减仓或退出。
+      backtest_2024:
+        trades: 18
+        avg_return_pct: 2.396637
+        win_rate: 0.722222
+        max_drawdown_pct: -7.423568
+        profit_factor: 4.160687
+      description: 3倍量锚点；突破日前平均缩量；MA5>MA10>MA20 且 MA20 上行；不强制 MA60。
+
+    - id: tvb_expanded_v25_bull_no60
+      name: 扩展候选池
+      tier: expanded
+      volume_multiple: 2.5
+      signal_mode: avg_pre_shrink_bull_no60
+      base_score: 78
+      position_hint: 观察到小仓，必须结合市场环境和板块强度二次确认
+      buy_plan: T+1 开盘观察；只作为扩展候选，需结合市场环境、成交额和板块强度二次确认。
+      sell_plan: 优先沿用固定止盈 5%、硬止损 2.5%、最长 T+9；弱于保守层，仓位应低一档。
+      backtest_2024:
+        trades: 35
+        avg_return_pct: 1.845164
+        win_rate: 0.628571
+        max_drawdown_pct: -14.194666
+        profit_factor: 3.014726
+      description: 2.5倍量锚点；覆盖保守主策略，增加样本但回撤更高，需降仓和过滤。

@@ -71,7 +71,12 @@ def main() -> None:
         args.force_refresh,
         args.workers,
     )
-    family_cols = [col for col in family.columns if col.startswith(("b1_", "b2_", "b3_", "sb1_", "super_b1"))]
+    family_cols = [
+        col
+        for col in family.columns
+        if col.startswith(("b1_", "b2_", "b3_", "sb1_", "super_b1", "signal_vegas"))
+        or col.startswith("signal_tvb")
+    ]
     extended_cols = [
         "CHANGAN",
         "PINGHANG",

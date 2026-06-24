@@ -29,6 +29,22 @@ const state = {
 
 const API_BASE = "/api";
 const REFRESH_STATUS_STORAGE_KEY = "quant.selector.latestRefreshStatus";
+const REFRESH_SCOPE_LABELS = {
+  all: "全部",
+  short: "短线",
+  long: "长线",
+  cb: "可转债",
+  cbAllotment: "配债股",
+  byd: "BYD",
+};
+const REFRESH_BUTTON_LABELS = {
+  refreshAllButton: "更新全部",
+  refreshLatestButton: "更新本页",
+  longRefreshLatestButton: "更新本页",
+  cbRefreshLatestButton: "更新本页",
+  cbAllotmentRefreshLatestButton: "更新本页",
+  bydRefreshLatestButton: "更新本页",
+};
 
 const longStrategies = [
   {
@@ -1723,10 +1739,11 @@ function setRefreshStatus(status) {
   state.latestRefreshStatus = status;
   const time = status.finished_at || status.started_at || "";
   const percent = Number(status.percent || 0);
+  const scopeLabel = status.scope_label || REFRESH_SCOPE_LABELS[status.scope] || "";
   localStorage.setItem(REFRESH_STATUS_STORAGE_KEY, JSON.stringify(status));
   const statusHtml = `
     <div class="refresh-status-line">
-      <span>${status.message || status.status}${time ? ` · ${time}` : ""}</span>
+      <span>${scopeLabel ? `${scopeLabel} · ` : ""}${status.message || status.status}${time ? ` · ${time}` : ""}</span>
       <strong>${percent}%</strong>
     </div>
     <div class="refresh-progress-track">
@@ -1741,10 +1758,41 @@ function setRefreshStatus(status) {
 }
 
 function setRefreshButtonRunning(isRunning) {
-  document.querySelectorAll("#refreshLatestButton, #longRefreshLatestButton").forEach((button) => {
+  document.querySelectorAll("#refreshAllButton, [data-refresh-scope]").forEach((button) => {
     button.disabled = isRunning;
-    button.textContent = isRunning ? "更新中" : "一键更新数据";
+    button.textContent = isRunning ? "更新中" : (REFRESH_BUTTON_LABELS[button.id] || "更新本页");
   });
+}
+
+async function reloadAfterRefresh(status) {
+  const scope = status?.scope || "all";
+  const shouldReloadShort = scope === "all" || scope === "short";
+  const shouldReloadLong = scope === "all" || scope === "long";
+  const shouldReloadCb = scope === "all" || scope === "cb";
+  const shouldReloadAllotment = scope === "all" || scope === "cbAllotment";
+  const shouldReloadByd = scope === "all" || scope === "byd";
+
+  if (shouldReloadShort) {
+    state.signalDate = "";
+    state.selectedSymbol = null;
+    await loadCalendar().catch(showError);
+  }
+  if (shouldReloadLong) state.longPayload = null;
+  if (shouldReloadCb) state.cbPayload = null;
+  if (shouldReloadAllotment) state.cbAllotmentPayload = null;
+  if (shouldReloadByd) state.bydPayload = null;
+
+  if (state.activePage === "long" && shouldReloadLong) {
+    await loadLongStockPool();
+  } else if (state.activePage === "cb" && shouldReloadCb) {
+    await loadConvertibleBondPlan();
+  } else if (state.activePage === "cbAllotment" && shouldReloadAllotment) {
+    await loadConvertibleBondAllotments();
+  } else if (state.activePage === "byd" && shouldReloadByd) {
+    await loadBydMinuteStrategy();
+  } else if (state.activePage === "short" && shouldReloadShort) {
+    await loadSelector();
+  }
 }
 
 function startRefreshPolling() {
@@ -1764,18 +1812,7 @@ async function pollLatestRefresh() {
   setRefreshStatus(status);
   if (status.status === "success") {
     stopRefreshPolling();
-    state.signalDate = "";
-    state.selectedSymbol = null;
-    state.longPayload = null;
-    await loadCalendar().catch(showError);
-    if (state.activePage === "long") {
-      await loadLongStockPool();
-    } else if (state.activePage === "cb") {
-      state.cbPayload = null;
-      await loadConvertibleBondPlan();
-    } else {
-      await loadSelector();
-    }
+    await reloadAfterRefresh(status);
     setRefreshButtonRunning(false);
   } else if (status.status === "failed") {
     stopRefreshPolling();
@@ -1808,10 +1845,13 @@ async function restoreLatestRefreshStatus() {
   }
 }
 
-async function startLatestDataRefresh() {
+async function startLatestDataRefresh(scope = "all") {
   setRefreshButtonRunning(true);
   try {
-    const status = await fetchJson("/selector/refresh-latest", { method: "POST" });
+    const status = await fetchJson("/selector/refresh-latest", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    });
     setRefreshStatus(status);
     startRefreshPolling();
     await pollLatestRefresh();
@@ -1821,8 +1861,14 @@ async function startLatestDataRefresh() {
   }
 }
 
-document.querySelectorAll("#refreshLatestButton, #longRefreshLatestButton").forEach((button) => {
-  button.addEventListener("click", startLatestDataRefresh);
+document.querySelector("#refreshAllButton")?.addEventListener("click", () => {
+  startLatestDataRefresh("all");
+});
+
+document.querySelectorAll("[data-refresh-scope]").forEach((button) => {
+  button.addEventListener("click", () => {
+    startLatestDataRefresh(button.dataset.refreshScope || "all");
+  });
 });
 
 document.querySelectorAll(".page-tab").forEach((button) => {

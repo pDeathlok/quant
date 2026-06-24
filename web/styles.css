@@ -111,6 +111,26 @@ h3 {
   line-height: 1.55;
 }
 
+.global-refresh-card {
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  margin-bottom: 22px;
+  padding: 12px;
+}
+
+.global-refresh-card > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.global-refresh-card button {
+  width: 100%;
+}
+
 .side-section {
   display: grid;
   gap: 10px;
@@ -292,8 +312,8 @@ h3 {
   align-items: end;
   display: grid;
   gap: 10px;
-  grid-template-columns: repeat(6, minmax(104px, 1fr)) auto;
-  max-width: 940px;
+  grid-template-columns: repeat(6, minmax(104px, 1fr)) repeat(2, auto);
+  max-width: 1120px;
 }
 
 .byd-toolbar-actions label {
@@ -1606,6 +1626,29 @@ h3 {
   justify-items: stretch;
   min-height: 34px;
   text-align: right;
+}
+
+.refresh-status.compact {
+  min-height: 0;
+  text-align: left;
+}
+
+.refresh-status.compact .refresh-status-line {
+  align-items: flex-start;
+  display: grid;
+  gap: 4px;
+  justify-content: stretch;
+}
+
+.progress-steps.compact {
+  justify-content: flex-start;
+}
+
+.progress-steps.compact .progress-step {
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 6px;
 }
 
 .date-calendar {

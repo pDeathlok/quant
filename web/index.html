@@ -21,6 +21,12 @@
             <span>工作区</span>
           <p>顶部 Tab 切换短线、长线、可转债、配债股与 BYD 做T。左侧区域跟随当前工作区显示对应策略选择。</p>
         </div>
+        <div class="global-refresh-card">
+          <span>全局更新</span>
+          <button id="refreshAllButton" type="button">更新全部</button>
+          <div class="refresh-status compact"></div>
+          <div class="progress-steps compact"></div>
+        </div>
         <div id="strategyFilterSection" class="side-section">
           <span>策略筛选</span>
           <div id="strategyFilters" class="filter-list"></div>
@@ -105,7 +111,7 @@
             </div>
             <input id="searchInput" type="search" placeholder="搜索股票 / 策略" />
             <button id="reloadButton" type="button">刷新当前日期</button>
-            <button id="refreshLatestButton" type="button">一键更新数据</button>
+            <button id="refreshLatestButton" type="button" data-refresh-scope="short">更新本页</button>
           </div>
           <div id="refreshStatus" class="refresh-status"></div>
           <div id="progressSteps" class="progress-steps"></div>
@@ -190,7 +196,7 @@
           </div>
           <div class="long-toolbar-actions">
             <div id="longDateSlot" class="long-date-slot"></div>
-            <button id="longRefreshLatestButton" type="button">一键更新数据</button>
+            <button id="longRefreshLatestButton" type="button" data-refresh-scope="long">更新本页</button>
             <div class="long-summary">
               <span id="longSummaryLabel">主推荐</span>
               <strong id="longSummaryName">茶大长线趋势网格</strong>
@@ -316,7 +322,10 @@
           </div>
           <div class="toolbar-actions">
             <div id="cbDateSlot"></div>
+            <button id="cbRefreshLatestButton" type="button" data-refresh-scope="cb">更新本页</button>
           </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
         </section>
 
         <section id="cbMetrics" class="metrics-grid cb-metrics"></section>
@@ -399,6 +408,11 @@
             <em>切到配债股页签后读取后端数据</em>
             <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">刷新配债数据</button>
           </div>
+          <div class="toolbar-actions">
+            <button id="cbAllotmentRefreshLatestButton" type="button" data-refresh-scope="cbAllotment">更新本页</button>
+          </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
         </section>
 
         <section class="panel allotment-table-panel">
@@ -542,7 +556,10 @@
               <input id="bydOpenTPriceInput" type="number" min="0" step="0.01" value="" />
             </label>
             <button id="bydRefreshButton" type="button">刷新日线计划</button>
+            <button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页</button>
           </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
         </section>
 
         <section class="panel byd-range-panel">
