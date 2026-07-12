@@ -275,6 +275,37 @@ def generate_daily_plan() -> dict:
     return {"status": "success", "output": str(output)}
 
 
+def refresh_daily_web_workspaces() -> dict[str, dict]:
+    """Refresh workspaces whose source data or forecasts change every day."""
+
+    from quant.webapp.services import (
+        get_convertible_bond_allotments,
+        refresh_similar_pattern_analysis,
+    )
+
+    results: dict[str, dict] = {}
+    try:
+        allotments = get_convertible_bond_allotments(refresh=True)
+        results["convertible_bond_allotments"] = {
+            "status": "success",
+            "generated_at": allotments.get("generated_at"),
+            "records": len(allotments.get("records") or []),
+        }
+    except Exception as exc:
+        results["convertible_bond_allotments"] = {"status": "failed", "error": str(exc)}
+
+    try:
+        similar = refresh_similar_pattern_analysis()
+        results["similar_patterns"] = {
+            "status": "success",
+            "generated_at": similar.get("generated_at"),
+            "targets": len(similar.get("results") or []),
+        }
+    except Exception as exc:
+        results["similar_patterns"] = {"status": "failed", "error": str(exc)}
+    return results
+
+
 def write_run_manifest(results: dict, strategies: list[StrategyConfig]) -> Path:
     run_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = ROUTINE_DIR / run_date
@@ -311,5 +342,6 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
         results["run_selected_strategies"] = run_selected_strategies()
     results["generate_daily_plan"] = generate_daily_plan()
     results["generate_dashboard"] = generate_dashboard()
+    results["refresh_daily_web_workspaces"] = refresh_daily_web_workspaces()
     manifest = write_run_manifest(results, strategies)
     return {"manifest": str(manifest), "steps": results}

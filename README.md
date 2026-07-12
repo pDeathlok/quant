@@ -71,6 +71,9 @@ http://127.0.0.1:8088
 PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
 ```
 
+每日任务同时刷新配债股工作区和相似走势决策台。Web 端也会校验 `generated_at`：若缓存
+不是当天生成，首次打开对应 Tab 时会自动补刷，页面上的“刷新”按钮仍可用于手工强制更新。
+
 手工补跑日线数据：
 
 ```bash

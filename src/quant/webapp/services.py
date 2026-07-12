@@ -198,6 +198,7 @@ REFRESH_SCOPE_LABELS = {
     "cb": "可转债策略",
     "cbAllotment": "配债股",
     "byd": "BYD 做T",
+    "similar": "相似走势",
 }
 REFRESH_SCOPE_STEPS = {
     "all": [
@@ -213,6 +214,7 @@ REFRESH_SCOPE_STEPS = {
         "convertible_bond_plan",
         "convertible_bond_allotment",
         "byd_daily_plan",
+        "similar_patterns",
         "snapshot",
     ],
     "short": [
@@ -230,6 +232,7 @@ REFRESH_SCOPE_STEPS = {
     "cb": ["refresh_data", "convertible_bond_plan"],
     "cbAllotment": ["refresh_data", "convertible_bond_allotment"],
     "byd": ["refresh_data", "byd_daily_plan"],
+    "similar": ["refresh_data", "similar_patterns"],
 }
 REFRESH_STEP_DEFINITIONS = {
     "refresh_data": {"label": "拉取 Tushare 最新日线数据", "percent": 10},
@@ -244,12 +247,14 @@ REFRESH_STEP_DEFINITIONS = {
     "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
     "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
     "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
+    "similar_patterns": {"label": "刷新相似走势决策台", "percent": 97},
     "snapshot": {"label": "写入策略股票池快照", "percent": 98},
 }
 SIMILAR_PATTERN_STATE_DIR = PROJECT_ROOT / "data/research/similar_patterns"
 SIMILAR_PATTERN_WATCHLIST_PATH = SIMILAR_PATTERN_STATE_DIR / "watchlist.json"
 SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analysis.json"
 SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
+CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH = PROJECT_ROOT / "data/routine/convertible_bond_allotments_latest.json"
 SIMILAR_PATTERN_DEFAULT_WATCHLIST = ["002594.SZ", "002788.SZ"]
 SIMILAR_PATTERN_CONFIG = SimilarPatternConfig(
     candidate_step_days=1,
@@ -360,6 +365,25 @@ def read_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(str(path))
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_daily_payload_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        return read_json_file(path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_daily_payload_cache(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _is_daily_payload_current(payload: dict[str, Any], today: date | None = None) -> bool:
+    generated_at = pd.to_datetime(payload.get("generated_at"), errors="coerce")
+    if pd.isna(generated_at):
+        return False
+    return generated_at.date() == (today or date.today())
 
 
 def _load_project_env() -> None:
@@ -1824,7 +1848,7 @@ def refresh_similar_pattern_analysis() -> dict[str, Any]:
         SIMILAR_PATTERN_CONFIG,
         SIMILAR_PATTERN_VECTOR_CACHE_DIR,
         target_symbols=set(symbols),
-        workers=max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "1"))),
+        workers=max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "4"))),
     )
     results = analyze_targets_by_threshold(
         DAILY_DIR,
@@ -1860,7 +1884,7 @@ def refresh_similar_pattern_analysis() -> dict[str, Any]:
 def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
     if not refresh:
         cached = _read_similar_pattern_analysis_cache()
-        if cached is not None:
+        if cached is not None and _is_daily_payload_current(cached):
             cached["cache"] = {"hit": True, "backend": "json"}
             return cached
     return refresh_similar_pattern_analysis()
@@ -2371,16 +2395,21 @@ def get_convertible_bond_allotments(
         "include_listed_days": int(include_listed_days),
         "stage_scope": str(stage_scope),
     }
+    cached = None
     if not refresh:
         cached = _read_workspace_snapshot("convertible_bond_allotments", params=params)
-        if cached is not None:
+        if cached is None:
+            cached = _read_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH)
+        if cached is not None and _is_daily_payload_current(cached):
             return cached
+    daily_refresh_required = refresh or cached is None or not _is_daily_payload_current(cached)
     payload = build_convertible_bond_allotment_payload(
         limit=limit,
         include_listed_days=include_listed_days,
-        refresh=refresh,
+        refresh=daily_refresh_required,
         stage_scope=stage_scope,
     )
+    _write_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH, payload)
     _write_workspace_snapshot(
         "convertible_bond_allotments",
         payload.get("asof") or payload.get("trade_date") or payload.get("generated_at"),
@@ -4184,6 +4213,21 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
                     percent=98,
                     complete_previous=False,
                 )
+            elif refresh_scope == "similar":
+                _set_refresh_progress(step_key="similar_patterns", message="正在刷新相似走势决策台", percent=92)
+                payload = refresh_similar_pattern_analysis()
+                results["similar_patterns"] = {
+                    "status": "success",
+                    "generated_at": payload.get("generated_at"),
+                    "targets": len(payload.get("results") or []),
+                }
+                _set_refresh_progress(
+                    step_key="similar_patterns",
+                    step_status="success",
+                    message="相似走势决策台刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
 
             _set_refresh_progress(
                 status="success",
@@ -4341,31 +4385,37 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
         trade_date = str(signal_date).replace("-", "") if signal_date else None
         _set_refresh_progress(
             step_key="chan_model_strategy",
-            message="正在并行计算长线、缠论、可转债、配债股与 BYD 工作区",
+            message="正在并行计算长线、缠论、可转债、配债股、BYD 与相似走势工作区",
             percent=92,
             complete_previous=False,
         )
         _set_refresh_progress(
             step_key="long_stock_pool",
-            message="正在并行计算长线、缠论、可转债、配债股与 BYD 工作区",
+            message="正在并行计算长线、缠论、可转债、配债股、BYD 与相似走势工作区",
             percent=92,
             complete_previous=False,
         )
         _set_refresh_progress(
             step_key="convertible_bond_plan",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
             percent=92,
             complete_previous=False,
         )
         _set_refresh_progress(
             step_key="convertible_bond_allotment",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
             percent=92,
             complete_previous=False,
         )
         _set_refresh_progress(
             step_key="byd_daily_plan",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
+            percent=92,
+            complete_previous=False,
+        )
+        _set_refresh_progress(
+            step_key="similar_patterns",
+            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
             percent=92,
             complete_previous=False,
         )
@@ -4388,6 +4438,10 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
                     "配债股数据刷新失败",
                 ),
                 executor.submit(get_byd_daily_strategy, refresh=True): ("byd_daily_plan", "BYD 做T日线计划刷新失败"),
+                executor.submit(refresh_similar_pattern_analysis): (
+                    "similar_patterns",
+                    "相似走势决策台刷新失败",
+                ),
             }
             for future in as_completed(futures):
                 result_key, failure_message = futures[future]
@@ -4426,6 +4480,12 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
                         "asof": payload.get("asof"),
                         "records": len(payload.get("records") or []),
                     }
+                elif result_key == "similar_patterns":
+                    results[result_key] = {
+                        "status": "success",
+                        "generated_at": payload.get("generated_at"),
+                        "targets": len(payload.get("results") or []),
+                    }
                 else:
                     planned_t = payload.get("planned_t") or {}
                     results[result_key] = {
@@ -4443,6 +4503,7 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
                         "convertible_bond_plan": 95,
                         "convertible_bond_allotment": 96,
                         "byd_daily_plan": 97,
+                        "similar_patterns": 97,
                     }[result_key],
                     complete_previous=False,
                 )
