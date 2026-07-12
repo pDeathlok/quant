@@ -7,8 +7,10 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from quant.webapp.services import (
+    add_similar_pattern_watch_symbol,
     get_byd_daily_strategy,
     get_b1_plan,
+    get_chan_model_strategy_plan,
     get_convertible_bond_allotments,
     get_convertible_bond_grid_plan,
     get_dashboard,
@@ -16,9 +18,14 @@ from quant.webapp.services import (
     get_long_stock_pool,
     get_selector_calendar,
     get_research_index,
+    get_similar_pattern_analysis,
+    get_similar_pattern_watchlist,
     get_stock_selector_payload,
+    refresh_similar_pattern_analysis,
     refresh_b1_plan,
+    refresh_chan_model_strategy_plan,
     refresh_dashboard,
+    remove_similar_pattern_watch_symbol,
     start_latest_refresh,
 )
 
@@ -33,6 +40,10 @@ class RefreshPlanRequest(BaseModel):
 
 class RefreshLatestRequest(BaseModel):
     scope: str = "all"
+
+
+class SimilarPatternWatchRequest(BaseModel):
+    symbol: str
 
 
 @router.get("/health")
@@ -146,6 +157,37 @@ def b1_research(limit: int = Query(default=200, ge=1, le=2000)) -> dict[str, Any
         raise HTTPException(status_code=500, detail=f"B1 研究结果读取失败: {exc}") from exc
 
 
+@router.get("/chan/strategy-plan")
+def chan_strategy_plan(
+    top_n: int = Query(default=20, ge=1, le=100),
+    signal_date: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        if signal_date:
+            date.fromisoformat(signal_date)
+        return get_chan_model_strategy_plan(top_n=top_n, refresh=refresh, signal_date=signal_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"缠论策略参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"缠论策略计划生成失败: {exc}") from exc
+
+
+@router.post("/chan/strategy-plan/refresh")
+def chan_strategy_plan_refresh(
+    top_n: int = Query(default=20, ge=1, le=100),
+    signal_date: str | None = None,
+) -> dict[str, Any]:
+    try:
+        if signal_date:
+            date.fromisoformat(signal_date)
+        return refresh_chan_model_strategy_plan(top_n=top_n, signal_date=signal_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"缠论策略参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"缠论策略计划刷新失败: {exc}") from exc
+
+
 @router.get("/long/stock-pool")
 def long_stock_pool(
     variant: str = Query(default="tea"),
@@ -250,3 +292,47 @@ def selector_refresh_latest(body: RefreshLatestRequest | None = None) -> dict[st
 @router.get("/selector/refresh-latest/status")
 def selector_refresh_latest_status() -> dict[str, Any]:
     return get_latest_refresh_status()
+
+
+@router.get("/similar-patterns/watchlist")
+def similar_pattern_watchlist() -> dict[str, Any]:
+    try:
+        return get_similar_pattern_watchlist()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势自选池读取失败: {exc}") from exc
+
+
+@router.post("/similar-patterns/watchlist")
+def add_similar_pattern_watchlist_symbol(body: SimilarPatternWatchRequest) -> dict[str, Any]:
+    try:
+        return add_similar_pattern_watch_symbol(body.symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势自选池保存失败: {exc}") from exc
+
+
+@router.delete("/similar-patterns/watchlist/{symbol}")
+def delete_similar_pattern_watchlist_symbol(symbol: str) -> dict[str, Any]:
+    try:
+        return remove_similar_pattern_watch_symbol(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势自选池删除失败: {exc}") from exc
+
+
+@router.get("/similar-patterns/analysis")
+def similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
+    try:
+        return get_similar_pattern_analysis(refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势分析失败: {exc}") from exc
+
+
+@router.post("/similar-patterns/analysis/refresh")
+def refresh_similar_pattern_analysis_api() -> dict[str, Any]:
+    try:
+        return refresh_similar_pattern_analysis()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势分析刷新失败: {exc}") from exc

@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional, Callable
 from .broker import Broker, Order, OrderSide
-from risk.manager import RiskManager
+from quant.risk.manager import RiskManager
 
 
 class OrderManager:

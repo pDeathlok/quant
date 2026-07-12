@@ -37,6 +37,19 @@ class TestMarketDataStore:
         assert list(loaded["symbol"].unique()) == ["TEST"]
 
 
+class TestDataStorage:
+    def test_partitioned_parquet_roundtrip_and_filter(self, tmp_path):
+        from quant.data import DataStorage
+
+        storage = DataStorage(tmp_path)
+        source = pd.DataFrame({"year": [2025, 2026], "value": [1.0, 2.0]})
+
+        storage.save_parquet(source, "sample", partition_by="year")
+        loaded = storage.load_parquet("sample", partition_filter={"year": 2026})
+
+        assert loaded.to_dict("records") == [{"value": 2.0, "year": 2026}]
+
+
 class TestTechnicalFactors:
     def test_ma_calculation(self, sample_data):
         from quant.data.factors import MA
@@ -144,6 +157,12 @@ class TestRiskManager:
             assert manager._check_order_rate() is True
 
         assert manager._check_order_rate() is False
+
+
+def test_trading_package_imports_order_manager():
+    from quant.trading import OrderManager
+
+    assert OrderManager.__name__ == "OrderManager"
 
 
 if __name__ == "__main__":

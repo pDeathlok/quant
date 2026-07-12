@@ -227,7 +227,7 @@ h3 {
   border-radius: 8px;
   display: grid;
   gap: 4px;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   padding: 4px;
 }
 
@@ -1873,6 +1873,46 @@ button:disabled {
   gap: 12px;
 }
 
+.chan-performance {
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) repeat(2, minmax(220px, 1.2fr));
+  min-height: 74px;
+  padding: 10px 16px;
+}
+
+.chan-performance-title,
+.chan-performance-item {
+  display: grid;
+  gap: 4px;
+}
+
+.chan-performance-title span,
+.chan-performance-item span,
+.chan-performance-item em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.chan-performance-title strong {
+  font-size: 14px;
+}
+
+.chan-performance-item {
+  border-left: 1px solid var(--line);
+  grid-template-columns: minmax(64px, auto) minmax(70px, auto) 1fr;
+  align-items: baseline;
+  padding-left: 18px;
+}
+
+.chan-performance-item strong {
+  font-size: 19px;
+}
+
 .metric {
   padding: 14px;
 }
@@ -1886,6 +1926,15 @@ button:disabled {
   display: block;
   font-size: 22px;
   margin-top: 8px;
+}
+
+.metric em {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.35;
+  margin-top: 4px;
 }
 
 .operation-grid {
@@ -2154,12 +2203,242 @@ th {
   padding: 7px 9px;
 }
 
+.chan-table td:first-child strong {
+  display: block;
+}
+
+.chan-table td:first-child span {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.chan-table tr {
+  cursor: pointer;
+}
+
+.chan-detail-cards {
+  max-height: 760px;
+}
+
+.chan-mini-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.chan-mini-card {
+  min-height: 96px;
+}
+
+.chan-mini-card span {
+  color: var(--muted);
+  display: block;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.chan-mini-card strong {
+  display: block;
+  font-size: 18px;
+}
+
+.chan-mini-card p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 8px;
+}
+
 .notes {
   margin: 0;
   padding: 14px 18px 16px 34px;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.7;
+}
+
+.similar-toolbar {
+  grid-template-columns: minmax(280px, 1fr) minmax(360px, auto);
+}
+
+.similar-add-form {
+  align-items: end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+}
+
+.similar-add-form label {
+  display: grid;
+  gap: 6px;
+}
+
+.similar-add-form span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.similar-watchlist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.similar-watch-table-wrap {
+  max-height: 360px;
+}
+
+.similar-watch-table th,
+.similar-watch-table td {
+  white-space: nowrap;
+}
+
+.similar-watch-row {
+  cursor: pointer;
+}
+
+.similar-watch-row.active {
+  background: var(--accent-soft);
+}
+
+.similar-watch-row button {
+  min-height: 30px;
+  padding: 4px 10px;
+}
+
+.similar-watch-item {
+  align-items: center;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: flex;
+  gap: 10px;
+  min-height: 42px;
+  padding: 8px 10px;
+}
+
+.similar-watch-item strong {
+  font-size: 14px;
+}
+
+.similar-watch-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.similar-watch-item button {
+  border-color: transparent;
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+.similar-card-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.similar-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.similar-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.similar-card-head,
+.similar-forecast-row,
+.similar-model-item {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.similar-card-head span,
+.similar-card small,
+.similar-model-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.similar-snapshot {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.similar-snapshot div {
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+}
+
+.similar-snapshot span,
+.similar-forecast-row span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.similar-snapshot strong,
+.similar-forecast-row strong {
+  font-size: 14px;
+}
+
+.similar-forecast {
+  display: grid;
+  gap: 6px;
+}
+
+.similar-split {
+  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.8fr);
+}
+
+.similar-scenario-wrap {
+  max-height: 520px;
+}
+
+.similar-scenario-table th,
+.similar-scenario-table td {
+  white-space: nowrap;
+}
+
+.similar-model-list {
+  display: grid;
+  gap: 8px;
+}
+
+.similar-model-item {
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.similar-model-item strong {
+  font-size: 14px;
+}
+
+.similar-action-sell {
+  color: var(--warn);
+  font-weight: 700;
+}
+
+.similar-action-buy {
+  color: var(--good);
+  font-weight: 700;
 }
 
 @media (max-width: 1100px) {
@@ -2184,6 +2463,19 @@ th {
   .long-strategy-grid,
   .long-notes {
     grid-template-columns: 1fr;
+  }
+
+  .chan-performance {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .chan-performance-title {
+    grid-column: 1 / -1;
+  }
+
+  .chan-performance-title + .chan-performance-item {
+    border-left: 0;
+    padding-left: 0;
   }
 
   .toolbar {
@@ -2249,16 +2541,23 @@ th {
   .byd-grid,
   .cb-split,
   .byd-split,
+  .similar-split,
+  .chan-mini-grid,
   .byd-ladder,
   .byd-dynamic-zones {
     grid-template-columns: 1fr;
   }
 
-  .byd-trade-toast {
-    bottom: 12px;
+  .similar-toolbar,
+  .similar-add-form {
     grid-template-columns: 1fr;
-    left: 12px;
-    max-width: none;
+  }
+
+.byd-trade-toast {
+  bottom: 12px;
+  grid-template-columns: 1fr;
+  left: 12px;
+  max-width: none;
     right: 12px;
   }
 

@@ -107,7 +107,7 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         cwd=PROJECT_ROOT,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
@@ -124,14 +124,13 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
                 percent=10 + int(ratio * 25),
                 message=f"正在拉取 Tushare 最新日线数据：{done}/{total}，成功 {ok}，失败 {failed}",
             )
-    stderr = process.stderr.read() if process.stderr is not None else ""
     returncode = process.wait()
     stdout = "".join(stdout_lines)
     return {
         "status": "success" if returncode == 0 else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
-        "stderr_tail": stderr[-4000:],
+        "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
     }
@@ -154,7 +153,7 @@ def build_features(progress_callback=None) -> dict:
         cwd=PROJECT_ROOT,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
@@ -171,14 +170,13 @@ def build_features(progress_callback=None) -> dict:
                 percent=35 + int(ratio * 10),
                 message=f"正在增量构建 B1 特征：{done}/{total}，命中 {frames}",
             )
-    stderr = process.stderr.read() if process.stderr is not None else ""
     returncode = process.wait()
     stdout = "".join(stdout_lines)
     return {
         "status": "success" if returncode == 0 else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
-        "stderr_tail": stderr[-4000:],
+        "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
     }
@@ -200,7 +198,7 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         cwd=PROJECT_ROOT,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
@@ -225,14 +223,13 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
                 percent=percent,
                 message=f"正在增量重建{label}：{done}/{total}",
             )
-    stderr = process.stderr.read() if process.stderr is not None else ""
     returncode = process.wait()
     stdout = "".join(stdout_lines)
     return {
         "status": "success" if returncode == 0 else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
-        "stderr_tail": stderr[-4000:],
+        "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
     }

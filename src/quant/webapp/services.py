@@ -26,6 +26,13 @@ from quant.routine.convertible_bond_allotment import build_convertible_bond_allo
 from quant.routine.convertible_bond_grid_plan import build_convertible_bond_grid_plan, refresh_convertible_bond_daily
 from quant.routine.dashboard import DASHBOARD_PATH, build_dashboard_payload, write_dashboard_json
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT, WEB_DATA_DIR
+from quant.research.similar_patterns import (
+    SimilarPatternConfig,
+    SimilarPatternResult,
+    analyze_targets_by_threshold,
+    build_vector_caches_parallel,
+    load_stock_basic,
+)
 from quant.strategies.custom.byd_minute_t import BydHolding, build_minute_payload, load_daily_qfq
 from quant.strategies.custom.b1_family import add_b1_family_signals
 from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
@@ -33,6 +40,11 @@ from quant.strategies.custom.z_skill_patterns import (
     EXTENDED_STRATEGIES,
     build_extended_daily_signals,
     _stock_basic_map,
+)
+from quant.strategies.custom.chan_model import (
+    add_chan_model_strategy_columns,
+    select_chan_model_candidates,
+    summarize_chan_model_strategy,
 )
 
 
@@ -181,6 +193,7 @@ _REFRESH_STATUS: dict[str, Any] = {
 REFRESH_SCOPE_LABELS = {
     "all": "全部工作区",
     "short": "短线策略",
+    "chan": "缠论策略",
     "long": "长线策略",
     "cb": "可转债策略",
     "cbAllotment": "配债股",
@@ -195,6 +208,7 @@ REFRESH_SCOPE_STEPS = {
         "model_score",
         "selector_core",
         "selector_extended",
+        "chan_model_strategy",
         "long_stock_pool",
         "convertible_bond_plan",
         "convertible_bond_allotment",
@@ -211,6 +225,7 @@ REFRESH_SCOPE_STEPS = {
         "selector_extended",
         "snapshot",
     ],
+    "chan": ["refresh_data", "chan_model_strategy"],
     "long": ["refresh_data", "long_stock_pool"],
     "cb": ["refresh_data", "convertible_bond_plan"],
     "cbAllotment": ["refresh_data", "convertible_bond_allotment"],
@@ -224,12 +239,30 @@ REFRESH_STEP_DEFINITIONS = {
     "model_score": {"label": "计算当日策略模型分", "percent": 70},
     "selector_core": {"label": "计算短线核心股票池", "percent": 78},
     "selector_extended": {"label": "计算短线全策略股票池", "percent": 88},
+    "chan_model_strategy": {"label": "生成缠论模型策略候选", "percent": 90},
     "long_stock_pool": {"label": "计算长线策略股票池", "percent": 92},
     "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
     "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
     "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
     "snapshot": {"label": "写入策略股票池快照", "percent": 98},
 }
+SIMILAR_PATTERN_STATE_DIR = PROJECT_ROOT / "data/research/similar_patterns"
+SIMILAR_PATTERN_WATCHLIST_PATH = SIMILAR_PATTERN_STATE_DIR / "watchlist.json"
+SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analysis.json"
+SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
+SIMILAR_PATTERN_DEFAULT_WATCHLIST = ["002594.SZ", "002788.SZ"]
+SIMILAR_PATTERN_CONFIG = SimilarPatternConfig(
+    candidate_step_days=1,
+    candidate_start_date="2018-01-01",
+    similarity_threshold=0.055,
+    take_profit_3d=0.03,
+    stop_loss_3d=0.03,
+)
+CHAN_MODEL_SCORED_PATH = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
+CHAN_MODEL_STRATEGY_DIR = PROJECT_ROOT / "reports/chan_daily/model_strategy"
+CHAN_MODEL_STRATEGY_SCORED_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_scored.parquet"
+CHAN_MODEL_LATEST_CANDIDATES_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_latest_candidates.csv"
+CHAN_MODEL_SUMMARY_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_summary.csv"
 
 
 def _persist_refresh_status_unlocked() -> None:
@@ -781,6 +814,49 @@ def _write_workspace_snapshot(
             )
     except Exception:
         return
+
+
+@lru_cache(maxsize=4)
+def _chan_model_strategy_dates() -> set[str]:
+    source = CHAN_MODEL_STRATEGY_SCORED_PATH if CHAN_MODEL_STRATEGY_SCORED_PATH.exists() else CHAN_MODEL_SCORED_PATH
+    if not source.exists():
+        return set()
+    try:
+        frame = pd.read_parquet(source)
+        if "chan_model_signal" not in frame.columns:
+            frame = add_chan_model_strategy_columns(frame)
+        selected = frame[frame["chan_model_signal"].eq(1)].copy()
+        if selected.empty:
+            return set()
+        dates = pd.to_datetime(selected["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        return set(dates.dropna().tolist())
+    except Exception:
+        return set()
+
+
+def _workspace_snapshot_dates(workspace: str, params: dict[str, Any] | None = None) -> set[str]:
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if not store.config.sql_url:
+        return set()
+    params_key = _workspace_params_key(params)
+    try:
+        from sqlalchemy import text
+
+        with store._engine().begin() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT snapshot_date
+                    FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
+                    WHERE workspace = :workspace
+                      AND params_key = :params_key
+                    """
+                ),
+                {"workspace": workspace, "params_key": params_key},
+            ).scalars().all()
+        return {str(item) for item in rows if item}
+    except Exception:
+        return set()
 
 
 def _long_entry_tranche(row: pd.Series, target_weight: float, regime: str) -> tuple[float, str]:
@@ -1583,6 +1659,213 @@ def get_long_stock_pool(
     return payload
 
 
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        if not np.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if pd.isna(value):
+        return None
+    return value
+
+
+def _frame_records(frame: pd.DataFrame | None, limit: int | None = None) -> list[dict[str, Any]]:
+    if frame is None or frame.empty:
+        return []
+    out = frame.head(limit).copy() if limit else frame.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return [_json_ready(record) for record in out.replace([np.inf, -np.inf], np.nan).to_dict("records")]
+
+
+def _normalize_watch_symbol(raw_symbol: str) -> str:
+    symbol = str(raw_symbol or "").strip().upper()
+    if not symbol:
+        raise ValueError("股票代码不能为空")
+    symbol = symbol.replace("_", ".")
+    if "." not in symbol and len(symbol) == 6 and symbol.isdigit():
+        suffix = "SH" if symbol.startswith(("6", "9")) else "SZ"
+        symbol = f"{symbol}.{suffix}"
+    path = DAILY_DIR / f"{symbol}.parquet"
+    if not path.exists():
+        raise ValueError(f"本地日线数据不存在: {symbol}")
+    return symbol
+
+
+def _stock_basic_for_similar_patterns() -> pd.DataFrame:
+    return load_stock_basic(PROJECT_ROOT / "data/raw/stock_basic.parquet")
+
+
+def _stock_profile_from_basic(symbol: str, basic: pd.DataFrame | None = None) -> dict[str, str]:
+    frame = basic if basic is not None else _stock_basic_for_similar_patterns()
+    if frame is not None and not frame.empty:
+        row = frame[frame["ts_code"] == symbol]
+        if not row.empty:
+            return {
+                "symbol": symbol,
+                "name": str(row["name"].iloc[0]),
+                "industry": str(row["industry"].iloc[0]),
+            }
+    return {"symbol": symbol, "name": symbol, "industry": ""}
+
+
+def _read_similar_pattern_watchlist_symbols() -> list[str]:
+    if not SIMILAR_PATTERN_WATCHLIST_PATH.exists():
+        return list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
+    try:
+        payload = json.loads(SIMILAR_PATTERN_WATCHLIST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
+    symbols = payload.get("symbols", payload) if isinstance(payload, dict) else payload
+    normalized: list[str] = []
+    for item in symbols if isinstance(symbols, list) else []:
+        try:
+            symbol = _normalize_watch_symbol(str(item))
+        except ValueError:
+            continue
+        if symbol not in normalized:
+            normalized.append(symbol)
+    return normalized or list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
+
+
+def _write_similar_pattern_watchlist_symbols(symbols: list[str]) -> None:
+    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "symbols": symbols,
+    }
+    SIMILAR_PATTERN_WATCHLIST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_similar_pattern_watchlist() -> dict[str, Any]:
+    symbols = _read_similar_pattern_watchlist_symbols()
+    basic = _stock_basic_for_similar_patterns()
+    return {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "stocks": [_stock_profile_from_basic(symbol, basic) for symbol in symbols],
+    }
+
+
+def add_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    symbols = _read_similar_pattern_watchlist_symbols()
+    if normalized not in symbols:
+        symbols.append(normalized)
+        _write_similar_pattern_watchlist_symbols(symbols)
+    return get_similar_pattern_watchlist()
+
+
+def remove_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    symbols = [item for item in _read_similar_pattern_watchlist_symbols() if item != normalized]
+    _write_similar_pattern_watchlist_symbols(symbols)
+    return get_similar_pattern_watchlist()
+
+
+def _similar_pattern_result_payload(result: SimilarPatternResult) -> dict[str, Any]:
+    top_cases = result.similar_cases.copy()
+    if not top_cases.empty:
+        for col in ["fwd_1d", "fwd_20d", "fwd_60d", "max_drawdown_60d"]:
+            if col in top_cases.columns:
+                top_cases[col] = (pd.to_numeric(top_cases[col], errors="coerce") * 100).round(2)
+        if "similarity" in top_cases.columns:
+            raw_similarity = pd.to_numeric(top_cases["similarity"], errors="coerce")
+            min_similarity = raw_similarity.min()
+            max_similarity = raw_similarity.max()
+            if pd.notna(min_similarity) and pd.notna(max_similarity) and max_similarity > min_similarity:
+                top_cases["similarity_score"] = ((raw_similarity - min_similarity) / (max_similarity - min_similarity) * 100).round(1)
+            else:
+                top_cases["similarity_score"] = 100.0
+            top_cases["similarity"] = raw_similarity.round(4)
+    return {
+        "target": {
+            "symbol": result.target.symbol,
+            "name": result.target.name,
+            "target_date": result.target.target_date.strftime("%Y-%m-%d"),
+        },
+        "latest_snapshot": _json_ready(result.latest_snapshot),
+        "forecast": _frame_records(result.forecast),
+        "status_probs": _json_ready(result.status_probs),
+        "t1_scenario_plan": _frame_records(result.t1_scenario_plan),
+        "sell_model_summary": _json_ready(result.sell_model_summary or {}),
+        "sell_model_plan": _frame_records(result.sell_model_plan),
+        "top_cases": _frame_records(top_cases, limit=10),
+        "scan_summary": _json_ready(result.scan_summary or {}),
+    }
+
+
+def _read_similar_pattern_analysis_cache() -> dict[str, Any] | None:
+    if not SIMILAR_PATTERN_ANALYSIS_PATH.exists():
+        return None
+    try:
+        return json.loads(SIMILAR_PATTERN_ANALYSIS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def refresh_similar_pattern_analysis() -> dict[str, Any]:
+    symbols = _read_similar_pattern_watchlist_symbols()
+    basic = _stock_basic_for_similar_patterns()
+    cache_audit = build_vector_caches_parallel(
+        DAILY_DIR,
+        basic,
+        SIMILAR_PATTERN_CONFIG,
+        SIMILAR_PATTERN_VECTOR_CACHE_DIR,
+        target_symbols=set(symbols),
+        workers=max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "1"))),
+    )
+    results = analyze_targets_by_threshold(
+        DAILY_DIR,
+        basic,
+        SIMILAR_PATTERN_CONFIG,
+        target_symbols=symbols,
+        vector_cache_dir=SIMILAR_PATTERN_VECTOR_CACHE_DIR,
+    )
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "watchlist": [_stock_profile_from_basic(symbol, basic) for symbol in symbols],
+        "config": {
+            "candidate_start_date": SIMILAR_PATTERN_CONFIG.candidate_start_date,
+            "candidate_step_days": SIMILAR_PATTERN_CONFIG.candidate_step_days,
+            "similarity_threshold": SIMILAR_PATTERN_CONFIG.similarity_threshold,
+            "take_profit_3d": SIMILAR_PATTERN_CONFIG.take_profit_3d,
+            "stop_loss_3d": SIMILAR_PATTERN_CONFIG.stop_loss_3d,
+        },
+        "results": [_similar_pattern_result_payload(results[symbol]) for symbol in symbols if symbol in results],
+        "cache": {
+            "hit": False,
+            "backend": "generated",
+            "rebuilt": int(cache_audit["status"].eq("built").sum()) if not cache_audit.empty else 0,
+            "reused": int(cache_audit["status"].eq("cache_hit").sum()) if not cache_audit.empty else 0,
+            "errors": int(cache_audit["status"].eq("error").sum()) if not cache_audit.empty else 0,
+        },
+    }
+    SIMILAR_PATTERN_ANALYSIS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SIMILAR_PATTERN_ANALYSIS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
+    if not refresh:
+        cached = _read_similar_pattern_analysis_cache()
+        if cached is not None:
+            cached["cache"] = {"hit": True, "backend": "json"}
+            return cached
+    return refresh_similar_pattern_analysis()
+
+
 def _signal_group_key(signal: dict[str, Any]) -> str:
     family = str(signal.get("strategy_family") or signal.get("strategy_key") or "").upper()
     return str(signal.get("strategy_group") or STRATEGY_MEMBER_TO_GROUP.get(family, family))
@@ -1966,8 +2249,12 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
     start_date = date.fromisoformat(start)
     snapshot_dates = set(_selector_snapshot_dates(None, True))
     long_snapshot_dates = _long_stock_pool_snapshot_dates("tea")
+    chan_strategy_dates = _chan_model_strategy_dates()
+    chan_snapshot_dates = _workspace_snapshot_dates("chan_model_strategy", params={"top_n": 20})
     latest_snapshot = max(snapshot_dates) if snapshot_dates else None
     latest_long_snapshot = max(long_snapshot_dates) if long_snapshot_dates else None
+    latest_chan_signal = max(chan_strategy_dates) if chan_strategy_dates else None
+    latest_chan_snapshot = max(chan_snapshot_dates) if chan_snapshot_dates else None
     if end:
         end_date = date.fromisoformat(end)
     elif latest_snapshot:
@@ -2000,6 +2287,8 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
                 "is_open": not is_closed,
                 "has_selector_snapshot": iso in snapshot_dates,
                 "has_long_stock_pool_snapshot": iso in long_snapshot_dates,
+                "has_chan_model_strategy": iso in chan_strategy_dates,
+                "has_chan_model_strategy_snapshot": iso in chan_snapshot_dates,
                 "effective_signal_date": effective,
                 "disabled": is_closed,
             }
@@ -2011,6 +2300,8 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
         "end": end_date.isoformat(),
         "latest_signal_date": latest_snapshot,
         "latest_long_signal_date": latest_long_snapshot,
+        "latest_chan_signal_date": latest_chan_signal,
+        "latest_chan_snapshot_date": latest_chan_snapshot,
         "days": days,
     }
 
@@ -2134,6 +2425,139 @@ def get_research_index(limit: int = 200) -> dict[str, Any]:
         "family_rule_rows": family_rows,
         "fusion_rows": fusion_rows,
     }
+
+
+def _numeric(value: Any, default: float | None = None) -> float | None:
+    if value is None or pd.isna(value):
+        return default
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    return numeric if np.isfinite(numeric) else default
+
+
+def _chan_candidate_record(row: pd.Series) -> dict[str, Any]:
+    return {
+        "date": str(pd.to_datetime(row.get("date")).date()) if pd.notna(row.get("date")) else "",
+        "symbol": str(row.get("symbol") or ""),
+        "name": _clean_text(row.get("name")),
+        "rule_id": _clean_text(row.get("chan_model_rule_id")),
+        "rule_name": _clean_text(row.get("chan_model_rule_name")),
+        "rule_description": _clean_text(row.get("chan_model_description")),
+        "rank_score": _numeric(row.get("chan_model_rank_score")),
+        "signal_name": _clean_text(row.get("chan_signal_name")),
+        "chan_score": _numeric(row.get("chan_score")),
+        "pred_good": _numeric(row.get("pred_target_good")),
+        "pred_big10": _numeric(row.get("pred_target_big10")),
+        "pred_win10": _numeric(row.get("pred_target_win10")),
+        "entry_gap_pct": _numeric(row.get("entry_gap_pct")),
+        "position_pct": _numeric(row.get("chan_model_position_pct")),
+        "close": _numeric(row.get("close")),
+        "entry_open": _numeric(row.get("entry_open")),
+        "center_low": _numeric(row.get("chan_center_low")),
+        "center_high": _numeric(row.get("chan_center_high")),
+        "center_width": _numeric(row.get("chan_center_width")),
+        "stroke_amplitude": _numeric(row.get("chan_stroke_amplitude")),
+        "buy_plan": _clean_text(row.get("chan_model_buy_plan")),
+        "sell_plan": _clean_text(row.get("chan_model_sell_plan")),
+        "structure_note": _clean_text(row.get("chan_structure_note")),
+    }
+
+
+def _chan_summary_records(summary: pd.DataFrame) -> list[dict[str, Any]]:
+    if summary.empty:
+        return []
+    return [
+        {
+            "rule_id": str(row.get("rule_id") or ""),
+            "split": str(row.get("split") or ""),
+            "rows": int(row.get("rows") or 0),
+            "avg_return_10d": _numeric(row.get("avg_return_10d")),
+            "median_return_10d": _numeric(row.get("median_return_10d")),
+            "win_rate_10d": _numeric(row.get("win_rate_10d")),
+            "big_win_rate_10d": _numeric(row.get("big_win_rate_10d")),
+            "profit_factor_10d": _numeric(row.get("profit_factor_10d")),
+        }
+        for _, row in summary.iterrows()
+    ]
+
+
+def _build_chan_model_strategy_payload(top_n: int = 20, signal_date: str | None = None) -> dict[str, Any]:
+    if not CHAN_MODEL_SCORED_PATH.exists():
+        raise FileNotFoundError(f"缺少缠论模型评分文件: {CHAN_MODEL_SCORED_PATH}")
+    scored = pd.read_parquet(CHAN_MODEL_SCORED_PATH)
+    strategy_frame = add_chan_model_strategy_columns(scored)
+    if signal_date is None:
+        CHAN_MODEL_STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
+        strategy_frame.to_parquet(CHAN_MODEL_STRATEGY_SCORED_PATH, index=False)
+        strategy_frame.to_csv(CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_scored.csv", index=False)
+
+    candidates = select_chan_model_candidates(strategy_frame, trade_date=signal_date, top_n=top_n)
+    if signal_date is None:
+        candidates.to_csv(CHAN_MODEL_LATEST_CANDIDATES_PATH, index=False)
+    summary = summarize_chan_model_strategy(strategy_frame)
+    if signal_date is None:
+        summary.to_csv(CHAN_MODEL_SUMMARY_PATH, index=False)
+
+    signal_date = (
+        str(pd.to_datetime(candidates["date"].iloc[0]).date())
+        if not candidates.empty
+        else signal_date
+    )
+    records = [_chan_candidate_record(row) for _, row in candidates.iterrows()]
+    summary_records = _chan_summary_records(summary)
+    oot_primary = next(
+        (item for item in summary_records if item["split"] == "oot" and item["rule_id"] == "chan_model_primary"),
+        None,
+    )
+    oot_expanded = next(
+        (item for item in summary_records if item["split"] == "oot" and item["rule_id"] == "chan_model_expanded"),
+        None,
+    )
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "signal_date": signal_date,
+        "top_n": int(top_n),
+        "candidate_count": len(records),
+        "primary_count": sum(1 for item in records if item["rule_id"] == "chan_model_primary"),
+        "expanded_count": sum(1 for item in records if item["rule_id"] == "chan_model_expanded"),
+        "candidates": records,
+        "summary": summary_records,
+        "oot_primary": oot_primary,
+        "oot_expanded": oot_expanded,
+        "execution_notes": [
+            "T日收盘确认缠论三买与模型分，T+1 开盘执行。",
+            "主策略优先，扩容策略仅在候选不足时补充。",
+            "T+1 高开不超过 3% 可执行；3%-6% 降仓观察；超过 6% 放弃。",
+            "优先持有 5-10 个交易日；跌破信号日低点或最近中枢下沿退出。",
+        ],
+        "files": {
+            "scored": str(CHAN_MODEL_STRATEGY_SCORED_PATH),
+            "candidates": str(CHAN_MODEL_LATEST_CANDIDATES_PATH),
+            "summary": str(CHAN_MODEL_SUMMARY_PATH),
+        },
+    }
+    return payload
+
+
+def get_chan_model_strategy_plan(
+    top_n: int = 20,
+    refresh: bool = False,
+    signal_date: str | None = None,
+) -> dict[str, Any]:
+    params = {"top_n": int(top_n)}
+    if not refresh:
+        cached = _read_workspace_snapshot("chan_model_strategy", snapshot_date=signal_date, params=params)
+        if cached is not None:
+            return cached
+    payload = _build_chan_model_strategy_payload(top_n=top_n, signal_date=signal_date)
+    _write_workspace_snapshot("chan_model_strategy", payload.get("signal_date"), payload, params=params)
+    return payload
+
+
+def refresh_chan_model_strategy_plan(top_n: int = 20, signal_date: str | None = None) -> dict[str, Any]:
+    return get_chan_model_strategy_plan(top_n=top_n, refresh=True, signal_date=signal_date)
 
 
 def _fmt_pct(value: Any, digits: int = 2) -> str:
@@ -3683,7 +4107,24 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
         if refresh_scope not in {"all", "short"}:
             signal_date = _latest_candidate_signal_date()
             trade_date = str(signal_date).replace("-", "") if signal_date else None
-            if refresh_scope == "long":
+            if refresh_scope == "chan":
+                _set_refresh_progress(step_key="chan_model_strategy", message="正在生成缠论模型策略候选", percent=92)
+                payload = get_chan_model_strategy_plan(top_n=20, refresh=True)
+                results["chan_model_strategy"] = {
+                    "status": "success",
+                    "signal_date": payload.get("signal_date"),
+                    "candidates": len(payload.get("candidates") or []),
+                    "primary_count": payload.get("primary_count"),
+                    "expanded_count": payload.get("expanded_count"),
+                }
+                _set_refresh_progress(
+                    step_key="chan_model_strategy",
+                    step_status="success",
+                    message="缠论模型策略候选生成完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "long":
                 _build_tea_master_stock_pool_cached.cache_clear()
                 _build_long_stock_pool_cached.cache_clear()
                 _set_refresh_progress(step_key="long_stock_pool", message="正在计算长线策略股票池", percent=92)
@@ -3899,8 +4340,14 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
         signal_date = full_payload.get("signal_date")
         trade_date = str(signal_date).replace("-", "") if signal_date else None
         _set_refresh_progress(
+            step_key="chan_model_strategy",
+            message="正在并行计算长线、缠论、可转债、配债股与 BYD 工作区",
+            percent=92,
+            complete_previous=False,
+        )
+        _set_refresh_progress(
             step_key="long_stock_pool",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            message="正在并行计算长线、缠论、可转债、配债股与 BYD 工作区",
             percent=92,
             complete_previous=False,
         )
@@ -3924,6 +4371,10 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
         )
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = {
+                executor.submit(get_chan_model_strategy_plan, 20, True): (
+                    "chan_model_strategy",
+                    "缠论模型策略候选生成失败",
+                ),
                 executor.submit(_refresh_long_stock_pool_variants, long_variants, signal_date): (
                     "long_stock_pool",
                     "长线策略股票池生成失败",
@@ -3954,6 +4405,14 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
                     raise
                 if result_key == "long_stock_pool":
                     results[result_key] = {"status": "success", "variants": payload}
+                elif result_key == "chan_model_strategy":
+                    results[result_key] = {
+                        "status": "success",
+                        "signal_date": payload.get("signal_date"),
+                        "candidates": len(payload.get("candidates") or []),
+                        "primary_count": payload.get("primary_count"),
+                        "expanded_count": payload.get("expanded_count"),
+                    }
                 elif result_key == "convertible_bond_plan":
                     results[result_key] = {
                         "status": "success",
@@ -3979,6 +4438,7 @@ def _run_latest_refresh_job(scope: str = "all") -> None:
                     step_status="success",
                     message=f"{failure_message.removesuffix('失败')}完成",
                     percent={
+                        "chan_model_strategy": 93,
                         "long_stock_pool": 94,
                         "convertible_bond_plan": 95,
                         "convertible_bond_allotment": 96,

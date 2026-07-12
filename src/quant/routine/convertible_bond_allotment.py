@@ -392,9 +392,11 @@ def _cninfo_pdf_url(adjunct_url: Any) -> str | None:
     text = _clean_text(adjunct_url)
     if not text:
         return None
-    if text.startswith("http"):
+    if text.startswith("http://"):
+        return "https://" + text.removeprefix("http://")
+    if text.startswith("https://"):
         return text
-    return f"http://static.cninfo.com.cn/{text.lstrip('/')}"
+    return f"https://static.cninfo.com.cn/{text.lstrip('/')}"
 
 
 def _query_cninfo_issue_documents(record: dict[str, Any], today: date | None = None) -> list[dict[str, Any]]:
@@ -432,7 +434,8 @@ def _query_cninfo_issue_documents(record: dict[str, Any], today: date | None = N
             "isHLtitle": "true",
         }
         try:
-            response = requests.post("http://www.cninfo.com.cn/new/hisAnnouncement/query", data=payload, timeout=8)
+            response = requests.post("https://www.cninfo.com.cn/new/hisAnnouncement/query", data=payload, timeout=8)
+            response.raise_for_status()
             data = response.json()
         except Exception:
             continue
@@ -492,7 +495,8 @@ def _query_cninfo_issuing_documents(record: dict[str, Any], today: date | None =
             "isHLtitle": "true",
         }
         try:
-            response = requests.post("http://www.cninfo.com.cn/new/hisAnnouncement/query", data=payload, timeout=8)
+            response = requests.post("https://www.cninfo.com.cn/new/hisAnnouncement/query", data=payload, timeout=8)
+            response.raise_for_status()
             data = response.json()
         except Exception:
             continue

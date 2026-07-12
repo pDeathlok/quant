@@ -18,6 +18,15 @@ docs/strategies/                   # 策略制定档案与复盘记录
 
 本地数据、模型、报告产物不提交到 Git，统一由 `.gitignore` 排除：`data/`、`models/`、`reports/`、`web/data/`。
 
+## 安装
+
+```bash
+python -m pip install -e .
+python -m pip install -e ".[dev]"  # 开发、测试和 lint
+```
+
+PyTorch 属于可选依赖，需要时使用 `python -m pip install -e ".[ml]"`。
+
 ## 环境变量
 
 复制 `.env.example` 为本地 `.env` 后填写真实值，`.env` 不允许提交。
@@ -74,6 +83,21 @@ PYTHONPATH=src python -m quant.routine.data_refresh \
   --retry-base-delay 2 \
   --retry-max-delay 60
 ```
+
+增量行情默认保存不复权价格，特征层统一构建连续价格。若显式使用 `--adjust qfq` 或
+`--adjust hfq`，刷新器会从该股票已有历史的第一天重新拉取，避免不同复权基准直接拼接。
+
+## 本地事件回测
+
+```bash
+PYTHONPATH=src python main.py backtest \
+  --strategy momentum \
+  --symbol 600000 \
+  --start-date 20200101 \
+  --end-date 20231231
+```
+
+可通过 `--data /absolute/path/to/daily.parquet` 指定行情文件；省略时会从项目标准数据目录解析。
 
 刷新 Tushare `daily_basic` 扩展因子：
 

@@ -15,6 +15,18 @@ def test_retryable_error_classification():
     assert not data_refresh._is_retryable_error("未获取到 000004.SZ 的数据")
 
 
+def test_adjusted_incremental_refresh_restarts_from_first_stored_date():
+    existing = pd.DataFrame(
+        {
+            "trade_date": ["20240102", "20240103", "20240104"],
+            "close": [10.0, 10.2, 10.1],
+        }
+    )
+
+    assert data_refresh._symbol_refresh_start(existing, "20240104", adjust="qfq") == "20240102"
+    assert data_refresh._symbol_refresh_start(existing, "20240104", adjust=None) == "20240104"
+
+
 def test_refresh_one_symbol_retries_then_succeeds(monkeypatch, tmp_path):
     calls = {"count": 0}
 

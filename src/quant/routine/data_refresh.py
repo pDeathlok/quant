@@ -145,8 +145,17 @@ def _format_trade_date(value: pd.Timestamp) -> str:
     return value.strftime("%Y%m%d")
 
 
-def _symbol_refresh_start(existing: pd.DataFrame, requested_start: str) -> str:
-    """Use the earlier of requested_start and the symbol's own next missing day."""
+def _symbol_refresh_start(
+    existing: pd.DataFrame,
+    requested_start: str,
+    adjust: str | None = None,
+) -> str:
+    """Resolve a safe start date for one symbol.
+
+    Adjusted prices are anchored to the request window. Re-fetch the complete
+    stored history before merging so old and new rows share one adjustment base.
+    Raw prices can continue from the symbol's next missing day.
+    """
 
     requested = _parse_trade_date(requested_start)
     if requested is None or existing.empty:
@@ -160,6 +169,9 @@ def _symbol_refresh_start(existing: pd.DataFrame, requested_start: str) -> str:
     latest = dates.max()
     if pd.isna(latest):
         return requested_start
+    if adjust in {"qfq", "hfq"}:
+        earliest = dates.min()
+        return requested_start if pd.isna(earliest) else _format_trade_date(earliest)
     next_missing = latest + pd.Timedelta(days=1)
     return _format_trade_date(min(requested, next_missing))
 
@@ -252,7 +264,7 @@ def _refresh_one_symbol_once(
         )
     existing = store.read_frame(dataset, key)
     latest_existing = _latest_existing_trade_date(existing)
-    effective_start = _symbol_refresh_start(existing, start_date)
+    effective_start = _symbol_refresh_start(existing, start_date, adjust=adjust)
     try:
         ts_df = tushare.get_stock_daily(symbol, effective_start, end_date, adjust=adjust)
     except ValueError as exc:
@@ -453,7 +465,7 @@ def refresh_daily_data(
     start_date: str,
     end_date: str | None = None,
     board: str = "all",
-    adjust: str = "qfq",
+    adjust: str | None = None,
     output_dir: Path = DAILY_DIR,
     workers: int = 2,
     limit: int | None = None,
@@ -563,7 +575,12 @@ def main() -> None:
     parser.add_argument("--start", default="20100101", help="Start date YYYYMMDD")
     parser.add_argument("--end", default=None, help="End date YYYYMMDD; default today")
     parser.add_argument("--board", default="all", choices=["all", "main", "gem"], help="Stock universe")
-    parser.add_argument("--adjust", default="qfq", choices=["qfq", "hfq", "none"], help="Adjustment type")
+    parser.add_argument(
+        "--adjust",
+        default="none",
+        choices=["qfq", "hfq", "none"],
+        help="Adjustment type; raw storage is the safe default for incremental refreshes",
+    )
     parser.add_argument("--output-dir", type=Path, default=DAILY_DIR, help="Daily parquet output directory")
     parser.add_argument("--workers", type=int, default=2, help="Concurrent workers; keep low to leave provider rate-limit buffer")
     parser.add_argument("--limit", type=int, default=None, help="Optional symbol limit for smoke tests")

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260617-cb-overlay-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260628-similar-list-v1" />
   </head>
   <body>
     <div class="app selector-app">
@@ -78,6 +78,10 @@
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
             <span>日线计划 / 降仓路线</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>相似走势</strong>
+            <span>自选池 / T+1 情景</span>
           </button>
         </nav>
 
@@ -164,6 +168,103 @@
         </section>
       </main>
 
+      <main id="chanPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="chan">
+            <strong>缠论策略</strong>
+            <span>三买模型 / T+1 计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>日线计划 / 降仓路线</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>相似走势</strong>
+            <span>自选池 / T+1 情景</span>
+          </button>
+        </nav>
+
+        <section class="toolbar chan-toolbar">
+          <div>
+            <p class="eyebrow">Chan Model Strategy</p>
+            <h2>缠论模型策略</h2>
+            <p id="chanPlanMeta" class="subline">等待加载</p>
+          </div>
+          <div class="toolbar-actions">
+            <div id="chanDateSlot"></div>
+            <button id="chanRefreshButton" type="button">刷新计划</button>
+            <button id="chanRefreshLatestButton" type="button" data-refresh-scope="chan">更新本页</button>
+          </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
+        </section>
+
+        <section id="chanMetrics" class="chan-performance"></section>
+
+        <section class="split chan-split">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>模型候选</h3>
+              <span id="chanCandidateCount">等待加载</span>
+            </div>
+            <div class="table-wrap tall">
+              <table class="chan-table">
+                <thead>
+                  <tr>
+                    <th>股票</th>
+                    <th>规则</th>
+                    <th>排名分</th>
+                    <th>模型分</th>
+                    <th>缠论分</th>
+                    <th>T+1跳空</th>
+                    <th>仓位</th>
+                  </tr>
+                </thead>
+                <tbody id="chanRows">
+                  <tr><td colspan="7" class="empty-cell">切到缠论策略后加载候选</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel detail-panel">
+            <div class="panel-head">
+              <div>
+                <h3 id="chanDetailTitle">选择候选</h3>
+                <span id="chanDetailMeta"></span>
+              </div>
+            </div>
+            <div id="chanDetail" class="chan-detail">
+              <div class="empty-state">选择一只股票查看缠论结构、模型分和执行计划</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>执行备注</h3>
+            <span>主策略优先，扩容策略补充</span>
+          </div>
+          <ul id="chanNotes" class="notes"></ul>
+        </section>
+      </main>
+
       <main id="longPage" class="main page-view">
         <nav class="workspace-tabs" aria-label="策略工作区">
           <button class="page-tab" type="button" data-page="short">
@@ -185,6 +286,10 @@
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
             <span>日线计划 / 降仓路线</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>相似走势</strong>
+            <span>自选池 / T+1 情景</span>
           </button>
         </nav>
 
@@ -312,6 +417,10 @@
             <strong>BYD 做T</strong>
             <span>日线计划 / 降仓路线</span>
           </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>相似走势</strong>
+            <span>自选池 / T+1 情景</span>
+          </button>
         </nav>
 
         <section class="toolbar cb-toolbar">
@@ -393,6 +502,10 @@
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
             <span>日线计划 / 降仓路线</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>相似走势</strong>
+            <span>自选池 / T+1 情景</span>
           </button>
         </nav>
 
@@ -522,6 +635,10 @@
             <strong>BYD 做T</strong>
             <span>日线计划 / 降仓路线</span>
           </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>相似走势</strong>
+            <span>自选池 / T+1 情景</span>
+          </button>
         </nav>
 
         <section class="toolbar byd-toolbar">
@@ -614,8 +731,153 @@
           </div>
         </section>
       </main>
+
+      <main id="similarPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>日线计划 / 降仓路线</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="similar">
+            <strong>相似走势</strong>
+            <span>自选池 / T+1 情景</span>
+          </button>
+        </nav>
+
+        <section class="toolbar similar-toolbar">
+          <div>
+            <p class="eyebrow">Similar Pattern Desk</p>
+            <h2>相似走势决策台</h2>
+            <p id="similarMeta" class="subline">等待加载自选池</p>
+          </div>
+          <form id="similarAddForm" class="similar-add-form">
+            <label>
+              <span>加入股票</span>
+              <input id="similarSymbolInput" type="text" placeholder="002594 或 002594.SZ" />
+            </label>
+            <button type="submit">加入自选</button>
+            <button id="similarRefreshButton" type="button">刷新分析</button>
+          </form>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
+        </section>
+
+        <section class="panel similar-watch-panel">
+          <div class="panel-head">
+            <div>
+              <h3>自选池</h3>
+              <span id="similarWatchCount">-</span>
+            </div>
+          </div>
+          <div class="table-wrap similar-watch-table-wrap">
+            <table class="similar-watch-table">
+              <thead>
+                <tr>
+                  <th>股票</th>
+                  <th>行业</th>
+                  <th>目标日</th>
+                  <th>收盘</th>
+                  <th>20日</th>
+                  <th>60日回撤</th>
+                  <th>量比</th>
+                  <th>相似样本</th>
+                  <th>次日预期</th>
+                  <th>1月预期</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="similarWatchlist">
+                <tr><td colspan="11" class="empty-cell">切到相似走势页后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="similarSelectedOverview" class="similar-card-grid"></section>
+
+        <section class="split similar-split">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3 id="similarDetailTitle">选择股票</h3>
+                <span id="similarDetailMeta">查看 T+1 量价情景</span>
+              </div>
+            </div>
+            <div class="table-wrap similar-scenario-wrap">
+              <table class="similar-scenario-table">
+                <thead>
+                  <tr>
+                    <th>T+1涨跌</th>
+                    <th>量比</th>
+                    <th>样本</th>
+                    <th>3日上冲</th>
+                    <th>3日下破</th>
+                    <th>1月中位</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="similarScenarioRows">
+                  <tr><td colspan="7" class="empty-cell">切到相似走势页后加载</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>卖出/持有模型</h3>
+                <span id="similarModelMeta">3日止盈止损概率</span>
+              </div>
+            </div>
+            <div id="similarSellModel" class="similar-model-list"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Top 相似阶段</h3>
+            <span>按相似度排序</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>排名</th>
+                  <th>股票</th>
+                  <th>行业</th>
+                  <th>日期</th>
+                  <th>相似分</th>
+                  <th>原始相似度</th>
+                  <th>次日</th>
+                  <th>1月</th>
+                  <th>3月</th>
+                </tr>
+              </thead>
+              <tbody id="similarTopRows">
+                <tr><td colspan="9" class="empty-cell">暂无数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
     </div>
     <div id="bydTradeToast" class="byd-trade-toast" role="status" aria-live="polite" aria-atomic="true"></div>
-    <script src="./app.js?v=20260617-buy-hold-score-v15"></script>
+    <script src="./app.js?v=20260712-chan-summary-v4"></script>
   </body>
 </html>
