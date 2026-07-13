@@ -1,150 +1,131 @@
-# Quant 策略选股器
+# Quant 策略工作台
 
-本项目已经从早期研究脚本整理为 Tushare-first 的量化策略工程。当前重点是策略选股器、例行数据刷新、B1/B2/B3/扩展策略复盘与每日候选池生成。
+Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、长线、可转债、配债股、BYD 做T 和相似走势 7 个工作区。
 
-## 当前主线
+> 本项目用于策略研究和数据分析，不构成投资建议。数据、模型、回测与页面信号都需要结合交易所公告和真实账户约束复核。
 
-```text
-src/quant/routine/                 # 例行任务：拉取数据、生成每日计划、生成 dashboard
-src/quant/webapp/                  # FastAPI 后端接口
-web/                               # 前端页面
-src/quant/data/market_data_store.py # MySQL/parquet 统一存储层
-src/quant/features/                # 项目级变量库
-src/quant/strategies/custom/       # B1 family 与扩展策略规则
-scripts/research/                  # 正式研究、训练、回测脚本
-configs/strategies/                # 已确认策略配置
-docs/strategies/                   # 策略制定档案与复盘记录
-```
+## 能力概览
 
-本地数据、模型、报告产物不提交到 Git，统一由 `.gitignore` 排除：`data/`、`models/`、`reports/`、`web/data/`。
+- 增量刷新 Tushare 日线数据，并支持 MySQL 主存储和 Parquet 镜像。
+- 构建 B1/B2/B3 与扩展策略特征、模型评分和每日候选池。
+- 在一个 FastAPI + 静态前端工作台中查看 7 类策略结果。
+- 按日期保存选股器和工作区快照，支持历史复盘。
+- 每日流水线采用有依赖的并行编排，单个非核心工作区失败不会阻断其他工作区。
 
-## 安装
+## 前置条件
 
-```bash
-python -m pip install -e .
-python -m pip install -e ".[dev]"  # 开发、测试和 lint
-```
+- Python 3.9 或更高版本。
+- 正式刷新行情时需要有效的 `TUSHARE_TOKEN`。
+- MySQL 为生产推荐项；本地开发可以仅使用 Parquet。
 
-PyTorch 属于可选依赖，需要时使用 `python -m pip install -e ".[ml]"`。
+下列命令以 macOS/Linux Shell 为例；Windows 用户需要使用对应的虚拟环境激活和环境变量语法。
 
-## 环境变量
+## 快速开始
 
-复制 `.env.example` 为本地 `.env` 后填写真实值，`.env` 不允许提交。
+在仓库根目录执行：
 
 ```bash
-TUSHARE_TOKEN=...
-MARKET_DATA_BACKEND=mysql
-MARKET_DATA_SQL_URL=mysql+pymysql://quant_user:<db-password>@127.0.0.1:3306/quant?charset=utf8mb4
-MARKET_DATA_MIRROR_PARQUET=1
-```
-
-说明：
-
-- `MARKET_DATA_BACKEND=mysql` 是生产口径。
-- `MARKET_DATA_MIRROR_PARQUET=1` 会在写入 MySQL 的同时保留 parquet 镜像，兼容当前仍按文件扫描的特征和复盘脚本。
-- 如果本机暂未配置 MySQL URL，存储层会回落读取 parquet 镜像，便于本地调试。
-
-## 启动选股器
-
-```bash
+python -m venv .venv && source .venv/bin/activate
+python -m pip install -e ".[dev]" && (test -f .env || cp .env.example .env)
 PYTHONPATH=src python scripts/run_webapp.py
 ```
 
-浏览器打开：
+打开 [http://127.0.0.1:8088](http://127.0.0.1:8088)。API 健康检查位于 [http://127.0.0.1:8088/api/health](http://127.0.0.1:8088/api/health)，交互式 API 文档位于 [http://127.0.0.1:8088/docs](http://127.0.0.1:8088/docs)。
 
-```text
-http://127.0.0.1:8088
+首次进行真实数据刷新前，编辑 `.env` 并至少填写：
+
+```dotenv
+TUSHARE_TOKEN=your_token
 ```
 
-前端能力：
+## 每日任务
 
-- 选择策略查看股票池。
-- 选择 2026-06-01 以来的历史日期做轻量复盘。
-- 点击“更新最新数据”启动后台 Tushare 数据刷新，并在完成后重新加载股票池。
-- 同一策略家族命中数按家族去重；同一策略家族下不同买入操作会分别展示。
-
-## 例行任务
-
-刷新 Tushare 日线数据并生成每日股票池：
+执行完整日常刷新，不运行正式组合回测：
 
 ```bash
 PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
 ```
 
-每日任务覆盖全部 7 个 Tab：短线策略由主流水线生成；共享行情和特征就绪后，缠论、长线、
-可转债、配债股、BYD 做T、相似走势 6 个工作区以受控线程池并行刷新。特征缓存与规则信号
-缓存、每日计划与 dashboard 也分别并行生成。可通过 `ROUTINE_WEB_WORKSPACE_WORKERS`
-限制工作区并发数，默认 `6`。配债股和相似走势仍会在首次打开时检查当日缓存并自动补刷，
-页面上的“刷新”按钮可用于手工强制更新。
+执行顺序为：
 
-手工补跑日线数据：
+1. 串行刷新共享 Tushare 行情。
+2. 并行构建特征缓存和规则信号缓存。
+3. 生成模型评分、短线股票池和例行产物。
+4. 并行刷新缠论、长线、可转债、配债股、BYD 做T、相似走势 6 个工作区。
+5. 将每个步骤写入 `data/routine/<运行时间>/manifest.json`。
 
-```bash
-PYTHONPATH=src python -m quant.routine.data_refresh \
-  --start 20100101 \
-  --output-dir data/raw/daily \
-  --workers 2 \
-  --sleep 0.25 \
-  --retries 3 \
-  --retry-base-delay 2 \
-  --retry-max-delay 60
-```
+短线策略由主流水线生成，因此这套流程覆盖全部 7 个 Tab。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述命令。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
 
-增量行情默认保存不复权价格，特征层统一构建连续价格。若显式使用 `--adjust qfq` 或
-`--adjust hfq`，刷新器会从该股票已有历史的第一天重新拉取，避免不同复权基准直接拼接。
+## 配置
 
-## 本地事件回测
+复制 [`.env.example`](.env.example) 后按环境填写；`.env` 已被 Git 忽略。
 
-```bash
-PYTHONPATH=src python main.py backtest \
-  --strategy momentum \
-  --symbol 600000 \
-  --start-date 20200101 \
-  --end-date 20231231
-```
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `TUSHARE_TOKEN` | 无 | 正式拉取 Tushare 数据时必填 |
+| `MARKET_DATA_BACKEND` | `mysql` | `mysql`/`sql` 使用 SQL 主存储，其他值使用 Parquet |
+| `MARKET_DATA_SQL_URL` | 无 | SQLAlchemy MySQL 连接串；未配置时可回落到 Parquet 镜像 |
+| `MARKET_DATA_ROOT` | `data/raw` | Parquet 数据根目录 |
+| `MARKET_DATA_MIRROR_PARQUET` | `1` | SQL 写入时是否同时保留 Parquet 镜像 |
+| `MARKET_DATA_SQL_CONNECT_TIMEOUT` | `10` | MySQL 连接超时，单位秒 |
+| `MARKET_DATA_SQL_READ_TIMEOUT` | `60` | MySQL 读取超时，单位秒 |
+| `MARKET_DATA_SQL_WRITE_TIMEOUT` | `60` | MySQL 写入超时，单位秒 |
+| `ROUTINE_DAILY_WORKERS` | `4` | 日线刷新并发数 |
+| `ROUTINE_DAILY_SLEEP` | `0.08` | Tushare 请求间隔，单位秒 |
+| `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
+| `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 六个下游工作区的最大并发数 |
+| `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似走势向量缓存并发数 |
 
-可通过 `--data /absolute/path/to/daily.parquet` 指定行情文件；省略时会从项目标准数据目录解析。
+完整的重试和增量参数见 [每日运行与故障排查](docs/operations.md#资源与限流配置)。
 
-刷新 Tushare `daily_basic` 扩展因子：
+## 常用命令
 
 ```bash
-PYTHONPATH=src python -m quant.routine.daily_basic_refresh \
-  --start 20240101 \
-  --workers 4 \
-  --sleep 0.25 \
-  --retries 3
+# 仅验证每日流水线编排，不访问外部行情源
+PYTHONPATH=src python -m quant.routine.cli daily --skip-backtest
+
+# 单独生成短线每日计划或 dashboard
+PYTHONPATH=src python -m quant.routine.cli plan
+PYTHONPATH=src python -m quant.routine.cli dashboard
+
+# 本地事件驱动回测
+PYTHONPATH=src python main.py backtest --strategy momentum --symbol 600000 \
+  --start-date 20200101 --end-date 20231231
+
+# 测试与静态检查
+PYTHONPATH=src pytest -q
+ruff check src tests
 ```
 
-## 主要 API
+## 项目结构
 
 ```text
-GET  /api/health
-GET  /api/selector/stocks?signal_date=2026-06-04&strategies=B1,B2
-POST /api/selector/refresh-latest
-GET  /api/selector/refresh-latest/status
-GET  /api/b1/plan
-POST /api/b1/plan/refresh
-GET  /api/b1/history
-GET  /api/research/b1
+src/quant/data/            数据源、标准化和统一存储
+src/quant/features/        项目级变量与特征
+src/quant/strategies/      可复用策略实现
+src/quant/routine/         每日任务和产物编排
+src/quant/webapp/          FastAPI 路由与工作区服务
+web/                       单页工作台前端
+scripts/research/          研究、训练、回测和校准脚本
+configs/strategies/        已确认的生产策略配置
+docs/strategies/           策略依据、口径和迭代记录
+tests/                     单元、集成和 API 测试
 ```
 
-## 文档索引
+`data/`、`models/`、`reports/` 和 `web/data/` 是本地运行产物，不提交到 Git。
 
-```text
-docs/project_restructure_plan.md
-docs/project_structure_and_storage.md
-docs/factor_tushare_factor_system.md
-docs/factor_variable_implementation_matrix.md
-docs/factor_variable_dictionary.md
-docs/strategies/b1_selected_strategy_record.md
-docs/strategies/extended_strategy_model_record_20260607.md
-```
+## 文档
 
-## 清理原则
+- [文档中心](docs/README.md)
+- [系统架构与数据流](docs/architecture.md)
+- [API 参考](docs/api.md)
+- [每日运行与故障排查](docs/operations.md)
+- [项目结构与 MySQL 存储](docs/project_structure_and_storage.md)
+- [正式策略档案](docs/strategies/b1_selected_strategy_record.md)
 
-已确认策略必须先写入 `docs/strategies/` 的策略档案，再删除历史模型和实验脚本。无效代码的判断标准：
+## 开发约定
 
-- 仍依赖 AkShare 或旧 DataFetcher 的入口。
-- 与当前 Tushare-only 数据层冲突。
-- 只服务一次性研究且已有正式研究报告或策略档案替代。
-- 会把本地数据、模型、报告或密钥误提交到 Git。
+- 新策略进入例行任务前，必须在 `docs/strategies/` 记录数据口径、入场/离场规则、风险和回测结果。
+- 新功能必须补充对应测试；涉及路由或工作区缓存时同时更新 API 或运维文档。
+- 禁止提交 `.env`、Token、数据库密码、原始数据、模型和报告产物。
+- 清理研究脚本前先确认已有正式策略档案或可复现的替代实现。
