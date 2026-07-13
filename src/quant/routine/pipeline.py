@@ -5,6 +5,7 @@ import sys
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -275,34 +276,100 @@ def generate_daily_plan() -> dict:
     return {"status": "success", "output": str(output)}
 
 
-def refresh_daily_web_workspaces() -> dict[str, dict]:
-    """Refresh workspaces whose source data or forecasts change every day."""
+def refresh_daily_web_workspaces(max_workers: int | None = None) -> dict[str, dict]:
+    """Refresh every non-short-line web workspace with bounded concurrency.
+
+    The short-line workspace is produced by the core daily pipeline. These six
+    downstream workspaces only read the refreshed shared datasets and write
+    separate snapshots, so they can safely run in parallel.
+    """
 
     from quant.webapp.services import (
+        _latest_candidate_signal_date,
+        get_byd_daily_strategy,
         get_convertible_bond_allotments,
+        get_convertible_bond_grid_plan,
+        get_chan_model_strategy_plan,
+        get_long_stock_pool,
         refresh_similar_pattern_analysis,
     )
 
-    results: dict[str, dict] = {}
-    try:
+    signal_date = _latest_candidate_signal_date()
+    trade_date = str(signal_date).replace("-", "") if signal_date else None
+
+    def refresh_chan() -> dict:
+        payload = get_chan_model_strategy_plan(top_n=20, refresh=True, signal_date=signal_date)
+        return {
+            "status": "success",
+            "signal_date": payload.get("signal_date"),
+            "candidates": len(payload.get("candidates") or []),
+        }
+
+    def refresh_long() -> dict:
+        variants = []
+        for variant in ("tea", "tea_safe", "v44"):
+            payload = get_long_stock_pool(variant=variant, signal_date=signal_date, refresh=True)
+            variants.append(
+                {
+                    "variant": variant,
+                    "signal_date": payload.get("signal_date"),
+                    "stocks": len(payload.get("stocks") or []),
+                }
+            )
+        return {"status": "success", "variants": variants}
+
+    def refresh_convertible_bonds() -> dict:
+        payload = get_convertible_bond_grid_plan(trade_date=trade_date, limit=18, refresh=bool(trade_date))
+        return {
+            "status": "success",
+            "trade_date": payload.get("trade_date") or signal_date,
+            "candidates": len(payload.get("candidates") or payload.get("items") or []),
+        }
+
+    def refresh_allotments() -> dict:
         allotments = get_convertible_bond_allotments(refresh=True)
-        results["convertible_bond_allotments"] = {
+        return {
             "status": "success",
             "generated_at": allotments.get("generated_at"),
             "records": len(allotments.get("records") or []),
         }
-    except Exception as exc:
-        results["convertible_bond_allotments"] = {"status": "failed", "error": str(exc)}
 
-    try:
+    def refresh_byd() -> dict:
+        payload = get_byd_daily_strategy(refresh=True)
+        planned_t = payload.get("planned_t") or {}
+        return {
+            "status": "success",
+            "signal_date": planned_t.get("signal_date"),
+            "alerts": len(payload.get("alerts") or []),
+        }
+
+    def refresh_similar() -> dict:
         similar = refresh_similar_pattern_analysis()
-        results["similar_patterns"] = {
+        return {
             "status": "success",
             "generated_at": similar.get("generated_at"),
             "targets": len(similar.get("results") or []),
         }
-    except Exception as exc:
-        results["similar_patterns"] = {"status": "failed", "error": str(exc)}
+
+    jobs = {
+        "chan_model_strategy": refresh_chan,
+        "long_stock_pool": refresh_long,
+        "convertible_bond_plan": refresh_convertible_bonds,
+        "convertible_bond_allotments": refresh_allotments,
+        "byd_daily_plan": refresh_byd,
+        "similar_patterns": refresh_similar,
+    }
+    worker_count = max_workers or int(os.getenv("ROUTINE_WEB_WORKSPACE_WORKERS", "6"))
+    worker_count = max(1, min(worker_count, len(jobs)))
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {executor.submit(job): name for name, job in jobs.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                results[name] = {"status": "failed", "error": str(exc)}
     return results
 
 
@@ -333,15 +400,25 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
     strategies = load_strategy_configs(CONFIG_PATH)
     results: dict[str, dict] = {}
     results["refresh_data"] = refresh_data(dry_run=skip_data)
-    results["build_features"] = build_features()
-    results["refresh_strategy_signal_cache"] = refresh_strategy_signal_cache()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        upstream_futures = {
+            executor.submit(build_features): "build_features",
+            executor.submit(refresh_strategy_signal_cache): "refresh_strategy_signal_cache",
+        }
+        for future in as_completed(upstream_futures):
+            results[upstream_futures[future]] = future.result()
     results["score_latest_models"] = score_latest_models()
     if skip_backtest:
         results["run_selected_strategies"] = {"status": "skipped", "reason": "skip_backtest=true"}
     else:
         results["run_selected_strategies"] = run_selected_strategies()
-    results["generate_daily_plan"] = generate_daily_plan()
-    results["generate_dashboard"] = generate_dashboard()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        output_futures = {
+            executor.submit(generate_daily_plan): "generate_daily_plan",
+            executor.submit(generate_dashboard): "generate_dashboard",
+        }
+        for future in as_completed(output_futures):
+            results[output_futures[future]] = future.result()
     results["refresh_daily_web_workspaces"] = refresh_daily_web_workspaces()
     manifest = write_run_manifest(results, strategies)
     return {"manifest": str(manifest), "steps": results}
