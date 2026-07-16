@@ -82,6 +82,38 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 
 只补跑单个工作区时，将作用域替换为 `short`、`chan`、`long`、`cb`、`cbAllotment`、`byd` 或 `similar`。后台状态同时持久化到 `data/routine/latest_refresh_status.json`。
 
+## 例行一键刷新脚本
+
+日常定时任务优先调用同一个脚本，让它自己完成交易日判断、服务检查/启动、触发“更新全部”、进度打印，以及失败后的自动重试：
+
+```bash
+cd /absolute/path/to/quant && python3 scripts/run_daily_web_refresh.py
+```
+
+也可以走现有 CLI：
+
+```bash
+cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-refresh
+```
+
+脚本默认行为：
+
+1. 读取项目 `.env`。
+2. 用 Tushare `trade_cal` 判断当天是否为 A 股交易日；不是交易日或无法可靠确认时直接跳过。
+3. 检查 `http://127.0.0.1:8088/api/health` 和前端首页 `http://127.0.0.1:8088/`；若任一未就绪则自动启动本地 web 服务，该进程同时提供 FastAPI 后端和静态前端。
+4. 触发 `POST /api/selector/refresh-latest`，作用域默认 `all`。
+5. 轮询 `/api/selector/refresh-latest/status` 并打印进度。
+6. 若终态为 `failed/error`，自动再次触发刷新。服务端会优先复用已有的断点续跑能力。
+7. 刷新成功后自动清理缓存：长线研究缓存保留最近 3 个自然月，相似走势向量只保留最新一套；Tushare 单股缓存长期保留、不参与清理。
+
+常用参数：
+
+- `--max-attempts 3`：最多触发几次刷新。
+- `--poll-seconds 20`：轮询间隔。
+- `--no-progress-timeout 2100`：本地监控无进展超时秒数。
+- `--log-file .run/daily_web_refresh.log`：自动启动 web 服务时的日志文件。
+- `--frontend-url http://127.0.0.1:8088/`：前端首页健康检查地址；默认由 `--base-url` 推导。
+
 ## 资源与限流配置
 
 | 变量 | 默认值 | 调整建议 |
