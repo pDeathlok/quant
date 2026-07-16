@@ -10,12 +10,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from quant.research.similar_patterns import (
     SimilarPatternConfig,
+    apply_probability_calibration,
     build_stock_vector_cache,
     build_pattern_vector,
     build_t1_scenario_plan,
     build_sell_model_plan,
     candidate_end_indices,
+    classify_forecast_signal,
+    fit_probability_calibration,
     load_stock_vector_cache,
+    optimize_similar_cases,
     select_best_positions_from_contiguous_matches,
     normalize_daily_frame,
     summarize_forecast,
@@ -43,6 +47,27 @@ def test_normalize_daily_frame_accepts_tushare_schema() -> None:
     assert daily["date"].is_monotonic_increasing
     assert "volume" in daily.columns
     assert "pct_change" in daily.columns
+
+
+def test_normalize_daily_frame_removes_ex_right_price_jump() -> None:
+    raw = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ"] * 3,
+            "trade_date": ["20250101", "20250102", "20250103"],
+            "open": [99.0, 101.0, 33.5],
+            "high": [101.0, 102.0, 34.0],
+            "low": [98.0, 100.0, 33.0],
+            "close": [100.0, 101.0, 33.67],
+            "vol": [1000, 1100, 3300],
+            "pct_chg": [0.0, 1.0, 0.0],
+        }
+    )
+
+    daily = normalize_daily_frame(raw, "000001.SZ")
+
+    assert np.isclose(daily["close"].pct_change().iloc[1], 0.01)
+    assert np.isclose(daily["close"].pct_change().iloc[2], 0.0)
+    assert np.isclose(daily.iloc[-1]["close"], 33.67)
 
 
 def test_build_pattern_vector_has_stable_length() -> None:
@@ -154,6 +179,9 @@ def test_stock_vector_cache_roundtrip(tmp_path: Path) -> None:
     assert "fwd_1d_volume_ratio" in cached
     assert "max_runup_3d" in cached
     assert "max_drawdown_3d" in cached
+    assert np.isfinite(cached["fwd_1d"][-1])
+    assert np.isnan(cached["fwd_20d"][-1])
+    assert np.isnan(cached["fwd_60d"][-1])
 
 
 def test_stock_vector_cache_rebuilds_when_daily_source_changes(tmp_path: Path) -> None:
@@ -214,3 +242,79 @@ def test_trade_plan_builders_return_recommendations() -> None:
     assert not scenario.empty
     assert summary["status"] == "trained"
     assert not model_plan.empty
+
+
+def test_optimize_similar_cases_deduplicates_events_and_caps_each_date() -> None:
+    cases = pd.DataFrame(
+        {
+            "symbol": ["A", "B", "C", "D", "E"],
+            "industry": ["汽车整车", "汽车整车", "软件服务", "医药商业", "汽车整车"],
+            "date": pd.to_datetime(["2024-01-02", "2024-01-02", "2024-01-02", "2024-01-02", "2024-02-02"]),
+            "similarity": [0.080, 0.070, 0.065, 0.060, 0.075],
+            "market_regime": ["risk_on", "risk_on", "risk_off", "neutral", "risk_on"],
+            "fwd_1d": [0.02, -0.01, 0.01, -0.02, 0.03],
+            "fwd_20d": [0.05, 0.01, -0.03, -0.04, 0.08],
+            "fwd_60d": [0.10, 0.03, -0.08, -0.06, 0.12],
+        }
+    )
+    config = SimilarPatternConfig(max_effective_cases=10, max_events_per_date=2)
+
+    optimized, summary = optimize_similar_cases(
+        cases,
+        config,
+        target_date=pd.Timestamp("2025-01-02"),
+        target_industry="汽车整车",
+        target_market_regime="risk_on",
+    )
+
+    assert set(optimized["symbol"]) == {"A", "C", "E"}
+    assert optimized.groupby("date").size().max() == 2
+    assert optimized.loc[optimized["symbol"] == "A", "forecast_weight"].iloc[0] > optimized.loc[
+        optimized["symbol"] == "C", "forecast_weight"
+    ].iloc[0]
+    assert summary["raw_cases"] == 5
+    assert summary["deduplicated_cases"] == 3
+    assert 0 < summary["effective_sample_size"] <= 3
+
+
+def test_classify_forecast_signal_uses_observe_zone_and_breakdown_gate() -> None:
+    config = SimilarPatternConfig(signal_bearish_max=45.0, signal_bullish_min=55.0)
+    healthy = {"dist_ma20": 1.0, "dist_ma60": 2.0, "drawdown_60d": -4.0, "vol_ratio20": 1.0}
+    breakdown = {"dist_ma20": -4.0, "dist_ma60": -7.0, "drawdown_60d": -14.0, "vol_ratio20": 1.6}
+
+    assert classify_forecast_signal(52.0, healthy, "neutral", config)["signal"] == "observe"
+    assert classify_forecast_signal(42.0, healthy, "neutral", config)["signal"] == "bearish"
+    gated = classify_forecast_signal(57.0, breakdown, "risk_off", config)
+    assert gated["signal"] == "observe"
+    assert gated["risk_gate"] == "blocked"
+    assert gated["reasons"]
+
+
+def test_probability_calibration_is_monotonic_and_serializable() -> None:
+    probabilities = [35, 40, 45, 50, 55, 60, 65, 70] * 4
+    outcomes = [False, False, False, False, True, True, True, True] * 4
+
+    calibration = fit_probability_calibration(probabilities, outcomes, min_samples=20)
+    calibrated = [apply_probability_calibration(value, calibration) for value in [40, 50, 60, 70]]
+
+    assert calibration["status"] == "fitted"
+    assert calibrated == sorted(calibrated)
+    assert 0 <= calibrated[0] <= calibrated[-1] <= 100
+    assert isinstance(calibration["x"], list)
+    assert isinstance(calibration["y"], list)
+
+
+def test_summarize_forecast_prefers_optimized_weight_column() -> None:
+    cases = pd.DataFrame(
+        {
+            "similarity": [0.9, 0.1],
+            "forecast_weight": [0.1, 0.9],
+            "fwd_1d": [0.10, -0.10],
+            "fwd_20d": [0.10, -0.10],
+            "fwd_60d": [0.10, -0.10],
+        }
+    )
+
+    forecast = summarize_forecast(cases).set_index("horizon")
+
+    assert forecast.loc["next_1d", "up_probability"] == 10.0

@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import hashlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -15,7 +17,7 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class SimilarPatternConfig:
-    cache_schema_version: int = 3
+    cache_schema_version: int = 5
     lookback_days: int = 60
     weekly_lookback: int = 26
     monthly_lookback: int = 12
@@ -30,6 +32,21 @@ class SimilarPatternConfig:
     stop_loss_3d: float = 0.03
     top_k: int = 80
     min_candidate_rows: int = 500
+    signal_bearish_max: float = 45.0
+    signal_bullish_min: float = 55.0
+    min_effective_cases: int = 100
+    max_effective_cases: int = 800
+    max_events_per_date: int = 3
+    similarity_weight_power: float = 2.0
+    same_industry_weight: float = 1.25
+    cross_industry_weight: float = 0.85
+    same_regime_weight: float = 1.15
+    regime_mismatch_weight: float = 0.75
+    same_industry_regime_weight: float = 1.10
+    industry_regime_mismatch_weight: float = 0.80
+    recency_half_life_days: int = 1095
+    transaction_cost: float = 0.001
+    enable_risk_gate: bool = True
 
 
 @dataclass(frozen=True)
@@ -93,6 +110,26 @@ def normalize_daily_frame(frame: pd.DataFrame, symbol_hint: str | None = None) -
     out = out[cols].dropna(subset=["date", "open", "high", "low", "close"]).copy()
     out = out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     out["symbol"] = out["symbol"].fillna(symbol_hint or "").astype(str)
+    out = _continuous_ohlc_from_pct_change(out)
+    return out
+
+
+def _continuous_ohlc_from_pct_change(frame: pd.DataFrame) -> pd.DataFrame:
+    """Remove ex-right jumps using Tushare's continuous pct_change series."""
+    out = frame.copy()
+    pct_change = pd.to_numeric(out["pct_change"], errors="coerce") / 100.0
+    raw_close = pd.to_numeric(out["close"], errors="coerce")
+    if len(out) < 2 or pct_change.notna().sum() < 2 or raw_close.iloc[-1] <= 0:
+        return out
+    growth = 1.0 + pct_change
+    raw_growth = raw_close.pct_change() + 1.0
+    growth = growth.where(growth.gt(0) & np.isfinite(growth), raw_growth)
+    growth.iloc[0] = 1.0
+    continuous = growth.fillna(1.0).cumprod()
+    continuous = continuous / continuous.iloc[-1] * raw_close.iloc[-1]
+    scale = continuous / raw_close.replace(0, np.nan)
+    for column in ["open", "high", "low", "close"]:
+        out[column] = pd.to_numeric(out[column], errors="coerce") * scale
     return out
 
 
@@ -149,7 +186,10 @@ def save_stock_vector_cache(
     volume_ma20 = pd.Series(volume).rolling(20).mean().to_numpy(dtype=float)
     future: dict[str, np.ndarray] = {}
     for days in config.forward_days:
-        future[f"fwd_{days}d"] = np.array([close[idx + days] / close[idx] - 1 for idx in indices], dtype=np.float32)
+        future[f"fwd_{days}d"] = np.array(
+            [close[idx + days] / close[idx] - 1 if idx + days < len(close) else np.nan for idx in indices],
+            dtype=np.float32,
+        )
     max_forward = max(config.forward_days)
     future["fwd_1d_volume_ratio"] = np.array(
         [
@@ -161,19 +201,29 @@ def save_stock_vector_cache(
         dtype=np.float32,
     )
     future["max_runup_3d"] = np.array(
-        [np.nanmax(high[idx + 1 : idx + 4]) / close[idx] - 1 for idx in indices],
+        [np.nanmax(high[idx + 1 : idx + 4]) / close[idx] - 1 if idx + 3 < len(high) else np.nan for idx in indices],
         dtype=np.float32,
     )
     future["max_drawdown_3d"] = np.array(
-        [np.nanmin(low[idx + 1 : idx + 4]) / close[idx] - 1 for idx in indices],
+        [np.nanmin(low[idx + 1 : idx + 4]) / close[idx] - 1 if idx + 3 < len(low) else np.nan for idx in indices],
         dtype=np.float32,
     )
     future["max_drawdown_60d"] = np.array(
-        [np.nanmin(close[idx + 1 : idx + max_forward + 1]) / close[idx] - 1 for idx in indices],
+        [
+            np.nanmin(close[idx + 1 : idx + max_forward + 1]) / close[idx] - 1
+            if idx + max_forward < len(close)
+            else np.nan
+            for idx in indices
+        ],
         dtype=np.float32,
     )
     future["max_runup_60d"] = np.array(
-        [np.nanmax(close[idx + 1 : idx + max_forward + 1]) / close[idx] - 1 for idx in indices],
+        [
+            np.nanmax(close[idx + 1 : idx + max_forward + 1]) / close[idx] - 1
+            if idx + max_forward < len(close)
+            else np.nan
+            for idx in indices
+        ],
         dtype=np.float32,
     )
     np.savez(
@@ -245,7 +295,7 @@ def build_stock_vector_cache(
     started = perf_counter()
     try:
         daily = load_daily_file(path)
-        if len(daily) < config.min_history_days + max(config.forward_days) + 1:
+        if len(daily) < config.min_history_days + min(config.forward_days) + 1:
             return {"symbol": symbol, "status": "too_short", "cache_path": str(cache_path), "vectors": 0, "elapsed_sec": 0.0}
         industry = str(info.get("industry", ""))
         if info.get("name"):
@@ -292,6 +342,14 @@ def _build_stock_vector_cache_worker(args: tuple[str, dict[str, object], Similar
     return build_stock_vector_cache(Path(path_text), info, config, Path(cache_dir_text), force)
 
 
+def _should_use_thread_pool_for_vector_cache() -> bool:
+    """Avoid nested process pools when the current worker cannot safely spawn children."""
+    try:
+        return bool(mp.current_process().daemon)
+    except Exception:
+        return False
+
+
 def build_vector_caches_parallel(
     daily_dir: Path,
     basic: pd.DataFrame,
@@ -301,6 +359,7 @@ def build_vector_caches_parallel(
     max_symbols: int | None = None,
     workers: int = 1,
     force: bool = False,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
     files = sorted(daily_dir.glob("*.parquet"))
     if max_symbols is not None:
@@ -317,12 +376,15 @@ def build_vector_caches_parallel(
             records.append(_build_stock_vector_cache_worker(task))
             if n % 200 == 0 or n == len(tasks):
                 built = sum(1 for record in records if record.get("status") in {"built", "cache_hit"})
-                print(f"  vector cache {n}/{len(tasks)} files usable={built:,} elapsed={perf_counter() - started:.1f}s", flush=True)
+                message = f"vector cache {n}/{len(tasks)} files usable={built:,} elapsed={perf_counter() - started:.1f}s"
+                print(f"  {message}", flush=True)
+                if progress_callback:
+                    progress_callback(message)
     else:
-        executor_cls = ProcessPoolExecutor
+        executor_cls = ThreadPoolExecutor if _should_use_thread_pool_for_vector_cache() else ProcessPoolExecutor
         try:
             executor = executor_cls(max_workers=workers)
-        except PermissionError:
+        except (AssertionError, BrokenPipeError, PermissionError):
             print("  process pool unavailable; falling back to thread pool", flush=True)
             executor_cls = ThreadPoolExecutor
             executor = executor_cls(max_workers=workers)
@@ -332,7 +394,10 @@ def build_vector_caches_parallel(
                 records.append(future.result())
                 if n % 200 == 0 or n == len(futures):
                     built = sum(1 for record in records if record.get("status") in {"built", "cache_hit"})
-                    print(f"  vector cache {n}/{len(futures)} files usable={built:,} elapsed={perf_counter() - started:.1f}s", flush=True)
+                    message = f"vector cache {n}/{len(futures)} files usable={built:,} elapsed={perf_counter() - started:.1f}s"
+                    print(f"  {message}", flush=True)
+                    if progress_callback:
+                        progress_callback(message)
     return pd.DataFrame(records)
 
 
@@ -471,7 +536,7 @@ def make_candidate_row(
     industry: str = "",
 ) -> dict[str, object] | None:
     max_forward = max(config.forward_days)
-    if end_idx + max_forward >= len(daily):
+    if end_idx + min(config.forward_days) >= len(daily):
         return None
     row = daily.iloc[end_idx]
     close = float(row["close"])
@@ -479,7 +544,11 @@ def make_candidate_row(
         return None
     future = {}
     for days in config.forward_days:
-        future[f"fwd_{days}d"] = float(daily.iloc[end_idx + days]["close"] / close - 1)
+        future[f"fwd_{days}d"] = (
+            float(daily.iloc[end_idx + days]["close"] / close - 1)
+            if end_idx + days < len(daily)
+            else np.nan
+        )
     volume = daily["volume"].replace(0, np.nan)
     vol_ma20 = volume.rolling(20).mean().iloc[end_idx]
     future["fwd_1d_volume_ratio"] = (
@@ -489,11 +558,11 @@ def make_candidate_row(
     )
     high_3d = daily.iloc[end_idx + 1 : end_idx + 4]["high"].astype(float)
     low_3d = daily.iloc[end_idx + 1 : end_idx + 4]["low"].astype(float)
-    future["max_runup_3d"] = float(high_3d.max() / close - 1)
-    future["max_drawdown_3d"] = float(low_3d.min() / close - 1)
+    future["max_runup_3d"] = float(high_3d.max() / close - 1) if len(high_3d) == 3 else np.nan
+    future["max_drawdown_3d"] = float(low_3d.min() / close - 1) if len(low_3d) == 3 else np.nan
     future_window = daily.iloc[end_idx + 1 : end_idx + max_forward + 1]["close"].astype(float)
-    future["max_drawdown_60d"] = float(future_window.min() / close - 1)
-    future["max_runup_60d"] = float(future_window.max() / close - 1)
+    future["max_drawdown_60d"] = float(future_window.min() / close - 1) if len(future_window) == max_forward else np.nan
+    future["max_runup_60d"] = float(future_window.max() / close - 1) if len(future_window) == max_forward else np.nan
     return {
         "symbol": str(row["symbol"]),
         "name": str(row.get("name", "")),
@@ -531,7 +600,7 @@ def make_cached_candidate_row(
 
 
 def candidate_end_indices(daily: pd.DataFrame, config: SimilarPatternConfig) -> range:
-    max_end = len(daily) - max(config.forward_days) - 1
+    max_end = len(daily) - min(config.forward_days) - 1
     if max_end < config.min_history_days:
         return range(0)
     if config.candidate_start_date:
@@ -756,6 +825,7 @@ def analyze_targets_by_threshold(
     target_date: str | None = None,
     max_symbols: int | None = None,
     vector_cache_dir: Path | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, SimilarPatternResult]:
     if config.similarity_threshold is None:
         raise ValueError("similarity_threshold is required for threshold mode")
@@ -848,11 +918,13 @@ def analyze_targets_by_threshold(
         if n % 500 == 0:
             elapsed = perf_counter() - started
             counts = ", ".join(f"{symbol}={len(rows):,}" for symbol, rows in target_matches.items())
-            print(
-                f"  threshold scan {n}/{len(files)} files, candidates={scanned_candidates:,}, "
-                f"matches: {counts}, elapsed={elapsed:.1f}s",
-                flush=True,
+            message = (
+                f"threshold scan {n}/{len(files)} files, candidates={scanned_candidates:,}, "
+                f"matches: {counts}, elapsed={elapsed:.1f}s"
             )
+            print(f"  {message}", flush=True)
+            if progress_callback:
+                progress_callback(message)
 
     results: dict[str, SimilarPatternResult] = {}
     for symbol, context in target_contexts.items():
@@ -902,6 +974,274 @@ def analyze_targets_by_threshold(
     return results
 
 
+def optimize_similar_cases(
+    cases: pd.DataFrame,
+    config: SimilarPatternConfig,
+    *,
+    target_date: pd.Timestamp,
+    target_industry: str,
+    target_market_regime: str,
+    target_industry_regime: str = "",
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Deduplicate correlated events and assign nonlinear forecast weights."""
+    raw_cases = int(len(cases))
+    if cases.empty:
+        return cases.copy(), {
+            "raw_cases": 0,
+            "deduplicated_cases": 0,
+            "effective_sample_size": 0.0,
+            "sample_status": "insufficient",
+        }
+
+    out = cases.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["industry"] = out.get("industry", "").fillna("").astype(str)
+    out["similarity"] = pd.to_numeric(out["similarity"], errors="coerce")
+    out = out.dropna(subset=["date", "similarity"])
+    out = out.sort_values(["similarity", "date"], ascending=[False, False])
+    out = out.drop_duplicates(["date", "industry"], keep="first")
+    out = (
+        out.sort_values(["date", "similarity"], ascending=[False, False])
+        .groupby("date", group_keys=False)
+        .head(max(1, config.max_events_per_date))
+    )
+
+    threshold = float(config.similarity_threshold or 0.0)
+    margins = (out["similarity"] - threshold).clip(lower=0.0001)
+    max_margin = float(margins.max()) if not margins.empty else 0.0001
+    base_weight = (margins / max(max_margin, 0.0001)).pow(config.similarity_weight_power)
+    industry_factor = np.where(
+        out["industry"].eq(str(target_industry)),
+        config.same_industry_weight,
+        config.cross_industry_weight,
+    )
+    if "market_regime" in out.columns and target_market_regime:
+        regime_factor = np.where(
+            out["market_regime"].fillna("neutral").astype(str).eq(str(target_market_regime)),
+            config.same_regime_weight,
+            config.regime_mismatch_weight,
+        )
+    else:
+        regime_factor = np.ones(len(out), dtype=float)
+    if "industry_regime" in out.columns and target_industry_regime:
+        same_industry = out["industry"].eq(str(target_industry))
+        industry_regime_factor = np.where(
+            ~same_industry,
+            1.0,
+            np.where(
+                out["industry_regime"].fillna("neutral").astype(str).eq(str(target_industry_regime)),
+                config.same_industry_regime_weight,
+                config.industry_regime_mismatch_weight,
+            ),
+        )
+    else:
+        industry_regime_factor = np.ones(len(out), dtype=float)
+    ages = (pd.Timestamp(target_date) - out["date"]).dt.days.clip(lower=0)
+    recency_factor = np.power(0.5, ages / max(1, config.recency_half_life_days))
+    out["forecast_weight"] = (
+        base_weight.to_numpy(dtype=float)
+        * industry_factor
+        * regime_factor
+        * industry_regime_factor
+        * recency_factor
+    )
+    out = out.sort_values(["forecast_weight", "similarity"], ascending=[False, False]).head(
+        max(1, config.max_effective_cases)
+    )
+    weight = out["forecast_weight"].to_numpy(dtype=float)
+    weight_sum = float(np.sum(weight))
+    effective_sample_size = (
+        float(weight_sum**2 / np.sum(np.square(weight)))
+        if weight_sum > 0 and float(np.sum(np.square(weight))) > 0
+        else 0.0
+    )
+    out = out.reset_index(drop=True)
+    out["rank"] = np.arange(1, len(out) + 1)
+    return out, {
+        "raw_cases": raw_cases,
+        "deduplicated_cases": int(len(out)),
+        "effective_sample_size": round(effective_sample_size, 2),
+        "sample_status": "ready" if effective_sample_size >= config.min_effective_cases else "insufficient",
+        "max_events_per_date": int(config.max_events_per_date),
+        "max_effective_cases": int(config.max_effective_cases),
+        "weight_power": float(config.similarity_weight_power),
+    }
+
+
+def build_probability_variant_cases(
+    cases: pd.DataFrame,
+    config: SimilarPatternConfig,
+    *,
+    target_date: pd.Timestamp,
+    target_industry: str,
+    target_market_regime: str,
+    target_industry_regime: str = "",
+) -> dict[str, pd.DataFrame]:
+    """Build transferable single-condition variants used by global model selection."""
+    if cases.empty:
+        return {name: cases.copy() for name in ("event_dedupe", "nonlinear", "regime_industry", "recency")}
+
+    normalized = cases.copy()
+    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce")
+    normalized["industry"] = normalized.get("industry", "").fillna("").astype(str)
+    normalized["similarity"] = pd.to_numeric(normalized["similarity"], errors="coerce")
+    normalized = normalized.dropna(subset=["date", "similarity"])
+
+    event_dedupe = normalized.sort_values(["similarity", "date"], ascending=[False, False]).drop_duplicates(
+        ["date", "industry"], keep="first"
+    )
+    event_dedupe = (
+        event_dedupe.sort_values(["date", "similarity"], ascending=[False, False])
+        .groupby("date", group_keys=False)
+        .head(max(1, config.max_events_per_date))
+    )
+
+    nonlinear = normalized.copy()
+    threshold = float(config.similarity_threshold or 0.0)
+    margin = (nonlinear["similarity"] - threshold).clip(lower=0.0001)
+    nonlinear["forecast_weight"] = np.square(margin / max(float(margin.max()), 0.0001))
+
+    regime_industry = normalized.copy()
+    weight = regime_industry["similarity"].fillna(0.0)
+    weight *= np.where(
+        regime_industry["industry"].eq(str(target_industry)),
+        config.same_industry_weight,
+        config.cross_industry_weight,
+    )
+    if "market_regime" in regime_industry.columns and target_market_regime:
+        weight *= np.where(
+            regime_industry["market_regime"].fillna("neutral").astype(str).eq(str(target_market_regime)),
+            config.same_regime_weight,
+            config.regime_mismatch_weight,
+        )
+    if "industry_regime" in regime_industry.columns and target_industry_regime:
+        same_industry = regime_industry["industry"].eq(str(target_industry))
+        weight *= np.where(
+            ~same_industry,
+            1.0,
+            np.where(
+                regime_industry["industry_regime"].fillna("neutral").astype(str).eq(str(target_industry_regime)),
+                config.same_industry_regime_weight,
+                config.industry_regime_mismatch_weight,
+            ),
+        )
+    regime_industry["forecast_weight"] = weight
+
+    recency = normalized.copy()
+    ages = (pd.Timestamp(target_date) - recency["date"]).dt.days.clip(lower=0)
+    recency["forecast_weight"] = recency["similarity"].fillna(0.0) * np.power(
+        0.5,
+        ages / max(1, config.recency_half_life_days),
+    )
+    return {
+        "event_dedupe": event_dedupe,
+        "nonlinear": nonlinear,
+        "regime_industry": regime_industry,
+        "recency": recency,
+    }
+
+
+def classify_forecast_signal(
+    up_probability: float | None,
+    snapshot: dict[str, float | str | None],
+    market_regime: str,
+    config: SimilarPatternConfig,
+) -> dict[str, object]:
+    """Classify a forecast and veto weak bullish signals during breakdowns."""
+    if up_probability is None or not np.isfinite(float(up_probability)):
+        return {"signal": "observe", "risk_gate": "missing", "reasons": ["缺少有效概率"]}
+    probability = float(up_probability)
+    if probability >= config.signal_bullish_min:
+        signal = "bullish"
+    elif probability <= config.signal_bearish_max:
+        signal = "bearish"
+    else:
+        signal = "observe"
+
+    def value(key: str) -> float:
+        raw = snapshot.get(key)
+        try:
+            parsed = float(raw) if raw is not None else np.nan
+        except (TypeError, ValueError):
+            return np.nan
+        return parsed
+
+    reasons: list[str] = []
+    dist_ma20 = value("dist_ma20")
+    dist_ma60 = value("dist_ma60")
+    drawdown = value("drawdown_60d")
+    volume_ratio = value("vol_ratio20")
+    breakdown = (
+        (np.isfinite(dist_ma20) and dist_ma20 <= -3.0)
+        and (np.isfinite(dist_ma60) and dist_ma60 <= -5.0)
+        and (
+            (np.isfinite(drawdown) and drawdown <= -12.0)
+            or (np.isfinite(volume_ratio) and volume_ratio >= 1.3)
+        )
+    )
+    if breakdown:
+        reasons.append("放量或深回撤破位")
+    if market_regime == "risk_off":
+        reasons.append("沪深300处于风险规避状态")
+    blocked = config.enable_risk_gate and signal == "bullish" and (
+        breakdown or (market_regime == "risk_off" and probability < 60.0)
+    )
+    return {
+        "signal": "observe" if blocked else signal,
+        "raw_signal": signal,
+        "risk_gate": "blocked" if blocked else "passed",
+        "reasons": reasons,
+        "probability": round(probability, 2),
+        "bearish_max": float(config.signal_bearish_max),
+        "bullish_min": float(config.signal_bullish_min),
+    }
+
+
+def fit_probability_calibration(
+    probabilities: list[float],
+    outcomes: list[bool],
+    *,
+    min_samples: int = 20,
+) -> dict[str, object]:
+    """Fit a small monotonic reliability curve that is JSON serializable."""
+    frame = pd.DataFrame({"probability": probabilities, "outcome": outcomes}).dropna()
+    if len(frame) < min_samples or frame["outcome"].nunique() < 2:
+        return {"status": "identity", "sample_count": int(len(frame)), "x": [0.0, 100.0], "y": [0.0, 100.0]}
+    frame["bin"] = pd.qcut(frame["probability"], q=min(6, frame["probability"].nunique()), duplicates="drop")
+    grouped = frame.groupby("bin", observed=True).agg(
+        x=("probability", "mean"),
+        positives=("outcome", "sum"),
+        count=("outcome", "size"),
+    )
+    grouped["y"] = (grouped["positives"] + 1.0) / (grouped["count"] + 2.0) * 100.0
+    x_values = grouped["x"].astype(float).to_numpy()
+    y_values = np.maximum.accumulate(grouped["y"].astype(float).to_numpy())
+    x_values = np.r_[0.0, x_values, 100.0]
+    y_values = np.r_[max(0.0, y_values[0] - 10.0), y_values, min(100.0, y_values[-1] + 10.0)]
+    return {
+        "status": "fitted",
+        "sample_count": int(len(frame)),
+        "x": [round(float(value), 4) for value in x_values],
+        "y": [round(float(value), 4) for value in y_values],
+    }
+
+
+def apply_probability_calibration(
+    probability: float | None,
+    calibration: dict[str, object] | None,
+) -> float | None:
+    """Apply a serialized monotonic reliability curve."""
+    if probability is None or not np.isfinite(float(probability)):
+        return None
+    if not calibration:
+        return _round(float(probability))
+    x_values = np.asarray(calibration.get("x") or [0.0, 100.0], dtype=float)
+    y_values = np.asarray(calibration.get("y") or [0.0, 100.0], dtype=float)
+    if len(x_values) != len(y_values) or len(x_values) < 2:
+        return _round(float(probability))
+    return _round(float(np.interp(float(probability), x_values, y_values)))
+
+
 def summarize_forecast(cases: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for col, label in [("fwd_1d", "next_1d"), ("fwd_20d", "next_1m"), ("fwd_60d", "next_3m")]:
@@ -921,7 +1261,8 @@ def summarize_forecast(cases: pd.DataFrame) -> pd.DataFrame:
             )
             continue
         values = cases[col].astype(float)
-        weights = cases["similarity"].astype(float)
+        weight_col = "forecast_weight" if "forecast_weight" in cases.columns else "similarity"
+        weights = cases[weight_col].astype(float)
         if values.notna().sum() == 0 or weights.sum() <= 0:
             rows.append(
                 {

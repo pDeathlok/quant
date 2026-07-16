@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260628-similar-list-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260715-watchlist-linked-v4" />
   </head>
   <body>
     <div class="app selector-app">
@@ -80,8 +80,8 @@
             <span>日线计划 / 降仓路线</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
-            <strong>相似走势</strong>
-            <span>自选池 / T+1 情景</span>
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -195,8 +195,8 @@
             <span>日线计划 / 降仓路线</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
-            <strong>相似走势</strong>
-            <span>自选池 / T+1 情景</span>
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -288,8 +288,8 @@
             <span>日线计划 / 降仓路线</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
-            <strong>相似走势</strong>
-            <span>自选池 / T+1 情景</span>
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -418,8 +418,8 @@
             <span>日线计划 / 降仓路线</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
-            <strong>相似走势</strong>
-            <span>自选池 / T+1 情景</span>
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -504,8 +504,8 @@
             <span>日线计划 / 降仓路线</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
-            <strong>相似走势</strong>
-            <span>自选池 / T+1 情景</span>
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -636,8 +636,8 @@
             <span>日线计划 / 降仓路线</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
-            <strong>相似走势</strong>
-            <span>自选池 / T+1 情景</span>
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -755,15 +755,15 @@
             <span>日线计划 / 降仓路线</span>
           </button>
           <button class="page-tab active" type="button" data-page="similar">
-            <strong>相似走势</strong>
-            <span>自选池 / T+1 情景</span>
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
         <section class="toolbar similar-toolbar">
           <div>
-            <p class="eyebrow">Similar Pattern Desk</p>
-            <h2>相似走势决策台</h2>
+            <p class="eyebrow">Watchlist Intelligence</p>
+            <h2>自选池</h2>
             <p id="similarMeta" class="subline">等待加载自选池</p>
           </div>
           <form id="similarAddForm" class="similar-add-form">
@@ -797,13 +797,14 @@
                   <th>60日回撤</th>
                   <th>量比</th>
                   <th>相似样本</th>
+                  <th>策略命中</th>
                   <th>次日预期</th>
                   <th>1月预期</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody id="similarWatchlist">
-                <tr><td colspan="11" class="empty-cell">切到相似走势页后加载</td></tr>
+                <tr><td colspan="12" class="empty-cell">切到自选池后加载</td></tr>
               </tbody>
             </table>
           </div>
@@ -878,6 +879,10 @@
       </main>
     </div>
     <div id="bydTradeToast" class="byd-trade-toast" role="status" aria-live="polite" aria-atomic="true"></div>
-    <script src="./app.js?v=20260712-chan-summary-v4"></script>
+    <div id="watchlistContextMenu" class="watchlist-context-menu" role="menu" hidden>
+      <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
+    </div>
+    <div id="watchlistToast" class="watchlist-toast" role="status" aria-live="polite"></div>
+    <script src="./app.js?v=20260715-watchlist-linked-v4"></script>
   </body>
 </html>

@@ -43,7 +43,7 @@ const REFRESH_SCOPE_LABELS = {
   cb: "可转债",
   cbAllotment: "配债股",
   byd: "BYD",
-  similar: "相似走势",
+  similar: "自选池",
 };
 const REFRESH_BUTTON_LABELS = {
   refreshAllButton: "更新全部",
@@ -464,13 +464,13 @@ async function loadSimilarPatterns(options = {}) {
   }
 }
 
-async function addSimilarWatchSymbol(symbol) {
+async function addSimilarWatchSymbol(symbol, options = {}) {
   await fetchJson("/similar-patterns/watchlist", {
     method: "POST",
     body: JSON.stringify({ symbol }),
   });
   state.similarPayload = null;
-  await loadSimilarPatterns({ refresh: true });
+  if (options.refresh !== false) await loadSimilarPatterns({ refresh: true });
 }
 
 async function removeSimilarWatchSymbol(symbol) {
@@ -504,7 +504,47 @@ function similarResultForSymbol(symbol) {
 }
 
 function similarForecastRow(item, horizon) {
-  return (item?.forecast || []).find((row) => row.horizon === horizon) || {};
+  const optimized = (item?.optimized_forecast || []).find((row) => row.horizon === horizon);
+  return optimized || (item?.forecast || []).find((row) => row.horizon === horizon) || {};
+}
+
+function similarDecision(item, horizon) {
+  return (item?.decisions || []).find((row) => row.horizon === horizon) || {};
+}
+
+function similarSignalLabel(signal) {
+  if (signal === "bullish") return "看涨";
+  if (signal === "bearish") return "看跌";
+  return "观望";
+}
+
+function similarProbabilitySourceLabel(source) {
+  const labels = {
+    raw_baseline: "原始相似样本",
+    event_dedupe: "事件去重",
+    nonlinear: "非线性权重",
+    regime_industry: "市场/行业状态权重",
+    recency: "时间衰减",
+    full_weighting: "完整组合权重",
+    optimized: "完整组合权重",
+    calibrated: "全池滚动校准",
+  };
+  return labels[source] || source || "统一策略";
+}
+
+function watchlistStrategyHits(item) {
+  return item?.strategy_hits || [];
+}
+
+function watchlistStrategyBadges(item, includeDetail = false) {
+  const hits = watchlistStrategyHits(item);
+  if (!hits.length) return `<span class="strategy-hit-empty">暂无其他策略命中</span>`;
+  return `<div class="strategy-hit-list">${hits.map((hit) => `
+    <span class="strategy-hit-badge ${hit.strategy_key || ""}" title="${hit.detail || hit.strategy_label || ""}">
+      <strong>${hit.strategy_label || hit.strategy_key || "策略"}</strong>
+      ${includeDetail ? `<em>${hit.detail || "已命中"}</em>` : ""}
+    </span>
+  `).join("")}</div>`;
 }
 
 function fallbackSimilarityScore(row, rows) {
@@ -535,20 +575,20 @@ function renderSimilarPatternsPage() {
   if (!meta || !watchlist || !overview || !scenarioRows || !modelList || !topRows) return;
 
   if (state.similarLoading && !payload) {
-    meta.textContent = "正在计算相似走势";
+    meta.textContent = "正在计算自选池相似走势";
     overview.innerHTML = `<article class="panel"><p class="subline">正在扫描历史相似片段...</p></article>`;
     return;
   }
   if (!payload) {
-    meta.textContent = "切到相似走势页后加载";
-    watchlist.innerHTML = `<tr><td colspan="11" class="empty-cell">切到相似走势页后加载</td></tr>`;
+    meta.textContent = "切到自选池后加载";
+    watchlist.innerHTML = `<tr><td colspan="12" class="empty-cell">切到自选池后加载</td></tr>`;
     overview.innerHTML = "";
     return;
   }
 
   const watch = payload.watchlist || [];
   const results = payload.results || [];
-  meta.textContent = `更新于 ${payload.generated_at || "-"} · 阈值 ${payload.config?.similarity_threshold ?? "-"} · 自选 ${watch.length} 只`;
+  meta.textContent = `更新于 ${payload.generated_at || "-"} · 全池统一策略 · T+1 观望区 ${payload.config?.signal_bearish_max ?? 45}%～${payload.config?.signal_bullish_min ?? 55}% · 自选 ${watch.length} 只`;
   if (watchCount) watchCount.textContent = `${watch.length} 只股票`;
   watchlist.innerHTML = watch.map((item) => {
     const result = similarResultForSymbol(item.symbol);
@@ -556,6 +596,7 @@ function renderSimilarPatternsPage() {
     const snapshot = result?.latest_snapshot || {};
     const nextDay = similarForecastRow(result, "next_1d");
     const nextMonth = similarForecastRow(result, "next_1m");
+    const nextDayDecision = similarDecision(result, "next_1d");
     const selectedClass = item.symbol === state.similarSelectedSymbol ? "active" : "";
     return `
       <tr class="similar-watch-row ${selectedClass}" data-similar-symbol="${item.symbol}">
@@ -566,20 +607,23 @@ function renderSimilarPatternsPage() {
         <td>${fmtPct(snapshot.ret_20d)}</td>
         <td>${fmtPct(snapshot.drawdown_60d)}</td>
         <td>${snapshot.vol_ratio20 ?? "-"}</td>
-        <td>${result?.scan_summary?.matched_cases || "-"}</td>
-        <td>${fmtPct(nextDay.up_probability)} / 中位 ${fmtPct(nextDay.median)}</td>
-        <td>${fmtPct(nextMonth.up_probability)} / 中位 ${fmtPct(nextMonth.median)}</td>
+        <td>${result?.optimization_summary?.effective_sample_size ?? result?.scan_summary?.matched_cases ?? "-"} 有效</td>
+        <td>${watchlistStrategyBadges(result)}</td>
+        <td><strong class="similar-signal-${nextDayDecision.signal || "observe"}">${similarSignalLabel(nextDayDecision.signal)}</strong><br><span class="subline">选择概率 ${fmtPct(nextDay.selected_up_probability ?? nextDay.calibrated_up_probability ?? nextDay.up_probability)}</span></td>
+        <td>${fmtPct(nextMonth.selected_up_probability ?? nextMonth.calibrated_up_probability ?? nextMonth.up_probability)} / 中位 ${fmtPct(nextMonth.median)}</td>
         <td><button type="button" data-similar-remove="${item.symbol}">删除</button></td>
       </tr>
     `;
-  }).join("") || `<tr><td colspan="11" class="empty-cell">暂无自选股票</td></tr>`;
+  }).join("") || `<tr><td colspan="12" class="empty-cell">暂无自选股票</td></tr>`;
 
   const selected = selectedSimilarResult();
   overview.innerHTML = selected ? (() => {
     const item = selected;
     const target = item.target || {};
     const snapshot = item.latest_snapshot || {};
-    const forecast = item.forecast || [];
+    const forecast = item.optimized_forecast?.length ? item.optimized_forecast : (item.forecast || []);
+    const nextDecision = similarDecision(item, "next_1d");
+    const validation = (item.validation_summary || []).find((row) => row.horizon === "next_1d") || {};
     return `
       <article class="similar-card active">
         <div class="similar-card-head">
@@ -587,20 +631,35 @@ function renderSimilarPatternsPage() {
             <strong>${target.name || target.symbol}</strong>
             <span>${target.symbol} · ${target.target_date || "-"}</span>
           </div>
-          <small>${item.scan_summary?.matched_cases || 0} 样本</small>
+          <small>${item.optimization_summary?.effective_sample_size ?? 0} 有效样本</small>
         </div>
         <div class="similar-snapshot">
           <div><span>收盘</span><strong>${fmtPrice(snapshot.close)}</strong></div>
           <div><span>20日</span><strong>${fmtPct(snapshot.ret_20d)}</strong></div>
           <div><span>量比</span><strong>${snapshot.vol_ratio20 ?? "-"}</strong></div>
         </div>
+        <div class="similar-decision-banner similar-signal-${nextDecision.signal || "observe"}">
+          <strong>T+1 ${similarSignalLabel(nextDecision.signal)}</strong>
+          <span>${item.market_regime || "neutral"} / 行业 ${item.industry_regime || "neutral"}${nextDecision.risk_gate === "blocked" ? ` · 风险闸门：${(nextDecision.reasons || []).join("、")}` : ""}</span>
+        </div>
+        <div class="watchlist-strategy-summary">
+          <span>其他策略联动</span>
+          ${watchlistStrategyBadges(item, true)}
+        </div>
         <div class="similar-forecast">
-          ${forecast.map((row) => `
+          ${forecast.map((row) => {
+            const rowDecision = similarDecision(item, row.horizon);
+            return `
             <div class="similar-forecast-row">
-              <span>${similarForecastLabel(row.horizon)} 上涨 ${fmtPct(row.up_probability)}</span>
-              <strong>中位 ${fmtPct(row.median)}</strong>
+              <span>${similarForecastLabel(row.horizon)} 选择上涨 ${fmtPct(row.selected_up_probability ?? row.calibrated_up_probability ?? row.up_probability)} · ${similarProbabilitySourceLabel(row.probability_source)}</span>
+              <strong>${rowDecision.bearish_max ?? "-"}/${rowDecision.bullish_min ?? "-"} · 中位 ${fmtPct(row.median)}</strong>
             </div>
-          `).join("")}
+          `}).join("")}
+        </div>
+        <div class="similar-validation-strip">
+          <span>2025+ T+1 验证</span>
+          <strong>本股覆盖 ${fmtPct(validation.selected_model_coverage ?? validation.coverage)} · 命中 ${fmtPct(validation.selected_model_accuracy ?? validation.direction_accuracy)}</strong>
+          <small>全池命中 ${fmtPct(validation.global_model_accuracy)} · ${similarProbabilitySourceLabel(validation.selected_model)}</small>
         </div>
       </article>
     `;
@@ -988,7 +1047,7 @@ function renderChanModelPage() {
   }
   if (tbody) {
     tbody.innerHTML = rows.length ? rows.map((item) => `
-      <tr class="${item.symbol === state.chanSelectedSymbol ? "selected-row" : ""}" data-chan-symbol="${item.symbol}">
+      <tr class="${item.symbol === state.chanSelectedSymbol ? "selected-row" : ""}" data-chan-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" tabindex="0">
         <td><strong>${item.symbol}</strong><span>${item.name || ""}</span></td>
         <td><span class="tag ${item.rule_id === "chan_model_primary" ? "strong" : ""}">${chanRuleLabel(item)}</span></td>
         <td>${Number(item.rank_score || 0).toFixed(3)}</td>
@@ -1263,7 +1322,7 @@ function renderStockRows() {
     return;
   }
   body.innerHTML = rows.map((item) => `
-    <tr class="${item.symbol === state.selectedSymbol ? "selected-row" : ""}" data-symbol="${item.symbol}">
+    <tr class="${item.symbol === state.selectedSymbol ? "selected-row" : ""}" data-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" tabindex="0">
       <td>
         <strong class="copyable-symbol">${item.symbol}</strong>
         <span>${item.name || ""}</span>
@@ -1494,7 +1553,7 @@ function renderLongStockPool() {
     return;
   }
   body.innerHTML = payload.stocks.map((item) => `
-    <tr>
+    <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" tabindex="0">
       <td><span class="state-pill ${item.state}">${stateLabel(item.state)}</span></td>
       <td>
         <strong>${item.ts_code}</strong>
@@ -1926,7 +1985,7 @@ function renderConvertibleBondAllotments() {
     return;
   }
   rows.innerHTML = records.map((item) => `
-    <tr>
+    <tr data-watchlist-symbol="${item.stock_code || ""}" data-watchlist-name="${item.stock_name || ""}" tabindex="0">
       <td><span class="allotment-status ${allotmentStatusClass(item.stage)}">${item.status || "-"}</span></td>
       <td><strong>${item.stock_code || "--"}</strong><em>${item.stock_name || "--"}</em></td>
       <td><strong>${fmtPrice(item.stock_price)}</strong><em>${item.stock_price_date || "--"}</em></td>
@@ -2376,6 +2435,7 @@ document.querySelectorAll("[data-refresh-scope]").forEach((button) => {
 
 document.querySelectorAll(".page-tab").forEach((button) => {
   button.addEventListener("click", () => {
+    hideWatchlistContextMenu();
     state.activePage = button.dataset.page || "short";
     const nextHash = pageHash(state.activePage);
     if (window.location.hash !== nextHash) {
@@ -2387,6 +2447,7 @@ document.querySelectorAll(".page-tab").forEach((button) => {
 });
 
 window.addEventListener("hashchange", () => {
+  hideWatchlistContextMenu();
   state.activePage = hashPage();
   render();
   loadActivePageData();
@@ -2486,6 +2547,80 @@ document.querySelectorAll("#bydSharesInput, #bydCostInput, #bydSoldTodaySharesIn
     }
   });
 });
+
+let watchlistContextTarget = null;
+let watchlistToastTimer = null;
+
+function hideWatchlistContextMenu() {
+  const menu = document.querySelector("#watchlistContextMenu");
+  if (menu) menu.hidden = true;
+  watchlistContextTarget = null;
+}
+
+function showWatchlistToast(message, tone = "success") {
+  const toast = document.querySelector("#watchlistToast");
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.toggle("error", tone === "error");
+  toast.classList.add("show");
+  window.clearTimeout(watchlistToastTimer);
+  watchlistToastTimer = window.setTimeout(() => toast.classList.remove("show"), 2400);
+}
+
+function openWatchlistContextMenu(target, clientX, clientY) {
+  const menu = document.querySelector("#watchlistContextMenu");
+  if (!menu || !target?.dataset.watchlistSymbol) return;
+  watchlistContextTarget = {
+    symbol: target.dataset.watchlistSymbol,
+    name: target.dataset.watchlistName || target.dataset.watchlistSymbol,
+  };
+  menu.hidden = false;
+  const width = menu.offsetWidth || 150;
+  const height = menu.offsetHeight || 44;
+  menu.style.left = `${Math.max(8, Math.min(clientX, window.innerWidth - width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(clientY, window.innerHeight - height - 8))}px`;
+  menu.querySelector("button")?.focus();
+}
+
+document.addEventListener("contextmenu", (event) => {
+  const target = event.target.closest("[data-watchlist-symbol]");
+  if (!target || !["short", "chan", "long", "cbAllotment"].includes(state.activePage)) return;
+  event.preventDefault();
+  openWatchlistContextMenu(target, event.clientX, event.clientY);
+});
+
+document.addEventListener("keydown", (event) => {
+  const target = event.target.closest?.("[data-watchlist-symbol]");
+  if (target && (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))) {
+    event.preventDefault();
+    const rect = target.getBoundingClientRect();
+    openWatchlistContextMenu(target, rect.left + 24, rect.top + 24);
+    return;
+  }
+  if (event.key === "Escape") hideWatchlistContextMenu();
+});
+
+document.querySelector("[data-watchlist-context-add]")?.addEventListener("click", async () => {
+  const target = watchlistContextTarget;
+  if (!target) return;
+  const button = document.querySelector("[data-watchlist-context-add]");
+  button.disabled = true;
+  try {
+    await addSimilarWatchSymbol(target.symbol, { refresh: false });
+    showWatchlistToast(`${target.name} 已加入自选池`);
+  } catch (error) {
+    showWatchlistToast(error.message || "加入自选池失败", "error");
+  } finally {
+    button.disabled = false;
+    hideWatchlistContextMenu();
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#watchlistContextMenu")) hideWatchlistContextMenu();
+});
+window.addEventListener("resize", hideWatchlistContextMenu);
+window.addEventListener("scroll", hideWatchlistContextMenu, true);
 
 document.querySelector("#similarAddForm")?.addEventListener("submit", async (event) => {
   event.preventDefault();

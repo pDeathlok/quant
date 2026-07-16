@@ -2402,6 +2402,142 @@ th {
   gap: 6px;
 }
 
+.similar-decision-banner,
+.similar-validation-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 88%, var(--accent) 12%);
+}
+
+.similar-decision-banner span,
+.similar-validation-strip span,
+.similar-validation-strip small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.watchlist-strategy-summary {
+  align-items: flex-start;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.watchlist-strategy-summary > span,
+.strategy-hit-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.strategy-hit-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.strategy-hit-badge {
+  align-items: center;
+  background: #eef2f7;
+  border: 1px solid #d7dee8;
+  border-radius: 999px;
+  color: #334155;
+  display: inline-flex;
+  gap: 5px;
+  max-width: 260px;
+  padding: 4px 8px;
+}
+
+.strategy-hit-badge strong,
+.strategy-hit-badge em {
+  font-size: 11px;
+  font-style: normal;
+}
+
+.strategy-hit-badge em {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.strategy-hit-badge.short { background: #e8f3ff; border-color: #bedcff; color: #195a91; }
+.strategy-hit-badge.chan { background: #f2ebff; border-color: #d8c7ff; color: #6641a5; }
+.strategy-hit-badge.long { background: #e7f6ee; border-color: #bce4cf; color: #176b3a; }
+.strategy-hit-badge.cb_allotment { background: #fff4df; border-color: #f0d39a; color: #8a5a00; }
+
+[data-watchlist-symbol] {
+  cursor: context-menu;
+}
+
+.watchlist-context-menu {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  box-shadow: 0 14px 35px rgba(15, 23, 42, 0.18);
+  min-width: 150px;
+  padding: 5px;
+  position: fixed;
+  z-index: 1000;
+}
+
+.watchlist-context-menu[hidden] {
+  display: none;
+}
+
+.watchlist-context-menu button {
+  background: transparent;
+  border: 0;
+  color: var(--ink);
+  min-height: 36px;
+  padding: 8px 10px;
+  text-align: left;
+  width: 100%;
+}
+
+.watchlist-context-menu button:hover,
+.watchlist-context-menu button:focus-visible {
+  background: var(--accent-soft);
+  outline: none;
+}
+
+.watchlist-toast {
+  background: #173a31;
+  border-radius: 9px;
+  bottom: 24px;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.2);
+  color: #fff;
+  left: 50%;
+  opacity: 0;
+  padding: 10px 16px;
+  pointer-events: none;
+  position: fixed;
+  transform: translate(-50%, 12px);
+  transition: opacity 160ms ease, transform 160ms ease;
+  z-index: 1001;
+}
+
+.watchlist-toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.watchlist-toast.error {
+  background: var(--warn);
+}
+
+.similar-signal-bullish { color: var(--danger); }
+.similar-signal-bearish { color: var(--success); }
+.similar-signal-observe { color: var(--muted); }
+
 .similar-split {
   grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.8fr);
 }
