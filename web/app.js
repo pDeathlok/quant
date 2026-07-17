@@ -58,6 +58,17 @@ const REFRESH_BUTTON_LABELS = {
   similarRefreshLatestButton: "更新本页",
 };
 
+const WORKSPACE_TABS = [
+  { key: "short", label: "短线策略", description: "每日选股 / 交易计划", panelId: "shortPage" },
+  { key: "chan", label: "缠论策略", description: "三买模型 / T+1 计划", panelId: "chanPage" },
+  { key: "long", label: "长线策略", description: "组合候选 / 仓位择时", panelId: "longPage" },
+  { key: "cb", label: "可转债策略", description: "低位候选 / 分批计划", panelId: "cbPage" },
+  { key: "cbAllotment", label: "配债股", description: "发行流程 / 关键日期", panelId: "cbAllotmentPage" },
+  { key: "byd", label: "BYD 做T", description: "日线计划 / 降仓路线", panelId: "bydPage" },
+  { key: "similar", label: "自选池", description: "相似走势 / 策略联动", panelId: "similarPage" },
+];
+let focusWorkspaceTabAfterRender = false;
+
 const longStrategies = [
   {
     key: "tea",
@@ -271,16 +282,27 @@ const formatBuyPlanText = (text) => {
 const pageHash = (page) => page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#byd" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
 const currentLongStrategy = () => longStrategies.find((item) => item.key === state.longVariant) || longStrategies[0];
 
-function ensureChanTabs() {
-  document.querySelectorAll(".workspace-tabs").forEach((nav) => {
-    if (nav.querySelector('[data-page="chan"]')) return;
-    const button = document.createElement("button");
-    button.className = "page-tab";
-    button.type = "button";
-    button.dataset.page = "chan";
-    button.innerHTML = "<strong>缠论策略</strong><span>三买模型 / T+1 计划</span>";
-    const longButton = nav.querySelector('[data-page="long"]');
-    nav.insertBefore(button, longButton || nav.children[1] || null);
+function ensureWorkspaceTabs() {
+  document.querySelectorAll(".workspace-tabs").forEach((nav, navIndex) => {
+    if (nav.dataset.workspaceTabsReady === "true") return;
+    nav.dataset.workspaceTabsReady = "true";
+    nav.setAttribute("role", "tablist");
+    nav.setAttribute("aria-orientation", "horizontal");
+    nav.innerHTML = WORKSPACE_TABS.map((tab) => `
+      <button
+        id="workspace-tab-${navIndex}-${tab.key}"
+        class="page-tab"
+        type="button"
+        role="tab"
+        data-page="${tab.key}"
+        aria-controls="${tab.panelId}"
+        aria-selected="false"
+        tabindex="-1"
+      >
+        <strong>${tab.label}</strong>
+        <span>${tab.description}</span>
+      </button>
+    `).join("");
   });
   if (!document.querySelector("#chanDateSlot")) {
     const actions = document.querySelector("#chanPage .toolbar-actions");
@@ -289,6 +311,21 @@ function ensureChanTabs() {
       slot.id = "chanDateSlot";
       actions.insertBefore(slot, actions.firstElementChild || null);
     }
+  }
+}
+
+function revealActiveWorkspaceTab() {
+  const activePage = document.querySelector(".page-view.active");
+  const nav = activePage?.querySelector(".workspace-tabs");
+  const activeTab = nav?.querySelector(".page-tab.active");
+  if (!nav || !activeTab || nav.scrollWidth <= nav.clientWidth) return;
+  const navRect = nav.getBoundingClientRect();
+  const tabRect = activeTab.getBoundingClientRect();
+  const behavior = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  if (tabRect.left < navRect.left) {
+    nav.scrollBy({ left: tabRect.left - navRect.left - 8, behavior });
+  } else if (tabRect.right > navRect.right) {
+    nav.scrollBy({ left: tabRect.right - navRect.right + 8, behavior });
   }
 }
 
@@ -1394,7 +1431,7 @@ function renderStrategyFilters() {
   wrap.innerHTML = (state.payload?.available_strategies || []).map((item) => {
     const active = state.selectedStrategies.has(item.key);
     return `
-      <button class="filter-chip ${active ? "active" : ""}" data-strategy="${item.key}" type="button">
+      <button class="filter-chip ${active ? "active" : ""}" data-strategy="${item.key}" type="button" aria-pressed="${active}">
         <strong>${item.label}</strong>
         <span>${item.status}</span>
       </button>
@@ -1521,7 +1558,7 @@ function renderNotes() {
 }
 
 function renderPageShell() {
-  ensureChanTabs();
+  ensureWorkspaceTabs();
   const shortPage = document.querySelector("#shortPage");
   const chanPage = document.querySelector("#chanPage");
   const longPage = document.querySelector("#longPage");
@@ -1562,7 +1599,22 @@ function renderPageShell() {
     }
   }
   document.querySelectorAll(".page-tab").forEach((button) => {
-    button.classList.toggle("active", button.dataset.page === state.activePage);
+    const active = button.dataset.page === state.activePage;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  WORKSPACE_TABS.forEach((tab) => {
+    const panel = document.querySelector(`#${tab.panelId}`);
+    panel?.setAttribute("role", "tabpanel");
+    panel?.setAttribute("aria-label", tab.label);
+    panel?.setAttribute("aria-hidden", String(tab.key !== state.activePage));
+  });
+  window.requestAnimationFrame(() => {
+    revealActiveWorkspaceTab();
+    if (!focusWorkspaceTabAfterRender) return;
+    document.querySelector(".page-view.active .page-tab.active")?.focus({ preventScroll: true });
+    focusWorkspaceTabAfterRender = false;
   });
 }
 
@@ -1634,7 +1686,9 @@ function renderLongStockPool() {
   const counts = document.querySelector("#longStateCounts");
   if (!body || !meta || !counts) return;
   document.querySelectorAll(".long-variant-button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.longVariant === state.longVariant);
+    const active = button.dataset.longVariant === state.longVariant;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
   });
   if (state.longLoading) {
     meta.textContent = "正在生成长线股票池...";
@@ -1747,7 +1801,7 @@ function renderConvertibleBondPage() {
   if (strategyWrap) {
     const totalGroups = cbCandidateGroups("all");
     const allCard = `
-        <button class="cb-strategy-card ${activeStrategyKey === "all" ? "active" : ""}" type="button" data-cb-strategy="all">
+        <button class="cb-strategy-card ${activeStrategyKey === "all" ? "active" : ""}" type="button" data-cb-strategy="all" aria-pressed="${activeStrategyKey === "all"}">
           <span>全策略</span>
           <strong>全部策略命中</strong>
           <em>${totalGroups.length} 只去重候选 · 点击转债查看全部计划</em>
@@ -1758,7 +1812,7 @@ function renderConvertibleBondPage() {
       const bt2024 = strategy.backtest?.from_2024 || {};
       const active = strategy.key === activeStrategyKey;
       return `
-        <button class="cb-strategy-card ${active ? "active" : ""}" type="button" data-cb-strategy="${strategy.key || ""}">
+        <button class="cb-strategy-card ${active ? "active" : ""}" type="button" data-cb-strategy="${strategy.key || ""}" aria-pressed="${active}">
           <span>${strategy.style || "策略"}</span>
           <strong>${strategy.name || strategy.key || "-"}</strong>
           <em>${(plan.candidates || []).length} 只 · 2024+ 年化 ${fmtRate(bt2024.annual_return, 2)} · Sharpe ${bt2024.sharpe == null ? "-" : Number(bt2024.sharpe).toFixed(2)} · 回撤 ${fmtRate(bt2024.max_drawdown, 2)}</em>
@@ -2549,7 +2603,7 @@ document.querySelector("#refreshAllButton")?.addEventListener("click", () => {
   startLatestDataRefresh("all");
 });
 
-ensureChanTabs();
+ensureWorkspaceTabs();
 
 document.querySelectorAll("[data-refresh-scope]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -2569,6 +2623,23 @@ document.querySelectorAll(".page-tab").forEach((button) => {
     state.activePage = nextPage;
     renderPageShell();
     loadActivePageData();
+  });
+});
+
+document.querySelectorAll(".workspace-tabs").forEach((nav) => {
+  nav.addEventListener("keydown", (event) => {
+    if (!event.target.matches(".page-tab")) return;
+    const tabs = [...nav.querySelectorAll(".page-tab")];
+    const currentIndex = tabs.indexOf(event.target);
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabs.length;
+    if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = tabs.length - 1;
+    if (nextIndex === currentIndex) return;
+    event.preventDefault();
+    focusWorkspaceTabAfterRender = true;
+    tabs[nextIndex].click();
   });
 });
 

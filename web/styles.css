@@ -7,6 +7,9 @@
   --line: #d9e0e8;
   --accent: #0f766e;
   --accent-soft: #e6f3f1;
+  --tab-track: #e8edf2;
+  --tab-active-border: #b9c8d6;
+  --tab-hover: rgba(255, 255, 255, 0.58);
   --warn: #a1412a;
   --good: #176b3a;
 }
@@ -222,12 +225,13 @@ h3 {
 
 .workspace-tabs {
   align-items: stretch;
-  background: #e8edf2;
+  background: var(--tab-track);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 10px;
   display: grid;
   gap: 4px;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  overflow: hidden;
   padding: 4px;
 }
 
@@ -235,36 +239,66 @@ h3 {
   align-items: center;
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 7px;
   color: var(--ink);
   cursor: pointer;
-  display: flex;
-  gap: 10px;
-  height: 52px;
+  display: grid;
+  gap: 3px;
+  height: 58px;
   justify-content: center;
-  min-height: 52px;
-  padding: 9px 12px;
+  justify-items: center;
+  min-height: 58px;
+  min-width: 0;
+  padding: 8px 10px;
+  position: relative;
   text-align: center;
+  transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease, color 140ms ease;
 }
 
 .page-tab strong {
-  font-size: 15px;
+  font-size: 14px;
+  line-height: 1.25;
+  white-space: nowrap;
 }
 
 .page-tab span {
   color: var(--muted);
-  font-size: 12px;
+  display: block;
+  font-size: 11px;
+  line-height: 1.25;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.page-tab:hover:not(.active) {
+  background: var(--tab-hover);
+  border-color: rgba(185, 200, 214, 0.72);
 }
 
 .page-tab.active {
   background: #fff;
-  border-color: #cdd7e2;
-  box-shadow: 0 1px 2px rgba(28, 36, 48, 0.08);
+  border-color: var(--tab-active-border);
+  box-shadow: 0 2px 5px rgba(28, 36, 48, 0.1);
+  color: var(--accent);
+}
+
+.page-tab.active::after {
+  background: var(--accent);
+  border-radius: 999px;
+  bottom: 3px;
+  content: "";
+  height: 3px;
+  left: 28%;
+  position: absolute;
+  right: 28%;
 }
 
 .page-tab:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: 3px solid rgba(15, 118, 110, 0.3);
+  outline-offset: 1px;
+  z-index: 1;
 }
 
 .toolbar,
@@ -1218,6 +1252,35 @@ h3 {
   color: var(--accent);
 }
 
+.filter-chip,
+.long-variant-button,
+.cb-strategy-card {
+  transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease, color 140ms ease;
+}
+
+.filter-chip:hover,
+.long-variant-button:hover,
+.cb-strategy-card:hover {
+  background: #f8fbfb;
+  border-color: #a9bbb9;
+}
+
+.filter-chip.active,
+.long-variant-button.active,
+.cb-strategy-card.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+  color: var(--accent);
+}
+
+.filter-chip:focus-visible,
+.long-variant-button:focus-visible,
+.cb-strategy-card:focus-visible {
+  outline: 3px solid rgba(15, 118, 110, 0.28);
+  outline-offset: 2px;
+}
+
 .long-strategy-grid {
   display: grid;
   gap: 18px;
@@ -1861,27 +1924,6 @@ input[readonly].date-closed {
 button:disabled {
   cursor: wait;
   opacity: 0.72;
-}
-
-.workspace-tabs .page-tab {
-  background: transparent;
-  border-color: transparent;
-  block-size: 52px;
-  color: var(--ink);
-  flex-wrap: nowrap;
-  max-height: 52px;
-  overflow: hidden;
-}
-
-.workspace-tabs .page-tab.active {
-  background: #fff;
-  border-color: #cdd7e2;
-  color: var(--ink);
-}
-
-.workspace-tabs .page-tab span {
-  color: var(--muted);
-  white-space: nowrap;
 }
 
 .metrics-grid {
@@ -2750,6 +2792,16 @@ th {
   font-weight: 700;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .page-tab,
+  .filter-chip,
+  .long-variant-button,
+  .cb-strategy-card {
+    scroll-behavior: auto;
+    transition: none;
+  }
+}
+
 @media (max-width: 1100px) {
   .app {
     grid-template-columns: 1fr;
@@ -2838,16 +2890,21 @@ th {
   }
 
   .workspace-tabs {
+    grid-auto-columns: minmax(148px, 1fr);
+    grid-auto-flow: column;
+    grid-template-columns: none;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
     position: sticky;
+    scrollbar-width: thin;
+    scroll-padding-inline: 4px;
+    scroll-snap-type: inline proximity;
     top: 0;
     z-index: 15;
   }
 
   .page-tab {
-    align-items: flex-start;
-    display: grid;
-    gap: 4px;
-    justify-items: center;
+    scroll-snap-align: start;
   }
 
   .long-metrics,
