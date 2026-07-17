@@ -25,10 +25,12 @@ const state = {
   selectedCbCode: null,
   cbAllotmentPayload: null,
   cbAllotmentLoading: false,
+  cbAllotmentError: "",
   cbAllotmentSort: null,
   cbAllotmentStatusFilters: new Set(),
   similarPayload: null,
   similarLoading: false,
+  similarError: "",
   similarSelectedSymbol: null,
   loading: false,
 };
@@ -359,14 +361,28 @@ function analystCoverageText(item) {
 }
 
 async function fetchJson(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    cache: "no-store",
-    ...options,
-    headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
-      ...(options.headers || {}),
-    },
-  });
+  const { timeoutMs = 0, ...fetchOptions } = options;
+  const controller = timeoutMs > 0 && !fetchOptions.signal ? new AbortController() : null;
+  const timeoutId = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      cache: "no-store",
+      ...fetchOptions,
+      ...(controller ? { signal: controller.signal } : {}),
+      headers: {
+        ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}),
+        ...(fetchOptions.headers || {}),
+      },
+    });
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error(`${path} 加载超时，请稍后重试`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) window.clearTimeout(timeoutId);
+  }
   if (!response.ok) {
     let detail = "";
     try {
@@ -404,9 +420,23 @@ function setRefreshMessage(message) {
   });
 }
 
+function workspaceRequestOptions(options = {}) {
+  return { timeoutMs: options.refresh ? 120000 : 15000 };
+}
+
+function renderShortPage() {
+  renderHeader();
+  renderStrategyFilters();
+  renderStockRows();
+  renderStockDetail();
+  renderNotes();
+  renderCalendar();
+  renderDateStatus();
+}
+
 async function loadSelector(options = {}) {
   state.loading = true;
-  render();
+  renderShortPage();
   if (options.latest && state.calendar?.latest_signal_date) {
     state.signalDate = state.calendar.latest_signal_date;
   }
@@ -421,7 +451,7 @@ async function loadSelector(options = {}) {
   const suffix = query.toString();
   const path = suffix ? `/selector/stocks?${suffix}` : "/selector/stocks";
   try {
-    state.payload = await fetchJson(path);
+    state.payload = await fetchJson(path, workspaceRequestOptions(options));
     state.signalDate = requestedSignalDate || state.payload.signal_date || state.signalDate;
     const dateInput = document.querySelector("#signalDateInput");
     if (dateInput) {
@@ -438,16 +468,17 @@ async function loadSelector(options = {}) {
     throw error;
   } finally {
     state.loading = false;
-    render();
+    renderShortPage();
   }
 }
 
 async function loadSimilarPatterns(options = {}) {
   state.similarLoading = true;
-  render();
+  state.similarError = "";
+  renderSimilarPatternsPage();
   try {
     const path = options.refresh ? "/similar-patterns/analysis?refresh=true" : "/similar-patterns/analysis";
-    state.similarPayload = await fetchJson(path);
+    state.similarPayload = await fetchJson(path, workspaceRequestOptions(options));
     const results = state.similarPayload.results || [];
     if (!state.similarSelectedSymbol && results.length) {
       state.similarSelectedSymbol = results[0].target?.symbol || null;
@@ -456,11 +487,12 @@ async function loadSimilarPatterns(options = {}) {
       state.similarSelectedSymbol = results[0]?.target?.symbol || null;
     }
   } catch (error) {
+    state.similarError = error.message || "自选池分析加载失败";
     showError(error);
     throw error;
   } finally {
     state.similarLoading = false;
-    render();
+    renderSimilarPatternsPage();
   }
 }
 
@@ -538,13 +570,20 @@ function watchlistStrategyHits(item) {
 
 function watchlistStrategyBadges(item, includeDetail = false) {
   const hits = watchlistStrategyHits(item);
-  if (!hits.length) return `<span class="strategy-hit-empty">暂无其他策略命中</span>`;
+  if (!hits.length) return `<span class="strategy-hit-empty">仅自选观察</span>`;
   return `<div class="strategy-hit-list">${hits.map((hit) => `
     <span class="strategy-hit-badge ${hit.strategy_key || ""}" title="${hit.detail || hit.strategy_label || ""}">
       <strong>${hit.strategy_label || hit.strategy_key || "策略"}</strong>
       ${includeDetail ? `<em>${hit.detail || "已命中"}</em>` : ""}
     </span>
   `).join("")}</div>`;
+}
+
+function strategyResonanceLabel(item) {
+  const count = watchlistStrategyHits(item).length;
+  if (count >= 2) return `${count} 策略共振`;
+  if (count === 1) return "策略命中";
+  return "观察中";
 }
 
 function fallbackSimilarityScore(row, rows) {
@@ -572,25 +611,68 @@ function renderSimilarPatternsPage() {
   const detailTitle = document.querySelector("#similarDetailTitle");
   const detailMeta = document.querySelector("#similarDetailMeta");
   const modelMeta = document.querySelector("#similarModelMeta");
+  const signalSummary = document.querySelector("#similarSignalSummary");
   if (!meta || !watchlist || !overview || !scenarioRows || !modelList || !topRows) return;
 
   if (state.similarLoading && !payload) {
     meta.textContent = "正在计算自选池相似走势";
+    if (signalSummary) signalSummary.innerHTML = `<article class="similar-summary-card loading"><span>策略共振</span><strong>分析中</strong><em>正在汇总其他策略命中</em></article>`;
     overview.innerHTML = `<article class="panel"><p class="subline">正在扫描历史相似片段...</p></article>`;
+    return;
+  }
+  if (state.similarError && !payload) {
+    meta.textContent = "自选池加载失败";
+    if (signalSummary) signalSummary.innerHTML = `
+      <article class="similar-summary-card error">
+        <span>数据状态</span>
+        <strong>加载失败</strong>
+        <em>${state.similarError}</em>
+      </article>
+    `;
+    watchlist.innerHTML = `<tr><td colspan="6" class="empty-cell">${state.similarError} · <button type="button" data-similar-retry>重新加载</button></td></tr>`;
+    overview.innerHTML = "";
     return;
   }
   if (!payload) {
     meta.textContent = "切到自选池后加载";
-    watchlist.innerHTML = `<tr><td colspan="12" class="empty-cell">切到自选池后加载</td></tr>`;
+    if (signalSummary) signalSummary.innerHTML = "";
+    watchlist.innerHTML = `<tr><td colspan="6" class="empty-cell">切到自选池后加载</td></tr>`;
     overview.innerHTML = "";
     return;
   }
 
   const watch = payload.watchlist || [];
   const results = payload.results || [];
+  const resonantResults = results.filter((item) => watchlistStrategyHits(item).length > 0);
+  const totalStrategyHits = resonantResults.reduce((total, item) => total + watchlistStrategyHits(item).length, 0);
+  const bullishCount = results.filter((item) => similarDecision(item, "next_1d").signal === "bullish").length;
+  const rankedWatch = [...watch].sort((left, right) => {
+    const rightHits = watchlistStrategyHits(similarResultForSymbol(right.symbol)).length;
+    const leftHits = watchlistStrategyHits(similarResultForSymbol(left.symbol)).length;
+    return rightHits - leftHits;
+  });
   meta.textContent = `更新于 ${payload.generated_at || "-"} · 全池统一策略 · T+1 观望区 ${payload.config?.signal_bearish_max ?? 45}%～${payload.config?.signal_bullish_min ?? 55}% · 自选 ${watch.length} 只`;
   if (watchCount) watchCount.textContent = `${watch.length} 只股票`;
-  watchlist.innerHTML = watch.map((item) => {
+  if (signalSummary) {
+    signalSummary.innerHTML = `
+      <article class="similar-summary-card primary">
+        <span>多策略确认</span>
+        <strong>${resonantResults.length} <small>/ ${watch.length} 只</small></strong>
+        <em>${resonantResults.length ? `累计 ${totalStrategyHits} 次策略命中` : "暂未命中其他策略"}</em>
+      </article>
+      <article class="similar-summary-card">
+        <span>T+1 看涨</span>
+        <strong>${bullishCount} <small>只</small></strong>
+        <em>来自相似走势统一模型</em>
+      </article>
+      <article class="similar-summary-card">
+        <span>当前自选</span>
+        <strong>${watch.length} <small>只</small></strong>
+        <em>优先查看带“策略命中”的股票</em>
+      </article>
+    `;
+  }
+  watchlist.innerHTML = rankedWatch.map((item) => {
     const result = similarResultForSymbol(item.symbol);
     const target = result?.target || {};
     const snapshot = result?.latest_snapshot || {};
@@ -598,23 +680,38 @@ function renderSimilarPatternsPage() {
     const nextMonth = similarForecastRow(result, "next_1m");
     const nextDayDecision = similarDecision(result, "next_1d");
     const selectedClass = item.symbol === state.similarSelectedSymbol ? "active" : "";
+    const strategyHits = watchlistStrategyHits(result);
+    const resonanceClass = strategyHits.length ? "has-strategy-hit" : "";
     return `
-      <tr class="similar-watch-row ${selectedClass}" data-similar-symbol="${item.symbol}">
-        <td><strong>${item.name || item.symbol}</strong><br><span class="subline">${item.symbol}</span></td>
-        <td>${item.industry || "-"}</td>
-        <td>${target.target_date || "-"}</td>
-        <td>${fmtPrice(snapshot.close)}</td>
-        <td>${fmtPct(snapshot.ret_20d)}</td>
-        <td>${fmtPct(snapshot.drawdown_60d)}</td>
-        <td>${snapshot.vol_ratio20 ?? "-"}</td>
-        <td>${result?.optimization_summary?.effective_sample_size ?? result?.scan_summary?.matched_cases ?? "-"} 有效</td>
-        <td>${watchlistStrategyBadges(result)}</td>
-        <td><strong class="similar-signal-${nextDayDecision.signal || "observe"}">${similarSignalLabel(nextDayDecision.signal)}</strong><br><span class="subline">选择概率 ${fmtPct(nextDay.selected_up_probability ?? nextDay.calibrated_up_probability ?? nextDay.up_probability)}</span></td>
-        <td>${fmtPct(nextMonth.selected_up_probability ?? nextMonth.calibrated_up_probability ?? nextMonth.up_probability)} / 中位 ${fmtPct(nextMonth.median)}</td>
+      <tr class="similar-watch-row ${selectedClass} ${resonanceClass}" data-similar-symbol="${item.symbol}" tabindex="0">
+        <td class="similar-stock-cell">
+          <strong>${item.name || item.symbol}</strong>
+          <span>${item.symbol} · ${item.industry || "-"}</span>
+          <em>${target.target_date || "-"}</em>
+        </td>
+        <td class="similar-resonance-cell">
+          <span class="similar-resonance-label">${strategyResonanceLabel(result)}</span>
+          ${watchlistStrategyBadges(result)}
+        </td>
+        <td class="similar-market-cell">
+          <strong>${fmtPrice(snapshot.close)}</strong>
+          <span>20日 ${fmtPct(snapshot.ret_20d)}</span>
+          <em>回撤 ${fmtPct(snapshot.drawdown_60d)} · 量比 ${snapshot.vol_ratio20 ?? "-"}</em>
+        </td>
+        <td class="similar-decision-cell">
+          <strong class="similar-signal-${nextDayDecision.signal || "observe"}">${similarSignalLabel(nextDayDecision.signal)}</strong>
+          <span>上涨概率 ${fmtPct(nextDay.selected_up_probability ?? nextDay.calibrated_up_probability ?? nextDay.up_probability)}</span>
+          <em>${result?.optimization_summary?.effective_sample_size ?? result?.scan_summary?.matched_cases ?? "-"} 个有效样本</em>
+        </td>
+        <td class="similar-medium-cell">
+          <strong>${fmtPct(nextMonth.selected_up_probability ?? nextMonth.calibrated_up_probability ?? nextMonth.up_probability)}</strong>
+          <span>1月上涨概率</span>
+          <em>收益中位 ${fmtPct(nextMonth.median)}</em>
+        </td>
         <td><button type="button" data-similar-remove="${item.symbol}">删除</button></td>
       </tr>
     `;
-  }).join("") || `<tr><td colspan="12" class="empty-cell">暂无自选股票</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
 
   const selected = selectedSimilarResult();
   overview.innerHTML = selected ? (() => {
@@ -624,27 +721,30 @@ function renderSimilarPatternsPage() {
     const forecast = item.optimized_forecast?.length ? item.optimized_forecast : (item.forecast || []);
     const nextDecision = similarDecision(item, "next_1d");
     const validation = (item.validation_summary || []).find((row) => row.horizon === "next_1d") || {};
+    const strategyHits = watchlistStrategyHits(item);
     return `
-      <article class="similar-card active">
+      <article class="similar-card active ${strategyHits.length ? "has-strategy-hit" : ""}">
         <div class="similar-card-head">
           <div>
+            <span class="similar-detail-kicker">当前决策</span>
             <strong>${target.name || target.symbol}</strong>
             <span>${target.symbol} · ${target.target_date || "-"}</span>
           </div>
-          <small>${item.optimization_summary?.effective_sample_size ?? 0} 有效样本</small>
-        </div>
-        <div class="similar-snapshot">
-          <div><span>收盘</span><strong>${fmtPrice(snapshot.close)}</strong></div>
-          <div><span>20日</span><strong>${fmtPct(snapshot.ret_20d)}</strong></div>
-          <div><span>量比</span><strong>${snapshot.vol_ratio20 ?? "-"}</strong></div>
+          <span class="similar-resonance-label">${strategyResonanceLabel(item)}</span>
         </div>
         <div class="similar-decision-banner similar-signal-${nextDecision.signal || "observe"}">
           <strong>T+1 ${similarSignalLabel(nextDecision.signal)}</strong>
           <span>${item.market_regime || "neutral"} / 行业 ${item.industry_regime || "neutral"}${nextDecision.risk_gate === "blocked" ? ` · 风险闸门：${(nextDecision.reasons || []).join("、")}` : ""}</span>
         </div>
-        <div class="watchlist-strategy-summary">
-          <span>其他策略联动</span>
+        <div class="watchlist-strategy-summary ${strategyHits.length ? "has-hits" : ""}">
+          <div><span>策略依据</span><strong>${strategyHits.length ? `${strategyHits.length} 个其他策略同时命中` : "暂无其他策略确认"}</strong></div>
           ${watchlistStrategyBadges(item, true)}
+        </div>
+        <div class="similar-snapshot">
+          <div><span>收盘</span><strong>${fmtPrice(snapshot.close)}</strong></div>
+          <div><span>20日涨跌</span><strong>${fmtPct(snapshot.ret_20d)}</strong></div>
+          <div><span>60日回撤</span><strong>${fmtPct(snapshot.drawdown_60d)}</strong></div>
+          <div><span>量比</span><strong>${snapshot.vol_ratio20 ?? "-"}</strong></div>
         </div>
         <div class="similar-forecast">
           ${forecast.map((row) => {
@@ -728,7 +828,7 @@ async function loadLongStockPool(options = {}) {
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
   try {
-    const payload = await fetchJson(`/long/stock-pool?${query.toString()}`);
+    const payload = await fetchJson(`/long/stock-pool?${query.toString()}`, workspaceRequestOptions(options));
     if (state.longVariant === requestedVariant) {
       state.longPayload = payload;
     }
@@ -761,7 +861,7 @@ async function loadBydMinuteStrategy(options = {}) {
   if (openTPrice > 0) query.set("open_t_price", String(openTPrice));
   if (options.refresh) query.set("refresh", "true");
   try {
-    state.bydPayload = await fetchJson(`/byd/daily-plan?${query.toString()}`);
+    state.bydPayload = await fetchJson(`/byd/daily-plan?${query.toString()}`, workspaceRequestOptions(options));
     maybeShowBydTradeToast(state.bydPayload, options);
   } catch (error) {
     showError(error);
@@ -780,7 +880,7 @@ async function loadConvertibleBondPlan(options = {}) {
   query.set("limit", "18");
   if (options.refresh) query.set("refresh", "true");
   try {
-    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`);
+    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`, workspaceRequestOptions(options));
     const plans = state.cbPayload.strategy_plans || [];
     if (!state.selectedCbStrategy && plans.length) {
       state.selectedCbStrategy = "all";
@@ -803,6 +903,7 @@ async function loadConvertibleBondPlan(options = {}) {
 
 async function loadConvertibleBondAllotments(options = {}) {
   state.cbAllotmentLoading = true;
+  state.cbAllotmentError = "";
   renderConvertibleBondAllotments();
   const query = new URLSearchParams();
   query.set("limit", "120");
@@ -810,8 +911,12 @@ async function loadConvertibleBondAllotments(options = {}) {
   query.set("stage_scope", "pipeline");
   if (options.refresh) query.set("refresh", "true");
   try {
-    state.cbAllotmentPayload = await fetchJson(`/convertible-bonds/allotments?${query.toString()}`);
+    state.cbAllotmentPayload = await fetchJson(
+      `/convertible-bonds/allotments?${query.toString()}`,
+      workspaceRequestOptions(options)
+    );
   } catch (error) {
+    state.cbAllotmentError = error.message;
     showError(error);
     throw error;
   } finally {
@@ -936,7 +1041,7 @@ function maybeShowBydTradeToast(payload, options = {}) {
 }
 
 async function loadCalendar() {
-  state.calendar = await fetchJson("/selector/calendar?start=2020-01-01");
+  state.calendar = await fetchJson("/selector/calendar?start=2020-01-01", { timeoutMs: 15000 });
   const latestPageDate = state.activePage === "chan"
     ? (state.calendar.latest_chan_snapshot_date || state.calendar.latest_chan_signal_date)
     : state.calendar.latest_signal_date;
@@ -966,7 +1071,7 @@ async function loadChanModelStrategy(options = {}) {
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
   try {
-    state.chanPayload = await fetchJson(`/chan/strategy-plan?${query.toString()}`);
+    state.chanPayload = await fetchJson(`/chan/strategy-plan?${query.toString()}`, workspaceRequestOptions(options));
     state.signalDate = state.signalDate || state.chanPayload?.signal_date || "";
     const dateInput = document.querySelector("#signalDateInput");
     if (dateInput) dateInput.value = state.signalDate || state.chanPayload?.signal_date || "";
@@ -1951,7 +2056,20 @@ function renderConvertibleBondAllotments() {
   }
   const payload = state.cbAllotmentPayload;
   if (!payload) {
-    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">切到配债股页面后加载后端数据</td></tr>`;
+    const errorMessage = state.cbAllotmentError;
+    if (generatedAt && state.activePage === "cbAllotment") {
+      generatedAt.textContent = errorMessage ? "配债股数据加载失败" : "等待加载配债股数据";
+    }
+    summary.innerHTML = `
+      <span>数据状态</span>
+      <strong>${errorMessage ? "加载失败" : "等待加载"}</strong>
+      <em>${errorMessage || "切到配债股页面后读取后端数据"}</em>
+      <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">${errorMessage ? "重试" : "加载数据"}</button>
+    `;
+    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">${errorMessage || "切到配债股页面后加载后端数据"}</td></tr>`;
+    document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", () => {
+      loadConvertibleBondAllotments().catch(showError);
+    });
     return;
   }
   if (generatedAt && state.activePage === "cbAllotment") generatedAt.textContent = `更新于 ${payload.generated_at || ""}`;
@@ -2182,22 +2300,28 @@ function renderBydPage() {
 function render() {
   renderPageShell();
   if (state.activePage === "short") {
-    renderHeader();
-    renderStrategyFilters();
-    renderStockRows();
-    renderStockDetail();
-    renderNotes();
+    renderShortPage();
+  } else if (state.activePage === "long") {
+    renderCalendar();
+    renderDateStatus();
+    renderLongOverview();
+    renderLongStrategies();
+    renderLongStockPool();
+  } else if (state.activePage === "chan") {
+    renderCalendar();
+    renderDateStatus();
+    renderChanModelPage();
+  } else if (state.activePage === "cb") {
+    renderCalendar();
+    renderDateStatus();
+    renderConvertibleBondPage();
+  } else if (state.activePage === "cbAllotment") {
+    renderConvertibleBondAllotments();
+  } else if (state.activePage === "byd") {
+    renderBydPage();
+  } else if (state.activePage === "similar") {
+    renderSimilarPatternsPage();
   }
-  renderCalendar();
-  renderDateStatus();
-  renderLongOverview();
-  renderLongStrategies();
-  renderLongStockPool();
-  renderConvertibleBondPage();
-  renderConvertibleBondAllotments();
-  renderBydPage();
-  renderSimilarPatternsPage();
-  renderChanModelPage();
 }
 
 function showError(error) {
@@ -2436,12 +2560,14 @@ document.querySelectorAll("[data-refresh-scope]").forEach((button) => {
 document.querySelectorAll(".page-tab").forEach((button) => {
   button.addEventListener("click", () => {
     hideWatchlistContextMenu();
-    state.activePage = button.dataset.page || "short";
-    const nextHash = pageHash(state.activePage);
+    const nextPage = button.dataset.page || "short";
+    const nextHash = pageHash(nextPage);
     if (window.location.hash !== nextHash) {
       window.location.hash = nextHash;
+      return;
     }
-    render();
+    state.activePage = nextPage;
+    renderPageShell();
     loadActivePageData();
   });
 });
@@ -2449,7 +2575,7 @@ document.querySelectorAll(".page-tab").forEach((button) => {
 window.addEventListener("hashchange", () => {
   hideWatchlistContextMenu();
   state.activePage = hashPage();
-  render();
+  renderPageShell();
   loadActivePageData();
 });
 
@@ -2654,6 +2780,11 @@ document.querySelector("#similarRefreshButton")?.addEventListener("click", async
 });
 
 document.querySelector("#similarPage")?.addEventListener("click", (event) => {
+  const retryButton = event.target.closest("[data-similar-retry]");
+  if (retryButton) {
+    loadSimilarPatterns().catch(showError);
+    return;
+  }
   const removeButton = event.target.closest("[data-similar-remove]");
   if (removeButton) {
     removeSimilarWatchSymbol(removeButton.dataset.similarRemove).catch(showError);
@@ -2662,6 +2793,15 @@ document.querySelector("#similarPage")?.addEventListener("click", (event) => {
   const card = event.target.closest("[data-similar-symbol]");
   if (!card) return;
   state.similarSelectedSymbol = card.dataset.similarSymbol;
+  renderSimilarPatternsPage();
+});
+
+document.querySelector("#similarPage")?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const row = event.target.closest("[data-similar-symbol]");
+  if (!row || event.target.closest("button, input")) return;
+  event.preventDefault();
+  state.similarSelectedSymbol = row.dataset.similarSymbol;
   renderSimilarPatternsPage();
 });
 
@@ -2679,20 +2819,5 @@ renderPageShell();
 renderLongStrategies();
 renderLongStockPool();
 restoreLatestRefreshStatus().catch(showError);
-loadCalendar().catch(showError).finally(() => {
-  if (state.activePage === "long") {
-    loadLongStockPool().catch(showError);
-  } else if (state.activePage === "chan") {
-    loadChanModelStrategy().catch(showError);
-  } else if (state.activePage === "cb") {
-    loadConvertibleBondPlan().catch(showError);
-  } else if (state.activePage === "cbAllotment") {
-    loadConvertibleBondAllotments().catch(showError);
-  } else if (state.activePage === "byd") {
-    loadBydMinuteStrategy().catch(showError);
-  } else if (state.activePage === "similar") {
-    loadSimilarPatterns().catch(showError);
-  } else {
-    loadSelector({ latest: true }).catch(showError);
-  }
-});
+loadCalendar().catch(showError);
+loadActivePageData();

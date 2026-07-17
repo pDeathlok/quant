@@ -2112,18 +2112,6 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
     except Exception:
         pass
 
-    try:
-        allotment_payload = _read_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH) or {}
-        for item in allotment_payload.get("records") or []:
-            append_hit(
-                str(item.get("stock_code") or ""),
-                "cb_allotment",
-                "配债股",
-                str(item.get("status") or item.get("stage") or "配债跟踪"),
-                allotment_payload.get("asof") or allotment_payload.get("generated_at"),
-            )
-    except Exception:
-        pass
     return hits
 
 

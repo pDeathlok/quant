@@ -110,7 +110,7 @@ def test_similar_pattern_payload_includes_optimized_decision_and_validation() ->
     assert payload["decisions"][0]["bearish_max"] == 49.0
 
 
-def test_watchlist_strategy_hits_merge_current_strategy_workspaces(monkeypatch) -> None:
+def test_watchlist_strategy_hits_merge_only_strategy_workspaces(monkeypatch) -> None:
     monkeypatch.setattr(
         services,
         "get_stock_selector_payload",
@@ -147,7 +147,7 @@ def test_watchlist_strategy_hits_merge_current_strategy_workspaces(monkeypatch) 
     hits = services._collect_watchlist_strategy_hits(["002594.SZ", "002788.SZ"])
 
     assert [item["strategy_key"] for item in hits["002594.SZ"]] == ["short", "chan"]
-    assert [item["strategy_key"] for item in hits["002788.SZ"]] == ["long", "cb_allotment"]
+    assert [item["strategy_key"] for item in hits["002788.SZ"]] == ["long"]
     assert hits["002594.SZ"][0]["detail"] == "B1 / 强K"
 
 

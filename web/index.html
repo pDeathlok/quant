@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260715-watchlist-linked-v4" />
+    <link rel="stylesheet" href="./styles.css?v=20260717-allotment-align-v7" />
   </head>
   <body>
     <div class="app selector-app">
@@ -778,33 +778,30 @@
           <div class="progress-steps"></div>
         </section>
 
+        <section id="similarSignalSummary" class="similar-signal-summary" aria-label="自选池策略信号总览"></section>
+
         <section class="panel similar-watch-panel">
           <div class="panel-head">
             <div>
-              <h3>自选池</h3>
+              <h3>自选股票</h3>
               <span id="similarWatchCount">-</span>
             </div>
+            <span>点击股票查看下方决策详情</span>
           </div>
           <div class="table-wrap similar-watch-table-wrap">
             <table class="similar-watch-table">
               <thead>
                 <tr>
                   <th>股票</th>
-                  <th>行业</th>
-                  <th>目标日</th>
-                  <th>收盘</th>
-                  <th>20日</th>
-                  <th>60日回撤</th>
-                  <th>量比</th>
-                  <th>相似样本</th>
-                  <th>策略命中</th>
-                  <th>次日预期</th>
-                  <th>1月预期</th>
+                  <th>策略共振</th>
+                  <th>当前走势</th>
+                  <th>T+1 结论</th>
+                  <th>中期预期</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody id="similarWatchlist">
-                <tr><td colspan="12" class="empty-cell">切到自选池后加载</td></tr>
+                <tr><td colspan="6" class="empty-cell">切到自选池后加载</td></tr>
               </tbody>
             </table>
           </div>
@@ -883,6 +880,6 @@
       <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
     </div>
     <div id="watchlistToast" class="watchlist-toast" role="status" aria-live="polite"></div>
-    <script src="./app.js?v=20260715-watchlist-linked-v4"></script>
+    <script src="./app.js?v=20260716-watchlist-layout-v6"></script>
   </body>
 </html>
