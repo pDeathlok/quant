@@ -40,6 +40,16 @@ def main() -> None:
         default=str(PROJECT_ROOT / ".run" / "daily_web_refresh.log"),
         help="Service log path for web-refresh.",
     )
+    parser.add_argument(
+        "--pid-file",
+        default=str(PROJECT_ROOT / ".run" / "daily_web_refresh.pid"),
+        help="Daemonized service pid path for web-refresh.",
+    )
+    parser.add_argument(
+        "--no-restart-service",
+        action="store_true",
+        help="Do not restart the local web service before web-refresh.",
+    )
     args = parser.parse_args()
 
     if args.command == "dashboard":
@@ -72,6 +82,8 @@ def main() -> None:
                 retry_delay_seconds=args.retry_delay,
                 max_attempts=args.max_attempts,
                 service_log_path=Path(args.log_file).expanduser().resolve(),
+                service_pid_path=Path(args.pid_file).expanduser().resolve(),
+                restart_service=not args.no_restart_service,
             )
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

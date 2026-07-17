@@ -170,6 +170,7 @@ def test_ensure_local_service_checks_frontend_and_starts_stack(monkeypatch, tmp_
     config = runner.RefreshRunnerConfig(
         project_root=tmp_path,
         service_log_path=tmp_path / "service.log",
+        service_pid_path=tmp_path / "service.pid",
         health_timeout_seconds=5,
     )
 
@@ -182,9 +183,71 @@ def test_ensure_local_service_checks_frontend_and_starts_stack(monkeypatch, tmp_
 
     assert process is not None
     assert started["args"][0][-1] == "scripts/run_webapp.py"
+    assert started["kwargs"]["start_new_session"] is True
+    assert started["kwargs"]["close_fds"] is True
+    assert (tmp_path / "service.pid").read_text(encoding="utf-8") == "12345\n"
     assert ("GET", "http://127.0.0.1:8088/", 10, None) in session.requests
     assert any("前后端未就绪" in line for line in logs)
-    assert any("已启动前后端" in line for line in logs)
+    assert any("已常驻后台启动前后端" in line for line in logs)
+
+
+def test_ensure_local_service_force_restarts_pid_file_service(monkeypatch, tmp_path: Path) -> None:
+    responses = [
+        FakeResponse({"status": "ok", "service": "quant-webapp"}),
+        FakeResponse("<html>quant</html>"),
+    ]
+    session = FakeSession(responses)
+    client = runner.RefreshApiClient("http://127.0.0.1:8088/api", session=session)
+    pid_path = tmp_path / "service.pid"
+    pid_path.write_text("22257\n", encoding="utf-8")
+    logs: list[str] = []
+    sleep_calls: list[float] = []
+    kill_calls: list[tuple[int, int]] = []
+    clock = iter([0.0, 0.1, 0.2, 0.3])
+    running_checks = iter([True, False])
+    started = {}
+
+    class FakeProcess:
+        pid = 33333
+
+        def poll(self):
+            return None
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        kill_calls.append((pid, sig))
+
+    def fake_process_is_running(pid: int) -> bool:
+        return next(running_checks)
+
+    def fake_popen(*args, **kwargs):
+        started["args"] = args
+        started["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(runner.os, "killpg", fake_killpg)
+    monkeypatch.setattr(runner, "process_is_running", fake_process_is_running)
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+    config = runner.RefreshRunnerConfig(
+        project_root=tmp_path,
+        service_log_path=tmp_path / "service.log",
+        service_pid_path=pid_path,
+        health_timeout_seconds=5,
+    )
+
+    process = runner.ensure_local_service(
+        config=config,
+        client=client,
+        force_restart=True,
+        sleep_fn=sleep_calls.append,
+        monotonic_fn=lambda: next(clock),
+        print_fn=logs.append,
+    )
+
+    assert process is not None
+    assert kill_calls == [(22257, runner.signal.SIGTERM)]
+    assert pid_path.read_text(encoding="utf-8") == "33333\n"
+    assert started["kwargs"]["start_new_session"] is True
+    assert any("准备重启常驻 web 服务" in line for line in logs)
 
 
 def test_run_refresh_workflow_skips_when_trade_day_unknown(tmp_path: Path) -> None:

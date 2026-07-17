@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ from quant.routine.cache_retention import cleanup_daily_caches
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_LOG_PATH = PROJECT_ROOT / ".run" / "daily_web_refresh.log"
+DEFAULT_PID_PATH = PROJECT_ROOT / ".run" / "daily_web_refresh.pid"
 
 
 @dataclass
@@ -35,6 +37,8 @@ class RefreshRunnerConfig:
     retry_delay_seconds: float = 5.0
     max_attempts: int = 3
     service_log_path: Path = DEFAULT_LOG_PATH
+    service_pid_path: Path = DEFAULT_PID_PATH
+    restart_service: bool = True
 
 
 @dataclass
@@ -87,6 +91,82 @@ def check_local_web_stack(client: RefreshApiClient, frontend_url: str) -> tuple[
     if not frontend_html.strip():
         raise RuntimeError(f"前端首页响应为空: {frontend_url}")
     return health, True
+
+
+def read_service_pid(pid_path: Path) -> int | None:
+    try:
+        raw_pid = pid_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not raw_pid:
+        return None
+    try:
+        return int(raw_pid)
+    except ValueError:
+        return None
+
+
+def process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_service_from_pid_file(
+    pid_path: Path,
+    timeout_seconds: float = 15.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    print_fn: Callable[[str], None] = print,
+) -> bool:
+    pid = read_service_pid(pid_path)
+    if pid is None:
+        return False
+    if not process_is_running(pid):
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
+        print_fn(f"[service] 清理旧 pid 文件，进程已不存在: pid={pid}")
+        return False
+
+    print_fn(f"[service] 准备重启常驻 web 服务，停止旧进程组 pid={pid}")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        os.kill(pid, signal.SIGTERM)
+
+    deadline = monotonic_fn() + timeout_seconds
+    while monotonic_fn() < deadline:
+        if not process_is_running(pid):
+            try:
+                pid_path.unlink()
+            except FileNotFoundError:
+                pass
+            print_fn(f"[service] 旧 web 服务已停止: pid={pid}")
+            return True
+        sleep_fn(0.5)
+
+    print_fn(f"[service] 旧 web 服务未在 {timeout_seconds:.0f}s 内退出，发送 SIGKILL: pid={pid}")
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        os.kill(pid, signal.SIGKILL)
+    try:
+        pid_path.unlink()
+    except FileNotFoundError:
+        pass
+    return True
 
 
 def load_env_file(env_path: Path) -> dict[str, str]:
@@ -158,22 +238,33 @@ def ensure_local_service(
     config: RefreshRunnerConfig,
     client: RefreshApiClient,
     env: Mapping[str, str] | None = None,
+    force_restart: bool = False,
     sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
     print_fn: Callable[[str], None] = print,
 ) -> subprocess.Popen[str] | None:
     frontend_url = config.frontend_url or default_frontend_url(config.base_url)
-    try:
-        health, _ = check_local_web_stack(client, frontend_url)
-        print_fn(f"[service] 前后端已就绪: api={json.dumps(health, ensure_ascii=False)} frontend={frontend_url}")
-        return None
-    except Exception as exc:
-        print_fn(f"[service] 前后端未就绪，准备启动本地 web 服务: {exc}")
+    if force_restart:
+        stop_service_from_pid_file(
+            config.service_pid_path,
+            sleep_fn=sleep_fn,
+            monotonic_fn=monotonic_fn,
+            print_fn=print_fn,
+        )
+    else:
+        try:
+            health, _ = check_local_web_stack(client, frontend_url)
+            print_fn(f"[service] 前后端已就绪: api={json.dumps(health, ensure_ascii=False)} frontend={frontend_url}")
+            return None
+        except Exception as exc:
+            print_fn(f"[service] 前后端未就绪，准备启动本地 web 服务: {exc}")
 
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
     merged_env["PYTHONPATH"] = str(config.project_root / "src")
     config.service_log_path.parent.mkdir(parents=True, exist_ok=True)
+    config.service_pid_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = config.service_log_path.open("a", encoding="utf-8")
     process = subprocess.Popen(
         [sys.executable, "scripts/run_webapp.py"],
@@ -182,9 +273,12 @@ def ensure_local_service(
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         text=True,
+        start_new_session=True,
+        close_fds=True,
     )
-    deadline = time.monotonic() + config.health_timeout_seconds
-    while time.monotonic() < deadline:
+    config.service_pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
+    deadline = monotonic_fn() + config.health_timeout_seconds
+    while monotonic_fn() < deadline:
         if process.poll() is not None:
             log_handle.flush()
             raise RuntimeError(
@@ -193,7 +287,7 @@ def ensure_local_service(
         try:
             health, _ = check_local_web_stack(client, frontend_url)
             print_fn(
-                f"[service] 已启动前后端 pid={process.pid}: api={json.dumps(health, ensure_ascii=False)} frontend={frontend_url}"
+                f"[service] 已常驻后台启动前后端 pid={process.pid}: api={json.dumps(health, ensure_ascii=False)} frontend={frontend_url}"
             )
             return process
         except Exception:
@@ -327,7 +421,9 @@ def run_refresh_workflow(
         config=config,
         client=client,
         env=env_values,
+        force_restart=config.restart_service,
         sleep_fn=sleep_fn,
+        monotonic_fn=monotonic_fn,
         print_fn=print_fn,
     )
     if service_process is not None:
@@ -363,7 +459,9 @@ def run_refresh_workflow(
                 config=config,
                 client=client,
                 env=env_values,
+                force_restart=False,
                 sleep_fn=sleep_fn,
+                monotonic_fn=monotonic_fn,
                 print_fn=print_fn,
             )
             sleep_fn(config.retry_delay_seconds)
@@ -413,7 +511,9 @@ def run_refresh_workflow(
             config=config,
             client=client,
             env=env_values,
+            force_restart=False,
             sleep_fn=sleep_fn,
+            monotonic_fn=monotonic_fn,
             print_fn=print_fn,
         )
         sleep_fn(config.retry_delay_seconds)
@@ -440,6 +540,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-delay", type=float, default=5.0, help="失败后重试前等待秒数")
     parser.add_argument("--max-attempts", type=int, default=3, help="最多触发刷新次数")
     parser.add_argument("--log-file", default=str(DEFAULT_LOG_PATH), help="服务启动日志路径")
+    parser.add_argument("--pid-file", default=str(DEFAULT_PID_PATH), help="常驻后台服务 pid 文件路径")
+    parser.add_argument(
+        "--no-restart-service",
+        action="store_true",
+        help="不在刷新前重启本地 web 服务，调试时使用",
+    )
     return parser
 
 
@@ -456,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
         retry_delay_seconds=args.retry_delay,
         max_attempts=args.max_attempts,
         service_log_path=Path(args.log_file).expanduser().resolve(),
+        service_pid_path=Path(args.pid_file).expanduser().resolve(),
+        restart_service=not args.no_restart_service,
     )
     result = run_refresh_workflow(config=config)
     print(json.dumps(result, ensure_ascii=False, indent=2))
