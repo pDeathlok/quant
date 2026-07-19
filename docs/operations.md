@@ -26,6 +26,26 @@ curl --fail http://127.0.0.1:8088/api/health
 {"status":"ok","service":"quant-webapp"}
 ```
 
+## Web 服务常驻运行（macOS）
+
+不要用普通终端后台进程长期托管 Web 服务；会话退出、开发工具回收子进程或机器重启后，进程不会自动恢复。项目提供 `launchd` 用户服务，登录后自动启动，退出时自动拉起：
+
+```bash
+scripts/webapp_service.sh install
+scripts/webapp_service.sh status
+```
+
+日常管理：
+
+```bash
+scripts/webapp_service.sh restart
+scripts/webapp_service.sh logs
+scripts/webapp_service.sh stop
+scripts/webapp_service.sh start
+```
+
+服务标识是 `com.didi.quant.webapp`，标准输出和错误日志分别位于 `.run/launchd_webapp.stdout.log` 和 `.run/launchd_webapp.stderr.log`。安装脚本会优先选用项目 `.venv`，其次选用已包含项目依赖的 Miniforge/Conda Python；也可用 `QUANT_PYTHON=/absolute/path/python` 显式指定。
+
 ## 执行每日任务
 
 推荐生产命令：
@@ -100,7 +120,7 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 
 1. 读取项目 `.env`。
 2. 用 Tushare `trade_cal` 判断当天是否为 A 股交易日；不是交易日或无法可靠确认时直接跳过。
-3. 默认先按 `.run/daily_web_refresh.pid` 重启本地 web 服务，再以常驻后台进程启动；该进程同时提供 FastAPI 后端和静态前端，并写日志到 `.run/daily_web_refresh.log`。
+3. 默认先按 `.run/daily_web_refresh.pid` 重启由该脚本启动的本地 web 服务。如果检测到 Web 服务由 `launchd` 等外部守护器托管，则保持现有服务，避免重复启动和端口冲突。
 4. 检查 `http://127.0.0.1:8088/api/health` 和前端首页 `http://127.0.0.1:8088/`，确认前后端已就绪。
 5. 触发 `POST /api/selector/refresh-latest`，作用域默认 `all`。
 6. 轮询 `/api/selector/refresh-latest/status` 并打印进度。

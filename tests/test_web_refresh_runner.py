@@ -250,6 +250,35 @@ def test_ensure_local_service_force_restarts_pid_file_service(monkeypatch, tmp_p
     assert any("准备重启常驻 web 服务" in line for line in logs)
 
 
+def test_ensure_local_service_reuses_externally_managed_service(
+    monkeypatch, tmp_path: Path
+) -> None:
+    responses = [
+        FakeResponse({"status": "ok", "service": "quant-webapp"}),
+        FakeResponse("<html>quant</html>"),
+    ]
+    session = FakeSession(responses)
+    client = runner.RefreshApiClient("http://127.0.0.1:8088/api", session=session)
+    logs: list[str] = []
+
+    monkeypatch.setattr(runner, "stop_service_from_pid_file", lambda *args, **kwargs: False)
+
+    config = runner.RefreshRunnerConfig(
+        project_root=tmp_path,
+        service_log_path=tmp_path / "service.log",
+        service_pid_path=tmp_path / "service.pid",
+    )
+    process = runner.ensure_local_service(
+        config=config,
+        client=client,
+        force_restart=True,
+        print_fn=logs.append,
+    )
+
+    assert process is None
+    assert any("外部守护器托管" in line for line in logs)
+
+
 def test_run_refresh_workflow_skips_when_trade_day_unknown(tmp_path: Path) -> None:
     logs: list[str] = []
     env_path = tmp_path / ".env"

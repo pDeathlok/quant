@@ -43,6 +43,7 @@ from quant.research.similar_patterns import (
     summarize_forecast,
 )
 from quant.research.similar_patterns_validation import build_industry_regime, load_market_regime
+from quant.research.byd_daily_t_plan import build_daily_t_plan
 from quant.strategies.custom.byd_minute_t import BydHolding, build_minute_payload, load_daily_qfq
 from quant.strategies.custom.b1_family import add_b1_family_signals
 from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
@@ -278,6 +279,29 @@ SIMILAR_PATTERN_CONFIG = SimilarPatternConfig(
     take_profit_3d=0.03,
     stop_loss_3d=0.03,
 )
+SIMILARITY_SCORE_CONTRAST = 15.0
+
+
+def _similarity_score_ceiling(config: SimilarPatternConfig = SIMILAR_PATTERN_CONFIG) -> float:
+    """Return the fixed global upper bound of the forecast-weight formula."""
+    return float(
+        max(config.same_industry_weight, config.cross_industry_weight)
+        * max(1.0, config.same_regime_weight, config.regime_mismatch_weight)
+        * max(
+            1.0,
+            config.same_industry_regime_weight,
+            config.industry_regime_mismatch_weight,
+        )
+    )
+
+
+def _similarity_score_config() -> dict[str, float]:
+    return {
+        "similarity_score_ceiling": _similarity_score_ceiling(),
+        "similarity_score_contrast": SIMILARITY_SCORE_CONTRAST,
+    }
+
+
 CHAN_MODEL_SCORED_PATH = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
 CHAN_MODEL_STRATEGY_DIR = PROJECT_ROOT / "reports/chan_daily/model_strategy"
 CHAN_MODEL_STRATEGY_SCORED_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_scored.parquet"
@@ -497,43 +521,108 @@ def _load_project_env() -> None:
 
 
 def get_byd_daily_strategy(
-    shares: int = 10500,
+    shares: int = 10000,
     cost: float = 110.6061,
     refresh: bool = False,
-    sold_today_shares: int = 0,
-    sold_today_price: float | None = None,
-    open_t_shares: int = 0,
-    open_t_price: float | None = None,
 ) -> dict[str, Any]:
-    """Return BYD single-stock daily range T playbook and alerts."""
+    """Return BYD's fixed, pre-market daily T plan."""
     params = {
+        "plan_version": 3,
         "shares": int(shares),
         "cost": round(float(cost), 6),
-        "sold_today_shares": int(sold_today_shares),
-        "sold_today_price": sold_today_price,
-        "open_t_shares": int(open_t_shares),
-        "open_t_price": open_t_price,
     }
     if not refresh:
         cached = _read_workspace_snapshot("byd_daily_plan", params=params)
         if cached is not None:
             return cached
     daily = _load_byd_daily_frame()
-    holding = BydHolding(shares=max(int(shares), 0), cost=float(cost), full_shares=10500)
+    holding = BydHolding(shares=max(int(shares), 0), cost=float(cost), full_shares=10000)
     payload = build_minute_payload(
         daily=daily,
         minutes=pd.DataFrame(),
         holding=holding,
-        data_status="daily_plan",
-        sold_today_shares=sold_today_shares,
-        sold_today_price=sold_today_price,
-        open_t_shares=open_t_shares,
-        open_t_price=open_t_price,
+        data_status="盘前固定日线计划",
     )
-    planned_t = payload.get("planned_t") or {}
-    snapshot_date = planned_t.get("signal_date") or payload.get("asof") or payload.get("trade_date")
+    daily_plan = build_daily_t_plan(
+        daily=daily,
+        intraday=_load_byd_intraday_validation_frame(),
+        shares=holding.shares,
+        full_shares=holding.full_shares,
+    )
+    positive = daily_plan["positive"]
+    if positive["execution_enabled"]:
+        primary_action = {
+            "action": "BUY_LIMIT",
+            "title": f"正T挂买单：{positive['shares']}股 × {positive['buy_price']:.2f}",
+            "detail": f"{positive['entry_rule']} {positive['exit_rule']}",
+            "shares_delta": positive["shares"],
+        }
+    else:
+        primary_action = {
+            "action": "WAIT",
+            "title": "今日不挂正T买单",
+            "detail": (
+                "历史规则本身已通过验证，但下一交易日质量分未过闸门；"
+                "不为增加次数而追价。反T仍暂停。"
+            ),
+            "shares_delta": 0,
+        }
+    payload.update(
+        {
+            "daily_t_plan": daily_plan,
+            "planned_t": daily_plan,
+            "validation": daily_plan["validation"],
+            "primary_action": primary_action,
+            "stage": {
+                "key": (
+                    "OVERWEIGHT"
+                    if holding.shares > holding.full_shares
+                    else "UNDERWEIGHT"
+                    if holding.shares < 8000
+                    else "BALANCED"
+                ),
+                "label": (
+                    f"高于满仓 {holding.shares - holding.full_shares} 股"
+                    if holding.shares > holding.full_shares
+                    else f"低于合理仓 {8000 - holding.shares} 股"
+                    if holding.shares < 8000
+                    else "合理仓位"
+                ),
+                "goal_shares": holding.full_shares,
+                "mode": daily_plan["inventory"]["note"],
+            },
+            "alerts": [],
+            "playbook": [
+                positive["entry_rule"],
+                positive["exit_rule"],
+                positive["no_fill_rule"],
+                daily_plan["reverse"]["reason"],
+                daily_plan["inventory"]["note"],
+            ],
+        }
+    )
+    for obsolete_key in [
+        "today_t",
+        "recent_minutes",
+        "intraday_dynamic",
+        "indicators",
+        "validated_positive_t",
+        "intraday_levels",
+    ]:
+        payload.pop(obsolete_key, None)
+    snapshot_date = daily_plan["signal_date"]
     _write_workspace_snapshot("byd_daily_plan", snapshot_date, payload, params=params)
     return payload
+
+
+@lru_cache(maxsize=1)
+def _load_byd_intraday_validation_frame() -> pd.DataFrame:
+    """Load the longest local 5-minute history for offline validation only."""
+    paths = list((PROJECT_ROOT / "data/cache").glob("baostock_002594_5min_*_qfq.parquet"))
+    if not paths:
+        raise FileNotFoundError("缺少比亚迪历史5分钟验证数据")
+    path = max(paths, key=lambda item: item.stat().st_size)
+    return pd.read_parquet(path)
 
 
 def _load_byd_daily_frame() -> pd.DataFrame:
@@ -1840,40 +1929,79 @@ def _stock_profile_from_basic(symbol: str, basic: pd.DataFrame | None = None) ->
     return {"symbol": symbol, "name": symbol, "industry": ""}
 
 
-def _read_similar_pattern_watchlist_symbols() -> list[str]:
+def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
+    default = {"symbols": list(SIMILAR_PATTERN_DEFAULT_WATCHLIST), "notes": {}}
     if not SIMILAR_PATTERN_WATCHLIST_PATH.exists():
-        return list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
+        return default
     try:
         payload = json.loads(SIMILAR_PATTERN_WATCHLIST_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
-    symbols = payload.get("symbols", payload) if isinstance(payload, dict) else payload
-    normalized: list[str] = []
-    for item in symbols if isinstance(symbols, list) else []:
+        return default
+
+    raw_symbols = payload.get("symbols", payload) if isinstance(payload, dict) else payload
+    symbols: list[str] = []
+    for item in raw_symbols if isinstance(raw_symbols, list) else []:
         try:
             symbol = _normalize_watch_symbol(str(item))
         except ValueError:
             continue
-        if symbol not in normalized:
-            normalized.append(symbol)
-    return normalized or list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
+        if symbol not in symbols:
+            symbols.append(symbol)
+
+    raw_notes = payload.get("notes", {}) if isinstance(payload, dict) else {}
+    notes: dict[str, dict[str, str]] = {}
+    if isinstance(raw_notes, dict):
+        for raw_symbol, raw_note in raw_notes.items():
+            symbol = str(raw_symbol or "").strip().upper().replace("_", ".")
+            if symbol not in symbols:
+                continue
+            if isinstance(raw_note, dict):
+                content = str(raw_note.get("content") or "")
+                updated_at = str(raw_note.get("updated_at") or "")
+            else:
+                content = str(raw_note or "")
+                updated_at = ""
+            if content:
+                notes[symbol] = {"content": content, "updated_at": updated_at}
+    return {"symbols": symbols or list(SIMILAR_PATTERN_DEFAULT_WATCHLIST), "notes": notes}
+
+
+def _read_similar_pattern_watchlist_symbols() -> list[str]:
+    return list(_read_similar_pattern_watchlist_state()["symbols"])
 
 
 def _write_similar_pattern_watchlist_symbols(symbols: list[str]) -> None:
     SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state = _read_similar_pattern_watchlist_state()
     payload = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "symbols": symbols,
+        "notes": {
+            symbol: state["notes"][symbol]
+            for symbol in symbols
+            if symbol in state["notes"]
+        },
     }
     SIMILAR_PATTERN_WATCHLIST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> list[dict[str, str]]:
+    state = _read_similar_pattern_watchlist_state()
+    profiles = []
+    for symbol in state["symbols"]:
+        profile = _stock_profile_from_basic(symbol, basic)
+        note = state["notes"].get(symbol, {})
+        profile["note"] = note.get("content", "")
+        profile["note_updated_at"] = note.get("updated_at", "")
+        profiles.append(profile)
+    return profiles
+
+
 def get_similar_pattern_watchlist() -> dict[str, Any]:
-    symbols = _read_similar_pattern_watchlist_symbols()
     basic = _stock_basic_for_similar_patterns()
     return {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "stocks": [_stock_profile_from_basic(symbol, basic) for symbol in symbols],
+        "stocks": _similar_pattern_watchlist_profiles(basic),
     }
 
 
@@ -1890,6 +2018,34 @@ def remove_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
     normalized = _normalize_watch_symbol(symbol)
     symbols = [item for item in _read_similar_pattern_watchlist_symbols() if item != normalized]
     _write_similar_pattern_watchlist_symbols(symbols)
+    return get_similar_pattern_watchlist()
+
+
+def save_similar_pattern_watch_note(symbol: str, content: str) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        raise ValueError(f"股票不在自选池中: {normalized}")
+    cleaned = str(content or "").strip()
+    if len(cleaned) > 20_000:
+        raise ValueError("笔记不能超过 20000 个字符")
+    if cleaned:
+        state["notes"][normalized] = {
+            "content": cleaned,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    else:
+        state["notes"].pop(normalized, None)
+    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "symbols": state["symbols"],
+        "notes": state["notes"],
+    }
+    SIMILAR_PATTERN_WATCHLIST_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return get_similar_pattern_watchlist()
 
 
@@ -2009,12 +2165,16 @@ def _similar_pattern_result_payload(
                 top_cases[col] = (pd.to_numeric(top_cases[col], errors="coerce") * 100).round(2)
         if "similarity" in top_cases.columns:
             raw_similarity = pd.to_numeric(top_cases["similarity"], errors="coerce")
-            min_similarity = raw_similarity.min()
-            max_similarity = raw_similarity.max()
-            if pd.notna(min_similarity) and pd.notna(max_similarity) and max_similarity > min_similarity:
-                top_cases["similarity_score"] = ((raw_similarity - min_similarity) / (max_similarity - min_similarity) * 100).round(1)
-            else:
-                top_cases["similarity_score"] = 100.0
+            forecast_weight = pd.to_numeric(
+                top_cases.get("forecast_weight", pd.Series(0.0, index=top_cases.index)),
+                errors="coerce",
+            )
+            normalized_weight = (forecast_weight / _similarity_score_ceiling()).clip(lower=0, upper=1)
+            top_cases["similarity_score"] = (
+                np.log1p(SIMILARITY_SCORE_CONTRAST * normalized_weight)
+                / np.log1p(SIMILARITY_SCORE_CONTRAST)
+                * 100
+            ).round(1)
             top_cases["similarity"] = raw_similarity.round(4)
     return {
         "target": {
@@ -2166,7 +2326,7 @@ def refresh_similar_pattern_analysis(progress_callback=None) -> dict[str, Any]:
     }
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "watchlist": [_stock_profile_from_basic(symbol, basic) for symbol in symbols],
+        "watchlist": _similar_pattern_watchlist_profiles(basic),
         "config": {
             "candidate_start_date": SIMILAR_PATTERN_CONFIG.candidate_start_date,
             "candidate_step_days": SIMILAR_PATTERN_CONFIG.candidate_step_days,
@@ -2181,6 +2341,7 @@ def refresh_similar_pattern_analysis(progress_callback=None) -> dict[str, Any]:
             ),
             "max_effective_cases": SIMILAR_PATTERN_CONFIG.max_effective_cases,
             "max_events_per_date": SIMILAR_PATTERN_CONFIG.max_events_per_date,
+            **_similarity_score_config(),
         },
         "global_policy": _json_ready(global_model_selection),
         "results": [
@@ -2293,6 +2454,10 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
             and cached_symbols == watchlist_symbols
         ):
             cached = _attach_watchlist_strategy_hits(cached)
+            cached["watchlist"] = _similar_pattern_watchlist_profiles(
+                _stock_basic_for_similar_patterns()
+            )
+            cached.setdefault("config", {}).update(_similarity_score_config())
             cached["cache"] = {"hit": True, "backend": "json"}
             return cached
     return refresh_similar_pattern_analysis()

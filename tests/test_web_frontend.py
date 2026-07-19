@@ -4,6 +4,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_JS = (PROJECT_ROOT / "web" / "app.js").read_text(encoding="utf-8")
 STYLES_CSS = (PROJECT_ROOT / "web" / "styles.css").read_text(encoding="utf-8")
+INDEX_HTML = (PROJECT_ROOT / "web" / "index.html").read_text(encoding="utf-8")
 
 
 def test_workspace_tabs_use_one_seven_item_contract() -> None:
@@ -33,3 +34,72 @@ def test_workspace_tabs_scroll_consistently_on_narrow_screens() -> None:
     assert "overflow-x: auto;" in STYLES_CSS
     assert "scroll-snap-type: inline proximity;" in STYLES_CSS
     assert "prefers-reduced-motion: reduce" in STYLES_CSS
+
+
+def test_watchlist_stocks_have_persistent_note_editor() -> None:
+    assert 'data-similar-note="${item.symbol}"' in APP_JS
+    assert 'id="similarNoteDialog"' in INDEX_HTML
+    assert 'id="similarNoteInput"' in INDEX_HTML
+    assert "/note`, {" in APP_JS
+    assert 'method: "PUT"' in APP_JS
+    assert 'await fetchJson("/similar-patterns/watchlist")' in APP_JS
+    assert "分析加载失败，笔记仍可编辑" in APP_JS
+    assert ".similar-note-dialog" in STYLES_CSS
+
+
+def test_watchlist_note_is_visible_on_stock_hover_and_keyboard_focus() -> None:
+    assert 'id="similarNoteTooltip"' in INDEX_HTML
+    assert 'role="tooltip"' in INDEX_HTML
+    assert 'addEventListener("mouseover"' in APP_JS
+    assert 'addEventListener("mousemove"' in APP_JS
+    assert 'addEventListener("focusin"' in APP_JS
+    assert 'row.setAttribute("aria-describedby", "similarNoteTooltip")' in APP_JS
+    assert ".similar-note-tooltip" in STYLES_CSS
+
+
+def test_similar_cases_explain_and_display_forecast_weight_ranking() -> None:
+    assert "综合相似度、行业与市场匹配和时间衰减；按预测权重降序，采用全局统一尺度" in INDEX_HTML
+    assert "<th>原始相似度</th>" not in INDEX_HTML
+    assert "Math.log1p(contrast * normalized) / Math.log1p(contrast) * 100" in APP_JS
+    assert '<td>${row.similarity ?? "-"}</td>' not in APP_JS
+
+
+def test_byd_holding_inputs_are_restored_and_persisted() -> None:
+    assert 'const BYD_HOLDING_STORAGE_KEY = "quant.byd.holding.v1"' in APP_JS
+    assert "function saveBydHoldingInputs()" in APP_JS
+    assert "function restoreBydHoldingInputs()" in APP_JS
+    assert "version: 3" in APP_JS
+    assert '"bydSharesInput"' in APP_JS
+    assert '"bydCostInput"' in APP_JS
+    assert "已恢复永久保存的持仓和成本" in APP_JS
+    for removed in [
+        "bydSoldTodaySharesInput",
+        "bydSoldTodayPriceInput",
+        "bydBoughtTodaySharesInput",
+        "bydBoughtTodayPriceInput",
+        "bydOpenTInput",
+        "bydOpenTPriceInput",
+        "bydOpenPositiveInput",
+        "bydOpenPositivePriceInput",
+        "sold_today_shares",
+        "bought_today_shares",
+        "open_t_shares",
+        "open_positive_shares",
+    ]:
+        assert removed not in APP_JS
+        assert removed not in INDEX_HTML
+    assert APP_JS.rindex("restoreBydHoldingInputs();") < APP_JS.rindex("loadActivePageData();")
+    assert 'id="bydHoldingSaveStatus"' in INDEX_HTML
+
+
+def test_byd_page_shows_historical_validation_gate() -> None:
+    assert 'id="bydValidationStatus"' in INDEX_HTML
+    assert 'id="bydValidationMetrics"' in INDEX_HTML
+    assert "横盘期历史验证" in INDEX_HTML
+    assert "正T / 反T 分开计划" in INDEX_HTML
+    assert "payload.daily_t_plan" in APP_JS
+    assert "正T优先" in APP_JS
+    assert "反T计划" in APP_JS
+    assert "validation.held_out_results" in APP_JS
+    assert ".byd-validation-metrics" in STYLES_CSS
+    assert ".byd-alert.research-only" in STYLES_CSS

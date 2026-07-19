@@ -26,6 +26,7 @@ from quant.webapp.services import (
     refresh_chan_model_strategy_plan,
     refresh_dashboard,
     remove_similar_pattern_watch_symbol,
+    save_similar_pattern_watch_note,
     start_latest_refresh,
 )
 
@@ -46,18 +47,18 @@ class SimilarPatternWatchRequest(BaseModel):
     symbol: str
 
 
+class SimilarPatternWatchNoteRequest(BaseModel):
+    content: str = ""
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "quant-webapp"}
 
 
 def _build_byd_daily_plan(
-    shares: int = Query(default=10500, ge=0, le=200000),
+    shares: int = Query(default=10000, ge=0, le=200000),
     cost: float = Query(default=110.6061, gt=0),
-    sold_today_shares: int = Query(default=0, ge=0, le=50000),
-    sold_today_price: float | None = Query(default=None, gt=0),
-    open_t_shares: int = Query(default=0, ge=0, le=50000),
-    open_t_price: float | None = Query(default=None, gt=0),
     refresh: bool = False,
 ) -> dict[str, Any]:
     try:
@@ -65,10 +66,6 @@ def _build_byd_daily_plan(
             shares=shares,
             cost=cost,
             refresh=refresh,
-            sold_today_shares=sold_today_shares,
-            sold_today_price=sold_today_price,
-            open_t_shares=open_t_shares,
-            open_t_price=open_t_price,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"BYD 日线计划生成失败: {exc}") from exc
@@ -76,21 +73,13 @@ def _build_byd_daily_plan(
 
 @router.get("/byd/daily-plan")
 def byd_daily_plan(
-    shares: int = Query(default=10500, ge=0, le=200000),
+    shares: int = Query(default=10000, ge=0, le=200000),
     cost: float = Query(default=110.6061, gt=0),
-    sold_today_shares: int = Query(default=0, ge=0, le=50000),
-    sold_today_price: float | None = Query(default=None, gt=0),
-    open_t_shares: int = Query(default=0, ge=0, le=50000),
-    open_t_price: float | None = Query(default=None, gt=0),
     refresh: bool = False,
 ) -> dict[str, Any]:
     return _build_byd_daily_plan(
         shares=shares,
         cost=cost,
-        sold_today_shares=sold_today_shares,
-        sold_today_price=sold_today_price,
-        open_t_shares=open_t_shares,
-        open_t_price=open_t_price,
         refresh=refresh,
     )
 
@@ -320,6 +309,19 @@ def delete_similar_pattern_watchlist_symbol(symbol: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"相似走势自选池删除失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/{symbol}/note")
+def update_similar_pattern_watchlist_note(
+    symbol: str,
+    body: SimilarPatternWatchNoteRequest,
+) -> dict[str, Any]:
+    try:
+        return save_similar_pattern_watch_note(symbol, body.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选股笔记保存失败: {exc}") from exc
 
 
 @router.get("/similar-patterns/analysis")

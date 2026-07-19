@@ -245,12 +245,22 @@ def ensure_local_service(
 ) -> subprocess.Popen[str] | None:
     frontend_url = config.frontend_url or default_frontend_url(config.base_url)
     if force_restart:
-        stop_service_from_pid_file(
+        stopped_pid_service = stop_service_from_pid_file(
             config.service_pid_path,
             sleep_fn=sleep_fn,
             monotonic_fn=monotonic_fn,
             print_fn=print_fn,
         )
+        if not stopped_pid_service:
+            try:
+                health, _ = check_local_web_stack(client, frontend_url)
+                print_fn(
+                    "[service] 检测到外部守护器托管的前后端，保持运行: "
+                    f"api={json.dumps(health, ensure_ascii=False)} frontend={frontend_url}"
+                )
+                return None
+            except Exception:
+                pass
     else:
         try:
             health, _ = check_local_web_stack(client, frontend_url)

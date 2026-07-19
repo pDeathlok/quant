@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260717-workspace-tabs-v8" />
+    <link rel="stylesheet" href="./styles.css?v=20260718-byd-success-gate-v4" />
   </head>
   <body>
     <div class="app selector-app">
@@ -77,7 +77,7 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -192,7 +192,7 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -285,7 +285,7 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -415,7 +415,7 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -501,7 +501,7 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -633,7 +633,7 @@
           </button>
           <button class="page-tab active" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -645,45 +645,41 @@
           <div>
             <p class="eyebrow">BYD Inventory Desk</p>
             <h2>比亚迪日线做T计划</h2>
-            <p id="bydSubline" class="subline">10500 股 · 成本 110.6061 · 等待日线计划</p>
+            <p id="bydSubline" class="subline">10000 股 · 成本 110.6061 · 等待历史验证计划</p>
           </div>
           <div class="byd-toolbar-actions">
             <label>
               <span>持仓股数</span>
-              <input id="bydSharesInput" type="number" min="0" step="100" value="10500" />
+              <input id="bydSharesInput" type="number" min="0" step="100" value="10000" />
             </label>
             <label>
               <span>成本价</span>
               <input id="bydCostInput" type="number" min="0" step="0.0001" value="110.6061" />
             </label>
-            <label>
-              <span>今日已卖</span>
-              <input id="bydSoldTodaySharesInput" type="number" min="0" step="100" value="0" />
-            </label>
-            <label>
-              <span>今日卖价</span>
-              <input id="bydSoldTodayPriceInput" type="number" min="0" step="0.01" value="" />
-            </label>
-            <label>
-              <span>待买回股数</span>
-              <input id="bydOpenTInput" type="number" min="0" step="100" value="0" />
-            </label>
-            <label>
-              <span>待买回卖价</span>
-              <input id="bydOpenTPriceInput" type="number" min="0" step="0.01" value="" />
-            </label>
             <button id="bydRefreshButton" type="button">刷新日线计划</button>
             <button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页</button>
+            <span id="bydHoldingSaveStatus" class="byd-save-status" role="status" aria-live="polite">持仓修改后自动保存</span>
           </div>
           <div class="refresh-status"></div>
           <div class="progress-steps"></div>
         </section>
 
+        <section class="panel byd-validation-panel">
+          <div class="panel-head">
+            <div>
+              <h3>横盘期历史验证</h3>
+              <span id="bydValidationStatus">等待加载</span>
+            </div>
+          </div>
+          <p id="bydValidationDecision" class="subline">只使用2022年后的横盘期选择参数；历史分钟线只负责验证成交先后，盘中计划不刷新。</p>
+          <div id="bydValidationMetrics" class="byd-validation-metrics"></div>
+        </section>
+
         <section class="panel byd-range-panel">
           <div class="panel-head">
             <div>
-              <h3>核心做T区间</h3>
-              <span>前复权日线 + ATR + 箱体分位</span>
+              <h3>正T / 反T 分开计划</h3>
+              <span>正T优先 · 反T未通过则暂停</span>
             </div>
           </div>
           <div id="bydIntradayZones" class="byd-dynamic-zones"></div>
@@ -708,8 +704,8 @@
 
         <section class="panel byd-ladder-panel">
           <div class="panel-head">
-            <h3>辅助价位</h3>
-            <span>风控线 / 兜底线 / 箱体边界</span>
+            <h3>固定计划价位</h3>
+            <span>正T买卖 / 尾盘退出 / 反T观察</span>
           </div>
           <div id="bydPriceLadder" class="byd-ladder"></div>
         </section>
@@ -725,7 +721,7 @@
           <div class="panel">
             <div class="panel-head">
               <h3>执行路线</h3>
-              <span>先反T，后正T</span>
+              <span>先验证，再交易</span>
             </div>
             <ol id="bydPlaybook" class="byd-playbook"></ol>
           </div>
@@ -752,7 +748,7 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
           </button>
           <button class="page-tab active" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -797,11 +793,12 @@
                   <th>当前走势</th>
                   <th>T+1 结论</th>
                   <th>中期预期</th>
+                  <th>笔记 / 操作计划</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody id="similarWatchlist">
-                <tr><td colspan="6" class="empty-cell">切到自选池后加载</td></tr>
+                <tr><td colspan="7" class="empty-cell">切到自选池后加载</td></tr>
               </tbody>
             </table>
           </div>
@@ -850,7 +847,7 @@
         <section class="panel">
           <div class="panel-head">
             <h3>Top 相似阶段</h3>
-            <span>按相似度排序</span>
+            <span>综合相似度、行业与市场匹配和时间衰减；按预测权重降序，采用全局统一尺度</span>
           </div>
           <div class="table-wrap">
             <table>
@@ -861,14 +858,13 @@
                   <th>行业</th>
                   <th>日期</th>
                   <th>相似分</th>
-                  <th>原始相似度</th>
                   <th>次日</th>
                   <th>1月</th>
                   <th>3月</th>
                 </tr>
               </thead>
               <tbody id="similarTopRows">
-                <tr><td colspan="9" class="empty-cell">暂无数据</td></tr>
+                <tr><td colspan="8" class="empty-cell">暂无数据</td></tr>
               </tbody>
             </table>
           </div>
@@ -880,6 +876,32 @@
       <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
     </div>
     <div id="watchlistToast" class="watchlist-toast" role="status" aria-live="polite"></div>
-    <script src="./app.js?v=20260717-workspace-tabs-v8"></script>
+    <div id="similarNoteTooltip" class="similar-note-tooltip" role="tooltip" hidden>
+      <strong></strong>
+      <p></p>
+    </div>
+    <dialog id="similarNoteDialog" class="similar-note-dialog" aria-labelledby="similarNoteTitle">
+      <form id="similarNoteForm" method="dialog">
+        <div class="similar-note-dialog-head">
+          <div>
+            <h3 id="similarNoteTitle">自选股笔记</h3>
+            <p id="similarNoteMeta" class="subline"></p>
+          </div>
+          <button id="similarNoteCancel" class="similar-note-close" type="button" aria-label="关闭笔记编辑器">×</button>
+        </div>
+        <label class="similar-note-field" for="similarNoteInput">
+          <span>笔记内容</span>
+          <textarea id="similarNoteInput" maxlength="20000" rows="12" placeholder="例如：&#10;操作计划：回踩 20 日线且缩量时分批关注&#10;关注价位：……&#10;止损条件：……&#10;复盘记录：……"></textarea>
+        </label>
+        <div class="similar-note-dialog-actions">
+          <span>内容会随自选股持久保存；清空后保存可删除笔记。</span>
+          <div>
+            <button type="button" data-dialog-secondary id="similarNoteCancelBottom">取消</button>
+            <button id="similarNoteSave" type="submit">保存笔记</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+    <script src="./app.js?v=20260718-byd-success-gate-v4"></script>
   </body>
 </html>

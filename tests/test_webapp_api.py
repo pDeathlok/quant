@@ -1,13 +1,16 @@
 import queue
 from datetime import date
 
+import numpy as np
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
 from quant.research import similar_patterns as similar_patterns_module
 from quant.research.similar_patterns import SimilarPatternResult, TargetSpec, summarize_forecast
 from quant.webapp.app import app
 from quant.webapp import services
+from quant.webapp import api as webapp_api
 
 
 client = TestClient(app)
@@ -18,6 +21,31 @@ def test_health_endpoint_reports_service_status() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "quant-webapp"}
+
+
+def test_byd_daily_plan_only_forwards_permanent_holding(monkeypatch) -> None:
+    captured = {}
+
+    def fake_strategy(**kwargs):
+        captured.update(kwargs)
+        return {"validation": {"execution_enabled": False}, "alerts": []}
+
+    monkeypatch.setattr(webapp_api, "get_byd_daily_strategy", fake_strategy)
+
+    response = client.get(
+        "/api/byd/daily-plan",
+        params={
+            "shares": 10300,
+            "cost": 108.25,
+            "refresh": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["shares"] == 10300
+    assert captured["cost"] == 108.25
+    assert captured["refresh"] is True
+    assert set(captured) == {"shares", "cost", "refresh"}
 
 
 def test_refresh_endpoint_rejects_unknown_scope() -> None:
@@ -108,6 +136,18 @@ def test_similar_pattern_payload_includes_optimized_decision_and_validation() ->
     assert payload["validation_summary"][0]["coverage"] == 40.0
     assert payload["optimized_forecast"][0]["probability_source"] == "regime_industry"
     assert payload["decisions"][0]["bearish_max"] == 49.0
+    top_cases = payload["top_cases"]
+    ceiling = services._similarity_score_ceiling()
+    assert top_cases[0]["similarity_score"] == round(
+        np.log1p(services.SIMILARITY_SCORE_CONTRAST * top_cases[0]["forecast_weight"] / ceiling)
+        / np.log1p(services.SIMILARITY_SCORE_CONTRAST)
+        * 100,
+        1,
+    )
+    assert top_cases[0]["similarity_score"] < 100.0
+    assert [row["similarity_score"] for row in top_cases] == sorted(
+        [row["similarity_score"] for row in top_cases], reverse=True
+    )
 
 
 def test_watchlist_strategy_hits_merge_only_strategy_workspaces(monkeypatch) -> None:
@@ -168,6 +208,44 @@ def test_attach_watchlist_strategy_hits_adds_badges_to_each_result(monkeypatch) 
 
     assert enriched["results"][0]["strategy_hit_count"] == 1
     assert enriched["results"][1]["strategy_hit_count"] == 0
+
+
+def test_watchlist_notes_are_saved_and_returned_with_stock_profiles(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        '{"symbols":["002594.SZ"],"notes":{}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(
+            [{"ts_code": "002594.SZ", "name": "比亚迪", "industry": "汽车整车"}]
+        ),
+    )
+
+    payload = services.save_similar_pattern_watch_note(
+        "002594.SZ",
+        "操作计划：回踩 20 日线后分批关注",
+    )
+
+    stock = payload["stocks"][0]
+    persisted = watchlist_path.read_text(encoding="utf-8")
+    assert stock["note"] == "操作计划：回踩 20 日线后分批关注"
+    assert stock["note_updated_at"]
+    assert "回踩 20 日线" in persisted
+
+
+def test_watchlist_note_rejects_stock_outside_watchlist(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"symbols":["002594.SZ"]}', encoding="utf-8")
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+
+    with pytest.raises(ValueError, match="不在自选池"):
+        services.save_similar_pattern_watch_note("000001.SZ", "观察")
 
 
 def test_daily_payload_freshness_uses_generated_date() -> None:
