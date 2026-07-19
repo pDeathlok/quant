@@ -1898,11 +1898,11 @@ function renderConvertibleBondPage() {
   const generatedAt = document.querySelector("#generatedAt");
   if (state.cbLoading) {
     if (generatedAt) generatedAt.textContent = "正在加载可转债计划";
-    meta.textContent = "正在生成可转债计划...";
+    meta.textContent = "正在读取最近可用的可转债计划快照...";
     metrics.innerHTML = "";
     if (strategyWrap) strategyWrap.innerHTML = "";
-    rows.innerHTML = `<tr><td colspan="11" class="empty-cell">正在按低位网格策略筛选可转债...</td></tr>`;
-    detail.innerHTML = `<div class="empty-state">正在生成分批买入和网格计划...</div>`;
+    rows.innerHTML = `<tr><td colspan="11" class="empty-cell">正在读取低位网格策略候选...</td></tr>`;
+    detail.innerHTML = `<div class="empty-state">正在读取分批买入和网格计划...</div>`;
     return;
   }
   if (!rootPayload || !payload) {
@@ -1952,7 +1952,10 @@ function renderConvertibleBondPage() {
     });
   }
   const strategyName = activeStrategyKey === "all" ? "全部可转债策略" : (payload.strategy?.name || "可转债策略");
-  meta.textContent = `${strategyName} · 信号日 ${payload.trade_date || rootPayload.trade_date} · ${market.entry_permission || "-"}`;
+  const snapshotNote = rootPayload.cache?.stale
+    ? ` · 最近可用快照 ${rootPayload.cache.snapshot_date || payload.trade_date || rootPayload.trade_date}`
+    : "";
+  meta.textContent = `${strategyName} · 信号日 ${payload.trade_date || rootPayload.trade_date} · ${market.entry_permission || "-"}${snapshotNote}`;
   metrics.innerHTML = `
     <div><span>去重候选</span><strong>${candidates.length} 只</strong></div>
     <div><span>当前策略</span><strong>${activeStrategyKey === "all" ? `${plans.length} 套` : (payload.strategy?.name || "-")}</strong></div>

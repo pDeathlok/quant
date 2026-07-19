@@ -162,6 +162,8 @@ LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
 WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION = "workspace_payload_v1"
 WEB_WORKSPACE_SNAPSHOT_TABLE = "web_workspace_snapshots"
+WEB_WORKSPACE_SNAPSHOT_DIR = PROJECT_ROOT / "data/workspace_snapshots"
+CONVERTIBLE_BOND_GRID_PLAN_PATH = PROJECT_ROOT / "data/web/convertible_bond_grid_plan.json"
 REFRESH_STATUS_PATH = PROJECT_ROOT / "data/routine/latest_refresh_status.json"
 REFRESH_RUNNING_STALE_SECONDS = 6 * 60 * 60
 REFRESH_NO_PROGRESS_STALE_SECONDS = 30 * 60
@@ -532,7 +534,7 @@ def get_byd_daily_strategy(
         "cost": round(float(cost), 6),
     }
     if not refresh:
-        cached = _read_workspace_snapshot("byd_daily_plan", params=params)
+        cached = _read_workspace_snapshot("byd_daily_plan", params=params, allow_sql=False)
         if cached is not None:
             return cached
     daily = _load_byd_daily_frame()
@@ -611,7 +613,13 @@ def get_byd_daily_strategy(
     ]:
         payload.pop(obsolete_key, None)
     snapshot_date = daily_plan["signal_date"]
-    _write_workspace_snapshot("byd_daily_plan", snapshot_date, payload, params=params)
+    _write_workspace_snapshot(
+        "byd_daily_plan",
+        snapshot_date,
+        payload,
+        params=params,
+        write_sql=refresh,
+    )
     return payload
 
 
@@ -758,8 +766,49 @@ def _long_snapshot_path(snapshot_key: str) -> Path:
     return LONG_STOCK_POOL_SNAPSHOT_DIR / f"{snapshot_key}.json"
 
 
-def _read_long_stock_pool_snapshot(variant: str, signal_date: str | None) -> dict[str, Any] | None:
+def _read_long_stock_pool_snapshot(
+    variant: str,
+    signal_date: str | None,
+    allow_sql: bool = True,
+) -> dict[str, Any] | None:
     snapshot_key, _ = _long_snapshot_key(variant, signal_date)
+    requested = _canonical_workspace_snapshot_date(signal_date) if signal_date else None
+    local_candidates: list[tuple[str, Path]] = []
+    exact_path = _long_snapshot_path(snapshot_key)
+    if exact_path.exists():
+        local_candidates.append((requested or "", exact_path))
+    if LONG_STOCK_POOL_SNAPSHOT_DIR.exists():
+        for path in LONG_STOCK_POOL_SNAPSHOT_DIR.glob("*.json"):
+            if path == exact_path:
+                continue
+            try:
+                candidate_payload = read_json_file(path)
+            except Exception:
+                continue
+            if candidate_payload.get("variant") != variant:
+                continue
+            candidate_date = _canonical_workspace_snapshot_date(candidate_payload.get("signal_date"))
+            if requested and candidate_date > requested:
+                continue
+            local_candidates.append((candidate_date, path))
+    local_candidates.sort(key=lambda item: item[0], reverse=True)
+    for candidate_date, path in local_candidates:
+        try:
+            payload = read_json_file(path)
+        except Exception:
+            continue
+        cached_date = _canonical_workspace_snapshot_date(payload.get("signal_date") or candidate_date)
+        payload["cache"] = {
+            "hit": True,
+            "backend": "filesystem",
+            "snapshot_key": path.stem,
+            "snapshot_date": cached_date,
+            "requested_date": requested,
+            "stale": bool(requested and cached_date != requested),
+        }
+        return payload
+    if not allow_sql:
+        return None
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
         try:
@@ -777,14 +826,6 @@ def _read_long_stock_pool_snapshot(variant: str, signal_date: str | None) -> dic
         except Exception:
             pass
 
-    path = _long_snapshot_path(snapshot_key)
-    if path.exists():
-        try:
-            payload = read_json_file(path)
-            payload["cache"] = {"hit": True, "backend": "json", "snapshot_key": snapshot_key}
-            return payload
-        except Exception:
-            return None
     return None
 
 
@@ -823,13 +864,24 @@ def _long_stock_pool_snapshot_dates(variant: str) -> set[str]:
     return dates
 
 
-def _write_long_stock_pool_snapshot(payload: dict[str, Any], variant: str, signal_date: str | None) -> None:
+def _write_long_stock_pool_snapshot(
+    payload: dict[str, Any],
+    variant: str,
+    signal_date: str | None,
+    write_sql: bool = True,
+) -> None:
     snapshot_key, date_key = _long_snapshot_key(variant, signal_date)
     payload_to_store = dict(payload)
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_path = _long_snapshot_path(snapshot_key)
+    temporary_path = snapshot_path.with_suffix(".json.tmp")
+    temporary_path.write_text(payload_json, encoding="utf-8")
+    temporary_path.replace(snapshot_path)
+    if not write_sql:
+        return
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    wrote_sql = False
     if store.config.sql_url:
         try:
             from sqlalchemy import text
@@ -872,12 +924,8 @@ def _write_long_stock_pool_snapshot(payload: dict[str, Any], variant: str, signa
                         "payload_json": payload_json,
                     },
                 )
-            wrote_sql = True
         except Exception:
-            wrote_sql = False
-    if not wrote_sql:
-        LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        _long_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
+            return
 
 
 def _workspace_params_key(params: dict[str, Any] | None = None) -> str:
@@ -886,7 +934,18 @@ def _workspace_params_key(params: dict[str, Any] | None = None) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _canonical_workspace_snapshot_date(value: Any) -> str:
+    text_value = str(value or "latest").strip()
+    if text_value == "latest":
+        return text_value
+    compact = text_value.replace("-", "")
+    if len(compact) == 8 and compact.isdigit():
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
+    return text_value
+
+
 def _workspace_snapshot_key(workspace: str, snapshot_date: str, params_key: str) -> str:
+    snapshot_date = _canonical_workspace_snapshot_date(snapshot_date)
     raw = json.dumps(
         {
             "schema_version": WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
@@ -900,56 +959,123 @@ def _workspace_snapshot_key(workspace: str, snapshot_date: str, params_key: str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _workspace_snapshot_file_path(workspace: str, params_key: str, snapshot_date: str) -> Path:
+    safe_workspace = "".join(char for char in workspace if char.isalnum() or char in {"_", "-"})
+    date_key = _canonical_workspace_snapshot_date(snapshot_date)
+    return WEB_WORKSPACE_SNAPSHOT_DIR / safe_workspace / params_key / f"{date_key}.json"
+
+
+def _read_filesystem_workspace_snapshot(
+    workspace: str,
+    snapshot_date: str | None,
+    params_key: str,
+) -> dict[str, Any] | None:
+    directory = _workspace_snapshot_file_path(workspace, params_key, "latest").parent
+    requested = _canonical_workspace_snapshot_date(snapshot_date) if snapshot_date else None
+    candidates: list[Path] = []
+    if requested:
+        exact = _workspace_snapshot_file_path(workspace, params_key, requested)
+        if exact.exists():
+            candidates.append(exact)
+        candidates.extend(
+            sorted(
+                (
+                    path
+                    for path in directory.glob("*.json")
+                    if path != exact and path.stem != "latest" and path.stem <= requested
+                ),
+                key=lambda path: path.stem,
+                reverse=True,
+            )
+        )
+    elif directory.exists():
+        candidates = sorted(
+            (path for path in directory.glob("*.json") if path.stem != "latest"),
+            key=lambda path: path.stem,
+            reverse=True,
+        )
+    latest_path = directory / "latest.json"
+    if latest_path.exists() and latest_path not in candidates:
+        candidates.append(latest_path)
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        cached_date = _canonical_workspace_snapshot_date(
+            payload.get("trade_date") or payload.get("signal_date") or path.stem
+        )
+        if requested and cached_date != "latest" and cached_date > requested:
+            continue
+        payload["cache"] = {
+            "hit": True,
+            "backend": "filesystem",
+            "workspace": workspace,
+            "snapshot_date": cached_date,
+            "requested_date": requested,
+            "stale": bool(requested and cached_date != requested),
+        }
+        return payload
+    return None
+
+
 def _read_workspace_snapshot(
     workspace: str,
     snapshot_date: str | None = None,
     params: dict[str, Any] | None = None,
+    allow_sql: bool = True,
 ) -> dict[str, Any] | None:
+    params_key = _workspace_params_key(params)
+    filesystem_payload = _read_filesystem_workspace_snapshot(workspace, snapshot_date, params_key)
+    if filesystem_payload is not None:
+        return filesystem_payload
+    if not allow_sql:
+        return None
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if not store.config.sql_url:
         return None
-    params_key = _workspace_params_key(params)
+    requested = _canonical_workspace_snapshot_date(snapshot_date) if snapshot_date else None
     try:
         from sqlalchemy import text
 
         with store._engine().begin() as conn:
-            if snapshot_date:
-                snapshot_key = _workspace_snapshot_key(workspace, str(snapshot_date), params_key)
-                row = conn.execute(
-                    text(
-                        f"""
-                        SELECT snapshot_key, snapshot_date, payload_json
-                        FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
-                        WHERE snapshot_key = :snapshot_key
-                        """
-                    ),
-                    {"snapshot_key": snapshot_key},
-                ).mappings().first()
-            else:
-                row = conn.execute(
-                    text(
-                        f"""
-                        SELECT snapshot_key, snapshot_date, payload_json
-                        FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
-                        WHERE workspace = :workspace
-                          AND params_key = :params_key
-                        ORDER BY snapshot_date DESC, updated_at DESC
-                        LIMIT 1
-                        """
-                    ),
-                    {"workspace": workspace, "params_key": params_key},
-                ).mappings().first()
-        if not row or not row.get("payload_json"):
-            return None
-        payload = json.loads(row["payload_json"])
-        payload["cache"] = {
-            "hit": True,
-            "backend": "mysql",
-            "workspace": workspace,
-            "snapshot_key": str(row.get("snapshot_key") or ""),
-            "snapshot_date": str(row.get("snapshot_date") or ""),
-        }
-        return payload
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT snapshot_key, snapshot_date, payload_json
+                    FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
+                    WHERE workspace = :workspace
+                      AND params_key = :params_key
+                    ORDER BY updated_at DESC
+                    LIMIT 64
+                    """
+                ),
+                {"workspace": workspace, "params_key": params_key},
+            ).mappings().all()
+        eligible = []
+        for row in rows:
+            row_date = _canonical_workspace_snapshot_date(row.get("snapshot_date"))
+            if requested and row_date != "latest" and row_date > requested:
+                continue
+            eligible.append((row_date, row))
+        eligible.sort(key=lambda item: item[0] if item[0] != "latest" else "", reverse=True)
+        for row_date, row in eligible:
+            if not row.get("payload_json"):
+                continue
+            payload = json.loads(row["payload_json"])
+            payload["cache"] = {
+                "hit": True,
+                "backend": "mysql",
+                "workspace": workspace,
+                "snapshot_key": str(row.get("snapshot_key") or ""),
+                "snapshot_date": row_date,
+                "requested_date": requested,
+                "stale": bool(requested and row_date != requested),
+            }
+            return payload
+        return None
     except Exception:
         return None
 
@@ -959,8 +1085,9 @@ def _write_workspace_snapshot(
     snapshot_date: str | None,
     payload: dict[str, Any],
     params: dict[str, Any] | None = None,
+    write_sql: bool = True,
 ) -> None:
-    snapshot_date = str(snapshot_date or "latest")
+    snapshot_date = _canonical_workspace_snapshot_date(snapshot_date)
     params = params or {}
     params_key = _workspace_params_key(params)
     snapshot_key = _workspace_snapshot_key(workspace, snapshot_date, params_key)
@@ -973,6 +1100,9 @@ def _write_workspace_snapshot(
         "snapshot_date": snapshot_date,
     }
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    _write_filesystem_workspace_snapshot(workspace, params_key, snapshot_date, payload_json)
+    if not write_sql:
+        return
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if not store.config.sql_url:
         return
@@ -1020,6 +1150,26 @@ def _write_workspace_snapshot(
                     "payload_json": payload_json,
                 },
             )
+    except Exception:
+        return
+
+
+def _write_filesystem_workspace_snapshot(
+    workspace: str,
+    params_key: str,
+    snapshot_date: str,
+    payload_json: str,
+) -> None:
+    snapshot_path = _workspace_snapshot_file_path(workspace, params_key, snapshot_date)
+    latest_path = _workspace_snapshot_file_path(workspace, params_key, "latest")
+    try:
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = snapshot_path.with_suffix(".json.tmp")
+        temporary_path.write_text(payload_json, encoding="utf-8")
+        temporary_path.replace(snapshot_path)
+        latest_temporary_path = latest_path.with_suffix(".json.tmp")
+        latest_temporary_path.write_text(payload_json, encoding="utf-8")
+        latest_temporary_path.replace(latest_path)
     except Exception:
         return
 
@@ -1849,20 +1999,20 @@ def get_long_stock_pool(
         variant,
     )
     if not refresh:
-        cached = _read_long_stock_pool_snapshot(variant_key, signal_date)
+        cached = _read_long_stock_pool_snapshot(variant_key, signal_date, allow_sql=False)
         if cached is not None:
             return cached
     if variant_key in TEA_LONG_VARIANTS:
         if refresh:
             _build_tea_master_stock_pool_cached.cache_clear()
         payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
-        _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
+        _write_long_stock_pool_snapshot(payload, variant_key, signal_date, write_sql=refresh)
         payload["cache"] = {"hit": False, "backend": "generated"}
         return payload
     if refresh:
         _build_long_stock_pool_cached.cache_clear()
     payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
-    _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
+    _write_long_stock_pool_snapshot(payload, variant_key, signal_date, write_sql=refresh)
     payload["cache"] = {"hit": False, "backend": "generated"}
     return payload
 
@@ -2448,17 +2598,18 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
             for item in (cached or {}).get("results", [])
         ]
         watchlist_symbols = _read_similar_pattern_watchlist_symbols()
-        if (
-            cached is not None
-            and _is_daily_payload_current(cached)
-            and cached_symbols == watchlist_symbols
-        ):
+        if cached is not None:
             cached = _attach_watchlist_strategy_hits(cached)
             cached["watchlist"] = _similar_pattern_watchlist_profiles(
                 _stock_basic_for_similar_patterns()
             )
             cached.setdefault("config", {}).update(_similarity_score_config())
-            cached["cache"] = {"hit": True, "backend": "json"}
+            cached["cache"] = {
+                "hit": True,
+                "backend": "json",
+                "stale": not _is_daily_payload_current(cached),
+                "watchlist_changed": cached_symbols != watchlist_symbols,
+            }
             return cached
     return refresh_similar_pattern_analysis()
 
@@ -2627,6 +2778,14 @@ def _read_selector_snapshot(
     include_extended: bool,
 ) -> dict[str, Any] | None:
     snapshot_key, _, _ = _selector_snapshot_key(signal_date, strategies, include_extended)
+    path = _selector_snapshot_path(snapshot_key)
+    if path.exists():
+        try:
+            payload = read_json_file(path)
+            payload["cache"] = {"hit": True, "backend": "filesystem", "snapshot_key": snapshot_key}
+            return payload
+        except Exception:
+            pass
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
         try:
@@ -2673,14 +2832,6 @@ def _read_selector_snapshot(
         except Exception:
             pass
 
-    path = _selector_snapshot_path(snapshot_key)
-    if path.exists():
-        try:
-            payload = read_json_file(path)
-            payload["cache"] = {"hit": True, "backend": "json", "snapshot_key": snapshot_key}
-            return payload
-        except Exception:
-            return None
     return None
 
 
@@ -2695,8 +2846,12 @@ def _write_selector_snapshot(
     payload_to_store["selector_snapshot_schema_version"] = SELECTOR_SNAPSHOT_SCHEMA_VERSION
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_path = _selector_snapshot_path(snapshot_key)
+    temporary_path = snapshot_path.with_suffix(".json.tmp")
+    temporary_path.write_text(payload_json, encoding="utf-8")
+    temporary_path.replace(snapshot_path)
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    wrote_sql = False
     if store.config.sql_url:
         try:
             from sqlalchemy import text
@@ -2760,12 +2915,8 @@ def _write_selector_snapshot(
                         "payload_json": payload_json,
                     },
                 )
-            wrote_sql = True
         except Exception:
-            wrote_sql = False
-    if not wrote_sql:
-        SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        _selector_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
+            return
 
 
 def _strategy_keys_from_payload(payload: dict[str, Any]) -> list[str]:
@@ -2939,9 +3090,37 @@ def get_convertible_bond_grid_plan(
 ) -> dict[str, Any]:
     params = {"limit": int(limit)}
     if not refresh:
-        cached = _read_workspace_snapshot("convertible_bond_grid_plan", snapshot_date=trade_date, params=params)
+        cached = _read_workspace_snapshot(
+            "convertible_bond_grid_plan",
+            snapshot_date=trade_date,
+            params=params,
+            allow_sql=False,
+        )
         if cached is not None:
             return cached
+        try:
+            legacy = json.loads(CONVERTIBLE_BOND_GRID_PLAN_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            legacy = None
+        if isinstance(legacy, dict) and legacy.get("trade_date"):
+            cached_date = _canonical_workspace_snapshot_date(legacy.get("trade_date"))
+            requested_date = _canonical_workspace_snapshot_date(trade_date) if trade_date else None
+            if not requested_date or cached_date <= requested_date:
+                legacy["cache"] = {
+                    "hit": True,
+                    "backend": "legacy_filesystem",
+                    "workspace": "convertible_bond_grid_plan",
+                    "snapshot_date": cached_date,
+                    "requested_date": requested_date,
+                    "stale": bool(requested_date and cached_date != requested_date),
+                }
+                _write_filesystem_workspace_snapshot(
+                    "convertible_bond_grid_plan",
+                    _workspace_params_key(params),
+                    cached_date,
+                    json.dumps(legacy, ensure_ascii=False, default=str),
+                )
+                return legacy
     refresh_result = None
     if refresh and trade_date:
         refresh_result = refresh_convertible_bond_daily(trade_date=trade_date)
@@ -2953,6 +3132,7 @@ def get_convertible_bond_grid_plan(
         payload.get("trade_date") or trade_date,
         payload,
         params=params,
+        write_sql=refresh,
     )
     return payload
 
@@ -2970,12 +3150,21 @@ def get_convertible_bond_allotments(
     }
     cached = None
     if not refresh:
-        cached = _read_workspace_snapshot("convertible_bond_allotments", params=params)
+        cached = _read_workspace_snapshot(
+            "convertible_bond_allotments",
+            params=params,
+            allow_sql=False,
+        )
         if cached is None:
             cached = _read_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH)
-        if cached is not None and _is_daily_payload_current(cached):
+        if cached is not None:
+            cached.setdefault("cache", {})
+            cached["cache"].update({
+                "hit": True,
+                "stale": not _is_daily_payload_current(cached),
+            })
             return cached
-    daily_refresh_required = refresh or cached is None or not _is_daily_payload_current(cached)
+    daily_refresh_required = refresh
     payload = build_convertible_bond_allotment_payload(
         limit=limit,
         include_listed_days=include_listed_days,
@@ -2988,6 +3177,7 @@ def get_convertible_bond_allotments(
         payload.get("asof") or payload.get("trade_date") or payload.get("generated_at"),
         payload,
         params=params,
+        write_sql=refresh,
     )
     return payload
 
@@ -3150,11 +3340,22 @@ def get_chan_model_strategy_plan(
 ) -> dict[str, Any]:
     params = {"top_n": int(top_n)}
     if not refresh:
-        cached = _read_workspace_snapshot("chan_model_strategy", snapshot_date=signal_date, params=params)
+        cached = _read_workspace_snapshot(
+            "chan_model_strategy",
+            snapshot_date=signal_date,
+            params=params,
+            allow_sql=False,
+        )
         if cached is not None:
             return cached
     payload = _build_chan_model_strategy_payload(top_n=top_n, signal_date=signal_date)
-    _write_workspace_snapshot("chan_model_strategy", payload.get("signal_date"), payload, params=params)
+    _write_workspace_snapshot(
+        "chan_model_strategy",
+        payload.get("signal_date"),
+        payload,
+        params=params,
+        write_sql=refresh,
+    )
     return payload
 
 

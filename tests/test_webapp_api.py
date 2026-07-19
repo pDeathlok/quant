@@ -256,10 +256,68 @@ def test_daily_payload_freshness_uses_generated_date() -> None:
     assert not services._is_daily_payload_current({}, today=today)
 
 
-def test_allotment_tab_refreshes_stale_daily_cache(monkeypatch, tmp_path) -> None:
+def test_workspace_snapshot_uses_filesystem_and_nearest_prior_date(monkeypatch, tmp_path) -> None:
+    class NoSqlStore:
+        def __init__(self, config):
+            self.config = config
+
+    no_sql_config = type("NoSqlConfig", (), {"sql_url": None})()
+    monkeypatch.setattr(services, "WEB_WORKSPACE_SNAPSHOT_DIR", tmp_path / "snapshots")
+    monkeypatch.setattr(services, "MarketDataStore", NoSqlStore)
+    monkeypatch.setattr(services.MarketDataStoreConfig, "from_env", lambda **kwargs: no_sql_config)
+
+    services._write_workspace_snapshot(
+        "convertible_bond_grid_plan",
+        "20260717",
+        {"trade_date": "20260717", "candidates": [{"ts_code": "123001.SZ"}]},
+        params={"limit": 18},
+    )
+
+    payload = services._read_workspace_snapshot(
+        "convertible_bond_grid_plan",
+        snapshot_date="2026-07-18",
+        params={"limit": 18},
+    )
+
+    assert payload is not None
+    assert payload["candidates"][0]["ts_code"] == "123001.SZ"
+    assert payload["cache"]["backend"] == "filesystem"
+    assert payload["cache"]["snapshot_date"] == "2026-07-17"
+    assert payload["cache"]["requested_date"] == "2026-07-18"
+    assert payload["cache"]["stale"] is True
+
+
+def test_convertible_bond_plan_bootstraps_from_legacy_snapshot(monkeypatch, tmp_path) -> None:
+    legacy_path = tmp_path / "convertible_bond_grid_plan.json"
+    legacy_path.write_text(
+        '{"trade_date":"20260717","generated_at":"2026-07-17T18:00:00","candidates":[]}',
+        encoding="utf-8",
+    )
+    writes = []
+    monkeypatch.setattr(services, "CONVERTIBLE_BOND_GRID_PLAN_PATH", legacy_path)
+    monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        services,
+        "_write_filesystem_workspace_snapshot",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        services,
+        "build_convertible_bond_grid_plan",
+        lambda **kwargs: pytest.fail("tab read must not synchronously rebuild when a durable snapshot exists"),
+    )
+
+    payload = services.get_convertible_bond_grid_plan(trade_date="2026-07-18", limit=18)
+
+    assert payload["cache"]["backend"] == "legacy_filesystem"
+    assert payload["cache"]["snapshot_date"] == "2026-07-17"
+    assert payload["cache"]["stale"] is True
+    assert len(writes) == 1
+
+
+def test_allotment_tab_serves_stale_daily_cache_without_blocking_refresh(monkeypatch, tmp_path) -> None:
     calls = []
     stale = {"generated_at": "2026-06-28T22:52:04", "records": []}
-    refreshed = {"generated_at": "2026-07-13T08:30:00", "records": [{"stock_code": "000001"}]}
 
     monkeypatch.setattr(services, "CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH", tmp_path / "allotments.json")
     monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: stale)
@@ -267,17 +325,18 @@ def test_allotment_tab_refreshes_stale_daily_cache(monkeypatch, tmp_path) -> Non
 
     def fake_build(**kwargs):
         calls.append(kwargs["refresh"])
-        return refreshed
+        return {"generated_at": "2026-07-13T08:30:00", "records": [{"stock_code": "000001"}]}
 
     monkeypatch.setattr(services, "build_convertible_bond_allotment_payload", fake_build)
 
     payload = services.get_convertible_bond_allotments()
 
-    assert calls == [True]
-    assert payload == refreshed
+    assert calls == []
+    assert payload["records"] == []
+    assert payload["cache"]["stale"] is True
 
 
-def test_similar_pattern_tab_refreshes_stale_daily_cache(monkeypatch) -> None:
+def test_similar_pattern_tab_serves_stale_cache_without_blocking_refresh(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
         services,
@@ -293,8 +352,9 @@ def test_similar_pattern_tab_refreshes_stale_daily_cache(monkeypatch) -> None:
 
     payload = services.get_similar_pattern_analysis()
 
-    assert calls == [True]
-    assert payload["generated_at"].startswith("2026-07-13")
+    assert calls == []
+    assert payload["generated_at"].startswith("2026-06-28")
+    assert payload["cache"]["stale"] is True
 
 
 def test_vector_cache_builder_uses_thread_pool_in_daemon_process(monkeypatch, tmp_path) -> None:
