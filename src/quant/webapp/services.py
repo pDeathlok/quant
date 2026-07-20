@@ -2155,12 +2155,36 @@ def get_similar_pattern_watchlist() -> dict[str, Any]:
     }
 
 
-def add_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
+def add_similar_pattern_watch_symbol(symbol: str, note: str = "") -> dict[str, Any]:
     normalized = _normalize_watch_symbol(symbol)
-    symbols = _read_similar_pattern_watchlist_symbols()
-    if normalized not in symbols:
-        symbols.append(normalized)
-        _write_similar_pattern_watchlist_symbols(symbols)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        state["symbols"].append(normalized)
+    cleaned_note = str(note or "").strip()
+    if cleaned_note:
+        existing = str(state["notes"].get(normalized, {}).get("content") or "").strip()
+        existing_lines = {line.strip() for line in existing.splitlines() if line.strip()}
+        if cleaned_note not in existing_lines:
+            merged = f"{existing}\n{cleaned_note}".strip() if existing else cleaned_note
+            if len(merged) > 20_000:
+                raise ValueError("追加来源后笔记不能超过 20000 个字符")
+            state["notes"][normalized] = {
+                "content": merged,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SIMILAR_PATTERN_WATCHLIST_PATH.write_text(
+        json.dumps(
+            {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "symbols": state["symbols"],
+                "notes": state["notes"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return get_similar_pattern_watchlist()
 
 

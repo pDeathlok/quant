@@ -238,6 +238,48 @@ def test_watchlist_notes_are_saved_and_returned_with_stock_profiles(monkeypatch,
     assert "回踩 20 日线" in persisted
 
 
+def test_strategy_add_appends_source_note_without_overwriting_or_duplication(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        '{"symbols":["002594.SZ"],"notes":{"002594.SZ":{"content":"手工计划：回踩观察","updated_at":"2026-07-16T20:00:00"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(
+            [{"ts_code": "002594.SZ", "name": "比亚迪", "industry": "汽车整车"}]
+        ),
+    )
+
+    services.add_similar_pattern_watch_symbol("002594.SZ", note="7.17 触发 B1 策略")
+    payload = services.add_similar_pattern_watch_symbol("002594.SZ", note="7.17 触发 B1 策略")
+
+    note = payload["stocks"][0]["note"]
+    assert note == "手工计划：回踩观察\n7.17 触发 B1 策略"
+    assert note.count("7.17 触发 B1 策略") == 1
+
+
+def test_watchlist_api_forwards_default_source_note(monkeypatch) -> None:
+    captured = {}
+
+    def fake_add(symbol, note=""):
+        captured.update({"symbol": symbol, "note": note})
+        return {"stocks": []}
+
+    monkeypatch.setattr(webapp_api, "add_similar_pattern_watch_symbol", fake_add)
+
+    response = client.post(
+        "/api/similar-patterns/watchlist",
+        json={"symbol": "002594.SZ", "note": "7.15 配债股"},
+    )
+
+    assert response.status_code == 200
+    assert captured == {"symbol": "002594.SZ", "note": "7.15 配债股"}
+
+
 def test_watchlist_note_rejects_stock_outside_watchlist(monkeypatch, tmp_path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text('{"symbols":["002594.SZ"]}', encoding="utf-8")

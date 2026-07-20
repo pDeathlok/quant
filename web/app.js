@@ -614,7 +614,7 @@ async function loadSimilarPatterns(options = {}) {
 async function addSimilarWatchSymbol(symbol, options = {}) {
   await fetchJson("/similar-patterns/watchlist", {
     method: "POST",
-    body: JSON.stringify({ symbol }),
+    body: JSON.stringify({ symbol, note: options.note || "" }),
   });
   state.similarPayload = null;
   if (options.refresh !== false) await loadSimilarPatterns({ refresh: true });
@@ -713,6 +713,27 @@ function strategyResonanceLabel(item) {
   return "观察中";
 }
 
+function compactWatchlistDate(value) {
+  const digits = String(value || "").replaceAll("-", "").slice(0, 8);
+  if (!/^\d{8}$/.test(digits)) return "";
+  return `${Number(digits.slice(4, 6))}.${Number(digits.slice(6, 8))}`;
+}
+
+function watchlistSourceNote(dateValue, sourceText) {
+  const dateLabel = compactWatchlistDate(dateValue);
+  return [dateLabel, String(sourceText || "").trim()].filter(Boolean).join(" ");
+}
+
+function xueqiuStockUrl(symbol) {
+  const normalized = String(symbol || "").trim().toUpperCase();
+  const match = normalized.match(/^(\d{6})(?:\.(SH|SZ|BJ))?$/);
+  if (!match) return "";
+  const code = match[1];
+  const market = match[2]
+    || (/^[69]/.test(code) ? "SH" : /^[48]/.test(code) ? "BJ" : "SZ");
+  return `https://xueqiu.com/S/${market}${code}`;
+}
+
 function fallbackSimilarityScore(row, config) {
   const current = Number(row.forecast_weight);
   const ceiling = Number(config?.similarity_score_ceiling);
@@ -757,14 +778,14 @@ function renderSimilarPatternsPage() {
         <em>${state.similarError}</em>
       </article>
     `;
-    watchlist.innerHTML = `<tr><td colspan="7" class="empty-cell">${state.similarError} · <button type="button" data-similar-retry>重新加载</button></td></tr>`;
+    watchlist.innerHTML = `<tr><td colspan="8" class="empty-cell">${state.similarError} · <button type="button" data-similar-retry>重新加载</button></td></tr>`;
     overview.innerHTML = "";
     return;
   }
   if (!payload) {
     meta.textContent = "切到自选池后加载";
     if (signalSummary) signalSummary.innerHTML = "";
-    watchlist.innerHTML = `<tr><td colspan="7" class="empty-cell">切到自选池后加载</td></tr>`;
+    watchlist.innerHTML = `<tr><td colspan="8" class="empty-cell">切到自选池后加载</td></tr>`;
     overview.innerHTML = "";
     return;
   }
@@ -814,6 +835,7 @@ function renderSimilarPatternsPage() {
     const selectedClass = item.symbol === state.similarSelectedSymbol ? "active" : "";
     const strategyHits = watchlistStrategyHits(result);
     const resonanceClass = strategyHits.length ? "has-strategy-hit" : "";
+    const xueqiuUrl = xueqiuStockUrl(item.symbol);
     return `
       <tr class="similar-watch-row ${selectedClass} ${resonanceClass}" data-similar-symbol="${item.symbol}" tabindex="0">
         <td class="similar-stock-cell">
@@ -846,10 +868,17 @@ function renderSimilarPatternsPage() {
             <span>${item.note ? escapeHtml(item.note) : "记录操作计划、关注价位等"}</span>
           </button>
         </td>
+        <td class="similar-xueqiu-cell">
+          ${xueqiuUrl ? `
+            <a class="xueqiu-stock-link" data-similar-xueqiu href="${escapeHtml(xueqiuUrl)}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(item.name || item.symbol)}">
+              雪球
+            </a>
+          ` : `<span class="xueqiu-stock-unavailable">—</span>`}
+        </td>
         <td class="similar-row-actions"><button type="button" data-similar-remove="${item.symbol}">删除</button></td>
       </tr>
     `;
-  }).join("") || `<tr><td colspan="7" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
+  }).join("") || `<tr><td colspan="8" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
 
   const selected = selectedSimilarResult();
   overview.innerHTML = selected ? (() => {
@@ -1312,7 +1341,7 @@ function renderChanModelPage() {
   }
   if (tbody) {
     tbody.innerHTML = rows.length ? rows.map((item) => `
-      <tr class="${item.symbol === state.chanSelectedSymbol ? "selected-row" : ""}" data-chan-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" tabindex="0">
+      <tr class="${item.symbol === state.chanSelectedSymbol ? "selected-row" : ""}" data-chan-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload?.signal_date || item.date, `触发 ${chanRuleLabel(item)}`))}" tabindex="0">
         <td><strong>${item.symbol}</strong><span>${item.name || ""}</span></td>
         <td><span class="tag ${item.rule_id === "chan_model_primary" ? "strong" : ""}">${chanRuleLabel(item)}</span></td>
         <td>${Number(item.rank_score || 0).toFixed(3)}</td>
@@ -1587,7 +1616,7 @@ function renderStockRows() {
     return;
   }
   body.innerHTML = rows.map((item) => `
-    <tr class="${item.symbol === state.selectedSymbol ? "selected-row" : ""}" data-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" tabindex="0">
+    <tr class="${item.symbol === state.selectedSymbol ? "selected-row" : ""}" data-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(item.date || state.payload?.signal_date, `触发 ${(item.matched_families || []).join(" / ")} 策略`))}" tabindex="0">
       <td>
         <strong class="copyable-symbol">${item.symbol}</strong>
         <span>${item.name || ""}</span>
@@ -1835,7 +1864,7 @@ function renderLongStockPool() {
     return;
   }
   body.innerHTML = payload.stocks.map((item) => `
-    <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" tabindex="0">
+    <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload.signal_date, `${payload.variant_name} · ${stateLabel(item.state)}`))}" tabindex="0">
       <td><span class="state-pill ${item.state}">${stateLabel(item.state)}</span></td>
       <td>
         <strong>${item.ts_code}</strong>
@@ -2283,7 +2312,7 @@ function renderConvertibleBondAllotments() {
     return;
   }
   rows.innerHTML = records.map((item) => `
-    <tr data-watchlist-symbol="${item.stock_code || ""}" data-watchlist-name="${item.stock_name || ""}" tabindex="0">
+    <tr data-watchlist-symbol="${item.stock_code || ""}" data-watchlist-name="${item.stock_name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(item.stock_price_date || item.announce_date || payload.asof, `配债股${item.status ? ` · ${item.status}` : ""}`))}" tabindex="0">
       <td><span class="allotment-status ${allotmentStatusClass(item.stage)}">${item.status || "-"}</span></td>
       <td><strong>${item.stock_code || "--"}</strong><em>${item.stock_name || "--"}</em></td>
       <td><strong>${fmtPrice(item.stock_price)}</strong><em>${item.stock_price_date || "--"}</em></td>
@@ -2863,6 +2892,7 @@ function openWatchlistContextMenu(target, clientX, clientY) {
   watchlistContextTarget = {
     symbol: target.dataset.watchlistSymbol,
     name: target.dataset.watchlistName || target.dataset.watchlistSymbol,
+    note: target.dataset.watchlistNote || "",
   };
   menu.hidden = false;
   const width = menu.offsetWidth || 150;
@@ -2896,8 +2926,8 @@ document.querySelector("[data-watchlist-context-add]")?.addEventListener("click"
   const button = document.querySelector("[data-watchlist-context-add]");
   button.disabled = true;
   try {
-    await addSimilarWatchSymbol(target.symbol, { refresh: false });
-    showWatchlistToast(`${target.name} 已加入自选池`);
+    await addSimilarWatchSymbol(target.symbol, { refresh: false, note: target.note });
+    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}`);
   } catch (error) {
     showWatchlistToast(error.message || "加入自选池失败", "error");
   } finally {
@@ -2992,6 +3022,7 @@ document.querySelector("#similarNoteForm")?.addEventListener("submit", async (ev
 });
 
 document.querySelector("#similarPage")?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-similar-xueqiu]")) return;
   const retryButton = event.target.closest("[data-similar-retry]");
   if (retryButton) {
     loadSimilarPatterns().catch(showError);
@@ -3016,7 +3047,7 @@ document.querySelector("#similarPage")?.addEventListener("click", (event) => {
 document.querySelector("#similarPage")?.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" && event.key !== " ") return;
   const row = event.target.closest("[data-similar-symbol]");
-  if (!row || event.target.closest("button, input")) return;
+  if (!row || event.target.closest("button, input, a")) return;
   event.preventDefault();
   state.similarSelectedSymbol = row.dataset.similarSymbol;
   renderSimilarPatternsPage();

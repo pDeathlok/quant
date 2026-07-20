@@ -47,6 +47,17 @@ def test_watchlist_stocks_have_persistent_note_editor() -> None:
     assert ".similar-note-dialog" in STYLES_CSS
 
 
+def test_strategy_watchlist_add_includes_default_source_note() -> None:
+    assert "function compactWatchlistDate(value)" in APP_JS
+    assert "function watchlistSourceNote(dateValue, sourceText)" in APP_JS
+    assert 'body: JSON.stringify({ symbol, note: options.note || "" })' in APP_JS
+    assert 'data-watchlist-note=' in APP_JS
+    assert 'note: target.dataset.watchlistNote || ""' in APP_JS
+    assert 'note: target.note' in APP_JS
+    assert "触发 ${(item.matched_families || []).join(\" / \")} 策略" in APP_JS
+    assert "配债股${item.status ?" in APP_JS
+
+
 def test_watchlist_note_is_visible_on_stock_hover_and_keyboard_focus() -> None:
     assert 'id="similarNoteTooltip"' in INDEX_HTML
     assert 'role="tooltip"' in INDEX_HTML
@@ -55,6 +66,17 @@ def test_watchlist_note_is_visible_on_stock_hover_and_keyboard_focus() -> None:
     assert 'addEventListener("focusin"' in APP_JS
     assert 'row.setAttribute("aria-describedby", "similarNoteTooltip")' in APP_JS
     assert ".similar-note-tooltip" in STYLES_CSS
+
+
+def test_watchlist_stocks_link_to_xueqiu_in_a_new_tab() -> None:
+    assert "function xueqiuStockUrl(symbol)" in APP_JS
+    assert "https://xueqiu.com/S/${market}${code}" in APP_JS
+    assert 'data-similar-xueqiu' in APP_JS
+    assert 'target="_blank"' in APP_JS
+    assert 'rel="noopener noreferrer"' in APP_JS
+    assert 'event.target.closest("button, input, a")' in APP_JS
+    assert "<th>雪球</th>" in INDEX_HTML
+    assert ".xueqiu-stock-link" in STYLES_CSS
 
 
 def test_similar_cases_explain_and_display_forecast_weight_ranking() -> None:
@@ -103,3 +125,19 @@ def test_byd_page_shows_historical_validation_gate() -> None:
     assert "validation.held_out_results" in APP_JS
     assert ".byd-validation-metrics" in STYLES_CSS
     assert ".byd-alert.research-only" in STYLES_CSS
+
+
+def test_strategy_workspace_summaries_use_compact_layouts() -> None:
+    assert ".long-rule-panel {\n  display: none;" in STYLES_CSS
+    assert "grid-template-columns: repeat(7, minmax(0, 1fr));" in STYLES_CSS
+    assert ".byd-validation-panel {\n  display: grid;" in STYLES_CSS
+    assert ".similar-summary-card {\n  align-items: center;\n  display: grid;" in STYLES_CSS
+    assert "grid-auto-flow: column;" in STYLES_CSS
+    assert "20260720-compact-overview-v5" in INDEX_HTML
+
+
+def test_allotment_workspace_header_uses_compact_layout() -> None:
+    assert "/* Compact allotment header:" in STYLES_CSS
+    assert ".cb-allotment-toolbar .eyebrow," in STYLES_CSS
+    assert "grid-template-columns: auto auto minmax(0, 1fr) auto;" in STYLES_CSS
+    assert ".cb-allotment-toolbar .refresh-status:not(:has(.refresh-progress-fill.active))" in STYLES_CSS

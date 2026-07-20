@@ -4,7 +4,7 @@ from datetime import date
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from quant.webapp.services import (
     add_similar_pattern_watch_symbol,
@@ -45,6 +45,7 @@ class RefreshLatestRequest(BaseModel):
 
 class SimilarPatternWatchRequest(BaseModel):
     symbol: str
+    note: str = Field(default="", max_length=500)
 
 
 class SimilarPatternWatchNoteRequest(BaseModel):
@@ -294,7 +295,7 @@ def similar_pattern_watchlist() -> dict[str, Any]:
 @router.post("/similar-patterns/watchlist")
 def add_similar_pattern_watchlist_symbol(body: SimilarPatternWatchRequest) -> dict[str, Any]:
     try:
-        return add_similar_pattern_watch_symbol(body.symbol)
+        return add_similar_pattern_watch_symbol(body.symbol, note=body.note)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
