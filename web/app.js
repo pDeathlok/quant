@@ -38,6 +38,7 @@ const state = {
 const API_BASE = "/api";
 const REFRESH_STATUS_STORAGE_KEY = "quant.selector.latestRefreshStatus";
 const BYD_HOLDING_STORAGE_KEY = "quant.byd.holding.v1";
+const WORKSPACE_TAB_ORDER_STORAGE_KEY = "quant.workspaceTabOrder.v1";
 const BYD_HOLDING_INPUT_IDS = [
   "bydSharesInput",
   "bydCostInput",
@@ -73,6 +74,79 @@ const WORKSPACE_TABS = [
   { key: "similar", label: "自选池", description: "相似走势 / 策略联动", panelId: "similarPage" },
 ];
 let focusWorkspaceTabAfterRender = false;
+let workspaceTabDragKey = "";
+let suppressWorkspaceTabClick = false;
+
+function normalizeWorkspaceTabOrder(value) {
+  const knownKeys = WORKSPACE_TABS.map((tab) => tab.key);
+  const supplied = Array.isArray(value) ? value.filter((key) => knownKeys.includes(key)) : [];
+  return [...new Set([...supplied, ...knownKeys])];
+}
+
+function loadWorkspaceTabOrder() {
+  try {
+    return normalizeWorkspaceTabOrder(JSON.parse(localStorage.getItem(WORKSPACE_TAB_ORDER_STORAGE_KEY) || "[]"));
+  } catch (_error) {
+    return normalizeWorkspaceTabOrder([]);
+  }
+}
+
+let workspaceTabOrder = loadWorkspaceTabOrder();
+
+function orderedWorkspaceTabs() {
+  const tabByKey = new Map(WORKSPACE_TABS.map((tab) => [tab.key, tab]));
+  return workspaceTabOrder.map((key) => tabByKey.get(key)).filter(Boolean);
+}
+
+function syncWorkspaceTabDomOrder(focusKey = "") {
+  document.querySelectorAll(".workspace-tabs").forEach((nav) => {
+    workspaceTabOrder.forEach((key) => {
+      const button = nav.querySelector(`.page-tab[data-page="${key}"]`);
+      if (button) nav.appendChild(button);
+    });
+  });
+  if (focusKey) {
+    document.querySelector(`.page-view.active .page-tab[data-page="${focusKey}"]`)?.focus({ preventScroll: true });
+  }
+}
+
+function saveWorkspaceTabOrder(order, focusKey = "") {
+  workspaceTabOrder = normalizeWorkspaceTabOrder(order);
+  try {
+    localStorage.setItem(WORKSPACE_TAB_ORDER_STORAGE_KEY, JSON.stringify(workspaceTabOrder));
+  } catch (_error) {
+    // The current session still keeps the chosen order when storage is unavailable.
+  }
+  syncWorkspaceTabDomOrder(focusKey);
+}
+
+function reorderWorkspaceTab(sourceKey, targetKey, placeAfter = false) {
+  if (!sourceKey || !targetKey || sourceKey === targetKey) return false;
+  const nextOrder = workspaceTabOrder.filter((key) => key !== sourceKey);
+  const targetIndex = nextOrder.indexOf(targetKey);
+  if (targetIndex < 0) return false;
+  nextOrder.splice(targetIndex + (placeAfter ? 1 : 0), 0, sourceKey);
+  if (nextOrder.join("|") === workspaceTabOrder.join("|")) return false;
+  saveWorkspaceTabOrder(nextOrder, sourceKey);
+  return true;
+}
+
+function moveWorkspaceTabByOffset(key, offset) {
+  const currentIndex = workspaceTabOrder.indexOf(key);
+  const nextIndex = Math.max(0, Math.min(workspaceTabOrder.length - 1, currentIndex + offset));
+  if (currentIndex < 0 || nextIndex === currentIndex) return false;
+  const nextOrder = [...workspaceTabOrder];
+  nextOrder.splice(currentIndex, 1);
+  nextOrder.splice(nextIndex, 0, key);
+  saveWorkspaceTabOrder(nextOrder, key);
+  return true;
+}
+
+function clearWorkspaceTabDropTargets() {
+  document.querySelectorAll(".page-tab.tab-drop-before, .page-tab.tab-drop-after").forEach((button) => {
+    button.classList.remove("tab-drop-before", "tab-drop-after");
+  });
+}
 
 function setBydHoldingSaveStatus(message, tone = "") {
   const status = document.querySelector("#bydHoldingSaveStatus");
@@ -344,7 +418,7 @@ function ensureWorkspaceTabs() {
     nav.dataset.workspaceTabsReady = "true";
     nav.setAttribute("role", "tablist");
     nav.setAttribute("aria-orientation", "horizontal");
-    nav.innerHTML = WORKSPACE_TABS.map((tab) => `
+    nav.innerHTML = orderedWorkspaceTabs().map((tab) => `
       <button
         id="workspace-tab-${navIndex}-${tab.key}"
         class="page-tab"
@@ -353,7 +427,10 @@ function ensureWorkspaceTabs() {
         data-page="${tab.key}"
         aria-controls="${tab.panelId}"
         aria-selected="false"
+        aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
+        draggable="true"
         tabindex="-1"
+        title="按住拖动排序；Alt + 左右方向键也可调整"
       >
         <strong>${tab.label}</strong>
         <span>${tab.description}</span>
@@ -590,9 +667,10 @@ async function loadSimilarPatterns(options = {}) {
     renderSimilarPatternsPage();
     const path = options.refresh ? "/similar-patterns/analysis?refresh=true" : "/similar-patterns/analysis";
     const analysisPayload = await fetchJson(path, workspaceRequestOptions(options));
+    const latestWatchlist = state.similarPayload?.watchlist || watchlistPayload.stocks || analysisPayload.watchlist || [];
     state.similarPayload = {
       ...analysisPayload,
-      watchlist: watchlistPayload.stocks || analysisPayload.watchlist || [],
+      watchlist: latestWatchlist,
     };
     const results = state.similarPayload.results || [];
     if (!state.similarSelectedSymbol && results.length) {
@@ -637,6 +715,30 @@ async function saveSimilarWatchNote(symbol, content) {
   if (saved && current) Object.assign(current, saved);
   renderSimilarPatternsPage();
   return saved;
+}
+
+function applySimilarWatchlistPayload(payload) {
+  if (!state.similarPayload) return;
+  state.similarPayload.watchlist = payload.stocks || [];
+  renderSimilarPatternsPage();
+}
+
+async function saveSimilarWatchOrder(symbols) {
+  const payload = await fetchJson("/similar-patterns/watchlist/order", {
+    method: "PUT",
+    body: JSON.stringify({ symbols }),
+  });
+  applySimilarWatchlistPayload(payload);
+  return payload;
+}
+
+async function setSimilarWatchPinned(symbol, pinned) {
+  const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}/pin`, {
+    method: "PUT",
+    body: JSON.stringify({ pinned }),
+  });
+  applySimilarWatchlistPayload(payload);
+  return payload;
 }
 
 const similarActionClass = (action) => {
@@ -795,11 +897,7 @@ function renderSimilarPatternsPage() {
   const resonantResults = results.filter((item) => watchlistStrategyHits(item).length > 0);
   const totalStrategyHits = resonantResults.reduce((total, item) => total + watchlistStrategyHits(item).length, 0);
   const bullishCount = results.filter((item) => similarDecision(item, "next_1d").signal === "bullish").length;
-  const rankedWatch = [...watch].sort((left, right) => {
-    const rightHits = watchlistStrategyHits(similarResultForSymbol(right.symbol)).length;
-    const leftHits = watchlistStrategyHits(similarResultForSymbol(left.symbol)).length;
-    return rightHits - leftHits;
-  });
+  const rankedWatch = [...watch];
   meta.textContent = state.similarError
     ? `分析加载失败，笔记仍可编辑 · 自选 ${watch.length} 只`
     : state.similarLoading
@@ -837,9 +935,19 @@ function renderSimilarPatternsPage() {
     const resonanceClass = strategyHits.length ? "has-strategy-hit" : "";
     const xueqiuUrl = xueqiuStockUrl(item.symbol);
     return `
-      <tr class="similar-watch-row ${selectedClass} ${resonanceClass}" data-similar-symbol="${item.symbol}" tabindex="0">
+      <tr
+        class="similar-watch-row ${selectedClass} ${resonanceClass} ${item.pinned ? "is-pinned" : ""}"
+        data-similar-symbol="${item.symbol}"
+        data-watchlist-symbol="${item.symbol}"
+        data-watchlist-name="${escapeHtml(item.name || item.symbol)}"
+        data-watchlist-note="${escapeHtml(item.note || "")}"
+        data-watchlist-pinned="${item.pinned ? "true" : "false"}"
+        draggable="true"
+        tabindex="0"
+        title="按住拖动排序；右键可置顶"
+      >
         <td class="similar-stock-cell">
-          <strong>${item.name || item.symbol}</strong>
+          <strong>${item.name || item.symbol}${item.pinned ? `<span class="watchlist-pin-badge">置顶</span>` : ""}</strong>
           <span>${item.symbol} · ${item.industry || "-"}</span>
           <em>${target.target_date || "-"}</em>
         </td>
@@ -2732,7 +2840,12 @@ document.querySelectorAll("[data-refresh-scope]").forEach((button) => {
 });
 
 document.querySelectorAll(".page-tab").forEach((button) => {
-  button.addEventListener("click", () => {
+  button.addEventListener("click", (event) => {
+    if (suppressWorkspaceTabClick) {
+      event.preventDefault();
+      suppressWorkspaceTabClick = false;
+      return;
+    }
     hideWatchlistContextMenu();
     const nextPage = button.dataset.page || "short";
     const nextHash = pageHash(nextPage);
@@ -2747,8 +2860,57 @@ document.querySelectorAll(".page-tab").forEach((button) => {
 });
 
 document.querySelectorAll(".workspace-tabs").forEach((nav) => {
+  nav.addEventListener("dragstart", (event) => {
+    const button = event.target.closest(".page-tab");
+    if (!button) return;
+    workspaceTabDragKey = button.dataset.page || "";
+    button.classList.add("dragging");
+    nav.classList.add("is-reordering");
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", workspaceTabDragKey);
+    }
+  });
+
+  nav.addEventListener("dragover", (event) => {
+    const target = event.target.closest(".page-tab");
+    if (!target || !workspaceTabDragKey || target.dataset.page === workspaceTabDragKey) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    clearWorkspaceTabDropTargets();
+    const placeAfter = event.clientX >= target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2;
+    target.classList.add(placeAfter ? "tab-drop-after" : "tab-drop-before");
+  });
+
+  nav.addEventListener("dragleave", (event) => {
+    if (!nav.contains(event.relatedTarget)) clearWorkspaceTabDropTargets();
+  });
+
+  nav.addEventListener("drop", (event) => {
+    const target = event.target.closest(".page-tab");
+    if (!target || !workspaceTabDragKey) return;
+    event.preventDefault();
+    const placeAfter = event.clientX >= target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2;
+    const moved = reorderWorkspaceTab(workspaceTabDragKey, target.dataset.page || "", placeAfter);
+    suppressWorkspaceTabClick = moved;
+    if (moved) window.setTimeout(() => { suppressWorkspaceTabClick = false; }, 250);
+    clearWorkspaceTabDropTargets();
+  });
+
+  nav.addEventListener("dragend", () => {
+    document.querySelectorAll(".page-tab.dragging").forEach((button) => button.classList.remove("dragging"));
+    document.querySelectorAll(".workspace-tabs.is-reordering").forEach((item) => item.classList.remove("is-reordering"));
+    clearWorkspaceTabDropTargets();
+    workspaceTabDragKey = "";
+  });
+
   nav.addEventListener("keydown", (event) => {
     if (!event.target.matches(".page-tab")) return;
+    if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault();
+      moveWorkspaceTabByOffset(event.target.dataset.page || "", event.key === "ArrowLeft" ? -1 : 1);
+      return;
+    }
     const tabs = [...nav.querySelectorAll(".page-tab")];
     const currentIndex = tabs.indexOf(event.target);
     let nextIndex = currentIndex;
@@ -2869,6 +3031,8 @@ BYD_HOLDING_INPUT_IDS.map((id) => document.querySelector(`#${id}`)).filter(Boole
 
 let watchlistContextTarget = null;
 let watchlistToastTimer = null;
+let similarWatchDragSymbol = "";
+let suppressSimilarWatchRowClick = false;
 
 function hideWatchlistContextMenu() {
   const menu = document.querySelector("#watchlistContextMenu");
@@ -2893,18 +3057,29 @@ function openWatchlistContextMenu(target, clientX, clientY) {
     symbol: target.dataset.watchlistSymbol,
     name: target.dataset.watchlistName || target.dataset.watchlistSymbol,
     note: target.dataset.watchlistNote || "",
+    inWatchlist: Boolean(target.closest("#similarWatchlist")),
+    pinned: target.dataset.watchlistPinned === "true",
   };
+  const addButton = menu.querySelector("[data-watchlist-context-add]");
+  const pinButton = menu.querySelector("[data-watchlist-context-pin]");
+  if (addButton) addButton.hidden = watchlistContextTarget.inWatchlist;
+  if (pinButton) {
+    pinButton.hidden = !watchlistContextTarget.inWatchlist;
+    pinButton.textContent = watchlistContextTarget.pinned ? "取消置顶" : "置顶";
+  }
   menu.hidden = false;
   const width = menu.offsetWidth || 150;
   const height = menu.offsetHeight || 44;
   menu.style.left = `${Math.max(8, Math.min(clientX, window.innerWidth - width - 8))}px`;
   menu.style.top = `${Math.max(8, Math.min(clientY, window.innerHeight - height - 8))}px`;
-  menu.querySelector("button")?.focus();
+  menu.querySelector("button:not([hidden])")?.focus();
 }
 
 document.addEventListener("contextmenu", (event) => {
   const target = event.target.closest("[data-watchlist-symbol]");
-  if (!target || !["short", "chan", "long", "cbAllotment"].includes(state.activePage)) return;
+  const canAdd = ["short", "chan", "long", "cbAllotment"].includes(state.activePage);
+  const canManage = state.activePage === "similar" && Boolean(target?.closest("#similarWatchlist"));
+  if (!target || (!canAdd && !canManage)) return;
   event.preventDefault();
   openWatchlistContextMenu(target, event.clientX, event.clientY);
 });
@@ -2930,6 +3105,22 @@ document.querySelector("[data-watchlist-context-add]")?.addEventListener("click"
     showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}`);
   } catch (error) {
     showWatchlistToast(error.message || "加入自选池失败", "error");
+  } finally {
+    button.disabled = false;
+    hideWatchlistContextMenu();
+  }
+});
+
+document.querySelector("[data-watchlist-context-pin]")?.addEventListener("click", async () => {
+  const target = watchlistContextTarget;
+  if (!target?.inWatchlist) return;
+  const button = document.querySelector("[data-watchlist-context-pin]");
+  button.disabled = true;
+  try {
+    await setSimilarWatchPinned(target.symbol, !target.pinned);
+    showWatchlistToast(`${target.name} 已${target.pinned ? "取消置顶" : "置顶"}`);
+  } catch (error) {
+    showWatchlistToast(error.message || "置顶状态保存失败", "error");
   } finally {
     button.disabled = false;
     hideWatchlistContextMenu();
@@ -3040,8 +3231,91 @@ document.querySelector("#similarPage")?.addEventListener("click", (event) => {
   }
   const card = event.target.closest("[data-similar-symbol]");
   if (!card) return;
+  if (suppressSimilarWatchRowClick) {
+    suppressSimilarWatchRowClick = false;
+    return;
+  }
   state.similarSelectedSymbol = card.dataset.similarSymbol;
   renderSimilarPatternsPage();
+});
+
+function clearSimilarWatchDropTargets() {
+  document.querySelectorAll(".similar-watch-row.watch-drop-before, .similar-watch-row.watch-drop-after").forEach((row) => {
+    row.classList.remove("watch-drop-before", "watch-drop-after");
+  });
+}
+
+function reorderSimilarWatchRows(sourceSymbol, targetSymbol, placeAfter = false) {
+  const watch = state.similarPayload?.watchlist || [];
+  const source = watch.find((item) => item.symbol === sourceSymbol);
+  const target = watch.find((item) => item.symbol === targetSymbol);
+  if (!source || !target || sourceSymbol === targetSymbol) return false;
+  if (Boolean(source.pinned) !== Boolean(target.pinned)) {
+    showWatchlistToast("置顶股票和普通股票请在各自区域内排序", "error");
+    return false;
+  }
+  const order = watch.map((item) => item.symbol).filter((symbol) => symbol !== sourceSymbol);
+  const targetIndex = order.indexOf(targetSymbol);
+  order.splice(targetIndex + (placeAfter ? 1 : 0), 0, sourceSymbol);
+  suppressSimilarWatchRowClick = true;
+  saveSimilarWatchOrder(order)
+    .then(() => showWatchlistToast("自选池顺序已保存"))
+    .catch((error) => showWatchlistToast(error.message || "自选池排序保存失败", "error"));
+  window.setTimeout(() => { suppressSimilarWatchRowClick = false; }, 300);
+  return true;
+}
+
+document.querySelector("#similarWatchlist")?.addEventListener("dragstart", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row) return;
+  similarWatchDragSymbol = row.dataset.similarSymbol || "";
+  row.classList.add("dragging");
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", similarWatchDragSymbol);
+  }
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("dragover", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row || !similarWatchDragSymbol || row.dataset.similarSymbol === similarWatchDragSymbol) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  clearSimilarWatchDropTargets();
+  const placeAfter = event.clientY >= row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+  row.classList.add(placeAfter ? "watch-drop-after" : "watch-drop-before");
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("drop", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row || !similarWatchDragSymbol) return;
+  event.preventDefault();
+  const placeAfter = event.clientY >= row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+  reorderSimilarWatchRows(similarWatchDragSymbol, row.dataset.similarSymbol || "", placeAfter);
+  clearSimilarWatchDropTargets();
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("dragend", () => {
+  document.querySelectorAll(".similar-watch-row.dragging").forEach((row) => row.classList.remove("dragging"));
+  clearSimilarWatchDropTargets();
+  similarWatchDragSymbol = "";
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("keydown", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row || !event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+  const rows = [...document.querySelectorAll("#similarWatchlist .similar-watch-row")];
+  const currentIndex = rows.indexOf(row);
+  const nextIndex = currentIndex + (event.key === "ArrowUp" ? -1 : 1);
+  const target = rows[nextIndex];
+  if (!target) return;
+  event.preventDefault();
+  const moved = reorderSimilarWatchRows(
+    row.dataset.similarSymbol || "",
+    target.dataset.similarSymbol || "",
+    event.key === "ArrowDown",
+  );
+  if (moved) window.setTimeout(() => document.querySelector(`#similarWatchlist [data-similar-symbol="${row.dataset.similarSymbol}"]`)?.focus(), 0);
 });
 
 document.querySelector("#similarPage")?.addEventListener("keydown", (event) => {

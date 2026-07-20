@@ -1,3 +1,4 @@
+import json
 import queue
 from datetime import date
 
@@ -288,6 +289,57 @@ def test_watchlist_note_rejects_stock_outside_watchlist(monkeypatch, tmp_path) -
 
     with pytest.raises(ValueError, match="不在自选池"):
         services.save_similar_pattern_watch_note("000001.SZ", "观察")
+
+
+def test_watchlist_order_and_pins_are_persisted(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        '{"symbols":["000001.SZ","000002.SZ","000003.SZ"],"notes":{}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "name": "甲", "industry": "银行"},
+                {"ts_code": "000002.SZ", "name": "乙", "industry": "地产"},
+                {"ts_code": "000003.SZ", "name": "丙", "industry": "制造"},
+            ]
+        ),
+    )
+
+    pinned_payload = services.set_similar_pattern_watch_pin("000002.SZ", True)
+    reordered_payload = services.reorder_similar_pattern_watchlist(
+        ["000002.SZ", "000003.SZ", "000001.SZ"]
+    )
+
+    assert [item["symbol"] for item in pinned_payload["stocks"]] == [
+        "000002.SZ",
+        "000001.SZ",
+        "000003.SZ",
+    ]
+    assert pinned_payload["stocks"][0]["pinned"] is True
+    assert [item["symbol"] for item in reordered_payload["stocks"]] == [
+        "000002.SZ",
+        "000003.SZ",
+        "000001.SZ",
+    ]
+    persisted = json.loads(watchlist_path.read_text(encoding="utf-8"))
+    assert persisted["symbols"] == ["000002.SZ", "000003.SZ", "000001.SZ"]
+    assert persisted["pinned"] == ["000002.SZ"]
+
+
+def test_watchlist_reorder_rejects_incomplete_symbol_set(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"symbols":["000001.SZ","000002.SZ"]}', encoding="utf-8")
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+
+    with pytest.raises(ValueError, match="当前全部股票"):
+        services.reorder_similar_pattern_watchlist(["000001.SZ"])
 
 
 def test_daily_payload_freshness_uses_generated_date() -> None:

@@ -4183,6 +4183,7 @@ tbody tr.selected-row:hover td {
 /* Compact allotment header: keep the tracking table close to the workspace tabs. */
 .cb-allotment-toolbar {
   align-items: center;
+  border-bottom: 4px solid var(--accent);
   gap: 8px 12px;
   grid-template-columns: minmax(300px, 0.8fr) minmax(460px, 1.25fr) auto;
   grid-template-rows: auto;
@@ -4287,4 +4288,69 @@ tbody tr.selected-row:hover td {
   .allotment-summary > em {
     display: none;
   }
+}
+
+/* Draw the active workspace marker independently from the tab border. */
+.workspace-tabs .page-tab.active::after,
+.workspace-tabs .page-tab[aria-selected="true"]::after {
+  background: var(--accent);
+  border-radius: 0;
+  bottom: 0;
+  content: "";
+  display: block;
+  height: 3px;
+  left: 0;
+  position: absolute;
+  right: 0;
+}
+
+.workspace-tabs .page-tab[draggable="true"] {
+  cursor: grab;
+}
+
+.workspace-tabs .page-tab.dragging {
+  cursor: grabbing;
+  opacity: 0.42;
+}
+
+.workspace-tabs.is-reordering {
+  user-select: none;
+}
+
+.workspace-tabs .page-tab.tab-drop-before {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.workspace-tabs .page-tab.tab-drop-after {
+  box-shadow: inset -3px 0 0 var(--accent);
+}
+
+.similar-watch-row[draggable="true"] {
+  cursor: grab;
+}
+
+.similar-watch-row.dragging {
+  cursor: grabbing;
+  opacity: 0.42;
+}
+
+.similar-watch-row.watch-drop-before td {
+  box-shadow: inset 0 3px 0 var(--accent);
+}
+
+.similar-watch-row.watch-drop-after td {
+  box-shadow: inset 0 -3px 0 var(--accent);
+}
+
+.similar-stock-cell .watchlist-pin-badge {
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  margin-left: 6px;
+  padding: 2px 4px;
+  vertical-align: middle;
 }

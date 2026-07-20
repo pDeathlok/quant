@@ -2080,7 +2080,7 @@ def _stock_profile_from_basic(symbol: str, basic: pd.DataFrame | None = None) ->
 
 
 def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
-    default = {"symbols": list(SIMILAR_PATTERN_DEFAULT_WATCHLIST), "notes": {}}
+    default = {"symbols": list(SIMILAR_PATTERN_DEFAULT_WATCHLIST), "notes": {}, "pinned": []}
     if not SIMILAR_PATTERN_WATCHLIST_PATH.exists():
         return default
     try:
@@ -2113,7 +2113,12 @@ def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
                 updated_at = ""
             if content:
                 notes[symbol] = {"content": content, "updated_at": updated_at}
-    return {"symbols": symbols or list(SIMILAR_PATTERN_DEFAULT_WATCHLIST), "notes": notes}
+    symbols = symbols or list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
+    raw_pinned = payload.get("pinned", []) if isinstance(payload, dict) else []
+    pinned_values = raw_pinned if isinstance(raw_pinned, list) else []
+    pinned = [symbol for symbol in symbols if symbol in {str(item).strip().upper().replace("_", ".") for item in pinned_values}]
+    ordered_symbols = pinned + [symbol for symbol in symbols if symbol not in pinned]
+    return {"symbols": ordered_symbols, "notes": notes, "pinned": pinned}
 
 
 def _read_similar_pattern_watchlist_symbols() -> list[str]:
@@ -2121,11 +2126,19 @@ def _read_similar_pattern_watchlist_symbols() -> list[str]:
 
 
 def _write_similar_pattern_watchlist_symbols(symbols: list[str]) -> None:
-    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     state = _read_similar_pattern_watchlist_state()
+    state["symbols"] = symbols
+    _write_similar_pattern_watchlist_state(state)
+
+
+def _write_similar_pattern_watchlist_state(state: dict[str, Any]) -> None:
+    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    symbols = list(dict.fromkeys(state.get("symbols", [])))
+    pinned_set = set(state.get("pinned", []))
     payload = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "symbols": symbols,
+        "pinned": [symbol for symbol in symbols if symbol in pinned_set],
         "notes": {
             symbol: state["notes"][symbol]
             for symbol in symbols
@@ -2135,7 +2148,7 @@ def _write_similar_pattern_watchlist_symbols(symbols: list[str]) -> None:
     SIMILAR_PATTERN_WATCHLIST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> list[dict[str, str]]:
+def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> list[dict[str, Any]]:
     state = _read_similar_pattern_watchlist_state()
     profiles = []
     for symbol in state["symbols"]:
@@ -2143,6 +2156,7 @@ def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> li
         note = state["notes"].get(symbol, {})
         profile["note"] = note.get("content", "")
         profile["note_updated_at"] = note.get("updated_at", "")
+        profile["pinned"] = symbol in state["pinned"]
         profiles.append(profile)
     return profiles
 
@@ -2172,26 +2186,49 @@ def add_similar_pattern_watch_symbol(symbol: str, note: str = "") -> dict[str, A
                 "content": merged,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
-    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SIMILAR_PATTERN_WATCHLIST_PATH.write_text(
-        json.dumps(
-            {
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "symbols": state["symbols"],
-                "notes": state["notes"],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    _write_similar_pattern_watchlist_state(state)
     return get_similar_pattern_watchlist()
 
 
 def remove_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
     normalized = _normalize_watch_symbol(symbol)
-    symbols = [item for item in _read_similar_pattern_watchlist_symbols() if item != normalized]
-    _write_similar_pattern_watchlist_symbols(symbols)
+    state = _read_similar_pattern_watchlist_state()
+    state["symbols"] = [item for item in state["symbols"] if item != normalized]
+    state["pinned"] = [item for item in state["pinned"] if item != normalized]
+    state["notes"].pop(normalized, None)
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def reorder_similar_pattern_watchlist(symbols: list[str]) -> dict[str, Any]:
+    state = _read_similar_pattern_watchlist_state()
+    normalized = [_normalize_watch_symbol(symbol) for symbol in symbols]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("自选池排序不能包含重复股票")
+    if set(normalized) != set(state["symbols"]):
+        raise ValueError("自选池排序必须包含当前全部股票")
+    pinned_set = set(state["pinned"])
+    state["symbols"] = [symbol for symbol in normalized if symbol in pinned_set] + [
+        symbol for symbol in normalized if symbol not in pinned_set
+    ]
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def set_similar_pattern_watch_pin(symbol: str, pinned: bool) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        raise ValueError(f"股票不在自选池中: {normalized}")
+    symbols = [item for item in state["symbols"] if item != normalized]
+    current_pinned = [item for item in state["pinned"] if item != normalized]
+    if pinned:
+        state["pinned"] = [normalized, *current_pinned]
+        state["symbols"] = [normalized, *symbols]
+    else:
+        state["pinned"] = current_pinned
+        state["symbols"] = [*symbols[: len(current_pinned)], normalized, *symbols[len(current_pinned) :]]
+    _write_similar_pattern_watchlist_state(state)
     return get_similar_pattern_watchlist()
 
 
@@ -2210,16 +2247,7 @@ def save_similar_pattern_watch_note(symbol: str, content: str) -> dict[str, Any]
         }
     else:
         state["notes"].pop(normalized, None)
-    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "symbols": state["symbols"],
-        "notes": state["notes"],
-    }
-    SIMILAR_PATTERN_WATCHLIST_PATH.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _write_similar_pattern_watchlist_state(state)
     return get_similar_pattern_watchlist()
 
 

@@ -22,11 +22,13 @@ from quant.webapp.services import (
     get_similar_pattern_watchlist,
     get_stock_selector_payload,
     refresh_similar_pattern_analysis,
+    reorder_similar_pattern_watchlist,
     refresh_b1_plan,
     refresh_chan_model_strategy_plan,
     refresh_dashboard,
     remove_similar_pattern_watch_symbol,
     save_similar_pattern_watch_note,
+    set_similar_pattern_watch_pin,
     start_latest_refresh,
 )
 
@@ -50,6 +52,14 @@ class SimilarPatternWatchRequest(BaseModel):
 
 class SimilarPatternWatchNoteRequest(BaseModel):
     content: str = ""
+
+
+class SimilarPatternWatchOrderRequest(BaseModel):
+    symbols: list[str]
+
+
+class SimilarPatternWatchPinRequest(BaseModel):
+    pinned: bool = True
 
 
 @router.get("/health")
@@ -323,6 +333,29 @@ def update_similar_pattern_watchlist_note(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"自选股笔记保存失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/order")
+def update_similar_pattern_watchlist_order(body: SimilarPatternWatchOrderRequest) -> dict[str, Any]:
+    try:
+        return reorder_similar_pattern_watchlist(body.symbols)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选池排序保存失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/{symbol}/pin")
+def update_similar_pattern_watchlist_pin(
+    symbol: str,
+    body: SimilarPatternWatchPinRequest,
+) -> dict[str, Any]:
+    try:
+        return set_similar_pattern_watch_pin(symbol, body.pinned)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选股置顶保存失败: {exc}") from exc
 
 
 @router.get("/similar-patterns/analysis")

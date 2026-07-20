@@ -28,6 +28,18 @@ def test_workspace_tabs_expose_accessible_keyboard_state() -> None:
     assert "focusWorkspaceTabAfterRender" in APP_JS
 
 
+def test_workspace_tabs_support_persistent_reordering() -> None:
+    assert 'const WORKSPACE_TAB_ORDER_STORAGE_KEY = "quant.workspaceTabOrder.v1"' in APP_JS
+    assert "function normalizeWorkspaceTabOrder(value)" in APP_JS
+    assert "function reorderWorkspaceTab(sourceKey, targetKey, placeAfter = false)" in APP_JS
+    assert "localStorage.setItem(WORKSPACE_TAB_ORDER_STORAGE_KEY" in APP_JS
+    assert 'draggable="true"' in APP_JS
+    assert 'event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")' in APP_JS
+    assert '.workspace-tabs .page-tab[draggable="true"]' in STYLES_CSS
+    assert "20260720-allotment-divider-v10" in INDEX_HTML
+    assert "20260720-watchlist-reorder-v5" in INDEX_HTML
+
+
 def test_workspace_tabs_scroll_consistently_on_narrow_screens() -> None:
     assert "grid-auto-flow: column;" in STYLES_CSS
     assert "grid-auto-columns: minmax(148px, 1fr);" in STYLES_CSS
@@ -77,6 +89,18 @@ def test_watchlist_stocks_link_to_xueqiu_in_a_new_tab() -> None:
     assert 'event.target.closest("button, input, a")' in APP_JS
     assert "<th>雪球</th>" in INDEX_HTML
     assert ".xueqiu-stock-link" in STYLES_CSS
+
+
+def test_watchlist_rows_support_persistent_drag_order_and_pin_menu() -> None:
+    assert 'await fetchJson("/similar-patterns/watchlist/order", {' in APP_JS
+    assert '/pin`, {' in APP_JS
+    assert 'data-watchlist-pinned="${item.pinned ? "true" : "false"}"' in APP_JS
+    assert 'title="按住拖动排序；右键可置顶"' in APP_JS
+    assert "function reorderSimilarWatchRows(sourceSymbol, targetSymbol, placeAfter = false)" in APP_JS
+    assert 'event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)' in APP_JS
+    assert "data-watchlist-context-pin" in INDEX_HTML
+    assert ".similar-stock-cell .watchlist-pin-badge" in STYLES_CSS
+    assert "20260720-watchlist-reorder-v5" in INDEX_HTML
 
 
 def test_similar_cases_explain_and_display_forecast_weight_ranking() -> None:
@@ -133,11 +157,18 @@ def test_strategy_workspace_summaries_use_compact_layouts() -> None:
     assert ".byd-validation-panel {\n  display: grid;" in STYLES_CSS
     assert ".similar-summary-card {\n  align-items: center;\n  display: grid;" in STYLES_CSS
     assert "grid-auto-flow: column;" in STYLES_CSS
-    assert "20260720-compact-overview-v5" in INDEX_HTML
+    assert "20260720-allotment-divider-v10" in INDEX_HTML
 
 
 def test_allotment_workspace_header_uses_compact_layout() -> None:
     assert "/* Compact allotment header:" in STYLES_CSS
+    assert "border-bottom: 4px solid var(--accent);" in STYLES_CSS
     assert ".cb-allotment-toolbar .eyebrow," in STYLES_CSS
     assert "grid-template-columns: auto auto minmax(0, 1fr) auto;" in STYLES_CSS
     assert ".cb-allotment-toolbar .refresh-status:not(:has(.refresh-progress-fill.active))" in STYLES_CSS
+
+
+def test_active_workspace_tab_has_stable_red_indicator() -> None:
+    assert '.workspace-tabs .page-tab[aria-selected="true"]::after' in STYLES_CSS
+    assert "background: var(--accent);" in STYLES_CSS
+    assert "20260720-allotment-divider-v10" in INDEX_HTML
