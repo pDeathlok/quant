@@ -65,7 +65,7 @@ flowchart TD
 - 行情刷新是所有计算的共享上游，必须先完成。
 - 特征缓存与规则信号读取相同的日线数据，但写不同产物，可并行执行。
 - 六个非短线工作区读取共享产物并写各自快照，默认最多 6 路并行。
-- 长线工作区内部的 `tea`、`tea_safe`、`v44` 依次运行，避免缓存清理和输出重定向互相影响。
+- 长线工作区内部的 `tea`、`tea_safe`、`v44` 最多 3 路并行；三者共享一次加载到内存的月度行情和 `daily_basic`，生产刷新不落手工回测使用的大型中间缓存。
 - 每个下游工作区独立记录成功或失败；失败不会取消已经运行的其他工作区。
 
 ## Web 工作区
@@ -99,6 +99,15 @@ flowchart TD
 - 配债股最新日缓存位于 `data/routine/convertible_bond_allotments_latest.json`。
 - 相似走势自选池、分析和向量缓存位于 `data/research/similar_patterns/`。
 - 后台刷新状态位于 `data/routine/latest_refresh_status.json`，服务重启后仍可读取最后状态。
+
+### 缓存生命周期
+
+- `data/raw/` 和 MySQL 行情表是正式数据，不按请求缓存规则删除。
+- `data/cache/source_merge/tushare/` 是可重新拉取的请求级缓存：单股日线和已有正式 Parquet 副本的 `daily_basic` 只保留最近 7 天。
+- `data/research/long_dividend_quality/` 是手工研究/回测中间缓存，只保留最近 2 组；生产长线股票池直接复用内存中的共享输入。
+- 相似走势全市场历史参考向量最多每 7 天重建一次，只保留最新配置目录；自选池股票每天使用最新日线现场计算目标向量。
+- smoke 向量缓存不属于生产数据，清理时全部删除。
+- 每次完整刷新开始前执行统一清理；也可运行 `PYTHONPATH=src python -m quant.routine.cli cache-cleanup` 手工触发。
 
 所有本地产物目录均由 `.gitignore` 排除。
 

@@ -46,6 +46,15 @@ scripts/webapp_service.sh start
 
 服务标识是 `com.didi.quant.webapp`，应用日志统一写入 `.run/webapp.log`，按 5MB 轮转并保留 2 个备份（总量约 15MB）。launchd 的标准输出和错误输出定向到 `/dev/null`，避免与应用日志重复累积；`scripts/webapp_service.sh logs` 可持续查看轮转日志。安装脚本会优先选用项目 `.venv`，其次选用已包含项目依赖的 Miniforge/Conda Python；也可用 `QUANT_PYTHON=/absolute/path/python` 显式指定。
 
+更新服务启动参数或 launchd 配置后使用 `install`，不要只执行 `restart`，因为 `install` 会重新生成并加载 plist。若完整刷新正在运行，先等待终态，再执行安装，避免中断当日任务：
+
+```bash
+curl http://127.0.0.1:8088/api/selector/refresh-latest/status
+scripts/webapp_service.sh install
+scripts/webapp_service.sh status
+curl --fail http://127.0.0.1:8088/api/health
+```
+
 ## 执行每日任务
 
 推荐生产命令：
@@ -133,6 +142,44 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 ```bash
 cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli cache-cleanup
 ```
+
+`cache-cleanup` 会真正删除满足条件的文件和 MySQL 快照行，不是预览命令。正式行情位于 `data/raw/` 或 MySQL 行情表，不会因为普通请求缓存过期而被删除；`daily_basic` 请求缓存只有在对应正式 Parquet 已存在且非空时才允许删除。
+
+## 缓存清理生效验证
+
+清理规则在完整刷新开始时执行。因此，如果代码是在当天刷新完成后才部署，空间不会立刻下降；下一次完整刷新开始后才会自动清理。部署后的下一个交易日按以下顺序验证：
+
+```bash
+# 1. 确认完整刷新已结束
+curl http://127.0.0.1:8088/api/selector/refresh-latest/status
+
+# 2. 查看主要目录占用
+du -sh \
+  data/cache/source_merge/tushare \
+  data/research/long_dividend_quality \
+  data/research/similar_patterns/vector_cache
+
+# 3. smoke 缓存应不存在；find 无输出即符合预期
+find data/research/similar_patterns -maxdepth 1 \
+  -type d -name 'vector_cache*smoke*' -print
+
+# 4. 参考库元数据应记录最近一次全量重建时间和 7 天周期
+find data/research/similar_patterns/vector_cache -maxdepth 3 \
+  -name _refresh_metadata.json -print
+```
+
+2026-07-21 优化部署前的实测基线和预期稳态如下。数值会随股票数量、Parquet 编码和配置变化，应作为容量量级而不是严格告警阈值：
+
+| 内容 | 部署前 | 清理后/稳态预期 | 说明 |
+| --- | ---: | ---: | --- |
+| Tushare 请求缓存 | 约 3.29 GiB | 约 0.22–0.25 GiB | 单股日线及有正式副本的 `daily_basic` 保留 7 天 |
+| 长线研究中间缓存 | 约 13.68 GiB | 约 0.6–0.8 GiB | 只保留最近 2 组；生产刷新不再新增大缓存 |
+| 相似走势正式向量 | 约 1.91 GiB | 约 1.9 GiB | 只保留一个配置版本，每 7 天最多全量更新一次 |
+| 相似走势 smoke 向量 | 约 0.21 GiB | 0 | 全部删除，不再纳入生产保留范围 |
+| 快照、审计和 routine 历史 | 约 0.04 GiB | 约 0.01 GiB | 同时受天数和最大版本数限制 |
+| **以上合计** | **约 19.13 GiB** | **约 2.8–3.0 GiB** | 预计释放约 16 GiB |
+
+MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先释放为表内可复用空间，数据库文件未必立即缩小；这不代表清理没有生效。
 
 常用参数：
 

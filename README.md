@@ -48,11 +48,12 @@ PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
 
 执行顺序为：
 
-1. 串行刷新共享 Tushare 行情。
-2. 并行构建特征缓存和规则信号缓存。
-3. 生成模型评分、短线股票池和例行产物。
-4. 并行刷新缠论、长线、可转债、配债股、BYD 做T、相似走势 6 个工作区。
-5. 将每个步骤写入 `data/routine/<运行时间>/manifest.json`。
+1. 按保留策略清理请求缓存、研究缓存、历史快照和例行运行记录。
+2. 串行刷新共享 Tushare 行情。
+3. 并行构建特征缓存和规则信号缓存。
+4. 生成模型评分、短线股票池和例行产物。
+5. 并行刷新缠论、长线、可转债、配债股、BYD 做T、相似走势 6 个工作区。
+6. 将每个步骤写入 `data/routine/<运行时间>/manifest.json`。
 
 短线策略由主流水线生成，因此这套流程覆盖全部 7 个 Tab。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述命令。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
 
@@ -75,6 +76,7 @@ PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
 | `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 六个下游工作区的最大并发数 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似走势向量缓存并发数 |
+| `SIMILAR_PATTERN_FORCE_VECTOR_CACHE` | 空 | 设为 `1` 时强制重建相似走势全市场参考库；日常无需设置 |
 
 完整的重试和增量参数见 [每日运行与故障排查](docs/operations.md#资源与限流配置)。
 
