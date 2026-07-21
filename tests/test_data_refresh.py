@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pandas as pd
+import pytest
 
 from quant.data.source_merge import DailyRefreshAudit, audits_to_frame
 from quant.routine import data_refresh
@@ -81,6 +82,114 @@ def test_audit_frame_includes_attempts():
     assert isinstance(frame, pd.DataFrame)
 
 
+def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_path):
+    class DummyPro:
+        def __init__(self):
+            self.daily_calls = []
+
+        def trade_cal(self, **kwargs):
+            return pd.DataFrame({"cal_date": ["20260605", "20260606"]})
+
+        def daily(self, **kwargs):
+            self.daily_calls.append(kwargs)
+            trade_date = kwargs["trade_date"]
+            rows = [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": trade_date,
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "vol": 100.0,
+                },
+                {
+                    "ts_code": "600519.SH",
+                    "trade_date": trade_date,
+                    "open": 1500.0,
+                    "high": 1510.0,
+                    "low": 1490.0,
+                    "close": 1505.0,
+                    "vol": 20.0,
+                },
+            ]
+            return pd.DataFrame(rows)
+
+    dummy_pro = DummyPro()
+
+    class DummyTushareFetcher:
+        def __init__(self, *args, **kwargs):
+            self.pro = dummy_pro
+
+    def fake_load_symbols(fetcher, board="all", limit=None):
+        return [("000001.SZ", "平安银行"), ("600519.SH", "贵州茅台")]
+
+    output_dir = tmp_path / "daily"
+    output_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ"],
+            "trade_date": ["20260604"],
+            "date": [pd.Timestamp("2026-06-04")],
+            "close": [10.0],
+        }
+    ).to_parquet(output_dir / "000001.SZ.parquet", index=False)
+
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setattr(data_refresh, "AUDIT_ROOT", tmp_path / "audit")
+    monkeypatch.setattr(data_refresh, "TushareDataFetcher", DummyTushareFetcher)
+    monkeypatch.setattr(data_refresh, "load_tushare_symbols", fake_load_symbols)
+
+    manifest = data_refresh.refresh_daily_data(
+        start_date="20260605",
+        end_date="20260606",
+        output_dir=output_dir,
+        workers=1,
+        sleep_between=0,
+        retries=0,
+        final_retry_rounds=0,
+    )
+
+    assert dummy_pro.daily_calls == [
+        {"trade_date": "20260605"},
+        {"trade_date": "20260606"},
+    ]
+    assert manifest["refresh_mode"] == "batch_by_trade_date"
+    assert manifest["market_daily_requests"] == 2
+    assert manifest["failed"] == 0
+    ping_an = pd.read_parquet(output_dir / "000001.SZ.parquet")
+    mao_tai = pd.read_parquet(output_dir / "600519.SH.parquet")
+    assert ping_an["trade_date"].tolist() == ["20260604", "20260605", "20260606"]
+    assert mao_tai["trade_date"].tolist() == ["20260605", "20260606"]
+
+
+def test_market_daily_batch_rejects_possible_row_limit_truncation(monkeypatch):
+    class DummyPro:
+        def daily(self, **kwargs):
+            return pd.DataFrame(
+                {
+                    "ts_code": ["000001.SZ", "000002.SZ"],
+                    "trade_date": [kwargs["trade_date"], kwargs["trade_date"]],
+                }
+            )
+
+    class DummyFetcher:
+        pro = DummyPro()
+
+    monkeypatch.setattr(data_refresh, "TUSHARE_DAILY_ROW_LIMIT", 2)
+
+    with pytest.raises(RuntimeError, match="may have truncated"):
+        data_refresh._fetch_market_daily_with_retries(
+            DummyFetcher(),
+            "20260605",
+            data_refresh.RequestLimiter(0),
+            retries=0,
+            retry_base_delay=0,
+            retry_max_delay=0,
+            retry_jitter=0,
+        )
+
+
 def test_refresh_daily_data_writes_failed_symbols(monkeypatch, tmp_path):
     class DummyTushareFetcher:
         def __init__(self, *args, **kwargs):
@@ -108,6 +217,7 @@ def test_refresh_daily_data_writes_failed_symbols(monkeypatch, tmp_path):
     manifest = data_refresh.refresh_daily_data(
         start_date="20260605",
         end_date="20260606",
+        adjust="qfq",
         output_dir=tmp_path / "daily",
         workers=1,
         sleep_between=0,

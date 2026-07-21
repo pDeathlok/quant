@@ -17,12 +17,11 @@ from quant.data.source_merge import (
     DailyRefreshAudit,
     audits_to_frame,
     build_tushare_daily_audit,
-    normalize_tushare_daily,
     normalize_ts_code,
+    normalize_tushare_daily,
 )
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT
-
 
 AUDIT_ROOT = PROJECT_ROOT / "data/raw/source_audit"
 
@@ -50,6 +49,9 @@ NON_RETRYABLE_ERROR_KEYWORDS = (
 )
 
 SUSPENDED_STATUS = "no_trade_suspended"
+BATCH_NO_TRADE_STATUS = "no_trade_in_batch"
+TUSHARE_DAILY_ROW_LIMIT = 6000
+DEFAULT_BATCH_MAX_TRADE_DATES = 30
 
 
 class RequestLimiter:
@@ -189,6 +191,35 @@ def _latest_existing_trade_date(existing: pd.DataFrame) -> pd.Timestamp | None:
     return None if pd.isna(latest) else latest
 
 
+def _merge_symbol_daily(
+    existing: pd.DataFrame,
+    incoming: pd.DataFrame,
+    symbol: str,
+    name: str,
+) -> pd.DataFrame:
+    merged = normalize_tushare_daily(incoming, symbol)
+    merged["name"] = name
+    if existing.empty:
+        return merged
+    existing = existing.copy()
+    if "date" in existing.columns:
+        existing["date"] = pd.to_datetime(existing["date"])
+    elif "trade_date" in existing.columns:
+        existing["date"] = pd.to_datetime(
+            existing["trade_date"].astype(str),
+            format="%Y%m%d",
+            errors="coerce",
+        )
+    if "trade_date" not in existing.columns and "date" in existing.columns:
+        existing["trade_date"] = existing["date"].dt.strftime("%Y%m%d")
+    return (
+        pd.concat([existing, merged], ignore_index=True, sort=False)
+        .sort_values("date")
+        .drop_duplicates("trade_date", keep="last")
+        .reset_index(drop=True)
+    )
+
+
 _TRADE_CAL_CACHE: dict[tuple[str, str], set[str]] = {}
 
 
@@ -231,6 +262,140 @@ def _is_fully_suspended(tushare: TushareDataFetcher, symbol: str, start_date: st
     if open_dates:
         return open_dates.issubset(suspend_dates)
     return end_date in suspend_dates
+
+
+def _fetch_market_daily_with_retries(
+    tushare: TushareDataFetcher,
+    trade_date: str,
+    limiter: RequestLimiter,
+    retries: int,
+    retry_base_delay: float,
+    retry_max_delay: float,
+    retry_jitter: float,
+) -> tuple[pd.DataFrame, int]:
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            limiter.wait()
+            frame = tushare.pro.daily(trade_date=trade_date)
+            if frame is None or frame.empty:
+                raise RuntimeError(f"Tushare daily returned no market rows for {trade_date}")
+            if len(frame) >= TUSHARE_DAILY_ROW_LIMIT:
+                raise RuntimeError(
+                    f"Tushare daily returned {len(frame)} rows for {trade_date}; "
+                    f"the {TUSHARE_DAILY_ROW_LIMIT}-row limit may have truncated the market"
+                )
+            if "ts_code" not in frame.columns or "trade_date" not in frame.columns:
+                raise ValueError(f"Tushare daily market response missing required columns for {trade_date}")
+            return frame, attempt
+        except Exception:
+            if attempt >= attempts:
+                raise
+            delay = min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1)))
+            delay += random.uniform(0, retry_jitter) if retry_jitter > 0 else 0
+            time.sleep(delay)
+    raise RuntimeError(f"Tushare daily market request failed for {trade_date}")
+
+
+def _refresh_symbols_by_trade_date(
+    symbols: list[tuple[str, str]],
+    start_date: str,
+    end_date: str,
+    output_dir: Path,
+    cache_dir: Path,
+    sleep_between: float,
+    retries: int,
+    retry_base_delay: float,
+    retry_max_delay: float,
+    retry_jitter: float,
+) -> tuple[list[DailyRefreshAudit], int]:
+    """Refresh raw daily bars with one Tushare request per open trade date."""
+
+    tushare = TushareDataFetcher(cache_dir=cache_dir / "tushare")
+    trade_dates = sorted(_open_trade_dates(tushare, start_date, end_date))
+    max_trade_dates = max(
+        1,
+        int(os.getenv("ROUTINE_DAILY_BATCH_MAX_DATES", str(DEFAULT_BATCH_MAX_TRADE_DATES))),
+    )
+    if len(trade_dates) > max_trade_dates:
+        raise RuntimeError(
+            f"batch range has {len(trade_dates)} trade dates, above limit {max_trade_dates}"
+        )
+    if not trade_dates:
+        audits = [
+            _status_audit(symbol, "no_open_trade_dates", f"{start_date}-{end_date} 无交易日", attempts=0)
+            for symbol, _ in symbols
+        ]
+        return audits, 0
+
+    limiter = RequestLimiter(sleep_between)
+    market_frames: list[pd.DataFrame] = []
+    request_count = 0
+    for index, trade_date in enumerate(trade_dates, start=1):
+        frame, attempts = _fetch_market_daily_with_retries(
+            tushare,
+            trade_date,
+            limiter,
+            retries,
+            retry_base_delay,
+            retry_max_delay,
+            retry_jitter,
+        )
+        request_count += attempts
+        market_frames.append(frame)
+        print(
+            f"market daily batch progress: {index}/{len(trade_dates)} trade dates",
+            flush=True,
+        )
+
+    market = pd.concat(market_frames, ignore_index=True, sort=False)
+    market["ts_code"] = market["ts_code"].astype(str).map(normalize_ts_code)
+    name_by_symbol = {normalize_ts_code(symbol): name for symbol, name in symbols}
+    target_symbols = set(name_by_symbol)
+    market = market[market["ts_code"].isin(target_symbols)].copy()
+    rows_by_symbol = {
+        symbol: frame.copy()
+        for symbol, frame in market.groupby("ts_code", sort=False)
+    }
+
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
+    dataset = output_dir.name
+    end = _parse_trade_date(end_date)
+    audits: list[DailyRefreshAudit] = []
+    for symbol, name in symbols:
+        key = normalize_ts_code(symbol)
+        incoming = rows_by_symbol.get(key)
+        existing = store.read_frame(dataset, key)
+        if incoming is None or incoming.empty:
+            latest = _latest_existing_trade_date(existing)
+            if end is not None and latest is not None and latest >= end:
+                audits.append(
+                    _status_audit(key, "up_to_date", f"本地数据已覆盖到 {end_date}", attempts=0)
+                )
+            else:
+                audits.append(
+                    _status_audit(
+                        key,
+                        BATCH_NO_TRADE_STATUS,
+                        f"{start_date}-{end_date} 的全市场结果中无该股票成交记录",
+                        attempts=1,
+                    )
+                )
+            continue
+        try:
+            merged = _merge_symbol_daily(existing, incoming, key, name)
+            store.write_frame(merged, dataset, key)
+            audits.append(
+                build_tushare_daily_audit(
+                    key,
+                    rows=len(incoming),
+                    merged_rows=len(merged),
+                    status="tushare_daily_batch",
+                )
+            )
+        except Exception as exc:
+            audits.append(_failed_audit(key, str(exc), attempts=1))
+    return audits, request_count
 
 
 def _refresh_one_symbol_once(
@@ -276,19 +441,7 @@ def _refresh_one_symbol_once(
                 attempts=1,
             )
         raise
-    merged = normalize_tushare_daily(ts_df, symbol)
-    merged["name"] = name
-    if not existing.empty:
-        if "date" in existing.columns:
-            existing["date"] = pd.to_datetime(existing["date"])
-        if "trade_date" not in existing.columns and "date" in existing.columns:
-            existing["trade_date"] = existing["date"].dt.strftime("%Y%m%d")
-        merged = (
-            pd.concat([existing, merged], ignore_index=True, sort=False)
-            .sort_values("date")
-            .drop_duplicates("trade_date", keep="last")
-            .reset_index(drop=True)
-            )
+    merged = _merge_symbol_daily(existing, ts_df, symbol, name)
     store.write_frame(merged, dataset, key)
     return build_tushare_daily_audit(symbol, rows=len(ts_df), merged_rows=len(merged))
 
@@ -488,20 +641,60 @@ def refresh_daily_data(
     if not symbols:
         raise RuntimeError("Tushare stock_basic returned no symbols")
 
-    audits = _refresh_symbols(
-        symbols,
-        start_date,
-        end_date,
-        adjust,
-        output_dir,
-        cache_dir,
-        workers=workers,
-        sleep_between=sleep_between,
-        retries=retries,
-        retry_base_delay=retry_base_delay,
-        retry_max_delay=retry_max_delay,
-        retry_jitter=retry_jitter,
-    )
+    refresh_mode = "per_symbol"
+    market_daily_requests = 0
+    batch_fallback_reason: str | None = None
+    if adjust is None:
+        try:
+            audits, market_daily_requests = _refresh_symbols_by_trade_date(
+                symbols,
+                start_date,
+                end_date,
+                output_dir,
+                cache_dir,
+                sleep_between=sleep_between,
+                retries=retries,
+                retry_base_delay=retry_base_delay,
+                retry_max_delay=retry_max_delay,
+                retry_jitter=retry_jitter,
+            )
+            refresh_mode = "batch_by_trade_date"
+        except Exception as exc:
+            batch_fallback_reason = str(exc)
+            print(
+                f"market daily batch unavailable; falling back to per-symbol refresh: "
+                f"{batch_fallback_reason}",
+                flush=True,
+            )
+            audits = _refresh_symbols(
+                symbols,
+                start_date,
+                end_date,
+                adjust,
+                output_dir,
+                cache_dir,
+                workers=workers,
+                sleep_between=sleep_between,
+                retries=retries,
+                retry_base_delay=retry_base_delay,
+                retry_max_delay=retry_max_delay,
+                retry_jitter=retry_jitter,
+            )
+    else:
+        audits = _refresh_symbols(
+            symbols,
+            start_date,
+            end_date,
+            adjust,
+            output_dir,
+            cache_dir,
+            workers=workers,
+            sleep_between=sleep_between,
+            retries=retries,
+            retry_base_delay=retry_base_delay,
+            retry_max_delay=retry_max_delay,
+            retry_jitter=retry_jitter,
+        )
     final_retry_unique_symbols = 0
     if final_retry_rounds > 0:
         symbols_by_code = {normalize_ts_code(symbol): (symbol, name) for symbol, name in symbols}
@@ -541,6 +734,9 @@ def refresh_daily_data(
         "end_date": end_date,
         "board": board,
         "adjust": adjust,
+        "refresh_mode": refresh_mode,
+        "market_daily_requests": market_daily_requests,
+        "batch_fallback_reason": batch_fallback_reason,
         "output_dir": str(output_dir),
         "storage_backend": os.getenv("MARKET_DATA_BACKEND", "mysql"),
         "market_data_sql_url_configured": bool(os.getenv("MARKET_DATA_SQL_URL")),
