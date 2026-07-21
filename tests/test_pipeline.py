@@ -91,6 +91,7 @@ def test_daily_web_workspaces_isolates_individual_failure(monkeypatch) -> None:
 def test_daily_pipeline_parallelizes_independent_stages(monkeypatch, tmp_path) -> None:
     active = 0
     max_active = 0
+    call_order: list[str] = []
     lock = threading.Lock()
 
     def parallel_step() -> dict:
@@ -104,7 +105,16 @@ def test_daily_pipeline_parallelizes_independent_stages(monkeypatch, tmp_path) -
         return {"status": "success"}
 
     monkeypatch.setattr(pipeline, "load_strategy_configs", lambda path: [])
-    monkeypatch.setattr(pipeline, "refresh_data", lambda dry_run: {"status": "success"})
+    monkeypatch.setattr(
+        pipeline,
+        "run_cache_cleanup",
+        lambda project_root: call_order.append("cleanup") or {"status": "success"},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "refresh_data",
+        lambda dry_run: call_order.append("refresh") or {"status": "success"},
+    )
     monkeypatch.setattr(pipeline, "build_features", parallel_step)
     monkeypatch.setattr(pipeline, "refresh_strategy_signal_cache", parallel_step)
     monkeypatch.setattr(pipeline, "score_latest_models", lambda: {"status": "success"})
@@ -115,6 +125,8 @@ def test_daily_pipeline_parallelizes_independent_stages(monkeypatch, tmp_path) -
 
     result = pipeline.run_daily_pipeline(skip_data=False, skip_backtest=True)
 
+    assert call_order[:2] == ["cleanup", "refresh"]
     assert max_active == 2
+    assert result["steps"]["cache_cleanup"]["status"] == "success"
     assert result["steps"]["build_features"]["status"] == "success"
     assert result["steps"]["generate_dashboard"]["status"] == "success"

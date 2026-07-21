@@ -8,6 +8,12 @@
     <array>
         <string>__PYTHON__</string>
         <string>__PROJECT_ROOT__/scripts/run_webapp.py</string>
+        <string>--log-file</string>
+        <string>__PROJECT_ROOT__/.run/webapp.log</string>
+        <string>--log-max-bytes</string>
+        <string>5242880</string>
+        <string>--log-backup-count</string>
+        <string>2</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__PROJECT_ROOT__</string>
@@ -27,8 +33,8 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>__PROJECT_ROOT__/.run/launchd_webapp.stdout.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>__PROJECT_ROOT__/.run/launchd_webapp.stderr.log</string>
+    <string>/dev/null</string>
 </dict>
 </plist>

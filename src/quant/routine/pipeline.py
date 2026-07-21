@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.dashboard import write_dashboard_json
 from quant.routine.b1_daily_plan import write_daily_plan
 from quant.routine.paths import CONFIG_PATH, PROJECT_ROOT, ROUTINE_DIR
@@ -397,8 +398,9 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
     and invalid model artifacts can be removed without losing review context.
     """
 
-    strategies = load_strategy_configs(CONFIG_PATH)
     results: dict[str, dict] = {}
+    results["cache_cleanup"] = run_cache_cleanup(PROJECT_ROOT)
+    strategies = load_strategy_configs(CONFIG_PATH)
     results["refresh_data"] = refresh_data(dry_run=skip_data)
     with ThreadPoolExecutor(max_workers=2) as executor:
         upstream_futures = {

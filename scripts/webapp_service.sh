@@ -141,7 +141,7 @@ case "${1:-status}" in
     stop) stop_service ;;
     restart) restart_service ;;
     status) status_service ;;
-    logs) tail -n 100 -f "$PROJECT_ROOT/.run/launchd_webapp.stdout.log" "$PROJECT_ROOT/.run/launchd_webapp.stderr.log" ;;
+    logs) tail -n 100 -F "$PROJECT_ROOT/.run/webapp.log" ;;
     uninstall) uninstall_service ;;
     *) echo "用法: $0 {install|start|stop|restart|status|logs|uninstall}" >&2; exit 2 ;;
 esac

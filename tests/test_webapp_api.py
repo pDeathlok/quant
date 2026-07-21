@@ -1,6 +1,6 @@
 import json
 import queue
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,44 @@ from quant.webapp import api as webapp_api
 
 
 client = TestClient(app)
+
+
+def test_api_refresh_runs_cleanup_before_data_refresh_even_when_refresh_fails(monkeypatch) -> None:
+    from quant.routine import pipeline
+
+    call_order: list[str] = []
+    cleanup_result = {"status": "success", "reclaimed_bytes": 456, "errors": []}
+    status = {
+        "status": "idle",
+        "started_at": None,
+        "finished_at": None,
+        "updated_at": None,
+        "message": "idle",
+        "percent": 0,
+        "current_step": None,
+        "steps": [],
+        "result": None,
+        "error": None,
+    }
+
+    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+    monkeypatch.setattr(
+        services,
+        "run_cache_cleanup",
+        lambda project_root: call_order.append("cleanup") or cleanup_result,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "refresh_data",
+        lambda **kwargs: call_order.append("refresh") or {"status": "failed", "stderr_tail": "boom"},
+    )
+
+    services._run_latest_refresh_job("all")
+
+    assert call_order == ["cleanup", "refresh"]
+    assert status["status"] == "failed"
+    assert status["result"]["cache_cleanup"] == cleanup_result
 
 
 def test_health_endpoint_reports_service_status() -> None:
@@ -63,12 +101,187 @@ def test_global_refresh_includes_daily_similar_pattern_step() -> None:
     assert "similar_patterns" in step_keys
 
 
+def test_latest_extended_signals_reuses_candidate_parquet(monkeypatch, tmp_path) -> None:
+    cache_path = tmp_path / "z_skill_daily_candidates.parquet"
+    pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "date": pd.Timestamp("2026-07-19"),
+                "name": "平安银行",
+                "close": 10.0,
+                "KEY_K": True,
+                "NANA": False,
+            },
+            {
+                "symbol": "000002.SZ",
+                "date": pd.Timestamp("2026-07-20"),
+                "name": "万科A",
+                "close": 8.0,
+                "KEY_K": False,
+                "NANA": True,
+            },
+        ]
+    ).to_parquet(cache_path)
+
+    monkeypatch.setattr(services, "EXTENDED_SIGNAL_CACHE", tmp_path / "missing.json")
+    monkeypatch.setattr(services, "EXTENDED_CANDIDATE_CACHE", cache_path)
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_map",
+        lambda: {
+            "000001.SZ": {"name": "平安银行", "industry": "银行"},
+            "000002.SZ": {"name": "万科A", "industry": "地产"},
+        },
+    )
+    monkeypatch.setattr(
+        services,
+        "build_extended_daily_signals",
+        lambda *args, **kwargs: pytest.fail("should reuse candidate parquet"),
+    )
+    services._latest_extended_signals.cache_clear()
+
+    signals = services._latest_extended_signals("2026-07-20")
+
+    assert set(signals) == {"000002.SZ"}
+    assert signals["000002.SZ"]["industry"] == "地产"
+    assert signals["000002.SZ"]["signals"][0]["strategy_key"] == "NANA"
+
+
+def test_long_stock_pool_variants_run_in_parallel_and_keep_order(monkeypatch) -> None:
+    observed = []
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            observed.append(("max_workers", max_workers))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, fn, items):
+            observed.extend(("variant", item) for item in items)
+            return [fn(item) for item in reversed(list(items))]
+
+    monkeypatch.setattr(services, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        services,
+        "_refresh_long_stock_pool_variant",
+        lambda variant, signal_date: {"variant": variant, "signal_date": signal_date, "stocks": len(variant)},
+    )
+
+    result = services._refresh_long_stock_pool_variants(["tea", "tea_safe", "v44"], "2026-07-20")
+
+    assert ("max_workers", 3) in observed
+    assert [item["variant"] for item in result] == ["tea", "tea_safe", "v44"]
+    assert [item["signal_date"] for item in result] == ["2026-07-20"] * 3
+
+
+def test_live_long_base_skips_persistent_backtest_cache_and_reuses_memory(monkeypatch) -> None:
+    calls = []
+    features = pd.DataFrame({"date": pd.to_datetime(["2026-07-20"]), "ts_code": ["000001.SZ"]})
+    daily_basic = pd.DataFrame({"date": pd.to_datetime(["2026-07-20"]), "ts_code": ["000001.SZ"]})
+    stock_basic = pd.DataFrame({"ts_code": ["000001.SZ"]})
+
+    class FakeModule:
+        @staticmethod
+        def parse_date(value):
+            return pd.to_datetime(value)
+
+        @staticmethod
+        def load_stock_basic():
+            return stock_basic
+
+        @staticmethod
+        def load_daily_basic_monthly(start, end):
+            return daily_basic, {"first_trade_date": "20130101"}
+
+        @staticmethod
+        def load_daily_monthly_features(start, end, basic, candidate_symbols, **kwargs):
+            calls.append(kwargs)
+            return features, pd.DataFrame()
+
+    services._load_live_long_base_cached.cache_clear()
+    monkeypatch.setattr(services, "_long_research_module", lambda: FakeModule())
+
+    first = services._load_live_long_base("2026-07-20")
+    second = services._load_live_long_base("2026-07-20")
+
+    assert len(calls) == 1
+    assert calls[0] == {"use_cache": False, "include_daily_returns": False}
+    assert first[0] is second[0]
+    services._load_live_long_base_cached.cache_clear()
+
+
+def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
+    submitted = []
+
+    class FakeFuture:
+        def __init__(self, fn):
+            self.fn = fn
+
+        def result(self):
+            return self.fn()
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            submitted.append(("max_workers", max_workers))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn):
+            submitted.append(("submit", fn))
+            return FakeFuture(fn)
+
+    monkeypatch.setattr(services, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(services, "as_completed", lambda futures: list(futures))
+    monkeypatch.setattr(services, "_set_refresh_progress", lambda **kwargs: None)
+    monkeypatch.setattr(
+        services,
+        "get_stock_selector_payload",
+        lambda **kwargs: {"signal_date": "2026-07-20", "stocks": []},
+    )
+    monkeypatch.setattr(services, "_build_tea_master_stock_pool_cached", type("Cache", (), {"cache_clear": staticmethod(lambda: None)})())
+    monkeypatch.setattr(services, "_build_long_stock_pool_cached", type("Cache", (), {"cache_clear": staticmethod(lambda: None)})())
+    monkeypatch.setattr(services, "get_chan_model_strategy_plan", lambda *args, **kwargs: {"signal_date": "2026-07-20", "candidates": []})
+    monkeypatch.setattr(services, "_refresh_long_stock_pool_variants", lambda *args, **kwargs: [])
+    monkeypatch.setattr(services, "get_convertible_bond_grid_plan", lambda *args, **kwargs: {"trade_date": "20260720", "candidates": []})
+    monkeypatch.setattr(services, "get_convertible_bond_allotments", lambda *args, **kwargs: {"asof": "2026-07-20", "records": []})
+    monkeypatch.setattr(services, "get_byd_daily_strategy", lambda *args, **kwargs: {"planned_t": {"signal_date": "2026-07-20"}, "alerts": []})
+    monkeypatch.setattr(services, "_run_similar_pattern_analysis_isolated", lambda: {"generated_at": "2026-07-20T20:00:00", "results": []})
+    monkeypatch.setattr(services, "_write_strategy_pool_snapshots", lambda *args, **kwargs: {"ALL": 0})
+
+    result = services._resume_tail_refresh_from_cached_selector(
+        "all",
+        {
+            "steps": [
+                {"key": "selector_extended", "status": "success"},
+                {"key": "snapshot", "status": "failed"},
+            ],
+            "result": {},
+        },
+    )
+
+    assert ("max_workers", 6) in submitted
+    assert len([item for item in submitted if item[0] == "submit"]) == 6
+    assert result["snapshot"]["strategy_pools"] == {"ALL": 0}
+    assert result["similar_patterns"]["status"] == "success"
+
+
 def test_similar_pattern_refresh_updates_vector_caches(monkeypatch, tmp_path) -> None:
     calls = {"cache": 0}
 
     monkeypatch.setattr(services, "SIMILAR_PATTERN_ANALYSIS_PATH", tmp_path / "analysis.json")
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     monkeypatch.setattr(services, "_read_similar_pattern_watchlist_symbols", lambda: [])
     monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: pd.DataFrame())
+    monkeypatch.setattr(services, "_latest_similar_pattern_target_date", lambda symbols: "2026-07-20")
 
     def fake_build(*args, **kwargs):
         calls["cache"] += 1
@@ -82,6 +295,74 @@ def test_similar_pattern_refresh_updates_vector_caches(monkeypatch, tmp_path) ->
     assert calls["cache"] == 1
     assert payload["cache"]["rebuilt"] == 1
     assert payload["cache"]["reused"] == 1
+    assert payload["cache"]["reference_library_policy"] == "weekly"
+    assert payload["cache"]["reference_library_refreshed"] is True
+    assert payload["cache"]["target_vectors"] == "live_from_latest_daily_data"
+
+
+def test_similar_pattern_refresh_reuses_current_weekly_library_but_analyzes_live_targets(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls = {"cache": 0, "analysis": 0}
+    cache_root = tmp_path / "vector_cache"
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_ANALYSIS_PATH", tmp_path / "analysis.json")
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", cache_root)
+    monkeypatch.setattr(services, "_read_similar_pattern_watchlist_symbols", lambda: ["002594.SZ"])
+    monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: pd.DataFrame())
+    monkeypatch.setattr(services, "_latest_similar_pattern_target_date", lambda symbols: "2026-07-21")
+
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps(
+            {
+                "config_key": services.vector_cache_key(services.SIMILAR_PATTERN_CONFIG),
+                "refreshed_at": datetime.now().isoformat(timespec="seconds"),
+                "source_trade_date": "2026-07-20",
+                "cached_files": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_build(*args, **kwargs):
+        calls["cache"] += 1
+        return pd.DataFrame()
+
+    def fake_analyze(*args, **kwargs):
+        calls["analysis"] += 1
+        assert kwargs["target_symbols"] == ["002594.SZ"]
+        return {}
+
+    monkeypatch.setattr(services, "build_vector_caches_parallel", fake_build)
+    monkeypatch.setattr(services, "analyze_targets_by_threshold", fake_analyze)
+
+    payload = services.refresh_similar_pattern_analysis()
+
+    assert calls == {"cache": 0, "analysis": 1}
+    assert payload["cache"]["reference_library_refreshed"] is False
+    assert payload["cache"]["reference_library_reason"] == "weekly_cache_current"
+    assert payload["cache"]["reused"] == 1
+
+
+def test_similar_pattern_weekly_library_becomes_due_after_seven_days(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps({"refreshed_at": "2026-07-14T08:00:00"}),
+        encoding="utf-8",
+    )
+
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 21, 8, 0, 0)
+    )
+
+    assert decision["due"] is True
+    assert decision["reason"] == "weekly_interval_elapsed"
 
 
 def test_similar_pattern_payload_includes_optimized_decision_and_validation() -> None:

@@ -26,6 +26,7 @@ import pandas as pd
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_daily_plan, write_daily_plan
+from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.convertible_bond_allotment import build_convertible_bond_allotment_payload
 from quant.routine.convertible_bond_grid_plan import build_convertible_bond_grid_plan, refresh_convertible_bond_daily
 from quant.routine.dashboard import DASHBOARD_PATH, build_dashboard_payload, write_dashboard_json
@@ -41,6 +42,7 @@ from quant.research.similar_patterns import (
     load_stock_basic,
     optimize_similar_cases,
     summarize_forecast,
+    vector_cache_key,
 )
 from quant.research.similar_patterns_validation import build_industry_regime, load_market_regime
 from quant.research.byd_daily_t_plan import build_daily_t_plan
@@ -61,6 +63,7 @@ from quant.strategies.custom.chan_model import (
 
 REPORT_DIR = PROJECT_ROOT / "reports/b1/research/xgb_project_vars_strategy"
 FAMILY_SIGNAL_CACHE = PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet"
+EXTENDED_CANDIDATE_CACHE = PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet"
 EXTENDED_SIGNAL_CACHE = PROJECT_ROOT / "data/features/z_skill_daily_signals.json"
 EXTENDED_PLAYBOOK = REPORT_DIR / "latest_z_skill_operational_playbook.csv"
 EXTENDED_MODEL_PLAYBOOK = REPORT_DIR / "latest_z_skill_model_operational_playbook.csv"
@@ -96,6 +99,7 @@ MODEL_SIGNAL_LABELS = {
     "VIOLENCE_K": "暴力K",
 }
 _TEA_MASTER_MODULE_LOCK = threading.Lock()
+_LONG_LIVE_DATA_LOCK = threading.Lock()
 STRATEGY_GROUPS = [
     {"key": "B1", "label": "B1", "status": "超跌反弹，模型+规则", "members": ["B1"]},
     {"key": "B2", "label": "B2", "status": "B1后/独立右侧确认", "members": ["B2"]},
@@ -272,6 +276,8 @@ SIMILAR_PATTERN_WATCHLIST_PATH = SIMILAR_PATTERN_STATE_DIR / "watchlist.json"
 SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analysis.json"
 SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
 SIMILAR_PATTERN_VALIDATION_PATH = PROJECT_ROOT / "reports/similar_patterns/validation_2025/calibration.json"
+SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS = 7
+SIMILAR_PATTERN_VECTOR_CACHE_METADATA = "_refresh_metadata.json"
 CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH = PROJECT_ROOT / "data/routine/convertible_bond_allotments_latest.json"
 SIMILAR_PATTERN_DEFAULT_WATCHLIST = ["002594.SZ", "002788.SZ"]
 SIMILAR_PATTERN_CONFIG = SimilarPatternConfig(
@@ -302,6 +308,118 @@ def _similarity_score_config() -> dict[str, float]:
         "similarity_score_ceiling": _similarity_score_ceiling(),
         "similarity_score_contrast": SIMILARITY_SCORE_CONTRAST,
     }
+
+
+def _similar_pattern_vector_cache_state_dir() -> Path:
+    return SIMILAR_PATTERN_VECTOR_CACHE_DIR / vector_cache_key(SIMILAR_PATTERN_CONFIG)
+
+
+def _read_similar_pattern_vector_cache_metadata() -> dict[str, Any]:
+    path = _similar_pattern_vector_cache_state_dir() / SIMILAR_PATTERN_VECTOR_CACHE_METADATA
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _latest_similar_pattern_target_date(symbols: list[str]) -> str | None:
+    """Read only watchlist files; target vectors themselves are still built live later."""
+    latest: pd.Timestamp | None = None
+    for symbol in symbols:
+        path = DAILY_DIR / f"{symbol}.parquet"
+        if not path.exists():
+            continue
+        try:
+            frame = pd.read_parquet(path, columns=["trade_date"])
+        except (KeyError, OSError, ValueError):
+            try:
+                frame = pd.read_parquet(path, columns=["date"])
+            except (KeyError, OSError, ValueError):
+                continue
+        column = "trade_date" if "trade_date" in frame.columns else "date"
+        values = pd.to_datetime(frame[column], errors="coerce")
+        candidate = values.max()
+        if pd.notna(candidate) and (latest is None or candidate > latest):
+            latest = pd.Timestamp(candidate)
+    return latest.strftime("%Y-%m-%d") if latest is not None else None
+
+
+def _similar_pattern_vector_cache_refresh_decision(
+    *,
+    force: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    state_dir = _similar_pattern_vector_cache_state_dir()
+    cache_files = list(state_dir.glob("*.npz")) if state_dir.exists() else []
+    metadata = _read_similar_pattern_vector_cache_metadata()
+    current = now or datetime.now()
+    force_from_env = os.getenv("SIMILAR_PATTERN_FORCE_VECTOR_CACHE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    refreshed_at = pd.to_datetime(metadata.get("refreshed_at"), errors="coerce")
+    inferred_legacy = False
+    if pd.isna(refreshed_at) and cache_files:
+        refreshed_at = pd.Timestamp.fromtimestamp(max(path.stat().st_mtime for path in cache_files))
+        inferred_legacy = True
+
+    if force or force_from_env:
+        due, reason = True, "forced"
+    elif not cache_files:
+        due, reason = True, "cache_missing"
+    elif pd.isna(refreshed_at):
+        due, reason = True, "refresh_time_missing"
+    elif current - refreshed_at.to_pydatetime() >= timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS):
+        due, reason = True, "weekly_interval_elapsed"
+    else:
+        due, reason = False, "weekly_cache_current"
+
+    next_refresh_at = None
+    if pd.notna(refreshed_at):
+        next_refresh_at = (
+            refreshed_at.to_pydatetime() + timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS)
+        ).isoformat(timespec="seconds")
+    return {
+        "due": due,
+        "reason": reason,
+        "cached_files": len(cache_files),
+        "refreshed_at": refreshed_at.to_pydatetime().isoformat(timespec="seconds")
+        if pd.notna(refreshed_at)
+        else None,
+        "next_refresh_at": next_refresh_at,
+        "metadata": metadata,
+        "inferred_legacy": inferred_legacy,
+    }
+
+
+def _write_similar_pattern_vector_cache_metadata(
+    *,
+    refreshed_at: datetime,
+    source_trade_date: str | None,
+    cache_audit: pd.DataFrame,
+) -> dict[str, Any]:
+    state_dir = _similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "config_key": vector_cache_key(SIMILAR_PATTERN_CONFIG),
+        "refreshed_at": refreshed_at.isoformat(timespec="seconds"),
+        "source_trade_date": source_trade_date,
+        "refresh_interval_days": SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS,
+        "cached_files": len(list(state_dir.glob("*.npz"))),
+        "rebuilt": int(cache_audit["status"].eq("built").sum()) if not cache_audit.empty else 0,
+        "reused": int(cache_audit["status"].eq("cache_hit").sum()) if not cache_audit.empty else 0,
+        "errors": int(cache_audit["status"].eq("error").sum()) if not cache_audit.empty else 0,
+    }
+    path = state_dir / SIMILAR_PATTERN_VECTOR_CACHE_METADATA
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    return payload
 
 
 CHAN_MODEL_SCORED_PATH = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
@@ -708,6 +826,81 @@ def _tea_master_research_module():
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         return module
+
+
+@lru_cache(maxsize=2)
+def _load_live_long_base_cached(
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Build shared live long-strategy inputs without persistent backtest caches."""
+
+    module = _long_research_module()
+    requested_end = pd.to_datetime(signal_date) if signal_date else None
+    start = module.parse_date("20130101")
+    stock_basic = module.load_stock_basic()
+    daily_basic, coverage = module.load_daily_basic_monthly(start, requested_end)
+    if daily_basic.empty:
+        raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
+    features, _ = module.load_daily_monthly_features(
+        start,
+        requested_end,
+        stock_basic,
+        candidate_symbols=None,
+        use_cache=False,
+        include_daily_returns=False,
+    )
+    return features, daily_basic, stock_basic, coverage
+
+
+def _load_live_long_base(
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    normalized_date = pd.to_datetime(signal_date).date().isoformat() if signal_date else None
+    with _LONG_LIVE_DATA_LOCK:
+        features, daily_basic, stock_basic, coverage = _load_live_long_base_cached(normalized_date)
+    return features, daily_basic, stock_basic, dict(coverage)
+
+
+def _prepare_tea_master_live_data(
+    module: Any,
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    daily_features, daily_basic, stock_basic, coverage = _load_live_long_base(signal_date)
+    executable_start_text = max("20130101", coverage.get("first_trade_date") or "20130101")
+    executable_start = module.parse_date(executable_start_text)
+    daily_features = daily_features[daily_features["date"] >= executable_start].copy()
+    daily_basic = daily_basic[daily_basic["date"] >= executable_start].copy()
+    before_rows = len(daily_basic)
+    live_config = type(
+        "LiveTeaConfig",
+        (),
+        {
+            "variant": "tea",
+            "prefilter_min_dv_ttm": 0.0,
+            "prefilter_min_total_mv": 800000.0,
+            "prefilter_min_circ_mv": 500000.0,
+        },
+    )()
+    daily_basic = module.filter_daily_basic_point_in_time(daily_basic, live_config)
+    coverage["point_in_time_universe"] = True
+    coverage["point_in_time_universe_rows_before"] = int(before_rows)
+    coverage["point_in_time_universe_rows_after"] = int(len(daily_basic))
+    merged = daily_features.merge(
+        daily_basic.drop(columns=["trade_date"]),
+        on=["date", "ts_code"],
+        how="inner",
+    )
+    merged = module.load_financial_asof(merged)
+    merged = module.add_empty_analyst_forecast_columns(merged)
+    market_regime = module.load_market_regime(merged["date"].min(), merged["date"].max())
+    merged = merged.merge(market_regime, on="date", how="left")
+    merged["market_regime"] = merged["market_regime"].fillna("neutral")
+    for column in ["index_return_20d", "index_return_60d", "index_drawdown_60d"]:
+        if column not in merged.columns:
+            merged[column] = np.nan
+    if "index_overheat" not in merged.columns:
+        merged["index_overheat"] = False
+    return merged, stock_basic, coverage
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -1687,8 +1880,7 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     config = next((item for item in module.CONFIGS if item.name == config_name), None)
     if config is None:
         raise ValueError(f"未知茶大长线策略版本: {variant_key}")
-    end_text = pd.to_datetime(signal_date).strftime("%Y%m%d") if signal_date else None
-    merged, _, _, coverage = module.prepare_data(end=end_text)
+    merged, _, coverage = _prepare_tea_master_live_data(module, signal_date)
     scored = module.build_tea_scores(merged)
     targets = module.select_targets(scored, config)
     if targets.empty:
@@ -1826,23 +2018,14 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
 
     requested_end = pd.to_datetime(signal_date) if signal_date else None
     config = module.BacktestConfig(variant=variant, start="20130101", end=None)
-    start = module.parse_date(config.start)
-    stock_basic = module.load_stock_basic()
-    daily_basic, coverage = module.load_daily_basic_monthly(start, requested_end)
-    if daily_basic.empty:
-        raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
+    features, daily_basic, stock_basic, coverage = _load_live_long_base(signal_date)
     if variant in getattr(module, "PIT_UNIVERSE_VARIANTS", set()):
         candidate_symbols = None
         coverage["point_in_time_universe"] = True
     else:
         candidate_symbols = module.select_candidate_symbols_from_daily_basic(daily_basic, stock_basic, config)
         coverage["point_in_time_universe"] = False
-    features, _ = module.load_daily_monthly_features(
-        start,
-        requested_end,
-        stock_basic,
-        candidate_symbols=candidate_symbols,
-    )
+        features = features[features["ts_code"].astype(str).isin(candidate_symbols)].copy()
     if requested_end is not None:
         features = features[features["date"] <= requested_end].copy()
         daily_basic = daily_basic[daily_basic["date"] <= requested_end].copy()
@@ -2492,18 +2675,38 @@ def _attach_watchlist_strategy_hits(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def refresh_similar_pattern_analysis(progress_callback=None) -> dict[str, Any]:
+def refresh_similar_pattern_analysis(progress_callback=None, *, force_vector_cache: bool = False) -> dict[str, Any]:
     symbols = _read_similar_pattern_watchlist_symbols()
     basic = _stock_basic_for_similar_patterns()
-    cache_audit = build_vector_caches_parallel(
-        DAILY_DIR,
-        basic,
-        SIMILAR_PATTERN_CONFIG,
-        SIMILAR_PATTERN_VECTOR_CACHE_DIR,
-        target_symbols=set(symbols),
-        workers=max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "4"))),
-        progress_callback=progress_callback,
-    )
+    source_trade_date = _latest_similar_pattern_target_date(symbols)
+    cache_schedule = _similar_pattern_vector_cache_refresh_decision(force=force_vector_cache)
+    if cache_schedule["due"]:
+        cache_audit = build_vector_caches_parallel(
+            DAILY_DIR,
+            basic,
+            SIMILAR_PATTERN_CONFIG,
+            SIMILAR_PATTERN_VECTOR_CACHE_DIR,
+            target_symbols=set(symbols),
+            workers=max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "4"))),
+            progress_callback=progress_callback,
+        )
+        cache_metadata = _write_similar_pattern_vector_cache_metadata(
+            refreshed_at=datetime.now(),
+            source_trade_date=source_trade_date,
+            cache_audit=cache_audit,
+        )
+        cache_refreshed = True
+    else:
+        cache_audit = pd.DataFrame(columns=["status"])
+        cache_metadata = dict(cache_schedule["metadata"])
+        if cache_schedule["inferred_legacy"]:
+            inferred_at = pd.Timestamp(cache_schedule["refreshed_at"]).to_pydatetime()
+            cache_metadata = _write_similar_pattern_vector_cache_metadata(
+                refreshed_at=inferred_at,
+                source_trade_date=source_trade_date,
+                cache_audit=cache_audit,
+            )
+        cache_refreshed = False
     results = analyze_targets_by_threshold(
         DAILY_DIR,
         basic,
@@ -2561,8 +2764,24 @@ def refresh_similar_pattern_analysis(progress_callback=None) -> dict[str, Any]:
             "hit": False,
             "backend": "generated",
             "rebuilt": int(cache_audit["status"].eq("built").sum()) if not cache_audit.empty else 0,
-            "reused": int(cache_audit["status"].eq("cache_hit").sum()) if not cache_audit.empty else 0,
+            "reused": (
+                int(cache_audit["status"].eq("cache_hit").sum())
+                if not cache_audit.empty
+                else int(cache_schedule["cached_files"])
+            ),
             "errors": int(cache_audit["status"].eq("error").sum()) if not cache_audit.empty else 0,
+            "reference_library_policy": "weekly",
+            "reference_library_refreshed": cache_refreshed,
+            "reference_library_reason": cache_schedule["reason"],
+            "reference_library_refreshed_at": cache_metadata.get("refreshed_at"),
+            "reference_library_next_refresh_at": (
+                datetime.fromisoformat(str(cache_metadata["refreshed_at"]))
+                + timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS)
+            ).isoformat(timespec="seconds")
+            if cache_metadata.get("refreshed_at")
+            else None,
+            "reference_library_source_trade_date": cache_metadata.get("source_trade_date"),
+            "target_vectors": "live_from_latest_daily_data",
         },
     }
     payload = _attach_watchlist_strategy_hits(payload)
@@ -2896,6 +3115,10 @@ def _write_selector_snapshot(
     snapshot_key, date_key, strategy_key = _selector_snapshot_key(signal_date, strategies, include_extended)
     payload_to_store = dict(payload)
     payload_to_store["selector_snapshot_schema_version"] = SELECTOR_SNAPSHOT_SCHEMA_VERSION
+    payload_to_store["snapshot_scope"] = {
+        "strategies": sorted({str(item).upper() for item in strategies or [] if item}) or ["ALL"],
+        "include_extended": bool(include_extended),
+    }
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
     SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -4772,6 +4995,9 @@ def _latest_extended_signals(signal_date: str | None) -> dict[str, dict[str, Any
                 return cached["signals"]
         except Exception:
             pass
+    cached_signals = _extended_signals_from_candidate_cache(signal_date)
+    if cached_signals:
+        return cached_signals
     signals = build_extended_daily_signals(DAILY_DIR, signal_date=signal_date, max_workers=32)
     EXTENDED_SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
     EXTENDED_SIGNAL_CACHE.write_text(
@@ -4788,6 +5014,81 @@ def _latest_extended_signals(signal_date: str | None) -> dict[str, dict[str, Any
     return signals
 
 
+def _extended_signals_from_candidate_cache(signal_date: str | None) -> dict[str, dict[str, Any]]:
+    """Build selector-ready extended signals from the daily z-skill parquet cache."""
+
+    if not EXTENDED_CANDIDATE_CACHE.exists():
+        return {}
+    strategy_meta = {str(item["key"]).upper(): item for item in EXTENDED_STRATEGIES}
+    signal_cols = list(strategy_meta)
+    try:
+        cached = pd.read_parquet(EXTENDED_CANDIDATE_CACHE)
+    except Exception:
+        return {}
+    signal_cols = [col for col in signal_cols if col in cached.columns]
+    if not signal_cols:
+        return {}
+    if cached.empty or not {"date", "symbol"}.issubset(cached.columns):
+        return {}
+    cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
+    cached = cached.dropna(subset=["date", "symbol"])
+    if cached.empty:
+        return {}
+    if signal_date:
+        target = pd.to_datetime(signal_date, errors="coerce")
+        if pd.isna(target):
+            return {}
+        available = cached[cached["date"] <= target]["date"]
+        if available.empty:
+            return {}
+        selected_date = available.max()
+    else:
+        selected_date = cached["date"].max()
+    latest = cached[cached["date"] == selected_date].copy()
+    if latest.empty:
+        return {}
+
+    basic = _stock_basic_map()
+    signals_by_symbol: dict[str, dict[str, Any]] = {}
+    for _, row in latest.iterrows():
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        row_signals: list[dict[str, Any]] = []
+        for key in signal_cols:
+            value = row.get(key, False)
+            if pd.isna(value) or not bool(value):
+                continue
+            meta = strategy_meta[key]
+            label = str(meta.get("label") or key)
+            status = str(meta.get("status") or "日线观察")
+            row_signals.append(
+                {
+                    "strategy_key": key,
+                    "strategy_family": key,
+                    "strategy_name": label,
+                    "timeframe": "日线级，收盘确认，T+1 开盘观察",
+                    "logic": f"{label} 缓存命中，来自全市场扩展策略规则信号。",
+                    "reason": status,
+                    "buy_plan": "T+1 开盘观察，按策略 playbook 与模型分共同过滤。",
+                    "sell_plan": "按策略 playbook 风控退出。",
+                    "strength_score": 1.0,
+                }
+            )
+        if not row_signals:
+            continue
+        profile = basic.get(symbol, {})
+        signals_by_symbol[symbol] = {
+            "symbol": symbol,
+            "name": _clean_text(row.get("name")) or _clean_text(profile.get("name")),
+            "date": selected_date.strftime("%Y-%m-%d"),
+            "close": float(row.get("close")) if pd.notna(row.get("close")) else None,
+            "industry": _clean_text(profile.get("industry")),
+            "signals": row_signals,
+        }
+    return signals_by_symbol
+
+
 def _clear_selector_caches() -> None:
     for func in [
         _extended_playbooks,
@@ -4802,6 +5103,7 @@ def _clear_selector_caches() -> None:
         _family_signals_for_date,
         _family_profiles_for_date,
         _latest_extended_signals,
+        _load_live_long_base_cached,
     ]:
         try:
             func.cache_clear()
@@ -4903,10 +5205,10 @@ def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> d
 
 
 def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | None) -> list[dict[str, Any]]:
-    results = [
-        _refresh_long_stock_pool_variant(variant, signal_date)
-        for variant in variants
-    ]
+    if not variants:
+        return []
+    with ThreadPoolExecutor(max_workers=min(3, len(variants))) as executor:
+        results = list(executor.map(lambda variant: _refresh_long_stock_pool_variant(variant, signal_date), variants))
     return sorted(results, key=lambda item: variants.index(item["variant"]))
 
 
@@ -4943,60 +5245,79 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
         ("byd_daily_plan", lambda: get_byd_daily_strategy(refresh=True), "BYD 做T日线计划刷新失败"),
         ("similar_patterns", lambda: _run_similar_pattern_analysis_isolated(), "相似走势决策台刷新失败"),
     ]
+    pending_steps = [item for item in pending_steps if step_map.get(item[0]) != "success"]
 
-    for step_key, func, failure_message in pending_steps:
-        if step_map.get(step_key) == "success":
-            continue
+    for step_key, _, _ in pending_steps:
         _set_refresh_progress(
             step_key=step_key,
             message=f"检测到断点，正在续跑 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
             percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
             complete_previous=False,
         )
-        payload = func()
-        if step_key == "long_stock_pool":
-            results[step_key] = {"status": "success", "variants": payload}
-        elif step_key == "chan_model_strategy":
-            results[step_key] = {
-                "status": "success",
-                "signal_date": payload.get("signal_date"),
-                "candidates": len(payload.get("candidates") or []),
-                "primary_count": payload.get("primary_count"),
-                "expanded_count": payload.get("expanded_count"),
+
+    if pending_steps:
+        with ThreadPoolExecutor(max_workers=min(6, len(pending_steps))) as executor:
+            futures = {
+                executor.submit(func): (step_key, failure_message)
+                for step_key, func, failure_message in pending_steps
             }
-        elif step_key == "convertible_bond_plan":
-            results[step_key] = {
-                "status": "success",
-                "trade_date": payload.get("trade_date") or signal_date,
-                "candidates": len(payload.get("candidates") or payload.get("items") or []),
-                "data_refresh": payload.get("data_refresh"),
-            }
-        elif step_key == "convertible_bond_allotment":
-            results[step_key] = {
-                "status": "success",
-                "asof": payload.get("asof"),
-                "records": len(payload.get("records") or []),
-            }
-        elif step_key == "similar_patterns":
-            results[step_key] = {
-                "status": "success",
-                "generated_at": payload.get("generated_at"),
-                "targets": len(payload.get("results") or []),
-            }
-        else:
-            planned_t = payload.get("planned_t") or {}
-            results[step_key] = {
-                "status": "success",
-                "signal_date": planned_t.get("signal_date"),
-                "alerts": len(payload.get("alerts") or []),
-            }
-        _set_refresh_progress(
-            step_key=step_key,
-            step_status="success",
-            message=f"{failure_message.removesuffix('失败')}完成",
-            percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
-            complete_previous=False,
-        )
+            for future in as_completed(futures):
+                step_key, failure_message = futures[future]
+                try:
+                    payload = future.result()
+                except Exception as exc:
+                    _set_refresh_progress(
+                        status="failed",
+                        step_key=step_key,
+                        step_status="failed",
+                        message="刷新任务失败",
+                        error=f"{failure_message}: {exc}\n{traceback.format_exc(limit=5)}",
+                        complete_previous=False,
+                    )
+                    raise
+                if step_key == "long_stock_pool":
+                    results[step_key] = {"status": "success", "variants": payload}
+                elif step_key == "chan_model_strategy":
+                    results[step_key] = {
+                        "status": "success",
+                        "signal_date": payload.get("signal_date"),
+                        "candidates": len(payload.get("candidates") or []),
+                        "primary_count": payload.get("primary_count"),
+                        "expanded_count": payload.get("expanded_count"),
+                    }
+                elif step_key == "convertible_bond_plan":
+                    results[step_key] = {
+                        "status": "success",
+                        "trade_date": payload.get("trade_date") or signal_date,
+                        "candidates": len(payload.get("candidates") or payload.get("items") or []),
+                        "data_refresh": payload.get("data_refresh"),
+                    }
+                elif step_key == "convertible_bond_allotment":
+                    results[step_key] = {
+                        "status": "success",
+                        "asof": payload.get("asof"),
+                        "records": len(payload.get("records") or []),
+                    }
+                elif step_key == "similar_patterns":
+                    results[step_key] = {
+                        "status": "success",
+                        "generated_at": payload.get("generated_at"),
+                        "targets": len(payload.get("results") or []),
+                    }
+                else:
+                    planned_t = payload.get("planned_t") or {}
+                    results[step_key] = {
+                        "status": "success",
+                        "signal_date": planned_t.get("signal_date"),
+                        "alerts": len(payload.get("alerts") or []),
+                    }
+                _set_refresh_progress(
+                    step_key=step_key,
+                    step_status="success",
+                    message=f"{failure_message.removesuffix('失败')}完成",
+                    percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
+                    complete_previous=False,
+                )
 
     _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
     written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
@@ -5042,9 +5363,11 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
         )
         _persist_refresh_status_unlocked()
     try:
-        results: dict[str, Any] = {}
+        cache_cleanup = run_cache_cleanup(PROJECT_ROOT)
+        results: dict[str, Any] = {"cache_cleanup": cache_cleanup}
         if resume_tail:
             results = _resume_tail_refresh_from_cached_selector(refresh_scope, resume_status)
+            results["cache_cleanup"] = cache_cleanup
             _set_refresh_progress(
                 status="success",
                 step_key="snapshot",
@@ -5077,6 +5400,7 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
             percent=35,
             complete_previous=False,
         )
+        _clear_selector_caches()
 
         if refresh_scope not in {"all", "short"}:
             signal_date = _latest_candidate_signal_date()
@@ -5477,6 +5801,7 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
             status="failed",
             step_key=_REFRESH_STATUS.get("current_step"),
             message="刷新任务失败",
+            result=results if "results" in locals() else None,
             error=f"{exc}\n{traceback.format_exc(limit=5)}",
         )
 

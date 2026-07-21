@@ -107,7 +107,14 @@ def test_run_refresh_workflow_retries_after_failed_status(tmp_path: Path) -> Non
                 "percent": 100,
                 "current_step": "snapshot",
                 "message": "done",
-                "result": {"refresh_data": {"failed": 11}},
+                "result": {
+                    "refresh_data": {"failed": 11},
+                    "cache_cleanup": {
+                        "status": "success",
+                        "reclaimed_bytes": 123,
+                        "errors": [],
+                    },
+                },
             }
         ),
     ]
@@ -138,7 +145,7 @@ def test_run_refresh_workflow_retries_after_failed_status(tmp_path: Path) -> Non
     assert result["status"] == "success"
     assert result["attempts"] == 2
     assert result["failed_count"] == 11
-    assert result["cache_cleanup"]["status"] == "success"
+    assert result["cache_cleanup"]["reclaimed_bytes"] == 123
     assert any("自动重试" in line for line in logs)
 
 
@@ -182,7 +189,11 @@ def test_ensure_local_service_checks_frontend_and_starts_stack(monkeypatch, tmp_
     )
 
     assert process is not None
-    assert started["args"][0][-1] == "scripts/run_webapp.py"
+    command = started["args"][0]
+    assert command[1] == "scripts/run_webapp.py"
+    assert command[command.index("--log-file") + 1] == str(tmp_path / "service.log")
+    assert started["kwargs"]["stdout"] is runner.subprocess.DEVNULL
+    assert started["kwargs"]["stderr"] is runner.subprocess.DEVNULL
     assert started["kwargs"]["start_new_session"] is True
     assert started["kwargs"]["close_fds"] is True
     assert (tmp_path / "service.pid").read_text(encoding="utf-8") == "12345\n"

@@ -307,6 +307,9 @@ def load_daily_monthly_features(
     end: pd.Timestamp | None,
     stock_basic: pd.DataFrame,
     candidate_symbols: set[str] | None = None,
+    *,
+    use_cache: bool = True,
+    include_daily_returns: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cache_key_source = "|".join(
         [
@@ -319,9 +322,17 @@ def load_daily_monthly_features(
     cache_key = hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()[:16]
     feature_cache = RESEARCH_CACHE_DIR / f"daily_monthly_features_{cache_key}.parquet"
     returns_cache = RESEARCH_CACHE_DIR / f"daily_returns_{cache_key}.parquet"
-    if feature_cache.exists() and returns_cache.exists():
+    cache_ready = feature_cache.exists() and (
+        returns_cache.exists() or not include_daily_returns
+    )
+    if use_cache and cache_ready:
         print(f"loading cached daily features: {feature_cache.name}", flush=True)
-        return pd.read_parquet(feature_cache), pd.read_parquet(returns_cache)
+        cached_returns = (
+            pd.read_parquet(returns_cache)
+            if include_daily_returns
+            else pd.DataFrame()
+        )
+        return pd.read_parquet(feature_cache), cached_returns
 
     history_start = start - pd.Timedelta(days=450)
     frames: list[pd.DataFrame] = []
@@ -370,11 +381,12 @@ def load_daily_monthly_features(
         df["downside_volatility_60d"] = downside.rolling(60).std() * np.sqrt(252)
         df["ma_120_slope_20d"] = df["ma_120"] / df["ma_120"].shift(20) - 1
 
-        daily_return = df.loc[
-            df["date"] >= start,
-            ["date", "trade_date", "ts_code", "ret_1d", "close", "ma_20", "ma_60", "ma_120"],
-        ].copy()
-        returns.append(daily_return)
+        if include_daily_returns:
+            daily_return = df.loc[
+                df["date"] >= start,
+                ["date", "trade_date", "ts_code", "ret_1d", "close", "ma_20", "ma_60", "ma_120"],
+            ].copy()
+            returns.append(daily_return)
 
         monthly_idx = df.groupby(df["date"].dt.to_period("M"))["date"].idxmax()
         monthly = df.loc[
@@ -408,10 +420,12 @@ def load_daily_monthly_features(
     if not frames:
         raise RuntimeError(f"No usable daily data found under {DAILY_DIR}")
     features = pd.concat(frames, ignore_index=True)
-    daily_returns = pd.concat(returns, ignore_index=True)
-    RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(feature_cache, index=False)
-    daily_returns.to_parquet(returns_cache, index=False)
+    daily_returns = pd.concat(returns, ignore_index=True) if returns else pd.DataFrame()
+    if use_cache:
+        RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        features.to_parquet(feature_cache, index=False)
+        if include_daily_returns:
+            daily_returns.to_parquet(returns_cache, index=False)
     return features, daily_returns
 
 

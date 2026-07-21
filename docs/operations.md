@@ -44,7 +44,7 @@ scripts/webapp_service.sh stop
 scripts/webapp_service.sh start
 ```
 
-服务标识是 `com.didi.quant.webapp`，标准输出和错误日志分别位于 `.run/launchd_webapp.stdout.log` 和 `.run/launchd_webapp.stderr.log`。安装脚本会优先选用项目 `.venv`，其次选用已包含项目依赖的 Miniforge/Conda Python；也可用 `QUANT_PYTHON=/absolute/path/python` 显式指定。
+服务标识是 `com.didi.quant.webapp`，应用日志统一写入 `.run/webapp.log`，按 5MB 轮转并保留 2 个备份（总量约 15MB）。launchd 的标准输出和错误输出定向到 `/dev/null`，避免与应用日志重复累积；`scripts/webapp_service.sh logs` 可持续查看轮转日志。安装脚本会优先选用项目 `.venv`，其次选用已包含项目依赖的 Miniforge/Conda Python；也可用 `QUANT_PYTHON=/absolute/path/python` 显式指定。
 
 ## 执行每日任务
 
@@ -125,7 +125,14 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 5. 触发 `POST /api/selector/refresh-latest`，作用域默认 `all`。
 6. 轮询 `/api/selector/refresh-latest/status` 并打印进度。
 7. 若终态为 `failed/error`，自动再次触发刷新。服务端会优先复用已有的断点续跑能力。
-8. 刷新成功后自动清理缓存：长线研究缓存保留最近 3 个自然月，相似走势向量只保留最新一套；Tushare 单股缓存长期保留、不参与清理。
+8. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应 `data/raw/daily_basic/YYYYMMDD.parquet` 正式文件存在且非空时才删除旧缓存，避免误删唯一副本。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
+9. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
+
+清理逻辑也会在 `daily` CLI 开始前执行。需要单独维护或立即释放空间时可运行：
+
+```bash
+cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli cache-cleanup
+```
 
 常用参数：
 
@@ -150,6 +157,7 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 | `ROUTINE_FEATURE_WORKERS` | `8` | 内存或 CPU 紧张时降低 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 下游接口限频或机器负载高时降低 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似向量计算占用高时降低 |
+| `SIMILAR_PATTERN_FORCE_VECTOR_CACHE` | 空 | 设为 `1` 可在下一次相似走势刷新时强制重建全市场参考库；正常每日任务无需设置 |
 
 一次运行同时包含多层并发。不要盲目把每个并发参数都调大；优先观察内存、CPU、Tushare 限频和 MySQL 写入延迟。
 

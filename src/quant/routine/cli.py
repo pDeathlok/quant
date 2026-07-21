@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.dashboard import write_dashboard_json
 from quant.routine.b1_daily_plan import write_daily_plan
 from quant.routine.convertible_bond_plan import write_convertible_bond_plan
@@ -20,8 +21,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run routine B1 strategy operations.")
     parser.add_argument(
         "command",
-        choices=["daily", "dashboard", "plan", "cb-plan", "web-refresh"],
-        help="daily runs the routine pipeline; dashboard regenerates dashboard.json; plan generates next-day B1 plan; cb-plan generates convertible-bond plan; web-refresh orchestrates the page-equivalent latest-data refresh",
+        choices=["daily", "dashboard", "plan", "cb-plan", "web-refresh", "cache-cleanup"],
+        help="daily runs the routine pipeline; dashboard regenerates dashboard.json; plan generates next-day B1 plan; cb-plan generates convertible-bond plan; web-refresh orchestrates the page-equivalent latest-data refresh; cache-cleanup applies cache retention immediately",
     )
     parser.add_argument("--trade-date", help="Trade date in YYYYMMDD format for cb-plan.")
     parser.add_argument("--refresh-data", action="store_true", help="Actually run the data refresh script.")
@@ -67,6 +68,11 @@ def main() -> None:
             raise SystemExit("--trade-date is required for cb-plan")
         output = write_convertible_bond_plan(trade_date=args.trade_date)
         print(json.dumps({"status": "success", "output": str(output)}, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "cache-cleanup":
+        result = run_cache_cleanup(PROJECT_ROOT)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
     if args.command == "web-refresh":

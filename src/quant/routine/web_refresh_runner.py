@@ -15,7 +15,11 @@ from typing import Any, Callable, Mapping
 import requests
 
 from quant.data.tushare_fetcher import TushareDataFetcher
-from quant.routine.cache_retention import cleanup_daily_caches
+from quant.routine.cache_retention import run_cache_cleanup
+from quant.routine.rotating_logs import (
+    DEFAULT_WEBAPP_LOG_BACKUP_COUNT,
+    DEFAULT_WEBAPP_LOG_MAX_BYTES,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -275,13 +279,21 @@ def ensure_local_service(
     merged_env["PYTHONPATH"] = str(config.project_root / "src")
     config.service_log_path.parent.mkdir(parents=True, exist_ok=True)
     config.service_pid_path.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = config.service_log_path.open("a", encoding="utf-8")
     process = subprocess.Popen(
-        [sys.executable, "scripts/run_webapp.py"],
+        [
+            sys.executable,
+            "scripts/run_webapp.py",
+            "--log-file",
+            str(config.service_log_path),
+            "--log-max-bytes",
+            str(DEFAULT_WEBAPP_LOG_MAX_BYTES),
+            "--log-backup-count",
+            str(DEFAULT_WEBAPP_LOG_BACKUP_COUNT),
+        ],
         cwd=config.project_root,
         env=merged_env,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
         close_fds=True,
@@ -290,7 +302,6 @@ def ensure_local_service(
     deadline = monotonic_fn() + config.health_timeout_seconds
     while monotonic_fn() < deadline:
         if process.poll() is not None:
-            log_handle.flush()
             raise RuntimeError(
                 f"本地 Quant web 服务启动失败，进程已退出，日志见 {config.service_log_path}"
             )
@@ -354,22 +365,6 @@ def _status_signature(status: Mapping[str, Any]) -> tuple[Any, ...]:
         status.get("updated_at"),
         status.get("message"),
     )
-
-
-def run_cache_cleanup(
-    project_root: Path,
-    reference_date: date,
-    cleanup_fn: Callable[[Path, date | None], dict[str, Any]] = cleanup_daily_caches,
-) -> dict[str, Any]:
-    try:
-        return cleanup_fn(project_root, reference_date)
-    except Exception as exc:
-        return {
-            "status": "failed",
-            "reference_date": reference_date.isoformat(),
-            "reclaimed_bytes": 0,
-            "errors": [str(exc)],
-        }
 
 
 def wait_for_terminal_status(
@@ -479,15 +474,11 @@ def run_refresh_workflow(
 
         if terminal.get("status") == "success":
             failed_count = extract_failed_count(terminal)
-            cache_cleanup = run_cache_cleanup(
-                config.project_root,
-                target_date or date.today(),
-            )
-            print_fn(
-                "[cache-cleanup] "
-                f"status={cache_cleanup['status']} "
-                f"reclaimed_bytes={cache_cleanup['reclaimed_bytes']} "
-                f"errors={len(cache_cleanup['errors'])}"
+            terminal_result = terminal.get("result")
+            cache_cleanup = (
+                terminal_result.get("cache_cleanup")
+                if isinstance(terminal_result, Mapping)
+                else None
             )
             return {
                 "status": "success",
@@ -497,7 +488,7 @@ def run_refresh_workflow(
                 "finished_at": terminal.get("finished_at"),
                 "failed_count": failed_count,
                 "error_summary": summarize_error(terminal),
-                "result": terminal.get("result"),
+                "result": terminal_result,
                 "cache_cleanup": cache_cleanup,
             }
 
