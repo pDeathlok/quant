@@ -330,8 +330,9 @@ def _cleanup_timestamped_directories(
     max_runs: int,
     error_prefix: str,
     errors: list[str],
+    group_by_suffix: bool = False,
 ) -> dict[str, int]:
-    runs: list[tuple[datetime, Path]] = []
+    runs: list[tuple[datetime, Path, str]] = []
     if directory.exists():
         for path in directory.iterdir():
             match = RUN_DIRECTORY_PATTERN.match(path.name)
@@ -341,20 +342,25 @@ def _cleanup_timestamped_directories(
                 timestamp = datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
             except ValueError:
                 continue
-            runs.append((timestamp, path))
+            suffix = path.name[len(match.group(1)) :].lstrip("_") or "default"
+            runs.append((timestamp, path, suffix if group_by_suffix else "all"))
     runs.sort(reverse=True)
     deleted_directories = 0
     reclaimed_bytes = 0
-    for index, (timestamp, path) in enumerate(runs):
-        if index == 0 or (index < max_runs and timestamp.date() >= cutoff):
-            continue
-        try:
-            size = _directory_size(path)
-            shutil.rmtree(path)
-            deleted_directories += 1
-            reclaimed_bytes += size
-        except OSError as exc:
-            errors.append(f"{error_prefix}:{path.name}:{exc}")
+    grouped: dict[str, list[tuple[datetime, Path]]] = {}
+    for timestamp, path, group in runs:
+        grouped.setdefault(group, []).append((timestamp, path))
+    for group_runs in grouped.values():
+        for index, (timestamp, path) in enumerate(group_runs):
+            if index == 0 or (index < max_runs and timestamp.date() >= cutoff):
+                continue
+            try:
+                size = _directory_size(path)
+                shutil.rmtree(path)
+                deleted_directories += 1
+                reclaimed_bytes += size
+            except OSError as exc:
+                errors.append(f"{error_prefix}:{path.name}:{exc}")
     return {
         "deleted_directories": deleted_directories,
         "reclaimed_bytes": reclaimed_bytes,
@@ -562,6 +568,7 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
         max_runs=SOURCE_AUDIT_MAX_RUNS,
         error_prefix="source_audit",
         errors=errors,
+        group_by_suffix=True,
     )
     source_audit.update(
         {

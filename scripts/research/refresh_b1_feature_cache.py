@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -69,7 +70,11 @@ def main() -> None:
         load_target=args.load_target,
         load_hard_limit=args.load_hard_limit,
     )
-    incremental = merge_daily_basic_features(incremental, args.daily_basic_dir)
+    incremental = merge_daily_basic_features(
+        incremental,
+        args.daily_basic_dir,
+        min_match_rate=float(os.getenv("ROUTINE_DAILY_BASIC_MIN_MATCH_RATE", "0.98")),
+    )
 
     if args.dataset_out.exists():
         existing = pd.read_parquet(args.dataset_out)
@@ -95,6 +100,9 @@ def main() -> None:
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "incremental_start_date": start_ts.strftime("%Y-%m-%d"),
         "incremental_rows": int(len(incremental)),
+        "daily_basic_match_rate": float(incremental["turnover_rate"].notna().mean())
+        if "turnover_rate" in incremental.columns and len(incremental)
+        else 0.0,
         "total_rows": int(len(combined)),
         "date_min": combined["date"].min().strftime("%Y-%m-%d") if not combined.empty else None,
         "date_max": combined["date"].max().strftime("%Y-%m-%d") if not combined.empty else None,

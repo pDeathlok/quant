@@ -36,12 +36,13 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 import build_training_data_parallel as btd
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
 from quant.features.variable_library import (
     PROJECT_FACTOR_COLUMNS,
     build_continuous_ohlc,
     calc_bbi as project_calc_bbi,
-    calculate_project_extra_features,
     merge_daily_basic_features,
 )
 from quant.ml.label_maker import create_b1_labels
@@ -70,14 +71,22 @@ MODEL_PARAMS = {
 def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
     path_str, start_date = args
     path = Path(path_str)
+    start_ts = pd.to_datetime(start_date)
+    history_start = start_ts - pd.Timedelta(days=450)
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=path.parent.parent))
+    df = store.read_market_range(path.parent.name, start_date=history_start.strftime("%Y%m%d"), symbols=[path.stem])
+    return process_daily_frame((path.stem, df, start_date))
+
+
+def process_daily_frame(args: tuple[str, pd.DataFrame, str]) -> pd.DataFrame | None:
+    symbol, df, start_date = args
     try:
-        df = pd.read_parquet(path)
-        df = normalize_tushare_daily(df, path.stem)
+        start_ts = pd.to_datetime(start_date)
+        history_start = start_ts - pd.Timedelta(days=450)
+        df = normalize_tushare_daily(df, symbol)
         if "vol" in df.columns and "volume" in df.columns:
             df = df.drop(columns=["vol"])
         df = df.sort_values("date").reset_index(drop=True)
-        start_ts = pd.to_datetime(start_date)
-        history_start = start_ts - pd.Timedelta(days=450)
         df = df[df["date"] >= history_start].reset_index(drop=True)
         if len(df) < 130:
             return None
@@ -86,7 +95,14 @@ def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
         if "ST" in name.upper() or "退" in name:
             return None
 
-        factors = pd.concat([btd.calculate_factors_single_stock(df), calculate_project_extra_features(df)], axis=1)
+        shared = attach_daily_base_factors(
+            df,
+            symbol=symbol,
+            compute_if_missing=True,
+            persist_missing=False,
+        )
+        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
+        factors = pd.concat([btd.calculate_factors_single_stock(df), shared[shared_cols]], axis=1)
         factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
         labels = create_b1_labels(df, forward_days=5, exit_aware=True, use_new_labels=True)
         result = pd.concat([df, factors, labels], axis=1)
@@ -116,7 +132,7 @@ def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
         out = result.loc[(result["date"] >= start_ts) & b1_signal, present].copy()
         return out if len(out) else None
     except Exception as exc:
-        print(f"skip {path.name}: {exc}", flush=True)
+        print(f"skip {symbol}: {exc}", flush=True)
         return None
 
 
@@ -133,23 +149,28 @@ def build_dataset(
     load_target: float = 0.80,
     load_hard_limit: float = 1.20,
 ) -> pd.DataFrame:
-    files = sorted(
-        path for path in daily_dir.glob("*.parquet")
-        if len(path.stem) == 9 and path.stem[6] == "." and path.stem[-2:] in {"SZ", "SH", "BJ"}
-    )
+    start_ts = pd.to_datetime(start_date)
+    history_start = (start_ts - pd.Timedelta(days=450)).strftime("%Y%m%d")
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    market = store.read_market_range(daily_dir.name, start_date=history_start)
+    if market.empty:
+        raise RuntimeError(f"No canonical Tushare daily rows found for {history_start}+")
+    symbols = sorted(market["ts_code"].dropna().astype(str).unique().tolist())
     if limit:
-        files = files[:limit]
-    if not files:
-        raise RuntimeError(f"No standard Tushare daily files found in {daily_dir}")
+        symbols = symbols[:limit]
+        market = market[market["ts_code"].astype(str).isin(symbols)]
 
     frames: list[pd.DataFrame] = []
-    tasks = [(str(path), start_date) for path in files]
+    tasks = [
+        (str(symbol), group.reset_index(drop=True), start_date)
+        for symbol, group in market.groupby("ts_code", sort=True)
+    ]
     executor_cls = ThreadPoolExecutor if executor_type == "threads" else ProcessPoolExecutor
 
-    def consume_batch(batch: list[tuple[str, str]], batch_workers: int, processed_before: int) -> tuple[int, float]:
+    def consume_batch(batch: list[tuple[str, pd.DataFrame, str]], batch_workers: int, processed_before: int) -> tuple[int, float]:
         started = perf_counter()
         with executor_cls(max_workers=batch_workers) as executor:
-            futures = [executor.submit(process_daily_file, task) for task in batch]
+            futures = [executor.submit(process_daily_frame, task) for task in batch]
             for offset, future in enumerate(as_completed(futures), start=1):
                 frame = future.result()
                 if frame is not None and len(frame):

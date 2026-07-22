@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
 
 def normalize_ts_code(symbol: str) -> str:
     text = str(symbol)
@@ -28,26 +29,20 @@ def build_limit_proxy_features(daily_dir: Path, start: str | pd.Timestamp | None
     fallback that approximates broad sentiment with daily return thresholds.
     """
     start_ts = pd.to_datetime(start) if start is not None else None
-    rows: list[pd.DataFrame] = []
-    for path in sorted(daily_dir.glob("*.parquet")):
-        try:
-            df = pd.read_parquet(path, columns=["date", "close", "volume"])
-        except Exception:
-            continue
-        if df.empty:
-            continue
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.sort_values("date").dropna(subset=["date", "close"])
-        if start_ts is not None:
-            df = df[df["date"] >= start_ts]
-        if len(df) < 2:
-            continue
-        df["ret_1d_pct"] = df["close"].pct_change() * 100
-        rows.append(df[["date", "ret_1d_pct", "volume"]])
-    if not rows:
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    read_start = (start_ts - pd.Timedelta(days=10)).strftime("%Y%m%d") if start_ts is not None else None
+    all_daily = store.read_market_range(
+        daily_dir.name,
+        start_date=read_start,
+        columns=["ts_code", "trade_date", "date", "close", "volume"],
+    )
+    if all_daily.empty:
         return pd.DataFrame()
-
-    all_daily = pd.concat(rows, ignore_index=True)
+    all_daily["date"] = pd.to_datetime(all_daily["date"], errors="coerce")
+    all_daily = all_daily.sort_values(["ts_code", "date"]).dropna(subset=["date", "close"])
+    all_daily["ret_1d_pct"] = all_daily.groupby("ts_code")["close"].pct_change() * 100
+    if start_ts is not None:
+        all_daily = all_daily[all_daily["date"] >= start_ts]
     all_daily["limit_up_proxy"] = all_daily["ret_1d_pct"] >= 9.5
     all_daily["limit_down_proxy"] = all_daily["ret_1d_pct"] <= -9.5
     all_daily["strong_up_proxy"] = all_daily["ret_1d_pct"] >= 5.0

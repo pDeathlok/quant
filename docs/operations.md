@@ -201,12 +201,30 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_DAILY_FINAL_RETRY_ROUNDS` | `2` | 最终失败较多时谨慎增加 |
 | `ROUTINE_DAILY_FINAL_RETRY_WORKERS` | `4` | 限频时降低 |
 | `ROUTINE_DAILY_FINAL_RETRY_SLEEP` | `0.8` | 最终重试仍限频时提高 |
+| `MARKET_DATA_SQL_BATCH_SIZE` | `5000` | 统一行情表批量 upsert 行数；遇到 `max_allowed_packet` 限制时降低 |
+| `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日拉取的并发数；限频时降低 |
+| `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔；限频时提高 |
+| `ROUTINE_DAILY_BASIC_RETRIES` | `3` | `daily_basic` 单日失败重试次数 |
+| `TUSHARE_STOCK_BASIC_TTL_HOURS` | `24` | `stock_basic` 请求缓存最长有效时间；同一流水线内复用，避免重复请求 |
+| `ROUTINE_FINANCIAL_PERIODS` | `4` | 每日通过 Tushare VIP 重拉的最近报告期数 |
+| `ROUTINE_FINANCIAL_SLEEP` | `0.15` | 财务 VIP 请求之间的最小间隔秒数 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 内存或 CPU 紧张时降低 |
+| `ROUTINE_FEATURE_EXECUTOR` | `processes` | CPU 密集的特征计算默认使用多进程；调试时可改为 `threads` |
+| `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量候选与 `daily_basic` 匹配率门禁；不建议调低 |
+| `ROUTINE_CHAN_WORKERS` | `8` | 缠论增量候选扫描并发数；内存或 CPU 紧张时降低 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 下游接口限频或机器负载高时降低 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似向量计算占用高时降低 |
 | `SIMILAR_PATTERN_FORCE_VECTOR_CACHE` | 空 | 设为 `1` 可在下一次相似走势刷新时强制重建全市场参考库；正常每日任务无需设置 |
 
 一次运行同时包含多层并发。不要盲目把每个并发参数都调大；优先观察内存、CPU、Tushare 限频和 MySQL 写入延迟。
+
+日线正式存储为 MySQL `market_daily` 与年月分区 Parquet 镜像。每日刷新只更新当天所在月份，旧的 `data/raw/daily/*.parquet` 逐股票文件和 `daily_XXXXXX_XX` MySQL 分表不再使用。
+
+B1-family 与 z-skill 的生产信号刷新一次读取统一行情分区，再按股票分组交给多进程计算。每日流程不自动物化逐股票因子缓存，避免数千个小文件和额外 I/O。
+
+日线和 `daily_basic` 完成后，流水线还会刷新因子参考数据：`stock_basic` 每日缓存复用并同步，沪深300按最新日期回看 10 天增量合并，`fina_indicator` / `income` / `cashflow` 通过 VIP 接口重拉最近 4 个报告期，并更新 `v44` 使用的全市场分析师一致预期快照。同一交易日重试会复用已成功的财务和分析师快照检查点。所有写入都使用业务唯一键去重和临时文件原子替换；审计位于 `data/raw/source_audit/*_reference_data/manifest.json`。
+
+若任务在共享数据刷新之后失败，当天重试会直接复用已通过门禁的日线、`daily_basic` 和参考数据，从特征计算阶段续跑；若核心与扩展股票池已经完成，则从下游工作区或快照阶段续跑。跨日任务不会复用旧检查点。
 
 ## 常见故障
 

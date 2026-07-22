@@ -16,6 +16,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
 from quant.strategies.custom.chan_daily import add_chan_daily_signals
 
 
@@ -34,8 +35,12 @@ class ExitRule:
     ma_exit: str | None = None
 
 
-def read_daily_file(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+def read_daily_file(
+    path: Path,
+    start_date: str | pd.Timestamp | None = None,
+    source_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    df = source_frame.copy() if source_frame is not None else read_partitioned_symbol_file(path, start_date=start_date)
     if "trade_date" in df.columns:
         df["date"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
     elif "date" in df.columns:
@@ -57,13 +62,20 @@ def build_candidates(
     max_workers: int = 1,
     min_rows: int = 140,
 ) -> pd.DataFrame:
-    files = sorted(daily_dir.glob("*.parquet"))
     frames: list[pd.DataFrame] = []
     start_ts = pd.to_datetime(start_date)
+    history_start = start_ts - pd.Timedelta(days=800)
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    market = store.read_market_range(daily_dir.name, start_date=history_start.strftime("%Y%m%d"))
+    tasks = [
+        (daily_dir / f"{symbol}.parquet", group.reset_index(drop=True))
+        for symbol, group in market.groupby("ts_code", sort=False)
+    ]
 
-    def process(path: Path) -> pd.DataFrame | None:
+    def process(task: tuple[Path, pd.DataFrame]) -> pd.DataFrame | None:
+        path, source_frame = task
         try:
-            daily = read_daily_file(path)
+            daily = read_daily_file(path, source_frame=source_frame)
             if len(daily) < min_rows:
                 return None
             signal_frame = add_chan_daily_signals(daily)
@@ -104,23 +116,23 @@ def build_candidates(
             return None
 
     if max_workers <= 1:
-        for n, path in enumerate(files, start=1):
-            result = process(path)
+        for n, task in enumerate(tasks, start=1):
+            result = process(task)
             if result is not None:
                 frames.append(result)
-            if n % 500 == 0 or n == len(files):
-                print(f"  candidates: {n}/{len(files)} files")
+            if n % 500 == 0 or n == len(tasks):
+                print(f"  candidates: {n}/{len(tasks)} symbols")
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process, path) for path in files]
+            futures = [executor.submit(process, task) for task in tasks]
             for n, future in enumerate(as_completed(futures), start=1):
                 result = future.result()
                 if result is not None:
                     frames.append(result)
-                if n % 500 == 0 or n == len(files):
-                    print(f"  candidates: {n}/{len(files)} files")
+                if n % 500 == 0 or n == len(tasks):
+                    print(f"  candidates: {n}/{len(tasks)} symbols")
 
     if not frames:
         return pd.DataFrame()

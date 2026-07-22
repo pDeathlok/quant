@@ -27,8 +27,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 import build_training_data_parallel as btd
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR
+from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
 from quant.data.source_merge import normalize_tushare_daily
-from quant.features.variable_library import build_continuous_ohlc, calculate_project_extra_features
+from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
+from quant.features.variable_library import build_continuous_ohlc
 from train_z_skill_models_and_backtest import (
     AucGapEarlyStopping,
     LABELS,
@@ -61,10 +63,10 @@ def _process_symbol(args: tuple[str, pd.DataFrame, list[str], pd.Timestamp]) -> 
     path_str, signal_rows, signals, target_date = args
     path = Path(path_str)
     try:
-        daily = pd.read_parquet(path)
+        history_start = target_date - pd.Timedelta(days=450)
+        daily = read_partitioned_symbol_file(path, start_date=history_start, end_date=target_date)
         daily = normalize_tushare_daily(daily, path.stem)
         daily = daily.sort_values("date").reset_index(drop=True)
-        history_start = target_date - pd.Timedelta(days=450)
         daily = daily[(daily["date"] >= history_start) & (daily["date"] <= target_date)].reset_index(drop=True)
         if len(daily) < 130 or daily["date"].max() < target_date:
             return None
@@ -72,7 +74,14 @@ def _process_symbol(args: tuple[str, pd.DataFrame, list[str], pd.Timestamp]) -> 
         if "ST" in name.upper() or "退" in name:
             return None
 
-        factors = pd.concat([btd.calculate_factors_single_stock(daily), calculate_project_extra_features(daily)], axis=1)
+        shared = attach_daily_base_factors(
+            daily,
+            symbol=path.stem,
+            compute_if_missing=True,
+            persist_missing=False,
+        )
+        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
+        factors = pd.concat([btd.calculate_factors_single_stock(daily), shared[shared_cols]], axis=1)
         factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
         price = build_continuous_ohlc(daily)
         close_pos = ((price["close"] - price["low"]) / (price["high"] - price["low"]).replace(0, np.nan)).rename("close_pos")
@@ -102,7 +111,11 @@ def build_latest_dataset(daily_dir: Path, signals: list[str], start_date: str, t
 
     by_symbol = {symbol: group[["symbol", "date", *signals]].copy() for symbol, group in target_rows.groupby("symbol")}
     suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
-    files = [path for path in sorted(daily_dir.glob("*.parquet")) if path.name.endswith(suffixes) and path.stem in by_symbol]
+    files = [
+        path
+        for path in list_partitioned_symbol_paths(daily_dir)
+        if path.name.endswith(suffixes) and path.stem in by_symbol
+    ]
     frames: list[pd.DataFrame] = []
     started = perf_counter()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:

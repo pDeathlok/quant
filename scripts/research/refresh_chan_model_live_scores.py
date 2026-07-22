@@ -48,12 +48,13 @@ from quant.strategies.custom.chan_model import (
 )
 
 
-DEFAULT_DAILY_DIR = PROJECT_ROOT / "data/stocks_daily"
+DEFAULT_DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports/chan_daily"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models/research/chan_daily"
 DEFAULT_TOP_LIST_DIR = PROJECT_ROOT / "data/raw/moneyflow"
 DEFAULT_DAILY_BASIC_DIR = PROJECT_ROOT / "data/raw/daily_basic"
 DEFAULT_SCORED_PATH = DEFAULT_REPORT_DIR / "model_filter/chan_model_scored_candidates.parquet"
+DEFAULT_REFRESH_MANIFEST_PATH = DEFAULT_REPORT_DIR / "model_filter/live_refresh_manifest.json"
 DEFAULT_OUTPUT_DIR = DEFAULT_REPORT_DIR / "model_strategy"
 
 
@@ -88,6 +89,24 @@ def _load_models(model_dir: Path) -> dict[str, dict[str, Any]]:
     return models
 
 
+def _resolve_daily_path(daily_dir: Path, symbol: str) -> Path | None:
+    value = str(symbol)
+    direct = daily_dir / f"{value}.parquet"
+    if direct.exists():
+        return direct
+    digits = value.split(".", 1)[0].zfill(6)
+    legacy = daily_dir / f"{digits}.parquet"
+    if legacy.exists():
+        return legacy
+    matches = sorted(daily_dir.glob(f"{digits}.*.parquet"))
+    if matches:
+        return matches[0]
+    suffix = "SH" if digits.startswith(("6", "9")) else "BJ" if digits.startswith(("4", "8")) else "SZ"
+    canonical = daily_dir / f"{digits}.{suffix}.parquet"
+    partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
+    return canonical if partition_root.exists() else None
+
+
 def _build_recent_feature_dataset(
     candidates: pd.DataFrame,
     daily_dir: Path,
@@ -99,16 +118,17 @@ def _build_recent_feature_dataset(
     signal = candidates[candidates["signal_chan_daily_long"].eq(1)].copy()
     signal["date"] = pd.to_datetime(signal["date"], errors="coerce")
     signal = signal[signal["date"].between(pd.Timestamp(start), pd.Timestamp(end))].copy()
-    signal["symbol"] = signal["symbol"].astype(str).str.zfill(6)
+    signal["symbol"] = signal["symbol"].map(normalize_ts_code)
     if signal.empty:
         return pd.DataFrame()
 
     frames: list[pd.DataFrame] = []
     for symbol, group in signal.groupby("symbol"):
-        path = daily_dir / f"{symbol}.parquet"
-        if not path.exists():
+        path = _resolve_daily_path(daily_dir, str(symbol))
+        if path is None:
             continue
         daily = add_stock_features(read_daily_file(path))
+        daily["symbol"] = daily["symbol"].map(normalize_ts_code)
         daily["entry_open"] = daily["open"].shift(-1)
         daily["entry_gap_pct"] = (daily["entry_open"] / daily["close"] - 1) * 100
         keep = [
@@ -205,9 +225,24 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
     args.scored_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.rebuild_candidates:
-        candidates = build_candidates(args.daily_dir, args.candidate_start_date, args.max_workers)
-        candidates.to_parquet(args.report_dir / "chan_daily_candidates.parquet", index=False)
-        candidates.to_csv(args.report_dir / "chan_daily_candidates.csv", index=False)
+        candidate_path = args.report_dir / "chan_daily_candidates.parquet"
+        incremental_start = args.start if candidate_path.exists() else args.candidate_start_date
+        fresh_candidates = build_candidates(args.daily_dir, incremental_start, args.max_workers)
+        historical_candidates = pd.read_parquet(candidate_path) if candidate_path.exists() else pd.DataFrame()
+        if not historical_candidates.empty:
+            historical_candidates["date"] = pd.to_datetime(historical_candidates["date"], errors="coerce")
+            historical_candidates = historical_candidates[
+                ~historical_candidates["date"].between(pd.Timestamp(args.start), pd.Timestamp(args.end))
+            ].copy()
+        candidates = pd.concat([historical_candidates, fresh_candidates], ignore_index=True, sort=False)
+        candidates["date"] = pd.to_datetime(candidates["date"], errors="coerce")
+        candidates = candidates.sort_values(["date", "symbol"]).drop_duplicates(
+            ["date", "symbol"],
+            keep="last",
+        )
+        args.report_dir.mkdir(parents=True, exist_ok=True)
+        candidates.to_parquet(candidate_path, index=False)
+        candidates.to_csv(candidate_path.with_suffix(".csv"), index=False)
     else:
         candidates = pd.read_parquet(args.report_dir / "chan_daily_candidates.parquet")
 
@@ -251,7 +286,7 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
 
-    return {
+    result = {
         "status": "success",
         "start": args.start,
         "end": args.end,
@@ -262,6 +297,24 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
         "strategy": strategy_meta,
         "snapshots": snapshot_results,
     }
+    manifest_path = args.scored_path.parent / DEFAULT_REFRESH_MANIFEST_PATH.name
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "processed_through": args.end,
+                "daily_dir": str(args.daily_dir),
+                "daily_basic_dir": str(args.daily_basic_dir),
+                "live_rows": result["live_rows"],
+                "combined_max_date": result["combined_max_date"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    result["manifest_path"] = str(manifest_path)
+    return result
 
 
 def parse_args() -> argparse.Namespace:

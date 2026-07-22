@@ -215,6 +215,69 @@ def test_live_long_base_skips_persistent_backtest_cache_and_reuses_memory(monkey
     services._load_live_long_base_cached.cache_clear()
 
 
+def test_live_long_base_keeps_two_sections_and_bounded_history(monkeypatch) -> None:
+    observed = {}
+    dates = pd.to_datetime(["2026-05-29", "2026-06-30", "2026-07-21"])
+    daily_basic = pd.DataFrame(
+        {
+            "date": dates,
+            "trade_date": dates.strftime("%Y%m%d"),
+            "ts_code": ["000001.SZ"] * 3,
+        }
+    )
+    features = pd.DataFrame({"date": dates[-2:], "ts_code": ["000001.SZ"] * 2})
+    stock_basic = pd.DataFrame({"ts_code": ["000001.SZ"]})
+
+    class FakeModule:
+        @staticmethod
+        def load_stock_basic():
+            return stock_basic
+
+        @staticmethod
+        def load_daily_basic_monthly(start, end):
+            observed["basic_start"] = start
+            observed["basic_end"] = end
+            return daily_basic, {"first_trade_date": "20260529"}
+
+        @staticmethod
+        def load_daily_monthly_features(start, end, basic, candidate_symbols, **kwargs):
+            observed["price_start"] = start
+            return features, pd.DataFrame()
+
+    services._load_live_long_base_cached.cache_clear()
+    monkeypatch.setattr(services, "_long_research_module", lambda: FakeModule())
+
+    loaded_features, loaded_basic, _, coverage = services._load_live_long_base("2026-07-21")
+
+    assert observed["basic_start"] == pd.Timestamp("2023-03-21")
+    assert observed["price_start"] == pd.Timestamp("2026-06-30")
+    assert loaded_features["date"].tolist() == list(dates[-2:])
+    assert loaded_basic["date"].tolist() == list(dates[-2:])
+    assert coverage["live_rebalance_dates"] == ["2026-06-30", "2026-07-21"]
+    services._load_live_long_base_cached.cache_clear()
+
+
+def test_tea_checkpoint_recovers_previous_month_targets(monkeypatch) -> None:
+    monkeypatch.setattr(
+        services,
+        "_read_long_stock_pool_snapshot",
+        lambda *args, **kwargs: {
+            "signal_date": "2026-07-20",
+            "stocks": [
+                {"ts_code": "000001.SZ", "rank": 1, "previous_state": "CORE"},
+                {"ts_code": "000002.SZ", "rank": 2, "previous_state": "WATCH"},
+                {"ts_code": "000003.SZ", "rank": None, "previous_state": "CORE"},
+            ],
+        },
+    )
+
+    same_month = services._tea_previous_target_checkpoint("tea", pd.Timestamp("2026-07-21"))
+    next_month = services._tea_previous_target_checkpoint("tea", pd.Timestamp("2026-08-03"))
+
+    assert same_month == {"000001.SZ", "000003.SZ"}
+    assert next_month == {"000001.SZ", "000002.SZ"}
+
+
 def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
     submitted = []
 
@@ -242,6 +305,7 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
     monkeypatch.setattr(services, "ThreadPoolExecutor", FakeExecutor)
     monkeypatch.setattr(services, "as_completed", lambda futures: list(futures))
     monkeypatch.setattr(services, "_set_refresh_progress", lambda **kwargs: None)
+    monkeypatch.setattr("quant.routine.pipeline._incremental_daily_start", lambda: "20260720")
     monkeypatch.setattr(
         services,
         "get_stock_selector_payload",
@@ -272,6 +336,27 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
     assert len([item for item in submitted if item[0] == "submit"]) == 6
     assert result["snapshot"]["strategy_pools"] == {"ALL": 0}
     assert result["similar_patterns"]["status"] == "success"
+
+
+def test_same_day_failed_run_can_reuse_completed_source_inputs() -> None:
+    today = pd.Timestamp.now().isoformat()
+    status = {
+        "status": "failed",
+        "started_at": today,
+        "result": {
+            "refresh_data": {"status": "success"},
+            "refresh_daily_basic": {"status": "success"},
+            "refresh_reference_inputs": {
+                "status": "success",
+                "steps": {"analyst_forecast_snapshot": {"status": "success"}},
+            },
+            "feature_cache": {"status": "failed"},
+        },
+    }
+
+    assert services._input_resume_ready(status, "all") is True
+    status["result"]["refresh_daily_basic"]["status"] = "failed"
+    assert services._input_resume_ready(status, "all") is False
 
 
 def test_similar_pattern_refresh_updates_vector_caches(monkeypatch, tmp_path) -> None:

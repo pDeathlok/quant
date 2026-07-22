@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 import build_training_data_parallel as btd
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.features.variable_library import (
     EXTRA_FEATURE_COLUMNS,
     build_continuous_ohlc,
@@ -38,6 +39,7 @@ DEFAULT_DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
 DEFAULT_DAILY_BASIC_DIR = PROJECT_ROOT / "data/raw/daily_basic"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "reports/b1/research"
 DEFAULT_CANDIDATE_CACHE = PROJECT_ROOT / "data/features/b1/candidates_strict_no_volume_20240101.parquet"
+DEFAULT_FEATURE_CACHE = PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet"
 
 MODEL_PATHS = {
     "up8_es": PROJECT_ROOT / "models/production/b1/up8_es.joblib",
@@ -95,15 +97,29 @@ def process_strict_b1_no_volume_file(args: tuple[str, str, dict[str, dict]]) -> 
     path = Path(path_str)
     try:
         df = pd.read_parquet(path)
+        return process_strict_b1_no_volume_frame((path.stem, df, start_date, meta_by_ts_code))
+    except Exception as exc:
+        print(f"  skip {path.name}: {exc}")
+        return None
+
+
+def process_strict_b1_no_volume_frame(
+    args: tuple[str, pd.DataFrame, str, dict[str, dict]],
+) -> pd.DataFrame | None:
+    symbol, source_frame, start_date, meta_by_ts_code = args
+    try:
+        df = source_frame.copy()
         if "trade_date" in df.columns:
-            df["date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
+            df["date"] = pd.to_datetime(
+                df["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+            )
         else:
-            df["date"] = pd.to_datetime(df["date"])
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
         if "vol" in df.columns and "volume" not in df.columns:
             df = df.rename(columns={"vol": "volume"})
         if "ts_code" not in df.columns:
-            df["ts_code"] = path.stem
-        df["symbol"] = df["ts_code"].astype(str)
+            df["ts_code"] = symbol
+        df["symbol"] = str(symbol)
         df = df.sort_values("date").reset_index(drop=True)
         start_ts = pd.to_datetime(start_date)
         history_start = start_ts - pd.Timedelta(days=400)
@@ -111,7 +127,7 @@ def process_strict_b1_no_volume_file(args: tuple[str, str, dict[str, dict]]) -> 
         if len(df) < 130:
             return None
 
-        meta = meta_by_ts_code.get(str(df["ts_code"].iloc[0]), {})
+        meta = meta_by_ts_code.get(str(symbol), {})
         for col in ["name", "industry", "market"]:
             if col in meta:
                 df[col] = meta[col]
@@ -137,7 +153,7 @@ def process_strict_b1_no_volume_file(args: tuple[str, str, dict[str, dict]]) -> 
         result = result[(result["date"] >= start_ts) & strict_no_volume].copy()
         return result if len(result) > 0 else None
     except Exception as exc:
-        print(f"  skip {path.name}: {exc}")
+        print(f"  skip {symbol}: {exc}")
         return None
 
 
@@ -147,44 +163,36 @@ def build_strict_b1_no_volume_candidates(
     cache_path: Path | None = None,
     max_workers: int = 8,
     executor_type: str = "threads",
+    force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Build strict B1 candidates from raw daily files, removing the volume condition."""
-    if cache_path and cache_path.exists():
-        df = pd.read_parquet(cache_path)
-        df["date"] = pd.to_datetime(df["date"])
-        return df[df["date"] >= pd.to_datetime(start_date)].copy()
+    """Derive formal candidates from the single unified B1 feature cache."""
+    start_ts = pd.to_datetime(start_date)
 
-    stock_basic = load_stock_basic()
-    basic_cols = [col for col in ["ts_code", "name", "industry", "market"] if col in stock_basic.columns]
-    stock_basic = stock_basic[basic_cols].drop_duplicates("ts_code") if "ts_code" in basic_cols else stock_basic
-    meta_by_ts_code = (
-        stock_basic.set_index("ts_code").to_dict("index")
-        if "ts_code" in stock_basic.columns and not stock_basic.empty
-        else {}
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    market_latest = store.latest_dataset_trade_date(daily_dir.name)
+    if DEFAULT_FEATURE_CACHE.exists():
+        features = pd.read_parquet(DEFAULT_FEATURE_CACHE)
+        features["date"] = pd.to_datetime(features["date"])
+        feature_latest = features["date"].max() if not features.empty else pd.NaT
+        if market_latest is None or (pd.notna(feature_latest) and feature_latest >= market_latest):
+            derived = features[features["date"] >= start_ts].copy()
+            # Legacy production models still name these two equivalent inputs
+            # differently from the unified feature library.
+            if "kdj_j" not in derived and "kdj_d_j" in derived:
+                derived["kdj_j"] = derived["kdj_d_j"]
+            if "turnover_ratio" not in derived and "volume_relative_60d" in derived:
+                derived["turnover_ratio"] = derived["volume_relative_60d"]
+            derived = derived.sort_values(["symbol", "date"]).reset_index(drop=True)
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                derived.to_parquet(cache_path, index=False)
+                print(f"Candidate cache derived from unified B1 feature cache: {cache_path}")
+            return derived
+    raise RuntimeError(
+        "Unified B1 feature cache is missing or stale; run refresh_b1_feature_cache.py "
+        "before building formal candidates. Candidate-local factor rebuilding is disabled "
+        "to prevent feature-definition drift."
     )
-
-    files = sorted(daily_dir.glob("*.parquet"))
-    frames = []
-    tasks = [(str(path), start_date, meta_by_ts_code) for path in files]
-    executor_cls = ThreadPoolExecutor if executor_type == "threads" else ProcessPoolExecutor
-    with executor_cls(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_strict_b1_no_volume_file, task) for task in tasks]
-        for n, future in enumerate(as_completed(futures), start=1):
-            result = future.result()
-            if result is not None and len(result) > 0:
-                frames.append(result)
-            if n % 500 == 0 or n == len(futures):
-                print(f"  strict no-volume candidates: {n}/{len(futures)} files")
-
-    if not frames:
-        raise RuntimeError("No strict no-volume B1 candidates were built")
-
-    combined = pd.concat(frames, ignore_index=True).sort_values(["symbol", "date"]).reset_index(drop=True)
-    if cache_path:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        combined.to_parquet(cache_path)
-        print(f"Candidate cache written: {cache_path}")
-    return combined
 
 
 def predict_models(df: pd.DataFrame) -> pd.DataFrame:
@@ -483,7 +491,30 @@ def read_daily_file(daily_dir: Path, symbol: str) -> pd.DataFrame | None:
 
 
 def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: int) -> pd.DataFrame:
-    symbols = candidates["symbol"].dropna().unique().tolist()
+    if candidates.empty:
+        return candidates.copy()
+    prepared = candidates.copy()
+    prepared["date"] = pd.to_datetime(prepared["date"])
+    prepared["symbol"] = prepared["symbol"].astype(str)
+    prepared["_candidate_order"] = np.arange(len(prepared))
+    symbols = prepared["symbol"].dropna().unique().tolist()
+    start_date = prepared["date"].min().strftime("%Y%m%d")
+    end_date = (prepared["date"].max() + pd.Timedelta(days=max_hold_days * 3 + 10)).strftime("%Y%m%d")
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    market = store.read_market_range(
+        daily_dir.name,
+        start_date=start_date,
+        end_date=end_date,
+        symbols=symbols,
+        columns=["ts_code", "trade_date", "open", "high", "low", "close", "pre_close"],
+    )
+    if market.empty:
+        raise RuntimeError(f"No canonical daily rows found under {daily_dir.parent}")
+    market["ts_code"] = market["ts_code"].astype(str)
+    market_by_symbol = {symbol: frame for symbol, frame in market.groupby("ts_code", sort=False)}
+    candidate_by_symbol = {
+        symbol: frame for symbol, frame in prepared.groupby("symbol", sort=False)
+    }
     frames = []
     future_cols = ["entry_open", "date_t1", "open_t1", "high_t1", "low_t1", "close_t1"]
     for day in range(2, max_hold_days + 2):
@@ -491,9 +522,17 @@ def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: 
         future_cols.extend([f"open_t{day}", f"high_t{day}", f"low_t{day}", f"close_t{day}"])
 
     for n, symbol in enumerate(symbols, start=1):
-        daily = read_daily_file(daily_dir, symbol)
-        if daily is None:
+        raw_daily = market_by_symbol.get(symbol)
+        if raw_daily is None or raw_daily.empty:
             continue
+        daily = raw_daily.copy()
+        daily["date"] = pd.to_datetime(
+            daily["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+        )
+        daily["symbol"] = symbol
+        if "vol" in daily.columns and "volume" not in daily.columns:
+            daily = daily.rename(columns={"vol": "volume"})
+        daily = daily.sort_values("date").reset_index(drop=True)
         daily = build_continuous_ohlc(daily)
         keep_cols = ["symbol", "date", "open", "high", "low", "close"]
         daily = daily[keep_cols].copy()
@@ -511,19 +550,19 @@ def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: 
             future[f"high_t{day}"] = daily["high"].shift(-day)
             future[f"low_t{day}"] = daily["low"].shift(-day)
             future[f"close_t{day}"] = daily["close"].shift(-day)
-        frames.append(future)
+        enriched = candidate_by_symbol[symbol].merge(future, on=["symbol", "date"], how="left")
+        frames.append(enriched)
         if n % 500 == 0:
             print(f"  future prices: {n}/{len(symbols)} symbols")
 
     if not frames:
-        raise RuntimeError(f"No daily files found under {daily_dir}")
+        raise RuntimeError(f"No candidate symbols matched canonical daily data under {daily_dir.parent}")
 
-    future_all = pd.concat(frames, ignore_index=True)
-    merged = candidates.merge(future_all, on=["symbol", "date"], how="left")
+    merged = pd.concat(frames, ignore_index=True).sort_values("_candidate_order")
     if "_adjusted_signal_close" in merged.columns:
         merged["close"] = merged["_adjusted_signal_close"].combine_first(merged.get("close"))
         merged = merged.drop(columns=["_adjusted_signal_close"])
-    return merged.dropna(subset=["entry_open"]).copy()
+    return merged.drop(columns=["_candidate_order"]).dropna(subset=["entry_open"]).copy()
 
 
 def simulate_exit(df: pd.DataFrame, rule: ExitRule) -> pd.DataFrame:
@@ -737,6 +776,16 @@ def parse_args() -> argparse.Namespace:
         help="rank uses daily top-N/top-percent rules; threshold uses fixed score/probability thresholds",
     )
     parser.add_argument("--candidate-cache", type=Path, default=None, help="Optional parquet cache for rebuilt candidates")
+    parser.add_argument(
+        "--force-candidate-refresh",
+        action="store_true",
+        help="Rewrite the derived candidate cache from the unified feature cache.",
+    )
+    parser.add_argument(
+        "--build-candidates-only",
+        action="store_true",
+        help="Stop after writing/validating the strict candidate cache.",
+    )
     parser.add_argument("--max-workers", type=int, default=8, help="Workers for strict candidate rebuild")
     parser.add_argument(
         "--executor",
@@ -763,11 +812,18 @@ def main() -> None:
             cache_path,
             args.max_workers,
             args.executor,
+            force_refresh=args.force_candidate_refresh,
         )
     else:
         print(f"Loading candidates: {args.data}")
         candidates = load_candidates(args.data, args.start_date)
     print(f"Candidates after {args.start_date}: {len(candidates):,}")
+    if args.build_candidates_only:
+        print(
+            f"Candidate range: {pd.to_datetime(candidates['date']).min():%Y-%m-%d}"
+            f" to {pd.to_datetime(candidates['date']).max():%Y-%m-%d}"
+        )
+        return
     candidates = merge_daily_basic_features(candidates, args.daily_basic_dir)
 
     print("Predicting entry models...")

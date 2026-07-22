@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
@@ -339,18 +341,30 @@ def load_daily_monthly_features(
     returns: list[pd.DataFrame] = []
     stock_meta = stock_basic.set_index("ts_code") if not stock_basic.empty else pd.DataFrame()
 
-    paths = sorted(DAILY_DIR.glob("*.parquet"))
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+    market = store.read_market_range(
+        DAILY_DIR.name,
+        start_date=history_start.strftime("%Y%m%d"),
+        end_date=end.strftime("%Y%m%d") if end is not None else None,
+        symbols=candidate_symbols,
+        columns=["ts_code", "trade_date", "open", "high", "low", "close", "pct_chg"],
+    )
+    if market.empty:
+        legacy_frames = []
+        for path in sorted(DAILY_DIR.glob("*.parquet")):
+            frame = pd.read_parquet(path)
+            if "ts_code" not in frame.columns or frame["ts_code"].isna().all():
+                frame["ts_code"] = path.stem
+            legacy_frames.append(frame)
+        market = pd.concat(legacy_frames, ignore_index=True, sort=False) if legacy_frames else pd.DataFrame()
     processed = 0
-    for n, path in enumerate(paths, start=1):
-        ts_code = normalize_ts_code(path)
+    grouped = market.groupby("ts_code", sort=True) if not market.empty else []
+    for _, (ts_code, source_frame) in enumerate(grouped, start=1):
         if candidate_symbols is not None and ts_code not in candidate_symbols:
             continue
         processed += 1
         try:
-            df = pd.read_parquet(
-                path,
-                columns=["ts_code", "trade_date", "open", "high", "low", "close", "pct_chg"],
-            )
+            df = source_frame.copy()
         except Exception:
             continue
         if df.empty:

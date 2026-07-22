@@ -10,7 +10,7 @@ only, because real early/tail execution needs minute data.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +20,9 @@ import pandas as pd
 
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
-from quant.features.variable_library import build_continuous_ohlc, calculate_project_extra_features
+from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.variable_library import build_continuous_ohlc
 from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
 from quant.strategies.custom.vegas_tunnel import OPTIMIZED_VEGAS_TUNNEL_PARAMS, add_vegas_tunnel_signals
 
@@ -241,12 +243,25 @@ def normalize_daily(path: Path) -> pd.DataFrame:
     return df
 
 
+def normalize_daily_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Normalize one symbol sliced from the canonical market dataset."""
+
+    df = frame.copy()
+    if "trade_date" in df.columns:
+        df["date"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    else:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if "vol" in df.columns and "volume" not in df.columns:
+        df["volume"] = df["vol"]
+    df["symbol"] = symbol
+    if "ts_code" not in df.columns:
+        df["ts_code"] = symbol
+    return df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
+
+
 def compute_signal_flags(df: pd.DataFrame) -> pd.DataFrame:
-    extra = calculate_project_extra_features(df)
-    out = df.copy()
-    for col in extra.columns:
-        if col not in out.columns:
-            out[col] = extra[col]
+    symbol = str(df["symbol"].dropna().iloc[-1]) if "symbol" in df.columns and df["symbol"].notna().any() else ""
+    out = attach_daily_base_factors(df, symbol=symbol, compute_if_missing=True, persist_missing=False)
 
     price = build_continuous_ohlc(out)
     close = price["close"]
@@ -469,6 +484,25 @@ def process_file(path: Path) -> pd.DataFrame | None:
         return None
 
 
+def process_frame(symbol: str, frame: pd.DataFrame) -> pd.DataFrame | None:
+    """Build family signals without reopening storage for every symbol."""
+
+    try:
+        df = normalize_daily_frame(frame, symbol)
+        if len(df) < 160:
+            return None
+        if "name" in df.columns:
+            names = df["name"].fillna("").astype(str)
+            df = df[~names.str.upper().str.contains("ST") & ~names.str.contains("退")].copy()
+        signals = compute_signal_flags(df)
+        signal_cols = [spec.name for spec in build_signal_specs()]
+        signals = signals[signals[signal_cols].any(axis=1)].copy()
+        return signals if not signals.empty else None
+    except Exception as exc:
+        print(f"skip {symbol}: {exc}", flush=True)
+        return None
+
+
 def _parse_start_date(value: str | None) -> pd.Timestamp | None:
     if not value:
         return None
@@ -496,10 +530,19 @@ def build_signal_candidates(
             print("signal cache is missing new columns; rebuilding", flush=True)
             cached = None
 
-    files = sorted(DEFAULT_DAILY_DIR.glob("*.parquet"))
+    rebuild_from = incremental_start or pd.Timestamp("2020-01-01")
+    history_start = rebuild_from - pd.Timedelta(days=600)
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DEFAULT_DAILY_DIR.parent))
+    market = store.read_market_range(DEFAULT_DAILY_DIR.name, start_date=history_start.strftime("%Y%m%d"))
+    if market.empty:
+        raise RuntimeError(f"No canonical daily rows found for {history_start:%Y-%m-%d}+")
+    tasks = [
+        (str(symbol), group.reset_index(drop=True))
+        for symbol, group in market.groupby("ts_code", sort=False)
+    ]
     frames = []
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [executor.submit(process_file, path) for path in files]
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = [executor.submit(process_frame, symbol, frame) for symbol, frame in tasks]
         for n, future in enumerate(as_completed(futures), start=1):
             result = future.result()
             if result is not None and not result.empty:
@@ -508,7 +551,7 @@ def build_signal_candidates(
                 if not result.empty:
                     frames.append(result)
             if n % 500 == 0 or n == len(futures):
-                print(f"  family signals: {n}/{len(futures)} files", flush=True)
+                print(f"  family signals: {n}/{len(futures)} symbols", flush=True)
     if cached is not None and incremental_start is not None:
         old = cached[pd.to_datetime(cached["date"]) < incremental_start].copy()
         if frames:

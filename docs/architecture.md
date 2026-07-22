@@ -38,6 +38,7 @@ PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
 ```mermaid
 flowchart TD
     A[刷新共享日线数据] --> B1[构建 B1 特征缓存]
+    A --> R[刷新 stock_basic / 沪深300 / 财务报表]
     A --> B2[重建全市场规则信号]
     B1 --> C[计算最新模型评分]
     B2 --> D[短线核心与扩展股票池]
@@ -89,7 +90,8 @@ flowchart TD
 `MarketDataStore` 由环境变量控制：
 
 - 配置 `MARKET_DATA_SQL_URL` 时读写 MySQL。
-- `MARKET_DATA_MIRROR_PARQUET=1` 时同时写 Parquet，供仍按目录扫描的研究脚本使用。
+- 日线只写统一表 `market_daily`，以 `(ts_code, trade_date)` 为唯一键批量 upsert，不再创建逐股票分表。
+- `MARKET_DATA_MIRROR_PARQUET=1` 时同步更新年月分区 `data/raw/daily_partitioned/year_month=YYYYMM/data.parquet`，不再重写逐股票历史文件。
 - 未配置 SQL URL 时，本地读取可回落到 Parquet。
 
 ### 应用快照

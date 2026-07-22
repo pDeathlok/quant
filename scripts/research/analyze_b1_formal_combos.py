@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -112,6 +114,31 @@ def main() -> None:
     candidates["date"] = pd.to_datetime(candidates["date"])
     candidates = candidates[candidates["date"] >= pd.Timestamp("2024-01-01")].copy()
     candidates = predict_models(candidates)
+
+    compatibility = {
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "candidate_rows": int(len(candidates)),
+        "candidate_date_min": str(candidates["date"].min().date()),
+        "candidate_date_max": str(candidates["date"].max().date()),
+        "stable_threshold_rows": int(
+            ((candidates["pred_up8_es"] >= 0.55) & (candidates["pred_down3_es"] <= 0.55)).sum()
+        ),
+        "aggressive_threshold_rows": int(
+            ((candidates["pred_up8_es"] >= 0.65) & (candidates["pred_down3_es"] <= 0.50)).sum()
+        ),
+        "status": "valid",
+    }
+    if compatibility["stable_threshold_rows"] < 30 or compatibility["aggressive_threshold_rows"] < 10:
+        compatibility["status"] = "incompatible"
+        compatibility["reason"] = (
+            "Production model thresholds are incompatible with the unified feature distribution; "
+            "retrain and recalibrate before publishing a replacement backtest."
+        )
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DIR / "model_compatibility_audit.json").write_text(
+            json.dumps(compatibility, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        raise RuntimeError(compatibility["reason"])
 
     print("adding future prices")
     candidates = add_future_prices(candidates, DAILY_DIR, max_hold_days=8)

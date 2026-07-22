@@ -12,6 +12,7 @@ from quant.routine.paths import REPORTS_DIR, WEB_DATA_DIR
 SUMMARY_PATH = REPORTS_DIR / "summary.csv"
 TRADES_PATH = REPORTS_DIR / "trades.csv"
 DASHBOARD_PATH = WEB_DATA_DIR / "dashboard.json"
+MODEL_COMPATIBILITY_PATH = REPORTS_DIR / "model_compatibility_audit.json"
 
 
 COMBO_TO_STRATEGY = {
@@ -36,6 +37,13 @@ def _records(df: pd.DataFrame) -> list[dict]:
 
 
 def build_dashboard_payload(summary_path: Path = SUMMARY_PATH, trades_path: Path = TRADES_PATH) -> dict:
+    if summary_path == SUMMARY_PATH and MODEL_COMPATIBILITY_PATH.exists():
+        compatibility = json.loads(MODEL_COMPATIBILITY_PATH.read_text(encoding="utf-8"))
+        if compatibility.get("status") != "valid":
+            raise RuntimeError(
+                "B1 dashboard publication blocked by model compatibility audit: "
+                + str(compatibility.get("reason") or compatibility.get("status"))
+            )
     summary = pd.read_csv(summary_path)
     trades = pd.read_csv(trades_path, parse_dates=["date"])
     summary["strategy_id"] = summary["combo"].map(COMBO_TO_STRATEGY).fillna(summary["combo"])

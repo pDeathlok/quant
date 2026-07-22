@@ -36,6 +36,39 @@ class TestMarketDataStore:
         assert len(loaded) == len(sample_data)
         assert list(loaded["symbol"].unique()) == ["TEST"]
 
+    def test_partitioned_market_batch_is_idempotent_and_preserves_legacy_base(self, tmp_path):
+        from quant.data import MarketDataStore, MarketDataStoreConfig
+
+        store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=tmp_path))
+        legacy = pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20260720"],
+                "date": [pd.Timestamp("2026-07-20")],
+                "close": [10.0],
+            }
+        )
+        store.write_market_batch(legacy)
+        incoming = pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20260721"],
+                "date": [pd.Timestamp("2026-07-21")],
+                "close": [10.5],
+            }
+        )
+
+        first = store.write_market_batch(incoming)
+        second = store.write_market_batch(incoming)
+        loaded = store.read_frame("daily", "000001.SZ")
+
+        assert first["parquet_partitions"] == second["parquet_partitions"] == 1
+        assert loaded["trade_date"].tolist() == ["20260720", "20260721"]
+        partition = pd.read_parquet(
+            tmp_path / "daily_partitioned/year_month=202607/data.parquet"
+        )
+        assert len(partition) == 2
+
 
 class TestDataStorage:
     def test_partitioned_parquet_roundtrip_and_filter(self, tmp_path):

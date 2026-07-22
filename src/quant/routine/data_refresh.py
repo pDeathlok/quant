@@ -18,6 +18,7 @@ from quant.data.source_merge import (
     audits_to_frame,
     build_tushare_daily_audit,
     normalize_ts_code,
+    normalize_tushare_market_daily,
     normalize_tushare_daily,
 )
 from quant.data.tushare_fetcher import TushareDataFetcher
@@ -308,7 +309,7 @@ def _refresh_symbols_by_trade_date(
     retry_base_delay: float,
     retry_max_delay: float,
     retry_jitter: float,
-) -> tuple[list[DailyRefreshAudit], int]:
+) -> tuple[list[DailyRefreshAudit], int, dict[str, int | str]]:
     """Refresh raw daily bars with one Tushare request per open trade date."""
 
     tushare = TushareDataFetcher(cache_dir=cache_dir / "tushare")
@@ -326,7 +327,7 @@ def _refresh_symbols_by_trade_date(
             _status_audit(symbol, "no_open_trade_dates", f"{start_date}-{end_date} 无交易日", attempts=0)
             for symbol, _ in symbols
         ]
-        return audits, 0
+        return audits, 0, {"rows": 0, "sql_rows": 0, "parquet_partitions": 0, "table": "market_daily"}
 
     limiter = RequestLimiter(sleep_between)
     market_frames: list[pd.DataFrame] = []
@@ -348,54 +349,48 @@ def _refresh_symbols_by_trade_date(
             flush=True,
         )
 
-    market = pd.concat(market_frames, ignore_index=True, sort=False)
-    market["ts_code"] = market["ts_code"].astype(str).map(normalize_ts_code)
     name_by_symbol = {normalize_ts_code(symbol): name for symbol, name in symbols}
+    market = normalize_tushare_market_daily(
+        pd.concat(market_frames, ignore_index=True, sort=False),
+        name_by_symbol=name_by_symbol,
+    )
     target_symbols = set(name_by_symbol)
     market = market[market["ts_code"].isin(target_symbols)].copy()
-    rows_by_symbol = {
-        symbol: frame.copy()
-        for symbol, frame in market.groupby("ts_code", sort=False)
-    }
+    row_counts = market.groupby("ts_code", sort=False).size().to_dict()
 
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
     dataset = output_dir.name
-    end = _parse_trade_date(end_date)
+    try:
+        storage_stats = store.write_market_batch(market, dataset=dataset, partition_column="trade_date")
+        storage_error = None
+    except Exception as exc:
+        storage_stats = {"rows": 0, "sql_rows": 0, "parquet_partitions": 0, "table": "market_daily"}
+        storage_error = str(exc)
     audits: list[DailyRefreshAudit] = []
     for symbol, name in symbols:
         key = normalize_ts_code(symbol)
-        incoming = rows_by_symbol.get(key)
-        existing = store.read_frame(dataset, key)
-        if incoming is None or incoming.empty:
-            latest = _latest_existing_trade_date(existing)
-            if end is not None and latest is not None and latest >= end:
-                audits.append(
-                    _status_audit(key, "up_to_date", f"本地数据已覆盖到 {end_date}", attempts=0)
+        rows = int(row_counts.get(key, 0))
+        if rows == 0:
+            audits.append(
+                _status_audit(
+                    key,
+                    BATCH_NO_TRADE_STATUS,
+                    f"{start_date}-{end_date} 的全市场结果中无该股票成交记录",
+                    attempts=1,
                 )
-            else:
-                audits.append(
-                    _status_audit(
-                        key,
-                        BATCH_NO_TRADE_STATUS,
-                        f"{start_date}-{end_date} 的全市场结果中无该股票成交记录",
-                        attempts=1,
-                    )
-                )
-            continue
-        try:
-            merged = _merge_symbol_daily(existing, incoming, key, name)
-            store.write_frame(merged, dataset, key)
+            )
+        elif storage_error is not None:
+            audits.append(_failed_audit(key, storage_error, attempts=1))
+        else:
             audits.append(
                 build_tushare_daily_audit(
                     key,
-                    rows=len(incoming),
-                    merged_rows=len(merged),
-                    status="tushare_daily_batch",
+                    rows=rows,
+                    merged_rows=rows,
+                    status="tushare_daily_batch_upsert",
                 )
             )
-        except Exception as exc:
-            audits.append(_failed_audit(key, str(exc), attempts=1))
-    return audits, request_count
+    return audits, request_count, storage_stats
 
 
 def _refresh_one_symbol_once(
@@ -643,10 +638,11 @@ def refresh_daily_data(
 
     refresh_mode = "per_symbol"
     market_daily_requests = 0
+    batch_storage: dict[str, int | str] = {}
     batch_fallback_reason: str | None = None
     if adjust is None:
         try:
-            audits, market_daily_requests = _refresh_symbols_by_trade_date(
+            audits, market_daily_requests, batch_storage = _refresh_symbols_by_trade_date(
                 symbols,
                 start_date,
                 end_date,
@@ -696,7 +692,7 @@ def refresh_daily_data(
             retry_jitter=retry_jitter,
         )
     final_retry_unique_symbols = 0
-    if final_retry_rounds > 0:
+    if final_retry_rounds > 0 and refresh_mode == "per_symbol":
         symbols_by_code = {normalize_ts_code(symbol): (symbol, name) for symbol, name in symbols}
         audits, final_retry_unique_symbols = _retry_failed_audits(
             audits,
@@ -736,6 +732,7 @@ def refresh_daily_data(
         "adjust": adjust,
         "refresh_mode": refresh_mode,
         "market_daily_requests": market_daily_requests,
+        "batch_storage": batch_storage,
         "batch_fallback_reason": batch_fallback_reason,
         "output_dir": str(output_dir),
         "storage_backend": os.getenv("MARKET_DATA_BACKEND", "mysql"),
@@ -811,6 +808,11 @@ def main() -> None:
         final_retry_sleep=args.final_retry_sleep,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    # A completed Python process is not the same thing as a complete market
+    # refresh.  Propagate row-level failures to orchestrators so stale
+    # downstream features cannot be published as a successful daily run.
+    if int(result.get("failed") or 0) > 0:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

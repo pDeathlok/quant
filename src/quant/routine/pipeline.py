@@ -5,6 +5,7 @@ import sys
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.dashboard import write_dashboard_json
 from quant.routine.b1_daily_plan import write_daily_plan
@@ -22,29 +24,12 @@ from quant.routine.strategies import StrategyConfig, load_strategy_configs
 def _incremental_daily_start(lookback_days: int | None = None) -> str:
     if lookback_days is None:
         lookback_days = int(os.getenv("ROUTINE_DAILY_LOOKBACK_DAYS", "0"))
-    latest_dates: list[pd.Timestamp] = []
     daily_dir = PROJECT_ROOT / "data/raw/daily"
-    if daily_dir.exists():
-        for path in daily_dir.glob("*.parquet"):
-            try:
-                frame = pd.read_parquet(path, columns=["trade_date"])
-            except Exception:
-                try:
-                    frame = pd.read_parquet(path, columns=["date"])
-                except Exception:
-                    continue
-            if frame.empty:
-                continue
-            if "trade_date" in frame.columns:
-                dates = pd.to_datetime(frame["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-            else:
-                dates = pd.to_datetime(frame["date"], errors="coerce")
-            latest = dates.max()
-            if pd.notna(latest):
-                latest_dates.append(latest)
-    if not latest_dates:
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    latest = store.latest_dataset_trade_date(daily_dir.name)
+    if latest is None:
         return "20100101"
-    start = max(latest_dates) - pd.Timedelta(days=lookback_days)
+    start = latest - pd.Timedelta(days=lookback_days)
     return start.strftime("%Y%m%d")
 
 
@@ -65,7 +50,18 @@ def _incremental_feature_start() -> str:
     return latest.strftime("%Y%m%d")
 
 
+def _incremental_daily_basic_start() -> str:
+    daily_basic_dir = PROJECT_ROOT / "data/raw/daily_basic"
+    dates = [
+        path.stem
+        for path in daily_basic_dir.glob("*.parquet")
+        if path.stem.isdigit() and len(path.stem) == 8
+    ]
+    return max(dates) if dates else _incremental_daily_start()
+
+
 def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
+    started = time.monotonic()
     start_date = _incremental_daily_start()
     workers = os.getenv("ROUTINE_DAILY_WORKERS", "4")
     sleep_seconds = os.getenv("ROUTINE_DAILY_SLEEP", "0.08")
@@ -102,6 +98,7 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
             "reason": "dry_run=true；未访问外部数据源。正式刷新仅使用 Tushare 日线数据。",
             "command": " ".join(command),
             "start_date": start_date,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
         }
     env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")}
     process = subprocess.Popen(
@@ -135,10 +132,127 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def refresh_daily_basic_data(dry_run: bool = True, progress_callback=None) -> dict:
+    started = time.monotonic()
+    start_date = _incremental_daily_basic_start()
+    if dry_run:
+        return {
+            "status": "skipped",
+            "reason": "dry_run=true；未访问 Tushare daily_basic。",
+            "start_date": start_date,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    if progress_callback is not None:
+        progress_callback(percent=36, message=f"正在补齐 daily_basic：{start_date} 至最新交易日")
+    from quant.routine.daily_basic_refresh import refresh_daily_basic
+
+    manifest = refresh_daily_basic(
+        start_date=start_date,
+        workers=int(os.getenv("ROUTINE_DAILY_BASIC_WORKERS", "4")),
+        sleep_between=float(os.getenv("ROUTINE_DAILY_BASIC_SLEEP", "0.25")),
+        retries=int(os.getenv("ROUTINE_DAILY_BASIC_RETRIES", "3")),
+    )
+    failed = int(manifest.get("failed") or 0)
+    return {
+        **manifest,
+        "status": "success" if failed == 0 else "failed",
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def refresh_reference_inputs(dry_run: bool = True, include_financials: bool = True) -> dict:
+    started = time.monotonic()
+    end_date = _incremental_daily_start()
+    if dry_run:
+        return {
+            "status": "skipped",
+            "reason": "dry_run=true；未刷新 stock_basic、沪深300和财务报表。",
+            "end_date": end_date,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    from quant.routine.reference_data_refresh import refresh_reference_data
+
+    result = refresh_reference_data(end_date=end_date, include_financials=include_financials)
+    if include_financials and result.get("status") == "success":
+        result.setdefault("steps", {})["analyst_forecast_snapshot"] = _refresh_analyst_forecast_snapshot()
+        if result["steps"]["analyst_forecast_snapshot"].get("status") == "failed":
+            result["status"] = "failed"
+            result.setdefault("critical_errors", []).append(
+                "analyst_forecast_snapshot: "
+                + str(result["steps"]["analyst_forecast_snapshot"].get("error") or "refresh failed")
+            )
+    result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    return result
+
+
+def _refresh_analyst_forecast_snapshot() -> dict:
+    """Refresh the all-market consensus input used by the production v44 pool."""
+
+    started = time.monotonic()
+    output_path = PROJECT_ROOT / "data/raw/analyst_forecasts.parquet"
+    today = pd.Timestamp.now().normalize()
+    if output_path.exists():
+        try:
+            current = pd.read_parquet(output_path, columns=["source", "report_date"])
+            dates = pd.to_datetime(
+                current.loc[current["source"] == "akshare_em_snapshot", "report_date"],
+                errors="coerce",
+            )
+            if not dates.empty and dates.max() == today:
+                return {
+                    "status": "skipped",
+                    "reason": "today's all-market analyst snapshot already exists",
+                    "latest_report_date": today.date().isoformat(),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+        except Exception:
+            pass
+
+    command = [
+        sys.executable,
+        "scripts/research/refresh_analyst_forecasts.py",
+        "--source",
+        "akshare_em_snapshot",
+    ]
+    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    result = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    latest: pd.Timestamp | None = None
+    if result.returncode == 0 and output_path.exists():
+        try:
+            current = pd.read_parquet(output_path, columns=["source", "report_date"])
+            dates = pd.to_datetime(
+                current.loc[current["source"] == "akshare_em_snapshot", "report_date"],
+                errors="coerce",
+            )
+            latest = dates.max() if not dates.empty else None
+        except Exception:
+            latest = None
+    success = result.returncode == 0 and latest == today
+    return {
+        "status": "success" if success else "failed",
+        "returncode": result.returncode,
+        "latest_report_date": latest.date().isoformat() if latest is not None and pd.notna(latest) else None,
+        "stdout_tail": result.stdout[-2000:],
+        "stderr_tail": result.stderr[-2000:],
+        "error": None if success else "analyst snapshot did not reach today's date",
+        "command": " ".join(command),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
 
 def build_features(progress_callback=None) -> dict:
+    started = time.monotonic()
     start_date = _incremental_feature_start()
     command = [
         sys.executable,
@@ -147,6 +261,8 @@ def build_features(progress_callback=None) -> dict:
         start_date,
         "--workers",
         os.getenv("ROUTINE_FEATURE_WORKERS", "8"),
+        "--executor",
+        os.getenv("ROUTINE_FEATURE_EXECUTOR", "processes"),
         "--no-adaptive-workers",
     ]
     env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
@@ -181,10 +297,12 @@ def build_features(progress_callback=None) -> dict:
         "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
 
 def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> dict:
+    started = time.monotonic()
     start_date = _incremental_daily_start()
     command = [
         sys.executable,
@@ -205,7 +323,7 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         bufsize=1,
     )
     stdout_lines: list[str] = []
-    progress_pattern = re.compile(r"(family|z-skill) signals: (\d+)/(\d+) files")
+    progress_pattern = re.compile(r"(family|z-skill) signals: (\d+)/(\d+) (?:files|symbols)")
     assert process.stdout is not None
     for line in process.stdout:
         stdout_lines.append(line)
@@ -234,10 +352,12 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
 
 def score_latest_models(workers: int = 8) -> dict:
+    started = time.monotonic()
     command = [
         sys.executable,
         "scripts/research/score_latest_strategy_models.py",
@@ -252,6 +372,68 @@ def score_latest_models(workers: int = 8) -> dict:
         "stdout_tail": result.stdout[-4000:],
         "stderr_tail": result.stderr[-4000:],
         "command": " ".join(command),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def refresh_chan_model_scores(progress_callback=None) -> dict:
+    started = time.monotonic()
+    scored_path = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
+    manifest_path = scored_path.parent / "live_refresh_manifest.json"
+    end_date = _incremental_daily_start()
+    start_date = end_date
+    if scored_path.exists():
+        try:
+            scored = pd.read_parquet(scored_path, columns=["date"])
+            latest = pd.to_datetime(scored["date"], errors="coerce").max()
+            if pd.notna(latest):
+                start_date = min(latest.strftime("%Y%m%d"), end_date)
+        except Exception:
+            pass
+    if progress_callback is not None:
+        progress_callback(percent=72, message=f"正在刷新缠论实时评分：{start_date} 至 {end_date}")
+    command = [
+        sys.executable,
+        "scripts/research/refresh_chan_model_live_scores.py",
+        "--start",
+        start_date,
+        "--end",
+        end_date,
+        "--daily-dir",
+        "data/raw/daily",
+        "--daily-basic-dir",
+        "data/raw/daily_basic",
+        "--max-workers",
+        os.getenv("ROUTINE_CHAN_WORKERS", "8"),
+        "--rebuild-candidates",
+        "--skip-backfill-snapshots",
+    ]
+    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    previous_manifest_mtime = manifest_path.stat().st_mtime_ns if manifest_path.exists() else None
+    result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
+    manifest: dict = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+    processed_through = str(manifest.get("processed_through") or "").replace("-", "")
+    current_manifest_mtime = manifest_path.stat().st_mtime_ns if manifest_path.exists() else None
+    manifest_updated = current_manifest_mtime is not None and (
+        previous_manifest_mtime is None or current_manifest_mtime > previous_manifest_mtime
+    )
+    success = result.returncode == 0 and manifest_updated and processed_through == end_date
+    return {
+        "status": "success" if success else "failed",
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout[-4000:],
+        "stderr_tail": result.stderr[-4000:],
+        "command": " ".join(command),
+        "start_date": start_date,
+        "end_date": end_date,
+        "processed_through": manifest.get("processed_through"),
+        "manifest_path": str(manifest_path),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
 
@@ -398,29 +580,77 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
     and invalid model artifacts can be removed without losing review context.
     """
 
+    pipeline_started = time.monotonic()
     results: dict[str, dict] = {}
     results["cache_cleanup"] = run_cache_cleanup(PROJECT_ROOT)
     strategies = load_strategy_configs(CONFIG_PATH)
-    results["refresh_data"] = refresh_data(dry_run=skip_data)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        upstream_futures = {
-            executor.submit(build_features): "build_features",
-            executor.submit(refresh_strategy_signal_cache): "refresh_strategy_signal_cache",
+    pipeline_status = "success"
+    pipeline_error: str | None = None
+
+    def require_complete(step_name: str, *, allow_skipped: bool = False) -> None:
+        status = str(results[step_name].get("status") or "")
+        allowed = {"success"} | ({"skipped"} if allow_skipped else set())
+        if status not in allowed:
+            detail = results[step_name].get("stderr_tail") or results[step_name].get("critical_errors") or status
+            raise RuntimeError(f"{step_name} incomplete: {detail}")
+
+    try:
+        results["refresh_data"] = refresh_data(dry_run=skip_data)
+        require_complete("refresh_data", allow_skipped=skip_data)
+        results["refresh_daily_basic"] = refresh_daily_basic_data(dry_run=skip_data)
+        require_complete("refresh_daily_basic", allow_skipped=skip_data)
+        results["refresh_reference_inputs"] = refresh_reference_inputs(
+            dry_run=skip_data,
+            include_financials=True,
+        )
+        require_complete("refresh_reference_inputs", allow_skipped=skip_data)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            upstream_futures = {
+                executor.submit(build_features): "build_features",
+                executor.submit(refresh_strategy_signal_cache): "refresh_strategy_signal_cache",
+            }
+            for future in as_completed(upstream_futures):
+                step_name = upstream_futures[future]
+                results[step_name] = future.result()
+                require_complete(step_name)
+        results["score_latest_models"] = score_latest_models()
+        require_complete("score_latest_models")
+        results["refresh_chan_model_scores"] = refresh_chan_model_scores()
+        require_complete("refresh_chan_model_scores")
+        if skip_backtest:
+            results["run_selected_strategies"] = {"status": "skipped", "reason": "skip_backtest=true"}
+        else:
+            results["run_selected_strategies"] = run_selected_strategies()
+            require_complete("run_selected_strategies")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            output_futures = {
+                executor.submit(generate_daily_plan): "generate_daily_plan",
+                executor.submit(generate_dashboard): "generate_dashboard",
+            }
+            for future in as_completed(output_futures):
+                step_name = output_futures[future]
+                results[step_name] = future.result()
+                require_complete(step_name)
+        results["refresh_daily_web_workspaces"] = refresh_daily_web_workspaces()
+        failed_workspaces = [
+            name
+            for name, payload in results["refresh_daily_web_workspaces"].items()
+            if isinstance(payload, dict) and payload.get("status") != "success"
+        ]
+        if failed_workspaces:
+            raise RuntimeError(f"downstream workspaces incomplete: {', '.join(failed_workspaces)}")
+    except Exception as exc:
+        pipeline_status = "failed"
+        pipeline_error = str(exc)
+    finally:
+        # Long-line caches are produced near the end of a run. Cleaning again
+        # here enforces the configured retention immediately instead of
+        # carrying obsolete multi-GB versions until tomorrow.
+        results["cache_cleanup_after"] = run_cache_cleanup(PROJECT_ROOT)
+        results["pipeline"] = {
+            "status": pipeline_status,
+            "error": pipeline_error,
+            "elapsed_seconds": round(time.monotonic() - pipeline_started, 3),
         }
-        for future in as_completed(upstream_futures):
-            results[upstream_futures[future]] = future.result()
-    results["score_latest_models"] = score_latest_models()
-    if skip_backtest:
-        results["run_selected_strategies"] = {"status": "skipped", "reason": "skip_backtest=true"}
-    else:
-        results["run_selected_strategies"] = run_selected_strategies()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        output_futures = {
-            executor.submit(generate_daily_plan): "generate_daily_plan",
-            executor.submit(generate_dashboard): "generate_dashboard",
-        }
-        for future in as_completed(output_futures):
-            results[output_futures[future]] = future.result()
-    results["refresh_daily_web_workspaces"] = refresh_daily_web_workspaces()
     manifest = write_run_manifest(results, strategies)
-    return {"manifest": str(manifest), "steps": results}
+    return {"status": pipeline_status, "manifest": str(manifest), "steps": results}

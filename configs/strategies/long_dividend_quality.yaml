@@ -3,12 +3,12 @@
 # Strategy record:
 #   docs/strategies/long_dividend_quality_strategy_record.md
 #
-# Current research winner:
-#   v33_bull_boost_defensive_bear_sleeve
+# Current production variant:
+#   v44_tea_master_defensive_neutral
 # Optional T overlay:
 #   v7_t_overlay_light
 # Optional growth sleeve:
-#   built into v33 as a capped risk_on analyst/growth sleeve
+#   retained in the v44 scoring pipeline with point-in-time universe controls
 #
 # Design intent:
 #   - Long-term core holding system, not a short-term rebound strategy.
@@ -24,10 +24,10 @@ strategies:
     enabled: true
     backtest:
       script: scripts/research/backtest_long_dividend_quality.py
-      variant: v33_bull_boost_defensive_bear_sleeve
+      variant: v44_tea_master_defensive_neutral
       start: "20130101"
-      latest_report: reports/long_dividend_quality/v33_bull_boost_defensive_bear_sleeve/l1_dividend_quality_backtest.md
-      latest_summary: reports/long_dividend_quality/v33_bull_boost_defensive_bear_sleeve/l1_dividend_quality_summary.json
+      latest_report: reports/long_dividend_quality/v44_tea_master_defensive_neutral/l1_dividend_quality_backtest.md
+      latest_summary: reports/long_dividend_quality/v44_tea_master_defensive_neutral/l1_dividend_quality_summary.json
     universe:
       exclude_st: true
       min_listing_years: 2
@@ -127,7 +127,7 @@ strategies:
         action: only_sell_no_buyback
     growth_sleeve:
       enabled: true
-      recommended_variant: v33_bull_boost_defensive_bear_sleeve
+      recommended_variant: v44_tea_master_defensive_neutral
       use_case: "Enabled only in risk_on markets as a capped sleeve inside the long-term system."
       risk_on:
         max_positions: 4
@@ -149,10 +149,10 @@ strategies:
         roe: 0.20
         return_120d: 0.15
         ma120_slope_20d: 0.10
-      note: "Keep growth as a capped sleeve. v33 keeps the quality/growth framework but lets market trend drive exposure: healthy bull markets add weight, overheated markets throttle, and bear markets keep a defensive core instead of going fully empty."
+      note: "Keep growth capped and time-safe. v44 uses a point-in-time universe and a defensive neutral sleeve so broader source coverage does not rewrite the historical universe."
     analyst_forecast:
       enabled: true
-      research_variant: v33_bull_boost_defensive_bear_sleeve
+      research_variant: v44_tea_master_defensive_neutral
       source:
         canonical: data/raw/analyst_forecasts.parquet
         tushare_raw: null
@@ -190,15 +190,15 @@ strategies:
       risk_off_quality_score_below: 55
       risk_off_risk_score_below: 35
     evaluated_results:
-      period: "2013-01-04 to 2026-06-12"
-      final_equity: 3.7631
-      annual_return: 0.1037
-      max_drawdown: -0.2779
-      sharpe: 0.8645
-      average_positions: 10.4690
-      average_total_weight: 0.4906
+      period: "2013-01-04 to 2026-07-21"
+      final_equity: 2.1639
+      annual_return: 0.0587
+      max_drawdown: -0.2235
+      sharpe: 0.6342
+      average_positions: 7.1880
+      average_total_weight: 0.4022
       benchmark: "沪深300"
-      benchmark_annual_return: 0.0507
+      benchmark_annual_return: 0.0476
       benchmark_max_drawdown: -0.4670
       t_overlay_light:
         variant: v7_t_overlay_light

@@ -21,10 +21,8 @@ AUDIT_ROOT = PROJECT_ROOT / "data/raw/source_audit"
 
 def load_trade_dates_from_daily(daily_dir: Path, start_date: str, end_date: str | None) -> list[str]:
     dates: set[str] = set()
-    for path in daily_dir.glob("*.parquet"):
-        stem = path.stem
-        if not (len(stem) == 9 and stem[6] == "." and stem[-2:] in {"SZ", "SH", "BJ"}):
-            continue
+    partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
+    for path in partition_root.glob("year_month=*/data.parquet"):
         try:
             df = pd.read_parquet(path, columns=["trade_date"])
         except Exception:

@@ -8,6 +8,7 @@ Tushare数据获取器
 """
 
 import os
+import time
 from typing import Dict, List, Optional, Union
 import pandas as pd
 from pathlib import Path
@@ -326,7 +327,13 @@ class TushareDataFetcher:
         
         return df
     
-    def get_stock_basic(self, market: str = "all") -> pd.DataFrame:
+    def get_stock_basic(
+        self,
+        market: str = "all",
+        *,
+        force_refresh: bool = False,
+        max_age_hours: float | None = None,
+    ) -> pd.DataFrame:
         """
         获取股票基本信息
         
@@ -337,18 +344,28 @@ class TushareDataFetcher:
             DataFrame 包含 ts_code, symbol, name, industry, list_date 等
         """
         cache_key = f"tushare_stock_basic_{market}"
-        if cache_key in self._memory_cache:
+        if max_age_hours is None:
+            max_age_hours = float(os.getenv("TUSHARE_STOCK_BASIC_TTL_HOURS", "24"))
+        if cache_key in self._memory_cache and not force_refresh:
             return self._memory_cache[cache_key]
         
         file_path = self.cache_dir / f"{cache_key}.parquet"
-        if file_path.exists():
+        cache_age_hours = (time.time() - file_path.stat().st_mtime) / 3600 if file_path.exists() else None
+        cache_fresh = cache_age_hours is not None and cache_age_hours <= max(0.0, max_age_hours)
+        if file_path.exists() and cache_fresh and not force_refresh:
             df = pd.read_parquet(file_path)
             self._memory_cache[cache_key] = df
             return df
         
-        df = self.pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry,list_date,market')
+        df = self.pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,area,industry,list_date,market",
+        )
         
-        df.to_parquet(file_path, index=False)
+        temp_path = file_path.with_suffix(f".{os.getpid()}.tmp.parquet")
+        df.to_parquet(temp_path, index=False)
+        os.replace(temp_path, file_path)
         self._memory_cache[cache_key] = df
         
         return df

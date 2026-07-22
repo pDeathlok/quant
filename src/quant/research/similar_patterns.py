@@ -14,6 +14,8 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
+from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
+
 
 @dataclass(frozen=True)
 class SimilarPatternConfig:
@@ -141,7 +143,7 @@ def load_stock_basic(path: Path) -> pd.DataFrame:
 
 
 def load_daily_file(path: Path) -> pd.DataFrame:
-    return normalize_daily_frame(pd.read_parquet(path), path.stem)
+    return normalize_daily_frame(read_partitioned_symbol_file(path), path.stem)
 
 
 def vector_cache_key(config: SimilarPatternConfig) -> str:
@@ -361,7 +363,7 @@ def build_vector_caches_parallel(
     force: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
-    files = sorted(daily_dir.glob("*.parquet"))
+    files = list_partitioned_symbol_paths(daily_dir)
     if max_symbols is not None:
         files = files[:max_symbols]
     target_symbols = {symbol.upper() for symbol in (target_symbols or set())}
@@ -692,7 +694,7 @@ def build_candidate_library(
     max_symbols: int | None = None,
 ) -> pd.DataFrame:
     """Build historical pattern candidates from local daily parquet files."""
-    files = sorted(daily_dir.glob("*.parquet"))
+    files = list_partitioned_symbol_paths(daily_dir)
     if max_symbols is not None:
         files = files[:max_symbols]
     basic_map = basic.set_index("ts_code").to_dict("index") if not basic.empty else {}
@@ -845,7 +847,7 @@ def analyze_targets_by_threshold(
     target_symbol_set = {symbol.upper() for symbol in target_contexts}
     target_matches: dict[str, list[dict[str, object]]] = {symbol: [] for symbol in target_contexts}
 
-    files = sorted(daily_dir.glob("*.parquet"))
+    files = list_partitioned_symbol_paths(daily_dir)
     if max_symbols is not None:
         files = files[:max_symbols]
     basic_map = basic.set_index("ts_code").to_dict("index") if not basic.empty else {}

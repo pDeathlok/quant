@@ -134,6 +134,19 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
             "close": [10.0],
         }
     ).to_parquet(output_dir / "000001.SZ.parquet", index=False)
+    initial_store = data_refresh.MarketDataStore(
+        data_refresh.MarketDataStoreConfig(backend="parquet", root=tmp_path)
+    )
+    initial_store.write_market_batch(
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20260604"],
+                "date": [pd.Timestamp("2026-06-04")],
+                "close": [10.0],
+            }
+        )
+    )
 
     monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
     monkeypatch.setattr(data_refresh, "AUDIT_ROOT", tmp_path / "audit")
@@ -157,10 +170,21 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
     assert manifest["refresh_mode"] == "batch_by_trade_date"
     assert manifest["market_daily_requests"] == 2
     assert manifest["failed"] == 0
-    ping_an = pd.read_parquet(output_dir / "000001.SZ.parquet")
-    mao_tai = pd.read_parquet(output_dir / "600519.SH.parquet")
+    store = data_refresh.MarketDataStore(
+        data_refresh.MarketDataStoreConfig(backend="parquet", root=tmp_path)
+    )
+    ping_an = store.read_frame("daily", "000001.SZ")
+    mao_tai = store.read_frame("daily", "600519.SH")
     assert ping_an["trade_date"].tolist() == ["20260604", "20260605", "20260606"]
     assert mao_tai["trade_date"].tolist() == ["20260605", "20260606"]
+    assert pd.read_parquet(output_dir / "000001.SZ.parquet")["trade_date"].tolist() == ["20260604"]
+    assert manifest["batch_storage"] == {
+        "rows": 4,
+        "sql_rows": 0,
+        "parquet_partitions": 1,
+        "table": "market_daily",
+    }
+    assert sorted((tmp_path / "daily_partitioned").glob("year_month=*/data.parquet"))
 
 
 def test_market_daily_batch_rejects_possible_row_limit_truncation(monkeypatch):

@@ -41,7 +41,8 @@ from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exi
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from analyze_z_skill_entry_exit_backtest import OpenFilter, apply_open_filter, build_open_filters
 from quant.data.source_merge import normalize_tushare_daily
-from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc, calculate_project_extra_features
+from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
+from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
 
@@ -275,7 +276,9 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
         if "ST" in name.upper() or "退" in name:
             return None
 
-        factors = pd.concat([btd.calculate_factors_single_stock(daily), calculate_project_extra_features(daily)], axis=1)
+        shared = attach_daily_base_factors(daily, symbol=path.stem, compute_if_missing=True)
+        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
+        factors = pd.concat([btd.calculate_factors_single_stock(daily), shared[shared_cols]], axis=1)
         factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
         labels = create_b1_labels(daily, forward_days=5, exit_aware=True, use_new_labels=True)
         price = build_continuous_ohlc(daily)

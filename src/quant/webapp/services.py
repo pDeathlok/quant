@@ -197,6 +197,7 @@ TEA_LONG_VARIANTS = {
     "tea": "core14_soft_plus",
     "tea_safe": "core14_soft_spread",
 }
+LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 40
 _REFRESH_LOCK = threading.Lock()
 _REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
 _REFRESH_STATUS: dict[str, Any] = {
@@ -326,20 +327,12 @@ def _read_similar_pattern_vector_cache_metadata() -> dict[str, Any]:
 def _latest_similar_pattern_target_date(symbols: list[str]) -> str | None:
     """Read only watchlist files; target vectors themselves are still built live later."""
     latest: pd.Timestamp | None = None
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
     for symbol in symbols:
-        path = DAILY_DIR / f"{symbol}.parquet"
-        if not path.exists():
-            continue
         try:
-            frame = pd.read_parquet(path, columns=["trade_date"])
-        except (KeyError, OSError, ValueError):
-            try:
-                frame = pd.read_parquet(path, columns=["date"])
-            except (KeyError, OSError, ValueError):
-                continue
-        column = "trade_date" if "trade_date" in frame.columns else "date"
-        values = pd.to_datetime(frame[column], errors="coerce")
-        candidate = values.max()
+            candidate = store.latest_trade_date(DAILY_DIR.name, symbol)
+        except Exception:
+            candidate = None
         if pd.notna(candidate) and (latest is None or candidate > latest):
             latest = pd.Timestamp(candidate)
     return latest.strftime("%Y-%m-%d") if latest is not None else None
@@ -492,6 +485,35 @@ def _tail_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
         return False
     step_map = _step_status_map(status)
     return step_map.get("selector_extended") == "success" and step_map.get("snapshot") != "success"
+
+
+def _input_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
+    """Reuse same-day source refreshes after a downstream stage fails."""
+
+    if not status or status.get("status") != "failed":
+        return False
+    started_at = _parse_refresh_timestamp(status.get("started_at"))
+    if started_at is None or started_at.date() != datetime.now().date():
+        return False
+    results = status.get("result") or {}
+    if (results.get("refresh_data") or {}).get("status") != "success":
+        return False
+    if scope in {"all", "short", "chan", "long"} and (
+        results.get("refresh_daily_basic") or {}
+    ).get("status") != "success":
+        return False
+    reference = results.get("refresh_reference_inputs") or {}
+    if reference.get("status") != "success":
+        return False
+    if scope in {"all", "long"}:
+        analyst = (reference.get("steps") or {}).get("analyst_forecast_snapshot") or {}
+        if analyst.get("status") not in {"success", "skipped"}:
+            return False
+    return True
+
+
+def _refresh_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
+    return _tail_resume_ready(status, scope) or _input_resume_ready(status, scope)
 
 
 def _terminate_active_worker_unlocked(status: dict[str, Any] | None = None) -> bool:
@@ -829,10 +851,10 @@ def _tea_master_research_module():
 
 
 @lru_cache(maxsize=2)
-def _load_live_long_base_cached(
+def _load_live_long_base_full_cached(
     signal_date: str | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Build shared live long-strategy inputs without persistent backtest caches."""
+    """Build the historical reference path used when no live checkpoint exists."""
 
     module = _long_research_module()
     requested_end = pd.to_datetime(signal_date) if signal_date else None
@@ -852,20 +874,68 @@ def _load_live_long_base_cached(
     return features, daily_basic, stock_basic, coverage
 
 
+@lru_cache(maxsize=2)
+def _load_live_long_base_cached(
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Build live inputs from bounded price history and the latest two rebalance sections."""
+
+    module = _long_research_module()
+    requested_end = pd.to_datetime(signal_date) if signal_date else pd.Timestamp.now().normalize()
+    basic_start = requested_end - pd.DateOffset(months=LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS)
+    stock_basic = module.load_stock_basic()
+    daily_basic, coverage = module.load_daily_basic_monthly(basic_start, requested_end)
+    if daily_basic.empty:
+        raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
+    rebalance_dates = sorted(pd.to_datetime(daily_basic["date"].dropna().unique()))[-2:]
+    if not rebalance_dates:
+        raise RuntimeError("daily_basic 没有可用调仓截面")
+    price_start = pd.Timestamp(rebalance_dates[0])
+    features, _ = module.load_daily_monthly_features(
+        price_start,
+        requested_end,
+        stock_basic,
+        candidate_symbols=None,
+        use_cache=False,
+        include_daily_returns=False,
+    )
+    daily_basic = daily_basic[daily_basic["date"].isin(rebalance_dates)].copy()
+    coverage = dict(coverage)
+    coverage.update(
+        {
+            "live_windowed": True,
+            "price_history_days": 450,
+            "daily_basic_lookback_months": LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS,
+            "live_rebalance_dates": [pd.Timestamp(item).date().isoformat() for item in rebalance_dates],
+            "live_feature_rows": int(len(features)),
+            "live_daily_basic_rows": int(len(daily_basic)),
+        }
+    )
+    return features, daily_basic, stock_basic, coverage
+
+
 def _load_live_long_base(
     signal_date: str | None,
+    *,
+    full_history: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     normalized_date = pd.to_datetime(signal_date).date().isoformat() if signal_date else None
     with _LONG_LIVE_DATA_LOCK:
-        features, daily_basic, stock_basic, coverage = _load_live_long_base_cached(normalized_date)
+        loader = _load_live_long_base_full_cached if full_history else _load_live_long_base_cached
+        features, daily_basic, stock_basic, coverage = loader(normalized_date)
     return features, daily_basic, stock_basic, dict(coverage)
 
 
 def _prepare_tea_master_live_data(
     module: Any,
     signal_date: str | None,
+    *,
+    full_history: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    daily_features, daily_basic, stock_basic, coverage = _load_live_long_base(signal_date)
+    daily_features, daily_basic, stock_basic, coverage = _load_live_long_base(
+        signal_date,
+        full_history=full_history,
+    )
     executable_start_text = max("20130101", coverage.get("first_trade_date") or "20130101")
     executable_start = module.parse_date(executable_start_text)
     daily_features = daily_features[daily_features["date"] >= executable_start].copy()
@@ -1873,6 +1943,33 @@ def _tea_status_row(
     }
 
 
+def _tea_previous_target_checkpoint(variant_key: str, signal_ts: pd.Timestamp) -> set[str] | None:
+    """Recover the prior rebalance target set from the latest persisted live snapshot."""
+
+    snapshot = _read_long_stock_pool_snapshot(
+        variant_key,
+        signal_ts.date().isoformat(),
+        allow_sql=False,
+    )
+    if not snapshot or not snapshot.get("signal_date"):
+        return None
+    snapshot_ts = pd.to_datetime(snapshot["signal_date"], errors="coerce")
+    if pd.isna(snapshot_ts) or snapshot_ts > signal_ts:
+        return None
+    rows = snapshot.get("stocks") or []
+    if snapshot_ts.to_period("M") == signal_ts.to_period("M"):
+        return {
+            str(row.get("ts_code"))
+            for row in rows
+            if row.get("ts_code") and str(row.get("previous_state") or "") == "CORE"
+        }
+    return {
+        str(row.get("ts_code"))
+        for row in rows
+        if row.get("ts_code") and row.get("rank") is not None
+    }
+
+
 @lru_cache(maxsize=8)
 def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | None) -> dict[str, Any]:
     module = _tea_master_research_module()
@@ -1882,7 +1979,23 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         raise ValueError(f"未知茶大长线策略版本: {variant_key}")
     merged, _, coverage = _prepare_tea_master_live_data(module, signal_date)
     scored = module.build_tea_scores(merged)
-    targets = module.select_targets(scored, config)
+    eligible_scored = scored.copy()
+    if signal_date:
+        eligible_scored = eligible_scored[eligible_scored["date"] <= pd.to_datetime(signal_date)].copy()
+    if eligible_scored.empty:
+        raise RuntimeError("所选日期之前没有茶大长线评分截面")
+    signal_ts = pd.to_datetime(eligible_scored["date"].max())
+    previous_set = _tea_previous_target_checkpoint(variant_key, signal_ts)
+    if previous_set is None:
+        merged, _, coverage = _prepare_tea_master_live_data(module, signal_date, full_history=True)
+        scored = module.build_tea_scores(merged)
+        targets = module.select_targets(scored, config)
+        coverage["live_checkpoint"] = "missing_full_history_fallback"
+    else:
+        latest_scored = eligible_scored[pd.to_datetime(eligible_scored["date"]) == signal_ts].copy()
+        targets = module.select_targets(latest_scored, config, initial_current=previous_set)
+        coverage["live_checkpoint"] = "snapshot"
+        coverage["live_checkpoint_symbols"] = int(len(previous_set))
     if targets.empty:
         raise RuntimeError("茶大长线策略没有生成候选股票")
     if signal_date:
@@ -1891,15 +2004,20 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     if targets.empty:
         raise RuntimeError("所选日期之前没有茶大长线股票池")
     signal_ts = pd.to_datetime(targets["rebalance_date"].max())
-    target_dates = sorted(pd.to_datetime(targets["rebalance_date"].dropna().unique()))
-    previous_dates = [item for item in target_dates if item < signal_ts]
-    previous_target_date = previous_dates[-1] if previous_dates else None
     latest = targets[targets["rebalance_date"] == signal_ts].copy()
-    previous = targets[targets["rebalance_date"] == previous_target_date].copy() if previous_target_date is not None else pd.DataFrame()
+    if previous_set is None:
+        target_dates = sorted(pd.to_datetime(targets["rebalance_date"].dropna().unique()))
+        previous_dates = [item for item in target_dates if item < signal_ts]
+        previous_target_date = previous_dates[-1] if previous_dates else None
+        previous = (
+            targets[targets["rebalance_date"] == previous_target_date].copy()
+            if previous_target_date is not None
+            else pd.DataFrame()
+        )
+        previous_set = set(previous["ts_code"].astype(str).tolist()) if not previous.empty else set()
     latest = latest.sort_values(["target_weight", "tea_score", "trend_score"], ascending=False)
     selected_codes = latest["ts_code"].astype(str).tolist()
     selected_set = set(selected_codes)
-    previous_set = set(previous["ts_code"].astype(str).tolist()) if not previous.empty else set()
     selected_order = {code: i + 1 for i, code in enumerate(selected_codes)}
     target_map = latest.set_index("ts_code").to_dict(orient="index") if not latest.empty else {}
 
@@ -2239,8 +2357,8 @@ def _normalize_watch_symbol(raw_symbol: str) -> str:
     if "." not in symbol and len(symbol) == 6 and symbol.isdigit():
         suffix = "SH" if symbol.startswith(("6", "9")) else "SZ"
         symbol = f"{symbol}.{suffix}"
-    path = DAILY_DIR / f"{symbol}.parquet"
-    if not path.exists():
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+    if store.latest_trade_date(DAILY_DIR.name, symbol) is None:
         raise ValueError(f"本地日线数据不存在: {symbol}")
     return symbol
 
@@ -3624,6 +3742,10 @@ def get_chan_model_strategy_plan(
         if cached is not None:
             return cached
     payload = _build_chan_model_strategy_payload(top_n=top_n, signal_date=signal_date)
+    if signal_date and str(payload.get("signal_date") or "") != str(signal_date):
+        raise RuntimeError(
+            f"缠论结果日期未更新到最新交易日: expected={signal_date} actual={payload.get('signal_date')}"
+        )
     _write_workspace_snapshot(
         "chan_model_strategy",
         payload.get("signal_date"),
@@ -5104,6 +5226,7 @@ def _clear_selector_caches() -> None:
         _family_profiles_for_date,
         _latest_extended_signals,
         _load_live_long_base_cached,
+        _load_live_long_base_full_cached,
     ]:
         try:
             func.cache_clear()
@@ -5209,7 +5332,13 @@ def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | No
         return []
     with ThreadPoolExecutor(max_workers=min(3, len(variants))) as executor:
         results = list(executor.map(lambda variant: _refresh_long_stock_pool_variant(variant, signal_date), variants))
-    return sorted(results, key=lambda item: variants.index(item["variant"]))
+    ordered = sorted(results, key=lambda item: variants.index(item["variant"]))
+    if signal_date:
+        stale = [item for item in ordered if str(item.get("signal_date") or "") != str(signal_date)]
+        if stale:
+            details = ", ".join(f"{item['variant']}={item.get('signal_date')}" for item in stale)
+            raise RuntimeError(f"长线结果日期未更新到最新交易日: expected={signal_date}; {details}")
+    return ordered
 
 
 def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -5221,6 +5350,15 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
 
     if not signal_date:
         raise RuntimeError("断点续跑失败：未找到可复用的短线快照 signal_date")
+    from quant.routine.pipeline import _incremental_daily_start
+
+    expected_signal_date = pd.to_datetime(
+        _incremental_daily_start(), format="%Y%m%d"
+    ).date().isoformat()
+    if str(signal_date) != expected_signal_date:
+        raise RuntimeError(
+            f"断点续跑快照已过期: expected={expected_signal_date} actual={signal_date}"
+        )
 
     if refresh_scope == "short":
         _set_refresh_progress(step_key="snapshot", message="检测到断点，正在补写短线策略股票池快照", percent=98)
@@ -5238,7 +5376,11 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
     trade_date = str(signal_date).replace("-", "") if signal_date else None
 
     pending_steps = [
-        ("chan_model_strategy", lambda: get_chan_model_strategy_plan(20, True), "缠论模型策略候选生成失败"),
+        (
+            "chan_model_strategy",
+            lambda: get_chan_model_strategy_plan(20, True, signal_date),
+            "缠论模型策略候选生成失败",
+        ),
         ("long_stock_pool", lambda: _refresh_long_stock_pool_variants(long_variants, signal_date), "长线策略股票池生成失败"),
         ("convertible_bond_plan", lambda: get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date)), "可转债策略计划刷新失败"),
         ("convertible_bond_allotment", lambda: get_convertible_bond_allotments(80, 90, True, "pipeline"), "配债股数据刷新失败"),
@@ -5336,7 +5478,11 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
         build_features,
         generate_dashboard,
         generate_daily_plan,
+        _incremental_daily_start,
+        refresh_chan_model_scores,
         refresh_data,
+        refresh_daily_basic_data,
+        refresh_reference_inputs,
         refresh_strategy_signal_cache,
         score_latest_models,
     )
@@ -5344,6 +5490,7 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
     refresh_scope = _normalize_refresh_scope(scope)
     refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
     resume_tail = _tail_resume_ready(resume_status, refresh_scope)
+    resume_inputs = not resume_tail and _input_resume_ready(resume_status, refresh_scope)
     with _REFRESH_LOCK:
         _REFRESH_STATUS.update(
             {
@@ -5351,9 +5498,15 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
                 "started_at": (resume_status or {}).get("started_at") or datetime.now().isoformat(timespec="seconds"),
                 "finished_at": None,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "message": f"{refresh_label}刷新任务已启动" if not resume_tail else f"{refresh_label}检测到断点，正在续跑尾段任务",
-                "percent": 1 if not resume_tail else 90,
-                "current_step": "refresh_data" if not resume_tail else "similar_patterns",
+                "message": (
+                    f"{refresh_label}检测到断点，正在续跑尾段任务"
+                    if resume_tail
+                    else f"{refresh_label}检测到同日数据检查点，正在续跑计算阶段"
+                    if resume_inputs
+                    else f"{refresh_label}刷新任务已启动"
+                ),
+                "percent": 90 if resume_tail else 35 if resume_inputs else 1,
+                "current_step": "similar_patterns" if resume_tail else "feature_cache" if resume_inputs else "refresh_data",
                 "steps": list((resume_status or {}).get("steps") or _progress_steps(refresh_scope)),
                 "scope": refresh_scope,
                 "scope_label": refresh_label,
@@ -5364,7 +5517,10 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
         _persist_refresh_status_unlocked()
     try:
         cache_cleanup = run_cache_cleanup(PROJECT_ROOT)
-        results: dict[str, Any] = {"cache_cleanup": cache_cleanup}
+        results: dict[str, Any] = (
+            dict((resume_status or {}).get("result") or {}) if resume_inputs else {}
+        )
+        results["cache_cleanup"] = cache_cleanup
         if resume_tail:
             results = _resume_tail_refresh_from_cached_selector(refresh_scope, resume_status)
             results["cache_cleanup"] = cache_cleanup
@@ -5381,17 +5537,39 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
                 _persist_refresh_status_unlocked()
             return
 
-        _set_refresh_progress(step_key="refresh_data", message=f"{refresh_label}：正在共享拉取 Tushare 最新日线数据", percent=10)
-        results["refresh_data"] = refresh_data(
-            dry_run=False,
-            progress_callback=lambda percent, message: _set_refresh_progress(
-                step_key="refresh_data",
-                message=message,
-                percent=percent,
-            ),
-        )
-        if results["refresh_data"].get("status") == "failed":
-            raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
+        if not resume_inputs:
+            _set_refresh_progress(step_key="refresh_data", message=f"{refresh_label}：正在共享拉取 Tushare 最新日线数据", percent=10)
+            results["refresh_data"] = refresh_data(
+                dry_run=False,
+                progress_callback=lambda percent, message: _set_refresh_progress(
+                    step_key="refresh_data",
+                    message=message,
+                    percent=percent,
+                ),
+            )
+            if results["refresh_data"].get("status") == "failed":
+                raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
+
+            if refresh_scope in {"all", "short", "chan", "long"}:
+                results["refresh_daily_basic"] = refresh_daily_basic_data(
+                    dry_run=False,
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="refresh_data",
+                        message=message,
+                        percent=percent,
+                        complete_previous=False,
+                    ),
+                )
+                if results["refresh_daily_basic"].get("status") == "failed":
+                    raise RuntimeError("Tushare daily_basic 刷新失败")
+
+            results["refresh_reference_inputs"] = refresh_reference_inputs(
+                dry_run=False,
+                include_financials=refresh_scope in {"all", "long"},
+            )
+            if results["refresh_reference_inputs"].get("status") not in {"success", "skipped"}:
+                details = results["refresh_reference_inputs"].get("critical_errors") or []
+                raise RuntimeError(f"参考数据刷新失败: {details}")
 
         _set_refresh_progress(
             step_key="refresh_data",
@@ -5403,11 +5581,23 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
         _clear_selector_caches()
 
         if refresh_scope not in {"all", "short"}:
-            signal_date = _latest_candidate_signal_date()
+            signal_date = pd.to_datetime(_incremental_daily_start(), format="%Y%m%d").date().isoformat()
             trade_date = str(signal_date).replace("-", "") if signal_date else None
             if refresh_scope == "chan":
                 _set_refresh_progress(step_key="chan_model_strategy", message="正在生成缠论模型策略候选", percent=92)
-                payload = get_chan_model_strategy_plan(top_n=20, refresh=True)
+                results["refresh_chan_model_scores"] = refresh_chan_model_scores(
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="chan_model_strategy",
+                        message=message,
+                        percent=percent,
+                        complete_previous=False,
+                    )
+                )
+                if results["refresh_chan_model_scores"].get("status") == "failed":
+                    raise RuntimeError(
+                        results["refresh_chan_model_scores"].get("stderr_tail") or "缠论实时评分刷新失败"
+                    )
+                payload = get_chan_model_strategy_plan(top_n=20, refresh=True, signal_date=signal_date)
                 results["chan_model_strategy"] = {
                     "status": "success",
                     "signal_date": payload.get("signal_date"),
@@ -5596,10 +5786,30 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
         results["model_score"] = score_latest_models()
         if results["model_score"].get("status") == "failed":
             raise RuntimeError(results["model_score"].get("stderr_tail") or "当日策略模型分计算失败")
+        results["refresh_chan_model_scores"] = refresh_chan_model_scores(
+            progress_callback=lambda percent, message: _set_refresh_progress(
+                step_key="chan_model_strategy",
+                message=message,
+                percent=percent,
+                complete_previous=False,
+            )
+        )
+        if results["refresh_chan_model_scores"].get("status") == "failed":
+            raise RuntimeError(
+                results["refresh_chan_model_scores"].get("stderr_tail") or "缠论实时评分刷新失败"
+            )
         _clear_selector_caches()
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
         core_payload = get_stock_selector_payload(use_cache=False)
+        expected_signal_date = pd.to_datetime(
+            _incremental_daily_start(), format="%Y%m%d"
+        ).date().isoformat()
+        if str(core_payload.get("signal_date") or "") != expected_signal_date:
+            raise RuntimeError(
+                "核心策略结果日期未更新到最新交易日: "
+                f"expected={expected_signal_date} actual={core_payload.get('signal_date')}"
+            )
         results["selector_core"] = {
             "status": "success",
             "signal_date": core_payload.get("signal_date"),
@@ -5613,6 +5823,11 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
             use_cache=False,
             full_snapshot=True,
         )
+        if str(full_payload.get("signal_date") or "") != expected_signal_date:
+            raise RuntimeError(
+                "扩展策略结果日期未更新到最新交易日: "
+                f"expected={expected_signal_date} actual={full_payload.get('signal_date')}"
+            )
         results["selector_extended"] = {
             "status": "success",
             "signal_date": full_payload.get("signal_date"),
@@ -5690,7 +5905,7 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
         )
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = {
-                executor.submit(get_chan_model_strategy_plan, 20, True): (
+                executor.submit(get_chan_model_strategy_plan, 20, True, signal_date): (
                     "chan_model_strategy",
                     "缠论模型策略候选生成失败",
                 ),
@@ -5815,12 +6030,12 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
         if current_status.get("status") == "running":
             if _is_refresh_status_stale(current_status):
                 current_status = _expire_stale_refresh_status_unlocked(current_status)
-                if _tail_resume_ready(current_status, refresh_scope):
+                if _refresh_resume_ready(current_status, refresh_scope):
                     resume_status = dict(current_status)
             else:
                 return dict(current_status)
         elif current_status.get("status") == "failed":
-            if _tail_resume_ready(current_status, refresh_scope):
+            if _refresh_resume_ready(current_status, refresh_scope):
                 resume_status = dict(current_status)
         elif current_status.get("status") == "idle":
             persisted = _load_persisted_refresh_status()
@@ -5828,7 +6043,7 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
                 persisted = _ensure_refresh_scope(persisted)
                 if persisted.get("status") in {"running", "queued"}:
                     persisted = _expire_interrupted_refresh_status_unlocked(persisted)
-                if _tail_resume_ready(persisted, refresh_scope):
+                if _refresh_resume_ready(persisted, refresh_scope):
                     resume_status = dict(persisted)
         thread = threading.Thread(
             target=_run_latest_refresh_job,
@@ -5845,8 +6060,8 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
                 "message": f"{refresh_label}刷新任务已进入后台队列"
                 if not resume_status
                 else f"{refresh_label}检测到断点，已进入自动续跑队列",
-                "percent": 0 if not resume_status else max(90, int(resume_status.get("percent") or 0)),
-                "current_step": None if not resume_status else str(resume_status.get("current_step") or "similar_patterns"),
+                "percent": 0 if not resume_status else int(resume_status.get("percent") or 35),
+                "current_step": None if not resume_status else str(resume_status.get("current_step") or "feature_cache"),
                 "steps": list((resume_status or {}).get("steps") or _progress_steps(refresh_scope)),
                 "scope": refresh_scope,
                 "scope_label": refresh_label,

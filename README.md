@@ -6,7 +6,8 @@ Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、
 
 ## 能力概览
 
-- 增量刷新 Tushare 日线数据，并支持 MySQL 主存储和 Parquet 镜像。
+- 增量刷新 Tushare 日线数据；MySQL 使用统一 `market_daily` 表，Parquet 使用年月分区镜像。
+- 每日同步 `daily_basic`、`stock_basic`、沪深300及最近报告期财务数据，保证短线和长线因子的原始输入新鲜度。
 - 构建 B1/B2/B3 与扩展策略特征、模型评分和每日候选池。
 - 在一个 FastAPI + 静态前端工作台中查看 7 类策略结果。
 - 按日期保存选股器和工作区快照，支持历史复盘。
@@ -67,13 +68,19 @@ PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
 | `MARKET_DATA_BACKEND` | `mysql` | `mysql`/`sql` 使用 SQL 主存储，其他值使用 Parquet |
 | `MARKET_DATA_SQL_URL` | 无 | SQLAlchemy MySQL 连接串；未配置时可回落到 Parquet 镜像 |
 | `MARKET_DATA_ROOT` | `data/raw` | Parquet 数据根目录 |
-| `MARKET_DATA_MIRROR_PARQUET` | `1` | SQL 写入时是否同时保留 Parquet 镜像 |
+| `MARKET_DATA_MIRROR_PARQUET` | `1` | SQL 写入时是否同时更新 `data/raw/daily_partitioned/year_month=YYYYMM/data.parquet` |
+| `MARKET_DATA_SQL_BATCH_SIZE` | `5000` | 全市场 MySQL 批量 upsert 每批行数 |
 | `MARKET_DATA_SQL_CONNECT_TIMEOUT` | `10` | MySQL 连接超时，单位秒 |
 | `MARKET_DATA_SQL_READ_TIMEOUT` | `60` | MySQL 读取超时，单位秒 |
 | `MARKET_DATA_SQL_WRITE_TIMEOUT` | `60` | MySQL 写入超时，单位秒 |
 | `ROUTINE_DAILY_WORKERS` | `4` | 日线刷新并发数 |
 | `ROUTINE_DAILY_SLEEP` | `0.08` | Tushare 请求间隔，单位秒 |
+| `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日刷新的并发数 |
+| `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔，单位秒 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
+| `ROUTINE_FEATURE_EXECUTOR` | `processes` | 特征计算执行器；CPU 密集计算默认使用多进程 |
+| `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量特征与 `daily_basic` 的最低匹配率；低于阈值阻断发布 |
+| `ROUTINE_CHAN_WORKERS` | `8` | 缠论增量候选扫描并发数 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 六个下游工作区的最大并发数 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似走势向量缓存并发数 |
 | `SIMILAR_PATTERN_FORCE_VECTOR_CACHE` | 空 | 设为 `1` 时强制重建相似走势全市场参考库；日常无需设置 |

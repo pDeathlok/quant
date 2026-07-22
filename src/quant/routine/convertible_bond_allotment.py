@@ -12,6 +12,7 @@ from typing import Any
 
 import pandas as pd
 
+from quant.data import read_partitioned_symbol_file
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.features.variable_library import calculate_project_extra_features
 from quant.routine.convertible_bond_grid_plan import CB_BASIC_PATH, CB_DATA_DIR
@@ -206,7 +207,7 @@ def _load_stock_daily(stock_code: Any, daily_dir: Path | None = None) -> pd.Data
     for candidate in _stock_code_candidates(stock_code):
         path = daily_dir / f"{candidate}.parquet"
         if path.exists():
-            return pd.read_parquet(path)
+            return read_partitioned_symbol_file(path)
     return pd.DataFrame()
 
 
