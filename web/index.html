@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1" />
   </head>
   <body>
     <div class="app selector-app">
@@ -346,15 +346,15 @@
             <table class="long-pool-table">
               <thead>
                 <tr>
-                  <th>状态</th>
+                  <th>推荐程度</th>
                   <th>股票</th>
                   <th>行业</th>
-                  <th>动作</th>
-                  <th>仓位计划</th>
+                  <th>价格状态</th>
+                  <th>策略计划</th>
                   <th>评分</th>
-                  <th>价格计划</th>
+                  <th>关键价格</th>
                   <th>预测覆盖</th>
-                  <th>原因</th>
+                  <th>入选 / 观察原因</th>
                 </tr>
               </thead>
               <tbody id="longStockRows">
@@ -790,6 +790,8 @@
                 <tr>
                   <th>股票</th>
                   <th>策略共振</th>
+                  <th>买入分</th>
+                  <th>持有分</th>
                   <th>当前走势</th>
                   <th>T+1 结论</th>
                   <th>中期预期</th>
@@ -799,7 +801,7 @@
                 </tr>
               </thead>
               <tbody id="similarWatchlist">
-                <tr><td colspan="8" class="empty-cell">切到自选池后加载</td></tr>
+                <tr><td colspan="10" class="empty-cell">切到自选池后加载</td></tr>
               </tbody>
             </table>
           </div>
@@ -904,6 +906,6 @@
         </div>
       </form>
     </dialog>
-    <script src="./app.js?v=20260720-watchlist-reorder-v5"></script>
+    <script src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1"></script>
   </body>
 </html>

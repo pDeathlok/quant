@@ -91,6 +91,15 @@ def test_watchlist_stocks_link_to_xueqiu_in_a_new_tab() -> None:
     assert ".xueqiu-stock-link" in STYLES_CSS
 
 
+def test_watchlist_reuses_selector_buy_and_hold_scores() -> None:
+    assert "<th>买入分</th>" in INDEX_HTML
+    assert "<th>持有分</th>" in INDEX_HTML
+    assert "item.opportunity_score ?? item.buy_score" in APP_JS
+    assert "item.holding_score ?? item.hold_score" in APP_JS
+    assert 'class="similar-score-cell"' in APP_JS
+    assert 'colspan="10"' in INDEX_HTML
+
+
 def test_watchlist_rows_support_persistent_drag_order_and_pin_menu() -> None:
     assert 'await fetchJson("/similar-patterns/watchlist/order", {' in APP_JS
     assert '/pin`, {' in APP_JS
@@ -108,6 +117,31 @@ def test_similar_cases_explain_and_display_forecast_weight_ranking() -> None:
     assert "<th>原始相似度</th>" not in INDEX_HTML
     assert "Math.log1p(contrast * normalized) / Math.log1p(contrast) * 100" in APP_JS
     assert '<td>${row.similarity ?? "-"}</td>' not in APP_JS
+
+
+def test_long_analyst_coverage_uses_honest_labels_and_missing_state() -> None:
+    assert '`${institutions}家机构 · ${researchReports}份研报`' in APP_JS
+    assert '`一致预期 · 覆盖${consensusReports}份研报`' in APP_JS
+    assert '`${dataPoints}项预测数据`' in APP_JS
+    assert '`覆盖未来${forwardYears}年`' in APP_JS
+    assert '"成长评分 暂无"' in APP_JS
+    assert "前瞻EPS增长35% + 营收增长30% + 净利润增长25% + 预测覆盖10%" in APP_JS
+    assert 'Number(item.analyst_forward_growth_score || 0).toFixed(1)' not in APP_JS
+
+
+def test_long_recommendation_and_price_status_are_separate() -> None:
+    assert "function recommendationBadge(item, includeDays = true)" in APP_JS
+    assert 'aria-label="连续推荐 ${days} 天"' in APP_JS
+    assert 'RECOMMENDED: "推荐"' in APP_JS
+    assert 'CAUTION: "谨慎"' in APP_JS
+    assert 'AVOID: "回避"' in APP_JS
+    assert "function priceStateText(item)" in APP_JS
+    assert "function longPricePlan(item)" in APP_JS
+    assert "不提供建仓或清仓指令" in APP_JS
+    assert 'item.display_reason || item.reason || "-"' in APP_JS
+    assert "<th>推荐程度</th>" in INDEX_HTML
+    assert "<th>价格状态</th>" in INDEX_HTML
+    assert ".recommendation-days" in STYLES_CSS
 
 
 def test_byd_holding_inputs_are_restored_and_persisted() -> None:

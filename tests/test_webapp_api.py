@@ -17,6 +17,93 @@ from quant.webapp import api as webapp_api
 client = TestClient(app)
 
 
+def test_historical_scores_are_independent_of_current_candidate_pool(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_selector_buy_hold_models", lambda: {})
+    base_row = {
+        "symbol": "000001.SZ",
+        "historical_buy_score": 72.4,
+        "historical_hold_score": 61.3,
+    }
+    other_row = {
+        "symbol": "000002.SZ",
+        "historical_buy_score": 99.0,
+        "historical_hold_score": 5.0,
+    }
+
+    score_alone = services._apply_historical_score_normalization([dict(base_row)])[0]
+    score_with_other = services._apply_historical_score_normalization([dict(base_row), dict(other_row)])[0]
+
+    assert score_alone["opportunity_score"] == score_with_other["opportunity_score"] == 72.4
+    assert score_alone["holding_score"] == score_with_other["holding_score"] == 61.3
+    assert score_alone["selector_score"] == 72.4
+    assert score_alone["score_target"] == "historical_return_model_score"
+
+
+def test_return_model_scores_use_fixed_historical_reference(monkeypatch) -> None:
+    class FakeImputer:
+        def transform(self, frame):
+            return frame[["selector_return_5d"]].to_numpy()
+
+    class FakeModel:
+        def predict(self, values):
+            return values[:, 0]
+
+    artifact = {
+        "features": ["selector_return_5d"],
+        "imputer": FakeImputer(),
+        "model": FakeModel(),
+        "score_reference": np.array([0.0, 1.0, 2.0, 3.0]),
+    }
+    monkeypatch.setattr(services, "_selector_buy_hold_models", lambda: {"buy": artifact})
+    monkeypatch.setattr(
+        services,
+        "_selector_model_feature_rows",
+        lambda signal_date: {
+            "000001.SZ": {"selector_return_5d": 1.0},
+            "000002.SZ": {"selector_return_5d": 3.0},
+        },
+    )
+    rows = [
+        {"symbol": "000001.SZ", "date": "2026-07-21", "matched_groups": ["B1"]},
+        {"symbol": "000002.SZ", "date": "2026-07-21", "matched_groups": ["B2"]},
+    ]
+
+    services._apply_return_model_scores(rows)
+
+    assert rows[0]["historical_buy_score"] < rows[1]["historical_buy_score"]
+    assert rows[1]["historical_buy_score"] < 100.0
+    assert rows[0]["buy_score_source"] == "historical_return_model"
+
+
+@pytest.mark.parametrize("mode", ["buy", "hold"])
+def test_historical_buy_and_hold_scores_preserve_return_order(monkeypatch, mode: str) -> None:
+    distribution = np.linspace(-20.0, 20.0, 401)
+    monkeypatch.setattr(
+        services,
+        "_selector_score_calibration",
+        lambda: {
+            "global": {mode: distribution},
+            "group": {mode: {"B1": distribution}},
+        },
+    )
+    common = {
+        "strategy_group": "B1",
+        "metrics": {
+            "trades": 240,
+            "win_rate": 0.5,
+            "max_drawdown_pct": 10.0,
+            "profit_factor": 1.5,
+        },
+    }
+    lower_return = {**common, "metrics": {**common["metrics"], "avg_return_pct": 1.0}}
+    higher_return = {**common, "metrics": {**common["metrics"], "avg_return_pct": 5.0}}
+
+    assert services._normalized_signal_score(higher_return, mode=mode) > services._normalized_signal_score(
+        lower_return,
+        mode=mode,
+    )
+
+
 def test_api_refresh_runs_cleanup_before_data_refresh_even_when_refresh_fails(monkeypatch) -> None:
     from quant.routine import pipeline
 
@@ -99,6 +186,78 @@ def test_global_refresh_includes_daily_similar_pattern_step() -> None:
 
     assert "convertible_bond_allotment" in step_keys
     assert "similar_patterns" in step_keys
+
+
+def test_refresh_progress_ignores_stale_run_context(monkeypatch) -> None:
+    status = {
+        "status": "running",
+        "run_id": "current-run",
+        "started_at": "2026-07-22T19:00:00",
+        "finished_at": None,
+        "updated_at": "2026-07-22T19:00:00",
+        "message": "current",
+        "percent": 10,
+        "current_step": "refresh_data",
+        "steps": services._progress_steps("all"),
+        "result": None,
+        "error": None,
+    }
+
+    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+    services._REFRESH_CONTEXT.run_id = "old-run"
+    try:
+        services._set_refresh_progress(
+            step_key="feature_cache",
+            message="old worker should not win",
+            percent=40,
+        )
+    finally:
+        delattr(services._REFRESH_CONTEXT, "run_id")
+
+    assert status["message"] == "current"
+    assert status["percent"] == 10
+    assert status["current_step"] == "refresh_data"
+
+
+def test_expiring_stale_refresh_terminates_known_child_processes(monkeypatch) -> None:
+    status = {
+        "status": "running",
+        "run_id": "stale-run",
+        "started_at": "2000-01-01T00:00:00",
+        "finished_at": None,
+        "updated_at": "2000-01-01T00:00:00",
+        "message": "stale",
+        "percent": 35,
+        "current_step": "feature_cache",
+        "steps": [{"key": "feature_cache", "status": "running"}],
+        "result": None,
+        "error": None,
+    }
+    killed: list[tuple[int, int]] = []
+
+    class Result:
+        returncode = 0
+        stdout = "\n".join(
+            [
+                "123 /Users/didi/miniforge3/bin/python scripts/research/refresh_b1_feature_cache.py --workers 8",
+                "456 /Users/didi/miniforge3/bin/python scripts/research/rebuild_strategy_signal_cache.py --workers 8",
+            ]
+        )
+        stderr = ""
+
+    monkeypatch.setattr(services, "_REFRESH_STATUS", dict(status))
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+    monkeypatch.setattr(services.subprocess, "run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr(services.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    expired = services._expire_stale_refresh_status_unlocked(status)
+
+    assert expired["status"] == "failed"
+    assert expired["steps"][0]["status"] == "failed"
+    assert (123, services.signal.SIGTERM) in killed
+    assert (456, services.signal.SIGTERM) in killed
+    assert "已终止卡住的后台节点" in expired["error"]
 
 
 def test_latest_extended_signals_reuses_candidate_parquet(monkeypatch, tmp_path) -> None:
@@ -276,6 +435,142 @@ def test_tea_checkpoint_recovers_previous_month_targets(monkeypatch) -> None:
 
     assert same_month == {"000001.SZ", "000003.SZ"}
     assert next_month == {"000001.SZ", "000002.SZ"}
+
+
+def test_tea_analyst_display_recomputes_growth_score_and_preserves_missing(monkeypatch) -> None:
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-07-21"] * 3),
+            "ts_code": ["000001.SZ", "000002.SZ", "000003.SZ"],
+            "close": [10.0, 20.0, 30.0],
+            "analyst_forward_growth_score": [0.0, 0.0, 0.0],
+        }
+    )
+
+    class FakeModule:
+        @staticmethod
+        def load_analyst_forecast_asof(out):
+            return out.assign(
+                analyst_report_count_180d=[9.0, 9.0, 5.0],
+                analyst_org_count_180d=[2.0, 2.0, 1.0],
+                analyst_forward_years_180d=[3.0, 3.0, 3.0],
+                analyst_forward_eps_growth_180d=[0.20, 0.10, float("nan")],
+                analyst_forward_revenue_growth_180d=[0.15, 0.05, float("nan")],
+                analyst_forward_net_profit_growth_180d=[0.25, 0.08, float("nan")],
+                analyst_target_upside_180d=[0.10, 0.05, float("nan")],
+            )
+
+        @staticmethod
+        def percentile_score(series, higher_is_better=True):
+            rank = pd.to_numeric(series, errors="coerce").rank(pct=True)
+            if not higher_is_better:
+                rank = 1.0 - rank
+            return (rank * 100).fillna(0.0)
+
+    monkeypatch.setattr(services, "_long_research_module", lambda: FakeModule())
+
+    result = services._attach_analyst_forecast_for_display(frame).set_index("ts_code")
+
+    assert result.loc["000001.SZ", "analyst_forward_growth_score"] > result.loc["000002.SZ", "analyst_forward_growth_score"]
+    assert pd.isna(result.loc["000003.SZ", "analyst_forward_growth_score"])
+
+
+def test_continuous_recommendation_days_follow_latest_unbroken_streak() -> None:
+    targets = pd.DataFrame(
+        {
+            "rebalance_date": pd.to_datetime(
+                [
+                    "2026-03-31",
+                    "2026-04-30",
+                    "2026-05-29",
+                    "2026-05-29",
+                    "2026-06-30",
+                    "2026-06-30",
+                    "2026-07-21",
+                    "2026-07-21",
+                ]
+            ),
+            "ts_code": [
+                "000001.SZ",
+                "000001.SZ",
+                "000001.SZ",
+                "000002.SZ",
+                "000001.SZ",
+                "000003.SZ",
+                "000001.SZ",
+                "000003.SZ",
+            ],
+        }
+    )
+
+    starts = services._continuous_recommendation_starts(targets, pd.Timestamp("2026-07-21"))
+
+    assert starts == {
+        "000001.SZ": pd.Timestamp("2026-03-31"),
+        "000003.SZ": pd.Timestamp("2026-06-30"),
+    }
+
+    recommended = services._decorate_long_recommendation_display(
+        {
+            "state": "BUILDING",
+            "close": 9.8,
+            "price_levels": {
+                "entry_aggressive_price": 10.0,
+                "entry_target_price": 10.2,
+                "entry_small_position_price": 11.0,
+            },
+        },
+        selected=True,
+        signal_ts=pd.Timestamp("2026-07-21"),
+        recommendation_since=starts["000001.SZ"],
+    )
+    assert recommended["recommendation_level"] == "RECOMMENDED"
+    assert recommended["recommendation_days"] == 113
+    assert recommended["price_state"] == "AGGRESSIVE"
+    assert recommended["display_reason"] == "本期进入推荐池，价格与风险条件支持分批执行"
+    assert "持有" not in recommended["display_reason"]
+
+    cautious = services._decorate_long_recommendation_display(
+        {
+            "state": "REDUCE",
+            "reason": "价格跌破 MA60，先降仓控制风险",
+            "close": 9.8,
+            "price_levels": {"reduce_ma60_price": 10.0},
+        },
+        selected=False,
+        signal_ts=pd.Timestamp("2026-07-21"),
+    )
+    assert cautious["recommendation_level"] == "CAUTION"
+    assert "降仓" not in cautious["display_reason"]
+
+
+def test_legacy_tea_snapshot_is_upgraded_without_full_pool_rebuild(monkeypatch) -> None:
+    payload = {
+        "variant": "tea",
+        "signal_date": "2026-07-21",
+        "stocks": [
+            {"ts_code": "000001.SZ", "close": 10.0, "analyst_forward_growth_score": 0.0},
+            {"ts_code": "000002.SZ", "close": 20.0, "analyst_forward_growth_score": 0.0},
+        ],
+    }
+    enriched = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000002.SZ"],
+            "analyst_report_count_180d": [9.0, 5.0],
+            "analyst_org_count_180d": [2.0, 1.0],
+            "analyst_forward_years_180d": [3.0, 2.0],
+            "analyst_forward_growth_score": [72.5, float("nan")],
+            "analyst_target_upside_180d": [0.12, float("nan")],
+        }
+    )
+    monkeypatch.setattr(services, "_attach_analyst_forecast_for_display", lambda frame: enriched)
+
+    upgraded, changed = services._upgrade_cached_tea_analyst_display(payload)
+
+    assert changed is True
+    assert upgraded["schema_version"] == services.LONG_STOCK_POOL_SCHEMA_VERSION
+    assert upgraded["stocks"][0]["analyst_forward_growth_score"] == 72.5
+    assert upgraded["stocks"][1]["analyst_forward_growth_score"] is None
 
 
 def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
@@ -592,6 +887,19 @@ def test_watchlist_notes_are_saved_and_returned_with_stock_profiles(monkeypatch,
             [{"ts_code": "002594.SZ", "name": "比亚迪", "industry": "汽车整车"}]
         ),
     )
+    monkeypatch.setattr(
+        services,
+        "_watchlist_buy_hold_scores",
+        lambda symbols: {
+            "002594.SZ": {
+                "opportunity_score": 73.2,
+                "holding_score": 61.8,
+                "buy_score": 73.2,
+                "hold_score": 61.8,
+                "score_date": "2026-07-21",
+            }
+        },
+    )
 
     payload = services.save_similar_pattern_watch_note(
         "002594.SZ",
@@ -602,6 +910,9 @@ def test_watchlist_notes_are_saved_and_returned_with_stock_profiles(monkeypatch,
     persisted = watchlist_path.read_text(encoding="utf-8")
     assert stock["note"] == "操作计划：回踩 20 日线后分批关注"
     assert stock["note_updated_at"]
+    assert stock["opportunity_score"] == 73.2
+    assert stock["holding_score"] == 61.8
+    assert stock["score_date"] == "2026-07-21"
     assert "回踩 20 日线" in persisted
 
 

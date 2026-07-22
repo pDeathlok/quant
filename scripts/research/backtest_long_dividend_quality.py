@@ -638,6 +638,9 @@ def add_empty_analyst_forecast_columns(features: pd.DataFrame) -> pd.DataFrame:
     defaults = {
         "analyst_report_count_180d": 0.0,
         "analyst_org_count_180d": 0.0,
+        "analyst_institution_count_180d": 0.0,
+        "analyst_research_report_count_180d": 0.0,
+        "analyst_consensus_report_count_180d": 0.0,
         "analyst_eps_mean_180d": np.nan,
         "analyst_pe_mean_180d": np.nan,
         "analyst_target_price_mean_180d": np.nan,
@@ -671,6 +674,7 @@ def load_raw_analyst_reports() -> pd.DataFrame:
         "source",
         "ts_code",
         "report_date",
+        "report_title",
         "org_name",
         "author_name",
         "quarter",
@@ -680,6 +684,7 @@ def load_raw_analyst_reports() -> pd.DataFrame:
         "target_price",
         "net_profit",
         "revenue",
+        "report_count",
         "snapshot_only",
     ]
     for column in keep_columns:
@@ -780,6 +785,19 @@ def load_analyst_forecast_asof(features: pd.DataFrame) -> pd.DataFrame:
                 target_upside = float(target_mean / close - 1.0)
             visible_orgs = pd.Series(org_values[lo_180:hi]).dropna()
             visible = symbol_reports.iloc[lo_180:hi]
+            detailed_reports = visible[
+                visible["source"].isin(["akshare_em_research", "akshare_cninfo_rating"])
+                & visible["org_name"].notna()
+            ].copy()
+            institution_count = detailed_reports["org_name"].nunique(dropna=True)
+            research_report_count = len(
+                detailed_reports.drop_duplicates(
+                    ["source", "report_date", "org_name", "author_name", "report_title"],
+                    keep="last",
+                )
+            )
+            consensus_report_counts = pd.to_numeric(visible["report_count"], errors="coerce").dropna()
+            consensus_report_count = float(consensus_report_counts.max()) if not consensus_report_counts.empty else 0.0
             forward = visible[visible["forecast_year"] >= date.year].copy()
             forward_years = forward["forecast_year"].dropna().nunique()
             forward_eps_growth = np.nan
@@ -808,6 +826,9 @@ def load_analyst_forecast_asof(features: pd.DataFrame) -> pd.DataFrame:
                     "date": date,
                     "analyst_report_count_180d": float(max(0, hi - lo_180)),
                     "analyst_org_count_180d": float(visible_orgs.nunique(dropna=True)),
+                    "analyst_institution_count_180d": float(institution_count),
+                    "analyst_research_report_count_180d": float(research_report_count),
+                    "analyst_consensus_report_count_180d": consensus_report_count,
                     "analyst_eps_mean_180d": window_mean(*metric_cumsums["eps"][1:], lo_180, hi),
                     "analyst_pe_mean_180d": window_mean(*metric_cumsums["pe"][1:], lo_180, hi),
                     "analyst_target_price_mean_180d": target_mean,

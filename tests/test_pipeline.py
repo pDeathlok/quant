@@ -22,6 +22,34 @@ def test_refresh_daily_basic_reports_partial_failure(monkeypatch) -> None:
     assert result["start_date"] == "20260720"
 
 
+def test_reference_and_analyst_interfaces_run_in_parallel(monkeypatch) -> None:
+    barrier = threading.Barrier(2, timeout=2)
+    thread_ids: set[int] = set()
+
+    def fake_reference_data(**kwargs):
+        thread_ids.add(threading.get_ident())
+        barrier.wait()
+        return {"status": "success", "steps": {}, "critical_errors": []}
+
+    def fake_analyst_refresh():
+        thread_ids.add(threading.get_ident())
+        barrier.wait()
+        return {"status": "success", "steps": {}}
+
+    monkeypatch.setattr(
+        "quant.routine.reference_data_refresh.refresh_reference_data",
+        fake_reference_data,
+    )
+    monkeypatch.setattr(pipeline, "_refresh_analyst_forecast_snapshot", fake_analyst_refresh)
+
+    result = pipeline.refresh_reference_inputs(dry_run=False, include_financials=True)
+
+    assert result["status"] == "success"
+    assert result["execution_mode"] == "parallel_tushare_and_akshare"
+    assert result["steps"]["analyst_forecast_snapshot"]["status"] == "success"
+    assert len(thread_ids) == 2
+
+
 def test_analyst_snapshot_reuses_today_checkpoint(monkeypatch, tmp_path) -> None:
     output = tmp_path / "data/raw/analyst_forecasts.parquet"
     output.parent.mkdir(parents=True)
@@ -43,6 +71,108 @@ def test_analyst_snapshot_reuses_today_checkpoint(monkeypatch, tmp_path) -> None
 
     assert result["status"] == "skipped"
     assert result["latest_report_date"] == today.date().isoformat()
+
+
+def test_daily_analyst_refresh_fetches_broker_reports_for_long_candidates(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "data/raw/analyst_forecasts.parquet"
+    output.parent.mkdir(parents=True)
+    today = pd.Timestamp.now().normalize()
+    pd.DataFrame({"source": ["akshare_em_snapshot"], "report_date": [today]}).to_parquet(output, index=False)
+    snapshot_dir = tmp_path / "data/long_stock_pool_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "tea.json").write_text(
+        json.dumps(
+            {
+                "variant": "tea",
+                "stocks": [
+                    {"ts_code": "000001.SZ", "state": "CORE"},
+                    {"ts_code": "000002.SZ", "state": "EXIT"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("ROUTINE_REFRESH_CANDIDATE_RESEARCH", "1")
+    monkeypatch.setattr(pipeline.subprocess, "run", lambda command, **kwargs: calls.append(command) or Result())
+
+    result = pipeline._refresh_analyst_forecast_snapshot()
+
+    assert result["status"] == "success"
+    assert result["candidate_symbols"] == ["000001.SZ"]
+    assert len(calls) == 1
+    assert "akshare_em_research" in calls[0]
+    assert "000001.SZ" in calls[0]
+    assert "--refresh-existing" in calls[0]
+
+
+def test_daily_analyst_timeout_uses_last_known_good_research(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "data/raw/analyst_forecasts.parquet"
+    output.parent.mkdir(parents=True)
+    today = pd.Timestamp.now().normalize()
+    pd.DataFrame(
+        {
+            "source": ["akshare_em_snapshot", "akshare_em_research"],
+            "ts_code": ["000001.SZ", "000001.SZ"],
+            "report_date": [today, today - pd.Timedelta(days=7)],
+        }
+    ).to_parquet(output, index=False)
+    snapshot_dir = tmp_path / "data/long_stock_pool_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "tea.json").write_text(
+        json.dumps({"variant": "tea", "stocks": [{"ts_code": "000001.SZ", "state": "CORE"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("ROUTINE_REFRESH_CANDIDATE_RESEARCH", "1")
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda command, **kwargs: (_ for _ in ()).throw(
+            pipeline.subprocess.TimeoutExpired(command, kwargs["timeout"])
+        ),
+    )
+
+    result = pipeline._refresh_analyst_forecast_snapshot()
+
+    assert result["status"] == "degraded"
+    step = result["steps"]["candidate_research_reports"]
+    assert step["status"] == "degraded"
+    assert step["returncode"] == 124
+    assert step["fallback_symbols"] == 1
+    assert not (tmp_path / "data/raw/analyst_research_refresh_status.json").exists()
+
+
+def test_daily_candidate_report_refresh_requires_explicit_external_opt_in(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "data/raw/analyst_forecasts.parquet"
+    output.parent.mkdir(parents=True)
+    today = pd.Timestamp.now().normalize()
+    pd.DataFrame({"source": ["akshare_em_snapshot"], "report_date": [today]}).to_parquet(output, index=False)
+    snapshot_dir = tmp_path / "data/long_stock_pool_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "tea.json").write_text(
+        json.dumps({"variant": "tea", "stocks": [{"ts_code": "000001.SZ", "state": "CORE"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.delenv("ROUTINE_REFRESH_CANDIDATE_RESEARCH", raising=False)
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("external refresh should remain disabled")),
+    )
+
+    result = pipeline._refresh_analyst_forecast_snapshot()
+
+    assert result["status"] == "skipped"
+    assert "disabled" in result["steps"]["candidate_research_reports"]["reason"]
 
 
 def test_chan_refresh_requires_current_completion_manifest(monkeypatch, tmp_path) -> None:
@@ -84,13 +214,14 @@ def test_chan_refresh_requires_current_completion_manifest(monkeypatch, tmp_path
 
 
 def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
-    captured: dict[str, list[str]] = {}
+    captured: dict[str, object] = {}
 
     class FakeProcess:
         stdout = io.StringIO("")
 
         def __init__(self, command, **kwargs) -> None:
             captured["command"] = command
+            captured["kwargs"] = kwargs
 
         def wait(self) -> int:
             return 0
@@ -102,7 +233,9 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     result = pipeline.build_features()
 
     command = captured["command"]
+    kwargs = captured["kwargs"]
     assert command[command.index("--executor") + 1] == "processes"
+    assert kwargs["start_new_session"] is True
     assert result["status"] == "success"
 
 

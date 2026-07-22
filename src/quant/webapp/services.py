@@ -8,9 +8,12 @@ import importlib.util
 import multiprocessing as mp
 import os
 import queue
+import signal
+import subprocess
 import sys
 import threading
 import traceback
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -72,6 +75,8 @@ EXTENDED_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.
 VEGAS_TUNNEL_REPORT_DIR = PROJECT_ROOT / "reports/vegas_tunnel"
 SELECTOR_HISTORY_SIGNAL_SAMPLES = PROJECT_ROOT / "data/research/selector_history_full/selector_signal_history_samples.parquet"
 SELECTOR_BUY_HOLD_SCORE_CALIBRATION = PROJECT_ROOT / "config/selector_buy_hold_score_calibration.json"
+SELECTOR_BUY_HOLD_MODEL_DIR = PROJECT_ROOT / "models/production/selector_buy_hold"
+SELECTOR_MODEL_HISTORY = PROJECT_ROOT / "data/research/selector_model_history_2020.parquet"
 FAMILY_RULE_PATTERN = "b1_family_rule_backtest_*.csv"
 FUSION_PATTERN = "b1_model_zettaranc_fusion_*.csv"
 MODEL_FILTERED_SIGNALS = {
@@ -158,10 +163,10 @@ DEFAULT_FAMILIES = {
 }
 DEFAULT_SELECTOR_LIMIT = 50
 DEFAULT_FAMILY_CAP = 12
-SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v5"
+SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v8_robust_return_models"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
-LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v1"
+LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v6_recommendation_and_analyst_coverage"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
 WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION = "workspace_payload_v1"
@@ -199,9 +204,11 @@ TEA_LONG_VARIANTS = {
 }
 LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 40
 _REFRESH_LOCK = threading.Lock()
+_REFRESH_CONTEXT = threading.local()
 _REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
 _REFRESH_STATUS: dict[str, Any] = {
     "status": "idle",
+    "run_id": None,
     "started_at": None,
     "finished_at": None,
     "updated_at": None,
@@ -212,6 +219,10 @@ _REFRESH_STATUS: dict[str, Any] = {
     "result": None,
     "error": None,
 }
+REFRESH_CHILD_PROCESS_MARKERS = (
+    "scripts/research/refresh_b1_feature_cache.py",
+    "scripts/research/rebuild_strategy_signal_cache.py",
+)
 REFRESH_SCOPE_LABELS = {
     "all": "全部工作区",
     "short": "短线策略",
@@ -516,6 +527,74 @@ def _refresh_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
     return _tail_resume_ready(status, scope) or _input_resume_ready(status, scope)
 
 
+def _new_refresh_run_id(scope: str) -> str:
+    return f"{scope}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def _owned_refresh_context_active_unlocked() -> bool:
+    context_run_id = getattr(_REFRESH_CONTEXT, "run_id", None)
+    if not context_run_id:
+        return True
+    if _REFRESH_STATUS.get("run_id") != context_run_id:
+        return False
+    return _REFRESH_STATUS.get("status") not in {"success", "failed"}
+
+
+def _refresh_child_process_pids() -> list[int]:
+    pids: list[int] = []
+    seen: set[int] = set()
+    for marker in REFRESH_CHILD_PROCESS_MARKERS:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-fl", marker],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            continue
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            pid_text, _, command = line.partition(" ")
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            if pid == os.getpid() or pid in seen:
+                continue
+            if not any(child_marker in command for child_marker in REFRESH_CHILD_PROCESS_MARKERS):
+                continue
+            seen.add(pid)
+            pids.append(pid)
+    return pids
+
+
+def _terminate_refresh_child_processes() -> int:
+    terminated = 0
+    for pid in _refresh_child_process_pids():
+        signaled = False
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            signaled = True
+        except ProcessLookupError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                signaled = True
+            except ProcessLookupError:
+                pass
+        except PermissionError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                signaled = True
+            except (ProcessLookupError, PermissionError):
+                pass
+        if signaled:
+            terminated += 1
+    return terminated
+
+
 def _terminate_active_worker_unlocked(status: dict[str, Any] | None = None) -> bool:
     worker_key = str((status or _REFRESH_STATUS).get("active_worker_key") or "")
     proc = _REFRESH_ACTIVE_PROCS.pop(worker_key, None) if worker_key else None
@@ -526,6 +605,8 @@ def _terminate_active_worker_unlocked(status: dict[str, Any] | None = None) -> b
         if proc.is_alive():
             proc.kill()
             proc.join(timeout=5)
+        terminated = True
+    if _terminate_refresh_child_processes():
         terminated = True
     _REFRESH_STATUS.pop("active_worker_key", None)
     _REFRESH_STATUS.pop("active_worker_pid", None)
@@ -1135,6 +1216,7 @@ def _write_long_stock_pool_snapshot(
 ) -> None:
     snapshot_key, date_key = _long_snapshot_key(variant, signal_date)
     payload_to_store = dict(payload)
+    payload_to_store["schema_version"] = LONG_STOCK_POOL_SCHEMA_VERSION
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
     LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1731,6 +1813,9 @@ def _long_status_row(
         "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
         "analyst_report_count_180d": int(_safe_float(row.get("analyst_report_count_180d"), 0.0) or 0),
         "analyst_org_count_180d": int(_safe_float(row.get("analyst_org_count_180d"), 0.0) or 0),
+        "analyst_institution_count_180d": int(_safe_float(row.get("analyst_institution_count_180d"), 0.0) or 0),
+        "analyst_research_report_count_180d": int(_safe_float(row.get("analyst_research_report_count_180d"), 0.0) or 0),
+        "analyst_consensus_report_count_180d": int(_safe_float(row.get("analyst_consensus_report_count_180d"), 0.0) or 0),
         "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
         "analyst_forward_growth_score": round(_safe_float(row.get("analyst_forward_growth_score"), 0.0) or 0.0, 2),
         "analyst_target_upside_180d": round(_safe_float(row.get("analyst_target_upside_180d"), 0.0) or 0.0, 4),
@@ -1786,9 +1871,98 @@ def _attach_analyst_forecast_for_display(frame: pd.DataFrame) -> pd.DataFrame:
     module = _long_research_module()
     out = frame.drop(columns=[col for col in frame.columns if col.startswith("analyst_")], errors="ignore")
     try:
-        return module.load_analyst_forecast_asof(out)
+        enriched = module.load_analyst_forecast_asof(out)
     except Exception:
         return module.add_empty_analyst_forecast_columns(out)
+
+    scored: list[pd.DataFrame] = []
+    growth_columns = [
+        "analyst_forward_eps_growth_180d",
+        "analyst_forward_revenue_growth_180d",
+        "analyst_forward_net_profit_growth_180d",
+    ]
+    for _, group in enriched.groupby("date", sort=False):
+        group = group.copy()
+        has_growth_metrics = group[growth_columns].notna().any(axis=1)
+        growth_score = (
+            module.percentile_score(group["analyst_forward_eps_growth_180d"].clip(-0.5, 1.5), True) * 0.35
+            + module.percentile_score(group["analyst_forward_revenue_growth_180d"].clip(-0.5, 1.5), True) * 0.30
+            + module.percentile_score(group["analyst_forward_net_profit_growth_180d"].clip(-0.8, 2.0), True) * 0.25
+            + module.percentile_score(group["analyst_report_count_180d"], True) * 0.10
+        )
+        group["analyst_forward_growth_score"] = growth_score.where(has_growth_metrics)
+        scored.append(group)
+    return pd.concat(scored, ignore_index=True) if scored else enriched
+
+
+def _upgrade_cached_tea_analyst_display(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    stocks = payload.get("stocks") or []
+    if payload.get("schema_version") == LONG_STOCK_POOL_SCHEMA_VERSION and all(
+        item.get("recommendation_level") and item.get("display_reason") for item in stocks
+    ):
+        return payload, False
+    signal_date = payload.get("signal_date")
+    if not stocks or not signal_date:
+        return payload, False
+
+    display_frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime([signal_date] * len(stocks)),
+            "ts_code": [str(item.get("ts_code")) for item in stocks],
+            "close": [item.get("close") for item in stocks],
+        }
+    )
+    enriched = _attach_analyst_forecast_for_display(display_frame).set_index("ts_code", drop=False)
+    analyst_columns = [
+        "analyst_report_count_180d",
+        "analyst_org_count_180d",
+        "analyst_institution_count_180d",
+        "analyst_research_report_count_180d",
+        "analyst_consensus_report_count_180d",
+        "analyst_forward_years_180d",
+        "analyst_forward_growth_score",
+        "analyst_target_upside_180d",
+    ]
+    upgraded = dict(payload)
+    upgraded_stocks: list[dict[str, Any]] = []
+    for item in stocks:
+        upgraded_item = dict(item)
+        code = str(item.get("ts_code"))
+        if code in enriched.index:
+            row = enriched.loc[code]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[-1]
+            for column in analyst_columns:
+                value = _safe_float(row.get(column))
+                if column in {
+                    "analyst_report_count_180d",
+                    "analyst_org_count_180d",
+                    "analyst_institution_count_180d",
+                    "analyst_research_report_count_180d",
+                    "analyst_consensus_report_count_180d",
+                    "analyst_forward_years_180d",
+                }:
+                    upgraded_item[column] = int(value or 0)
+                else:
+                    precision = 4 if column == "analyst_target_upside_180d" else 2
+                    upgraded_item[column] = round(value, precision) if value is not None else None
+        existing_since = pd.to_datetime(upgraded_item.get("recommendation_since"), errors="coerce")
+        _decorate_long_recommendation_display(
+            upgraded_item,
+            selected=upgraded_item.get("rank") is not None,
+            signal_ts=pd.Timestamp(signal_date),
+            recommendation_since=None if pd.isna(existing_since) else pd.Timestamp(existing_since),
+        )
+        upgraded_stocks.append(upgraded_item)
+    upgraded["stocks"] = upgraded_stocks
+    upgraded["state_counts"] = {
+        str(key): int(value)
+        for key, value in pd.Series(
+            [item["recommendation_level"] for item in upgraded_stocks]
+        ).value_counts().to_dict().items()
+    }
+    upgraded["schema_version"] = LONG_STOCK_POOL_SCHEMA_VERSION
+    return upgraded, True
 
 
 def _tea_t_action(row: pd.Series, regime: str) -> tuple[str, str, str]:
@@ -1934,9 +2108,20 @@ def _tea_status_row(
         "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
         "analyst_report_count_180d": int(_safe_float(row.get("analyst_report_count_180d"), 0.0) or 0),
         "analyst_org_count_180d": int(_safe_float(row.get("analyst_org_count_180d"), 0.0) or 0),
+        "analyst_institution_count_180d": int(_safe_float(row.get("analyst_institution_count_180d"), 0.0) or 0),
+        "analyst_research_report_count_180d": int(_safe_float(row.get("analyst_research_report_count_180d"), 0.0) or 0),
+        "analyst_consensus_report_count_180d": int(_safe_float(row.get("analyst_consensus_report_count_180d"), 0.0) or 0),
         "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
-        "analyst_forward_growth_score": round(_safe_float(row.get("analyst_forward_growth_score"), 0.0) or 0.0, 2),
-        "analyst_target_upside_180d": round(_safe_float(row.get("analyst_target_upside_180d"), 0.0) or 0.0, 4),
+        "analyst_forward_growth_score": (
+            round(growth_score, 2)
+            if (growth_score := _safe_float(row.get("analyst_forward_growth_score"))) is not None
+            else None
+        ),
+        "analyst_target_upside_180d": (
+            round(target_upside_score, 4)
+            if (target_upside_score := _safe_float(row.get("analyst_target_upside_180d"))) is not None
+            else None
+        ),
         "analyst_negative_warning": _safe_bool(row.get("analyst_negative_warning")),
         "close_above_ma120": bool(close is not None and _safe_float(row.get("ma_120")) is not None and close > float(row.get("ma_120"))),
         "ma_120_slope_20d": round(_safe_float(row.get("ma_120_slope_20d"), 0.0) or 0.0, 4),
@@ -1970,6 +2155,150 @@ def _tea_previous_target_checkpoint(variant_key: str, signal_ts: pd.Timestamp) -
     }
 
 
+def _continuous_recommendation_starts(
+    targets: pd.DataFrame,
+    signal_ts: pd.Timestamp,
+) -> dict[str, pd.Timestamp]:
+    """Find the first signal date in each latest uninterrupted recommendation streak."""
+
+    if targets.empty or "rebalance_date" not in targets.columns or "ts_code" not in targets.columns:
+        return {}
+    eligible = targets[pd.to_datetime(targets["rebalance_date"], errors="coerce") <= signal_ts].copy()
+    if eligible.empty:
+        return {}
+    eligible["rebalance_date"] = pd.to_datetime(eligible["rebalance_date"], errors="coerce")
+    dates = sorted(eligible["rebalance_date"].dropna().unique())
+    if not dates:
+        return {}
+    latest_date = pd.Timestamp(dates[-1])
+    active = set(eligible.loc[eligible["rebalance_date"] == latest_date, "ts_code"].astype(str))
+    starts = {code: latest_date for code in active}
+    for candidate_date in reversed(dates[:-1]):
+        candidate_ts = pd.Timestamp(candidate_date)
+        codes = set(eligible.loc[eligible["rebalance_date"] == candidate_ts, "ts_code"].astype(str))
+        active &= codes
+        if not active:
+            break
+        for code in active:
+            starts[code] = candidate_ts
+    return starts
+
+
+def _previous_recommendation_starts(
+    variant_key: str,
+    signal_ts: pd.Timestamp,
+) -> dict[str, pd.Timestamp]:
+    snapshot = _read_long_stock_pool_snapshot(
+        variant_key,
+        signal_ts.date().isoformat(),
+        allow_sql=False,
+    )
+    if not snapshot or not snapshot.get("signal_date"):
+        return {}
+    snapshot_ts = pd.to_datetime(snapshot.get("signal_date"), errors="coerce")
+    if pd.isna(snapshot_ts) or snapshot_ts > signal_ts:
+        return {}
+    starts: dict[str, pd.Timestamp] = {}
+    for row in snapshot.get("stocks") or []:
+        code = row.get("ts_code")
+        if not code or row.get("rank") is None:
+            continue
+        started = pd.to_datetime(row.get("recommendation_since"), errors="coerce")
+        starts[str(code)] = snapshot_ts if pd.isna(started) else pd.Timestamp(started)
+    return starts
+
+
+def _decorate_long_recommendation_display(
+    item: dict[str, Any],
+    *,
+    selected: bool,
+    signal_ts: pd.Timestamp,
+    recommendation_since: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    state = str(item.get("state") or "WATCH")
+    if selected and state in {"CORE", "BUILDING", "T_ACTIVE"}:
+        level = "RECOMMENDED"
+    elif state == "EXIT":
+        level = "AVOID"
+    elif state == "REDUCE":
+        level = "CAUTION"
+    else:
+        level = "WATCH"
+
+    item["recommendation_level"] = level
+    if level == "RECOMMENDED":
+        start = pd.Timestamp(recommendation_since) if recommendation_since is not None else signal_ts
+        start = min(start.normalize(), signal_ts.normalize())
+        item["recommendation_since"] = start.date().isoformat()
+        item["recommendation_days"] = max(1, int((signal_ts.normalize() - start).days) + 1)
+    else:
+        item["recommendation_since"] = None
+        item["recommendation_days"] = None
+
+    original_reason = str(item.get("reason") or "")
+    if level == "RECOMMENDED":
+        if state == "BUILDING":
+            display_reason = "本期进入推荐池，价格与风险条件支持分批执行"
+        elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_BUY":
+            display_reason = "价格进入策略低吸区，推荐条件仍然成立"
+        elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_SELL":
+            display_reason = "价格短期偏高，但中长期推荐条件仍然成立"
+        else:
+            display_reason = "核心筛选条件延续，维持推荐"
+    elif level == "CAUTION":
+        display_reason = (
+            original_reason
+            .replace("降仓观察", "转为谨慎观察")
+            .replace("降仓", "降低推荐优先级")
+            .replace("降低组合优先级", "降低推荐优先级")
+        ) or "风险条件转弱，降低推荐优先级"
+    elif level == "AVOID":
+        display_reason = original_reason or "当前趋势条件失效，暂时回避"
+    else:
+        display_reason = original_reason or "尚未满足本期推荐条件"
+    item["display_reason"] = display_reason
+
+    levels = item.get("price_levels") or {}
+    close = _safe_float(item.get("close"))
+    aggressive = _safe_float(levels.get("entry_aggressive_price"))
+    entry = _safe_float(levels.get("entry_target_price"))
+    small_position = _safe_float(levels.get("entry_small_position_price"))
+    if level == "AVOID":
+        price_state = "TREND_INVALID"
+        price_reason = str(item.get("display_reason") or "趋势条件未恢复")
+    elif level == "CAUTION":
+        price_state = "RISK_RISING"
+        price_reason = str(item.get("display_reason") or "风险条件正在转弱")
+    elif level == "WATCH":
+        price_state = "WAIT_SIGNAL"
+        price_reason = "价格不是唯一条件，等待评分与趋势重新满足推荐门槛"
+    elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_BUY":
+        price_state = "BUY_ZONE"
+        price_reason = "价格进入策略低吸区"
+    elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_SELL":
+        price_state = "WAIT_PULLBACK"
+        price_reason = "价格偏离短中期均线，等待回落"
+    elif close is not None and aggressive is not None and close <= aggressive:
+        price_state = "AGGRESSIVE"
+        price_reason = f"当前价不高于积极参考线 {aggressive:.2f}"
+    elif close is not None and entry is not None and close <= entry:
+        price_state = "BUY_ZONE"
+        price_reason = f"当前价进入建议建仓区，不高于 {entry:.2f}"
+    elif close is not None and small_position is not None and close <= small_position:
+        price_state = "SCALE_IN"
+        price_reason = f"高于理想建仓线 {entry:.2f}，仅适合分批"
+    else:
+        price_state = "WAIT_PULLBACK"
+        price_reason = (
+            f"当前价格偏高，等待回落至 {entry:.2f} 附近"
+            if entry is not None
+            else "当前缺少有效建仓参考线"
+        )
+    item["price_state"] = price_state
+    item["price_state_reason"] = price_reason
+    return item
+
+
 @lru_cache(maxsize=8)
 def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | None) -> dict[str, Any]:
     module = _tea_master_research_module()
@@ -1985,6 +2314,7 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     if eligible_scored.empty:
         raise RuntimeError("所选日期之前没有茶大长线评分截面")
     signal_ts = pd.to_datetime(eligible_scored["date"].max())
+    previous_recommendation_starts = _previous_recommendation_starts(variant_key, signal_ts)
     previous_set = _tea_previous_target_checkpoint(variant_key, signal_ts)
     if previous_set is None:
         merged, _, coverage = _prepare_tea_master_live_data(module, signal_date, full_history=True)
@@ -2005,6 +2335,11 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         raise RuntimeError("所选日期之前没有茶大长线股票池")
     signal_ts = pd.to_datetime(targets["rebalance_date"].max())
     latest = targets[targets["rebalance_date"] == signal_ts].copy()
+    recommendation_starts = (
+        _continuous_recommendation_starts(targets, signal_ts)
+        if previous_set is None
+        else previous_recommendation_starts
+    )
     if previous_set is None:
         target_dates = sorted(pd.to_datetime(targets["rebalance_date"].dropna().unique()))
         previous_dates = [item for item in target_dates if item < signal_ts]
@@ -2042,13 +2377,18 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
             enriched[key] = value
         previous_state = "CORE" if code in previous_set else "WATCH"
         rows.append(
-            _tea_status_row(
-                enriched,
-                variant=variant_key,
+            _decorate_long_recommendation_display(
+                _tea_status_row(
+                    enriched,
+                    variant=variant_key,
+                    selected=True,
+                    target_weight=float(target_map.get(code, {}).get("target_weight", 0.0) or 0.0),
+                    previous_state=previous_state,
+                    rank=selected_order.get(code),
+                ),
                 selected=True,
-                target_weight=float(target_map.get(code, {}).get("target_weight", 0.0) or 0.0),
-                previous_state=previous_state,
-                rank=selected_order.get(code),
+                signal_ts=signal_ts,
+                recommendation_since=recommendation_starts.get(code),
             )
         )
         appended.add(code)
@@ -2059,13 +2399,17 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         if isinstance(row, pd.DataFrame):
             row = row.iloc[-1]
         rows.append(
-            _tea_status_row(
-                row,
-                variant=variant_key,
+            _decorate_long_recommendation_display(
+                _tea_status_row(
+                    row,
+                    variant=variant_key,
+                    selected=False,
+                    target_weight=0.0,
+                    previous_state="CORE",
+                    rank=None,
+                ),
                 selected=False,
-                target_weight=0.0,
-                previous_state="CORE",
-                rank=None,
+                signal_ts=signal_ts,
             )
         )
         appended.add(code)
@@ -2086,13 +2430,17 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         if code in appended:
             continue
         rows.append(
-            _tea_status_row(
-                row,
-                variant=variant_key,
+            _decorate_long_recommendation_display(
+                _tea_status_row(
+                    row,
+                    variant=variant_key,
+                    selected=False,
+                    target_weight=0.0,
+                    previous_state="WATCH",
+                    rank=None,
+                ),
                 selected=False,
-                target_weight=0.0,
-                previous_state="WATCH",
-                rank=None,
+                signal_ts=signal_ts,
             )
         )
         appended.add(code)
@@ -2107,7 +2455,7 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         ),
     )
     regime = str(latest["market_regime"].dropna().iloc[0]) if not latest["market_regime"].dropna().empty else "neutral"
-    state_counts = pd.Series([row["state"] for row in rows]).value_counts().to_dict()
+    state_counts = pd.Series([row["recommendation_level"] for row in rows]).value_counts().to_dict()
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": signal_ts.date().isoformat(),
@@ -2258,6 +2606,17 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
             )
         )
 
+    for item in rows:
+        code = str(item.get("ts_code"))
+        previous = previous_states.get(code) or {}
+        previous_since = pd.to_datetime(previous.get("recommendation_since"), errors="coerce")
+        _decorate_long_recommendation_display(
+            item,
+            selected=item.get("rank") is not None,
+            signal_ts=pd.Timestamp(signal_ts),
+            recommendation_since=None if pd.isna(previous_since) else pd.Timestamp(previous_since),
+        )
+
     state_order = {"CORE": 0, "T_ACTIVE": 1, "BUILDING": 2, "REDUCE": 3, "WATCH": 4, "EXIT": 5, "COOLDOWN": 6}
     rows = sorted(
         rows,
@@ -2268,7 +2627,7 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
         ),
     )
     regime = str(scored["market_regime"].dropna().iloc[0]) if "market_regime" in scored.columns and not scored["market_regime"].dropna().empty else "neutral"
-    state_counts = pd.Series([row["state"] for row in rows]).value_counts().to_dict()
+    state_counts = pd.Series([row["recommendation_level"] for row in rows]).value_counts().to_dict()
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": pd.Timestamp(signal_ts).date().isoformat(),
@@ -2281,8 +2640,8 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
         "stocks": rows,
         "notes": [
             "长线股票池使用最新可用月度信号截面生成，券商预测严格按 report_date <= signal_date 合并。",
-            "状态机当前为策略状态建议，已读取上一轮信号快照；接入真实账户持仓后可升级为完整持仓状态机。",
-            "BUILDING 的 first_tranche_weight 是更谨慎的首批建仓建议，不等同于最终目标仓位。",
+            "推荐程度与价格状态分开表达；推荐角标为连续入选的自然日数，不代表真实账户持仓。",
+            "策略目标和参考首批仅用于组合研究，不生成降仓或清仓等账户指令。",
         ],
     }
     if persist_state:
@@ -2302,6 +2661,16 @@ def get_long_stock_pool(
     if not refresh:
         cached = _read_long_stock_pool_snapshot(variant_key, signal_date, allow_sql=False)
         if cached is not None:
+            if variant_key in TEA_LONG_VARIANTS:
+                cached, upgraded = _upgrade_cached_tea_analyst_display(cached)
+                if upgraded:
+                    _write_long_stock_pool_snapshot(cached, variant_key, signal_date, write_sql=False)
+                    cached["cache"] = {
+                        "hit": True,
+                        "backend": "filesystem",
+                        "migrated": True,
+                        "schema_version": LONG_STOCK_POOL_SCHEMA_VERSION,
+                    }
             return cached
     if variant_key in TEA_LONG_VARIANTS:
         if refresh:
@@ -2451,6 +2820,7 @@ def _write_similar_pattern_watchlist_state(state: dict[str, Any]) -> None:
 
 def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> list[dict[str, Any]]:
     state = _read_similar_pattern_watchlist_state()
+    scores = _watchlist_buy_hold_scores(tuple(state["symbols"]))
     profiles = []
     for symbol in state["symbols"]:
         profile = _stock_profile_from_basic(symbol, basic)
@@ -2458,6 +2828,7 @@ def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> li
         profile["note"] = note.get("content", "")
         profile["note_updated_at"] = note.get("updated_at", "")
         profile["pinned"] = symbol in state["pinned"]
+        profile.update(scores.get(symbol, {}))
         profiles.append(profile)
     return profiles
 
@@ -3345,7 +3716,7 @@ def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    rows = _apply_current_score_normalization(rows)
+    rows = _apply_historical_score_normalization(rows)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -4568,41 +4939,312 @@ def _aggregate_raw_scores(signal_scores: list[float], group_count: int, *, reson
     return float(best + resonance + group_bonus)
 
 
-def _rank_percentiles(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    series = pd.Series(values, dtype="float64")
-    if series.nunique(dropna=True) <= 1:
-        return [0.5 for _ in values]
-    return series.rank(method="average", pct=True).fillna(0.5).tolist()
+@lru_cache(maxsize=1)
+def _selector_buy_hold_models() -> dict[str, dict[str, Any]]:
+    try:
+        import joblib
+    except ImportError:
+        return {}
+    artifacts: dict[str, dict[str, Any]] = {}
+    for mode in ("buy", "hold"):
+        path = SELECTOR_BUY_HOLD_MODEL_DIR / f"{mode}.joblib"
+        if not path.exists():
+            continue
+        try:
+            artifact = joblib.load(path)
+        except Exception:
+            continue
+        if isinstance(artifact, dict) and artifact.get("schema_version") == "selector_buy_hold_return_model_v1":
+            artifacts[mode] = artifact
+    return artifacts
 
 
-def _apply_current_score_normalization(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+@lru_cache(maxsize=32)
+def _selector_model_feature_rows(signal_date: str) -> dict[str, dict[str, Any]]:
+    if not SELECTOR_MODEL_HISTORY.exists():
+        return {}
+    try:
+        frame = pd.read_parquet(
+            SELECTOR_MODEL_HISTORY,
+            filters=[("date", "==", pd.Timestamp(signal_date))],
+        )
+    except Exception:
+        return {}
+    if frame.empty or "symbol" not in frame.columns:
+        return {}
+    return {
+        str(row["symbol"]): row.to_dict()
+        for _, row in frame.sort_values("date").drop_duplicates("symbol", keep="last").iterrows()
+    }
+
+
+@lru_cache(maxsize=32)
+def _selector_model_score_date(signal_date: str | None) -> str | None:
+    """Resolve the newest model-feature date available on or before the market date."""
+    if not SELECTOR_MODEL_HISTORY.exists():
+        return None
+    try:
+        dates = pd.read_parquet(SELECTOR_MODEL_HISTORY, columns=["date"])["date"]
+    except Exception:
+        return None
+    dates = pd.to_datetime(dates, errors="coerce").dropna()
+    if signal_date:
+        dates = dates[dates <= pd.Timestamp(signal_date)]
+    if dates.empty:
+        return None
+    return dates.max().strftime("%Y-%m-%d")
+
+
+def _selector_market_feature_values(signal_date: str) -> dict[str, Any]:
+    rows = _selector_model_feature_rows(signal_date)
+    if not rows:
+        return {}
+    source = next(iter(rows.values()))
+    return {
+        key: value
+        for key, value in source.items()
+        if key.startswith("selector_market_")
+    }
+
+
+def _selector_watchlist_feature_row_from_daily(
+    symbol: str,
+    signal_date: str,
+    daily: pd.DataFrame,
+) -> dict[str, Any]:
+    required = {"date", "open", "high", "low", "close", "pre_close", "pct_chg", "volume", "turnover"}
+    if daily.empty or not required.issubset(daily.columns):
+        return {}
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily = daily[daily["date"] <= pd.Timestamp(signal_date)].sort_values("date").tail(80).copy()
+    if daily.empty:
+        return {}
+    numeric_columns = required - {"date"}
+    for column in numeric_columns:
+        daily[column] = pd.to_numeric(daily[column], errors="coerce")
+    returns = daily["pct_chg"] / 100.0
+    log_returns = np.log1p(returns.clip(lower=-0.999999))
+    latest = daily.iloc[-1]
+    values: dict[str, Any] = {
+        "symbol": symbol,
+        "date": latest["date"],
+        "matched_groups": [],
+        "matched_count": 0,
+        "best_profit_factor": np.nan,
+        "best_avg_return_pct": np.nan,
+        "selector_return_1d": latest["pct_chg"],
+        "selector_amplitude_1d": (latest["high"] - latest["low"]) / latest["pre_close"] * 100.0,
+        "selector_close_pos": (latest["close"] - latest["low"]) / (latest["high"] - latest["low"]),
+        "selector_gap_1d": (latest["open"] / latest["pre_close"] - 1.0) * 100.0,
+        "selector_high_1d": (latest["high"] / latest["pre_close"] - 1.0) * 100.0,
+        "selector_low_1d": (latest["low"] / latest["pre_close"] - 1.0) * 100.0,
+    }
+    for window in (3, 5, 10, 20, 60):
+        values[f"selector_return_{window}d"] = (np.exp(log_returns.tail(window).sum()) - 1.0) * 100.0
+    for window in (5, 10, 20, 60):
+        values[f"selector_volatility_{window}d"] = daily["pct_chg"].tail(window).std()
+        values[f"selector_volume_relative_{window}d"] = latest["volume"] / daily["volume"].tail(window).mean()
+    for window in (5, 10, 20):
+        values[f"selector_positive_ratio_{window}d"] = (daily["pct_chg"].tail(window) > 0).mean()
+    for window in (5, 20):
+        values[f"selector_turnover_relative_{window}d"] = latest["turnover"] / daily["turnover"].tail(window).mean()
+    values.update(_selector_market_feature_values(signal_date))
+    values["selector_excess_return_1d"] = latest["pct_chg"] - values.get("selector_market_mean_1d", np.nan)
+    return values
+
+
+@lru_cache(maxsize=4096)
+def _selector_watchlist_feature_row(symbol: str, signal_date: str) -> dict[str, Any]:
+    """Build the return-model factors for a stock outside the daily candidate list."""
+    candidate = _selector_model_feature_rows(signal_date).get(symbol)
+    if candidate is not None:
+        return dict(candidate)
+    try:
+        store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+        daily = store.read_frame(DAILY_DIR.name, symbol).copy()
+    except Exception:
+        return {}
+    return _selector_watchlist_feature_row_from_daily(symbol, signal_date, daily)
+
+
+def _historical_percentile_scores(
+    predictions: np.ndarray,
+    reference: np.ndarray,
+    normalization_width: float = 2.0,
+) -> np.ndarray:
+    values = np.asarray(reference, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.full(len(predictions), 50.0)
+    median = float(np.median(values))
+    q25, q75 = np.quantile(values, [0.25, 0.75])
+    scale = max(float((q75 - q25) / 1.349), 1e-6)
+    z_score = (np.asarray(predictions, dtype=float) - median) / scale
+    width = max(float(normalization_width), 0.1)
+    return np.clip(50.0 + 100.0 / np.pi * np.arctan(z_score / width), 0.0, 100.0)
+
+
+def _apply_return_model_scores(
+    rows: list[dict[str, Any]],
+    feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    artifacts = _selector_buy_hold_models()
+    if not artifacts:
+        return
+    for mode, artifact in artifacts.items():
+        features = [str(column) for column in artifact.get("features") or []]
+        if not features:
+            continue
+        indexes: list[int] = []
+        feature_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            signal_date = str(row.get("date") or "")
+            symbol = str(row.get("symbol") or "")
+            source = (
+                feature_rows_by_symbol.get(symbol)
+                if feature_rows_by_symbol is not None
+                else _selector_model_feature_rows(signal_date).get(symbol)
+            )
+            if source is None:
+                continue
+            groups = {str(group) for group in row.get("matched_groups") or []}
+            values = dict(source)
+            values["matched_count"] = len(groups)
+            values["best_profit_factor"] = row.get("best_profit_factor")
+            values["best_avg_return_pct"] = row.get("best_avg_return_pct")
+            for feature in features:
+                if feature.startswith("group__"):
+                    values[feature] = float(feature.removeprefix("group__") in groups)
+            indexes.append(index)
+            feature_rows.append(values)
+        if not feature_rows:
+            continue
+        frame = pd.DataFrame(feature_rows).reindex(columns=features).replace([np.inf, -np.inf], np.nan)
+        try:
+            transformed = artifact["imputer"].transform(frame)
+            if "models" in artifact:
+                component_scores: dict[str, np.ndarray] = {}
+                for component, model in artifact["models"].items():
+                    predictions = model.predict(transformed)
+                    component_scores[component] = _historical_percentile_scores(
+                        predictions,
+                        artifact["score_references"][component],
+                        (artifact.get("normalization_widths") or {}).get(component, 2.0),
+                    )
+                buy_weight = float(artifact.get("buy_weight", 0.0))
+                scores = buy_weight * component_scores["buy"] + (1.0 - buy_weight) * component_scores["hold"]
+            else:
+                predictions = artifact["model"].predict(transformed)
+                scores = _historical_percentile_scores(
+                    predictions,
+                    artifact["score_reference"],
+                    artifact.get("normalization_width", 2.0),
+                )
+        except Exception:
+            continue
+        historical_name = "historical_buy_score" if mode == "buy" else "historical_hold_score"
+        for index, score in zip(indexes, scores):
+            rows[index][historical_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
+            rows[index][f"{mode}_score_source"] = "historical_return_model"
+
+
+def _apply_historical_score_normalization(
+    rows: list[dict[str, Any]],
+    feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Expose fixed-history scores without a date-local cross-sectional adjustment.
+
+    Historical buy and hold scores are calibrated against their respective
+    fixed historical distributions. Keeping the displayed score equal to that
+    calibrated value makes the same signal comparable across selection dates
+    and independent of the other candidates present on a given day.
+    """
     if not rows:
         return rows
-    for score_name, raw_name, historical_name in [
-        ("opportunity_score", "buy_raw_score", "historical_buy_score"),
-        ("holding_score", "hold_raw_score", "historical_hold_score"),
-    ]:
-        raw_values = [float(row.get(raw_name) or 0.0) for row in rows]
-        global_pct = _rank_percentiles(raw_values)
-        group_pct: list[float] = [0.5 for _ in rows]
-        by_group: dict[str, list[int]] = {}
-        for index, row in enumerate(rows):
-            by_group.setdefault(_primary_family(row), []).append(index)
-        for indexes in by_group.values():
-            ranked = _rank_percentiles([raw_values[index] for index in indexes])
-            for index, pct in zip(indexes, ranked):
-                group_pct[index] = pct
-        for index, row in enumerate(rows):
-            historical = _safe_float(row.get(historical_name), 50.0) or 50.0
-            score = historical * 0.45 + group_pct[index] * 35.0 + global_pct[index] * 20.0
-            row[score_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
+    _apply_return_model_scores(rows, feature_rows_by_symbol)
     for row in rows:
+        historical_buy_score = _safe_float(row.get("historical_buy_score"), 50.0)
+        historical_hold_score = _safe_float(row.get("historical_hold_score"), 50.0)
+        buy_score = float(np.clip(50.0 if historical_buy_score is None else historical_buy_score, 0.0, 100.0))
+        hold_score = float(np.clip(50.0 if historical_hold_score is None else historical_hold_score, 0.0, 100.0))
+        row["opportunity_score"] = round(buy_score, 1)
+        row["holding_score"] = round(hold_score, 1)
         row["selector_score"] = row["opportunity_score"]
-        row["score_target"] = "buy_score_normalized"
-        row.update(_score_interpretation(float(row["opportunity_score"]), float(row["holding_score"])))
+        row["score_target"] = "historical_return_model_score"
+        row.update(_score_interpretation(row["opportunity_score"], row["holding_score"]))
     return rows
+
+
+def _watchlist_buy_hold_scores(symbols: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """Score every watchlist stock with the selector's fixed-history models."""
+    if not symbols:
+        return {}
+    market_date = _latest_similar_pattern_target_date(list(symbols))
+    score_date = _selector_model_score_date(market_date)
+    if not score_date:
+        return {}
+    candidate_rows = _selector_model_feature_rows(score_date)
+    feature_rows = {
+        symbol: dict(candidate_rows[symbol])
+        for symbol in symbols
+        if symbol in candidate_rows
+    }
+    missing_symbols = [symbol for symbol in symbols if symbol not in feature_rows]
+    if missing_symbols:
+        try:
+            store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+            start_date = (pd.Timestamp(score_date) - pd.Timedelta(days=130)).strftime("%Y-%m-%d")
+            daily = store.read_market_range(
+                DAILY_DIR.name,
+                start_date=start_date,
+                end_date=score_date,
+                symbols=missing_symbols,
+                columns=[
+                    "symbol",
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "pre_close",
+                    "pct_chg",
+                    "volume",
+                    "turnover",
+                ],
+            )
+        except Exception:
+            daily = pd.DataFrame()
+        if not daily.empty:
+            symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
+            for symbol, frame in daily.groupby(symbol_column, sort=False):
+                feature = _selector_watchlist_feature_row_from_daily(str(symbol), score_date, frame.copy())
+                if feature:
+                    feature_rows[str(symbol)] = feature
+    rows = [
+        {
+            "symbol": symbol,
+            "date": score_date,
+            "matched_groups": feature_rows[symbol].get("matched_groups") or [],
+            "best_profit_factor": feature_rows[symbol].get("best_profit_factor"),
+            "best_avg_return_pct": feature_rows[symbol].get("best_avg_return_pct"),
+        }
+        for symbol in symbols
+        if symbol in feature_rows
+    ]
+    _apply_historical_score_normalization(rows, feature_rows)
+    return {
+        row["symbol"]: {
+            "opportunity_score": row["opportunity_score"],
+            "holding_score": row["holding_score"],
+            "buy_score": row["opportunity_score"],
+            "hold_score": row["holding_score"],
+            "score_date": score_date,
+            "score_target": row["score_target"],
+        }
+        for row in rows
+        if row.get("buy_score_source") == "historical_return_model"
+        and row.get("hold_score_source") == "historical_return_model"
+    }
 
 
 def _score_interpretation(opportunity_score: float, holding_score: float) -> dict[str, str]:
@@ -4739,7 +5381,7 @@ def build_selector_stock_row(
         "buy_raw_score": round(float(buy_raw_score), 4),
         "hold_raw_score": round(float(hold_raw_score), 4),
         "legacy_selector_score": round(float(legacy_score), 2),
-        "score_target": "buy_score_normalized",
+        "score_target": "historical_return_model_score",
         **score_info,
         "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(groups)} 个策略组共振；当前买入分按未来 5 日冲高目标做历史校准",
         "signals": ordered_signals,
@@ -5275,6 +5917,8 @@ def _set_refresh_progress(
     complete_previous: bool = True,
 ) -> None:
     with _REFRESH_LOCK:
+        if not _owned_refresh_context_active_unlocked():
+            return
         steps = list(_REFRESH_STATUS.get("steps") or _progress_steps())
         if step_key:
             seen_current = False
@@ -5473,7 +6117,11 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
     return results
 
 
-def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | None = None) -> None:
+def _run_latest_refresh_job(
+    scope: str = "all",
+    resume_status: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> None:
     from quant.routine.pipeline import (
         build_features,
         generate_dashboard,
@@ -5489,33 +6137,42 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
 
     refresh_scope = _normalize_refresh_scope(scope)
     refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
+    refresh_run_id = run_id or _new_refresh_run_id(refresh_scope)
+    _REFRESH_CONTEXT.run_id = refresh_run_id
     resume_tail = _tail_resume_ready(resume_status, refresh_scope)
     resume_inputs = not resume_tail and _input_resume_ready(resume_status, refresh_scope)
-    with _REFRESH_LOCK:
-        _REFRESH_STATUS.update(
-            {
-                "status": "running",
-                "started_at": (resume_status or {}).get("started_at") or datetime.now().isoformat(timespec="seconds"),
-                "finished_at": None,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "message": (
-                    f"{refresh_label}检测到断点，正在续跑尾段任务"
-                    if resume_tail
-                    else f"{refresh_label}检测到同日数据检查点，正在续跑计算阶段"
-                    if resume_inputs
-                    else f"{refresh_label}刷新任务已启动"
-                ),
-                "percent": 90 if resume_tail else 35 if resume_inputs else 1,
-                "current_step": "similar_patterns" if resume_tail else "feature_cache" if resume_inputs else "refresh_data",
-                "steps": list((resume_status or {}).get("steps") or _progress_steps(refresh_scope)),
-                "scope": refresh_scope,
-                "scope_label": refresh_label,
-                "result": None,
-                "error": None,
-            }
-        )
-        _persist_refresh_status_unlocked()
     try:
+        with _REFRESH_LOCK:
+            current_run_id = _REFRESH_STATUS.get("run_id")
+            if current_run_id not in {None, refresh_run_id}:
+                return
+            if current_run_id == refresh_run_id and _REFRESH_STATUS.get("status") in {"success", "failed"}:
+                return
+            _REFRESH_STATUS.update(
+                {
+                    "status": "running",
+                    "run_id": refresh_run_id,
+                    "started_at": (resume_status or {}).get("started_at")
+                    or datetime.now().isoformat(timespec="seconds"),
+                    "finished_at": None,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "message": (
+                        f"{refresh_label}检测到断点，正在续跑尾段任务"
+                        if resume_tail
+                        else f"{refresh_label}检测到同日数据检查点，正在续跑计算阶段"
+                        if resume_inputs
+                        else f"{refresh_label}刷新任务已启动"
+                    ),
+                    "percent": 90 if resume_tail else 35 if resume_inputs else 1,
+                    "current_step": "similar_patterns" if resume_tail else "feature_cache" if resume_inputs else "refresh_data",
+                    "steps": list((resume_status or {}).get("steps") or _progress_steps(refresh_scope)),
+                    "scope": refresh_scope,
+                    "scope_label": refresh_label,
+                    "result": None,
+                    "error": None,
+                }
+            )
+            _persist_refresh_status_unlocked()
         cache_cleanup = run_cache_cleanup(PROJECT_ROOT)
         results: dict[str, Any] = (
             dict((resume_status or {}).get("result") or {}) if resume_inputs else {}
@@ -6019,12 +6676,16 @@ def _run_latest_refresh_job(scope: str = "all", resume_status: dict[str, Any] | 
             result=results if "results" in locals() else None,
             error=f"{exc}\n{traceback.format_exc(limit=5)}",
         )
+    finally:
+        if getattr(_REFRESH_CONTEXT, "run_id", None) == refresh_run_id:
+            delattr(_REFRESH_CONTEXT, "run_id")
 
 
 def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
     refresh_scope = _normalize_refresh_scope(scope)
     refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
     resume_status: dict[str, Any] | None = None
+    run_id = _new_refresh_run_id(refresh_scope)
     with _REFRESH_LOCK:
         current_status = _ensure_refresh_scope(dict(_REFRESH_STATUS))
         if current_status.get("status") == "running":
@@ -6047,13 +6708,14 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
                     resume_status = dict(persisted)
         thread = threading.Thread(
             target=_run_latest_refresh_job,
-            args=(refresh_scope, resume_status),
+            args=(refresh_scope, resume_status, run_id),
             name=f"quant-{refresh_scope}-refresh",
             daemon=True,
         )
         _REFRESH_STATUS.update(
             {
                 "status": "queued",
+                "run_id": run_id,
                 "started_at": datetime.now().isoformat(timespec="seconds"),
                 "finished_at": None,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -6238,7 +6900,7 @@ def get_stock_selector_payload(
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    rows = _apply_current_score_normalization(rows)
+    rows = _apply_historical_score_normalization(rows)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -6262,8 +6924,8 @@ def get_stock_selector_payload(
             "选股器按合并后的策略组聚合命中；同一策略组下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中按策略组去重计算。",
             "2026-06-14 已统一短线和长线为前复权价格口径；模型训练、标签、策略回测和页面价格展示使用同一套价格体系。",
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
-            "买入分为 0-100 历史归一化评分，按未来 5 日最大冲高收益和冲高 >=5% 概率校准，并混合同策略内分位和全策略分位。",
-            "持有分为 0-100 保守辅助评分，按未来 5 日收盘收益和正收益概率校准；当前历史验证显示持有目标预测较弱，不等同于收益承诺。",
+            "买入分为跨日期可比的 0-100 固定历史分位，模型按未来 5 日最大冲高收益训练，不再混入当日候选名单分位。",
+            "持有分为跨日期可比的 0-100 固定历史分位，以未来 5 日收盘收益排名为主、冲高能力为辅助做多任务训练；分数用于历史排序，不等同于收益承诺。",
             f"前端默认先过滤为可操作候选，再展示保守预期收益分 Top{DEFAULT_SELECTOR_LIMIT}；MySQL 快照仍保存完整规则全集，便于后续复盘和重新训练。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",

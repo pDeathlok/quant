@@ -109,6 +109,7 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     stdout_lines: list[str] = []
     progress_pattern = re.compile(r"refresh progress: (\d+)/(\d+) done, success=(\d+), failed=(\d+)")
@@ -176,59 +177,117 @@ def refresh_reference_inputs(dry_run: bool = True, include_financials: bool = Tr
         }
     from quant.routine.reference_data_refresh import refresh_reference_data
 
-    result = refresh_reference_data(end_date=end_date, include_financials=include_financials)
-    if include_financials and result.get("status") == "success":
-        result.setdefault("steps", {})["analyst_forecast_snapshot"] = _refresh_analyst_forecast_snapshot()
-        if result["steps"]["analyst_forecast_snapshot"].get("status") == "failed":
+    if include_financials:
+        # Eastmoney/AkShare and Tushare use independent upstreams and write to
+        # different datasets. Run them concurrently, then merge only their
+        # small status payloads after both have completed.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reference_future = executor.submit(
+                refresh_reference_data,
+                end_date=end_date,
+                include_financials=True,
+            )
+            analyst_future = executor.submit(_refresh_analyst_forecast_snapshot)
+            result = reference_future.result()
+            analyst_result = analyst_future.result()
+        result["execution_mode"] = "parallel_tushare_and_akshare"
+        result.setdefault("steps", {})["analyst_forecast_snapshot"] = analyst_result
+        if analyst_result.get("status") == "failed":
             result["status"] = "failed"
             result.setdefault("critical_errors", []).append(
                 "analyst_forecast_snapshot: "
-                + str(result["steps"]["analyst_forecast_snapshot"].get("error") or "refresh failed")
+                + str(analyst_result.get("error") or "refresh failed")
             )
+        elif analyst_result.get("status") == "degraded":
+            result.setdefault("warnings", []).append(
+                "analyst_forecast_snapshot: "
+                + str(analyst_result.get("error") or "using last-known-good data")
+            )
+    else:
+        result = refresh_reference_data(end_date=end_date, include_financials=False)
     result["elapsed_seconds"] = round(time.monotonic() - started, 3)
     return result
 
 
+def _latest_long_analyst_symbols(limit: int = 80) -> list[str]:
+    snapshot_dir = PROJECT_ROOT / "data/long_stock_pool_snapshots"
+    symbols: list[str] = []
+    seen: set[str] = set()
+    if not snapshot_dir.exists():
+        return symbols
+    for path in sorted(snapshot_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if payload.get("variant") not in {"tea", "tea_safe", "v44"}:
+            continue
+        for item in payload.get("stocks") or []:
+            if str(item.get("state") or "") == "EXIT":
+                continue
+            symbol = str(item.get("ts_code") or "")
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                symbols.append(symbol)
+                if len(symbols) >= limit:
+                    return symbols
+    return symbols
+
+
+def _run_analyst_command(command: list[str], env: dict[str, str], timeout_seconds: int) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=stdout,
+            stderr=(stderr + f"\nanalyst refresh timed out after {timeout_seconds}s").strip(),
+        )
+
+
+def _existing_analyst_symbols(output_path: Path, source: str) -> set[str]:
+    if not output_path.exists():
+        return set()
+    try:
+        frame = pd.read_parquet(output_path, columns=["source", "ts_code"])
+    except Exception:
+        return set()
+    return set(frame.loc[frame["source"] == source, "ts_code"].dropna().astype(str))
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f".{os.getpid()}.tmp.json")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def _refresh_analyst_forecast_snapshot() -> dict:
-    """Refresh the all-market consensus input used by the production v44 pool."""
+    """Refresh daily consensus plus broker-level reports for current long candidates."""
 
     started = time.monotonic()
     output_path = PROJECT_ROOT / "data/raw/analyst_forecasts.parquet"
+    research_marker = PROJECT_ROOT / "data/raw/analyst_research_refresh_status.json"
     today = pd.Timestamp.now().normalize()
-    if output_path.exists():
-        try:
-            current = pd.read_parquet(output_path, columns=["source", "report_date"])
-            dates = pd.to_datetime(
-                current.loc[current["source"] == "akshare_em_snapshot", "report_date"],
-                errors="coerce",
-            )
-            if not dates.empty and dates.max() == today:
-                return {
-                    "status": "skipped",
-                    "reason": "today's all-market analyst snapshot already exists",
-                    "latest_report_date": today.date().isoformat(),
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                }
-        except Exception:
-            pass
-
-    command = [
-        sys.executable,
-        "scripts/research/refresh_analyst_forecasts.py",
-        "--source",
-        "akshare_em_snapshot",
-    ]
     env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
-    result = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    steps: dict[str, dict] = {}
+
     latest: pd.Timestamp | None = None
-    if result.returncode == 0 and output_path.exists():
+    if output_path.exists():
         try:
             current = pd.read_parquet(output_path, columns=["source", "report_date"])
             dates = pd.to_datetime(
@@ -238,15 +297,113 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             latest = dates.max() if not dates.empty else None
         except Exception:
             latest = None
-    success = result.returncode == 0 and latest == today
+
+    if latest == today:
+        steps["consensus_snapshot"] = {"status": "skipped", "reason": "today's snapshot already exists"}
+    else:
+        command = [
+            sys.executable,
+            "scripts/research/refresh_analyst_forecasts.py",
+            "--source",
+            "akshare_em_snapshot",
+        ]
+        result = _run_analyst_command(
+            command,
+            env,
+            timeout_seconds=int(os.getenv("ROUTINE_AKSHARE_SNAPSHOT_TIMEOUT_SECONDS", "180")),
+        )
+        if result.returncode == 0 and output_path.exists():
+            current = pd.read_parquet(output_path, columns=["source", "report_date"])
+            dates = pd.to_datetime(current.loc[current["source"] == "akshare_em_snapshot", "report_date"], errors="coerce")
+            latest = dates.max() if not dates.empty else None
+        consensus_success = result.returncode == 0 and latest == today
+        steps["consensus_snapshot"] = {
+            "status": "success" if consensus_success else ("degraded" if latest is not None else "failed"),
+            "returncode": result.returncode,
+            "command": " ".join(command),
+            "stdout_tail": result.stdout[-2000:],
+            "stderr_tail": result.stderr[-2000:],
+            "fallback_latest_report_date": (
+                latest.date().isoformat() if not consensus_success and latest is not None and pd.notna(latest) else None
+            ),
+        }
+
+    symbols = _latest_long_analyst_symbols()
+    research_enabled = os.getenv("ROUTINE_REFRESH_CANDIDATE_RESEARCH", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    marker_date = None
+    if research_marker.exists():
+        try:
+            marker_date = json.loads(research_marker.read_text(encoding="utf-8")).get("date")
+        except Exception:
+            marker_date = None
+    if not symbols:
+        steps["candidate_research_reports"] = {"status": "skipped", "reason": "no long candidates"}
+    elif not research_enabled:
+        steps["candidate_research_reports"] = {
+            "status": "skipped",
+            "reason": "external candidate-report refresh is disabled; set ROUTINE_REFRESH_CANDIDATE_RESEARCH=1 after approval",
+            "symbols_requested": len(symbols),
+        }
+    elif marker_date == today.date().isoformat():
+        steps["candidate_research_reports"] = {"status": "skipped", "reason": "today's candidate reports already refreshed"}
+    else:
+        research_command = [
+            sys.executable,
+            "scripts/research/refresh_analyst_forecasts.py",
+            "--source",
+            "akshare_em_research",
+            "--symbols",
+            ",".join(symbols),
+            "--refresh-existing",
+            "--sleep",
+            os.getenv("ROUTINE_AKSHARE_RESEARCH_SLEEP", "0.35"),
+            "--retries",
+            os.getenv("ROUTINE_AKSHARE_RESEARCH_RETRIES", "3"),
+            "--circuit-breaker-failures",
+            os.getenv("ROUTINE_AKSHARE_CIRCUIT_BREAKER_FAILURES", "6"),
+            "--checkpoint-every",
+            os.getenv("ROUTINE_AKSHARE_CHECKPOINT_EVERY", "10"),
+        ]
+        research_result = _run_analyst_command(
+            research_command,
+            env,
+            timeout_seconds=int(os.getenv("ROUTINE_AKSHARE_RESEARCH_TIMEOUT_SECONDS", "900")),
+        )
+        research_success = research_result.returncode == 0
+        if research_success:
+            _atomic_write_json(
+                research_marker,
+                {"date": today.date().isoformat(), "symbols": symbols},
+            )
+        fallback_symbols = sorted(_existing_analyst_symbols(output_path, "akshare_em_research") & set(symbols))
+        steps["candidate_research_reports"] = {
+            "status": "success" if research_success else ("degraded" if fallback_symbols else "failed"),
+            "returncode": research_result.returncode,
+            "symbols_requested": len(symbols),
+            "fallback_symbols": len(fallback_symbols),
+            "command": " ".join(research_command),
+            "stdout_tail": research_result.stdout[-2000:],
+            "stderr_tail": research_result.stderr[-2000:],
+        }
+
+    failed = [name for name, item in steps.items() if item.get("status") == "failed"]
+    degraded = [name for name, item in steps.items() if item.get("status") == "degraded"]
+    ran = any(item.get("status") == "success" for item in steps.values())
     return {
-        "status": "success" if success else "failed",
-        "returncode": result.returncode,
+        "status": "failed" if failed else ("degraded" if degraded else ("success" if ran else "skipped")),
         "latest_report_date": latest.date().isoformat() if latest is not None and pd.notna(latest) else None,
-        "stdout_tail": result.stdout[-2000:],
-        "stderr_tail": result.stderr[-2000:],
-        "error": None if success else "analyst snapshot did not reach today's date",
-        "command": " ".join(command),
+        "candidate_symbols": symbols,
+        "steps": steps,
+        "error": (
+            f"failed analyst refresh steps: {', '.join(failed)}"
+            if failed
+            else (f"using last-known-good analyst data: {', '.join(degraded)}" if degraded else None)
+        ),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
@@ -274,6 +431,7 @@ def build_features(progress_callback=None) -> dict:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     stdout_lines: list[str] = []
     progress_pattern = re.compile(r"processed (\d+)/(\d+) daily files, frames=(\d+)")
@@ -321,6 +479,7 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     stdout_lines: list[str] = []
     progress_pattern = re.compile(r"(family|z-skill) signals: (\d+)/(\d+) (?:files|symbols)")

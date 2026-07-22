@@ -483,51 +483,110 @@ function loadActivePageData() {
 function longPositionPlan(item) {
   const target = Number(item.target_weight || 0);
   const first = Number(item.first_tranche_weight || 0);
-  if (target > 0) {
+  const { level } = recommendationLevel(item);
+  if (level === "RECOMMENDED" && target > 0) {
     return `
-      <strong>目标 ${fmtWeight(target)}</strong>
-      <em>首批 ${fmtWeight(first)}</em>
-      <em>建仓 <= ${fmtPrice(item.price_levels?.entry_target_price)}</em>
+      <strong>策略目标 ${fmtWeight(target)}</strong>
+      <em>参考首批 ${fmtWeight(first)}</em>
+      <em>不代表账户已持仓</em>
     `;
   }
-  if (item.state === "BUILDING") {
+  if (level === "CAUTION") {
     return `
-      <strong>待入池</strong>
-      <em>当前目标 0%</em>
-      <em>观察建仓 <= ${fmtPrice(item.price_levels?.entry_target_price)}</em>
+      <strong>本期不推荐</strong>
+      <em>风险条件正在转弱</em>
+      <em>等待重新满足筛选条件</em>
     `;
   }
-  if (item.state === "REDUCE") {
+  if (level === "AVOID") {
     return `
-      <strong>降仓观察</strong>
-      <em>未纳入本期目标仓</em>
-      <em>跌破 ${fmtPrice(item.price_levels?.reduce_ma60_price)} 降风险</em>
-    `;
-  }
-  if (item.state === "EXIT") {
-    return `
-      <strong>不建仓</strong>
-      <em>目标 0%</em>
-      <em>清仓线 ${fmtPrice(item.price_levels?.exit_ma120_price)}</em>
+      <strong>暂时回避</strong>
+      <em>不提供建仓或清仓指令</em>
+      <em>等待趋势恢复</em>
     `;
   }
   return `
-    <strong>观察</strong>
-    <em>等待席位/价格确认</em>
-    <em>建仓 <= ${fmtPrice(item.price_levels?.entry_target_price)}</em>
+    <strong>保留观察</strong>
+    <em>尚未进入推荐池</em>
+    <em>等待评分与趋势确认</em>
   `;
 }
 
+function recommendationLevel(item) {
+  const level = item.recommendation_level || (
+    ["CORE", "BUILDING", "T_ACTIVE"].includes(item.state) ? "RECOMMENDED"
+      : item.state === "EXIT" ? "AVOID"
+        : item.state === "REDUCE" ? "CAUTION"
+          : "WATCH"
+  );
+  const labels = { RECOMMENDED: "推荐", WATCH: "观察", CAUTION: "谨慎", AVOID: "回避" };
+  return { level, label: labels[level] || "观察" };
+}
+
+function recommendationBadge(item, includeDays = true) {
+  const recommendation = recommendationLevel(item);
+  const days = Number(item.recommendation_days || 0);
+  const dayBadge = includeDays && recommendation.level === "RECOMMENDED" && days > 0
+    ? `<span class="recommendation-days" aria-label="连续推荐 ${days} 天" title="连续推荐 ${days} 天">${days}</span>`
+    : "";
+  return `<span class="state-pill recommendation-pill ${recommendation.level}">${recommendation.label}${dayBadge}</span>`;
+}
+
+function priceStateText(item) {
+  const labels = {
+    AGGRESSIVE: "积极区",
+    BUY_ZONE: "建仓区",
+    SCALE_IN: "分批区",
+    WAIT_PULLBACK: "等待回落",
+    WAIT_SIGNAL: "等待信号",
+    RISK_RISING: "风险升高",
+    TREND_INVALID: "趋势失效",
+  };
+  return labels[item.price_state] || "等待信号";
+}
+
+function longPricePlan(item) {
+  const levels = item.price_levels || {};
+  const { level } = recommendationLevel(item);
+  if (level === "AVOID") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>趋势恢复前不提供建仓参考</em><em>年线防守位 ${fmtPrice(levels.exit_ma120_price)}</em>`;
+  }
+  if (level === "CAUTION") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>风险参考 MA60 ${fmtPrice(levels.reduce_ma60_price)}</em><em>转强后再评估建仓</em>`;
+  }
+  if (level === "WATCH") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>建仓参考 ${fmtPrice(levels.entry_target_price)}</em><em>需先满足推荐条件</em>`;
+  }
+  if (item.price_state === "WAIT_PULLBACK") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>等待回落至 ${fmtPrice(levels.entry_target_price)} 附近</em><em>小仓上限 ${fmtPrice(levels.entry_small_position_price)}</em>`;
+  }
+  return `<strong>${fmtPrice(item.close)}</strong><em>积极参考 ${fmtPrice(levels.entry_aggressive_price)}</em><em>建仓参考 ${fmtPrice(levels.entry_target_price)}</em>`;
+}
+
 function analystCoverageText(item) {
-  const reports = Number(item.analyst_report_count_180d || 0);
-  const orgs = Number(item.analyst_org_count_180d || 0);
+  const dataPoints = Number(item.analyst_report_count_180d || 0);
+  const institutions = Number(item.analyst_institution_count_180d || 0);
+  const researchReports = Number(item.analyst_research_report_count_180d || 0);
+  const consensusReports = Number(item.analyst_consensus_report_count_180d || 0);
   const forwardYears = Number(item.analyst_forward_years_180d || 0);
-  if (!reports) {
+  if (!dataPoints) {
     return { main: "近180日无结构化预测", sub: "使用财务/估值/趋势因子" };
   }
-  const orgText = orgs <= 1 ? "一致预期" : `${orgs}家机构`;
-  const yearText = forwardYears ? `未来${forwardYears}年` : "无前瞻年度";
-  return { main: `${reports}条 · ${orgText}`, sub: `${yearText} · 成长 ${Number(item.analyst_forward_growth_score || 0).toFixed(1)}` };
+  const coverageText = institutions && researchReports
+    ? `${institutions}家机构 · ${researchReports}份研报`
+    : consensusReports
+      ? `一致预期 · 覆盖${consensusReports}份研报`
+      : `${dataPoints}项预测数据`;
+  const yearText = forwardYears ? `覆盖未来${forwardYears}年` : "无有效前瞻年度";
+  const growth = item.analyst_forward_growth_score;
+  const growthText = growth == null || !Number.isFinite(Number(growth))
+    ? "成长评分 暂无"
+    : `成长评分 ${Number(growth).toFixed(1)}`;
+  return {
+    main: coverageText,
+    sub: `${yearText} · ${growthText}`,
+    title: "成长评分为0–100相对分位：前瞻EPS增长35% + 营收增长30% + 净利润增长25% + 预测覆盖10%；越高表示相对成长预期越强，不代表预期收益率。",
+  };
 }
 
 async function fetchJson(path, options = {}) {
@@ -880,14 +939,14 @@ function renderSimilarPatternsPage() {
         <em>${state.similarError}</em>
       </article>
     `;
-    watchlist.innerHTML = `<tr><td colspan="8" class="empty-cell">${state.similarError} · <button type="button" data-similar-retry>重新加载</button></td></tr>`;
+    watchlist.innerHTML = `<tr><td colspan="10" class="empty-cell">${state.similarError} · <button type="button" data-similar-retry>重新加载</button></td></tr>`;
     overview.innerHTML = "";
     return;
   }
   if (!payload) {
     meta.textContent = "切到自选池后加载";
     if (signalSummary) signalSummary.innerHTML = "";
-    watchlist.innerHTML = `<tr><td colspan="8" class="empty-cell">切到自选池后加载</td></tr>`;
+    watchlist.innerHTML = `<tr><td colspan="10" class="empty-cell">切到自选池后加载</td></tr>`;
     overview.innerHTML = "";
     return;
   }
@@ -934,6 +993,11 @@ function renderSimilarPatternsPage() {
     const strategyHits = watchlistStrategyHits(result);
     const resonanceClass = strategyHits.length ? "has-strategy-hit" : "";
     const xueqiuUrl = xueqiuStockUrl(item.symbol);
+    const rawBuyScore = item.opportunity_score ?? item.buy_score;
+    const rawHoldScore = item.holding_score ?? item.hold_score;
+    const buyScore = rawBuyScore == null ? Number.NaN : Number(rawBuyScore);
+    const holdScore = rawHoldScore == null ? Number.NaN : Number(rawHoldScore);
+    const scoreDate = item.score_date || "-";
     return `
       <tr
         class="similar-watch-row ${selectedClass} ${resonanceClass} ${item.pinned ? "is-pinned" : ""}"
@@ -954,6 +1018,14 @@ function renderSimilarPatternsPage() {
         <td class="similar-resonance-cell">
           <span class="similar-resonance-label">${strategyResonanceLabel(result)}</span>
           ${watchlistStrategyBadges(result)}
+        </td>
+        <td class="similar-score-cell" title="历史模型评分日期 ${scoreDate}">
+          <strong>${Number.isFinite(buyScore) ? buyScore.toFixed(1) : "—"}</strong>
+          <span>买入分</span>
+        </td>
+        <td class="similar-score-cell" title="历史模型评分日期 ${scoreDate}">
+          <strong>${Number.isFinite(holdScore) ? holdScore.toFixed(1) : "—"}</strong>
+          <span>持有分</span>
         </td>
         <td class="similar-market-cell">
           <strong>${fmtPrice(snapshot.close)}</strong>
@@ -986,7 +1058,7 @@ function renderSimilarPatternsPage() {
         <td class="similar-row-actions"><button type="button" data-similar-remove="${item.symbol}">删除</button></td>
       </tr>
     `;
-  }).join("") || `<tr><td colspan="8" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
+  }).join("") || `<tr><td colspan="10" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
 
   const selected = selectedSimilarResult();
   overview.innerHTML = selected ? (() => {
@@ -1929,6 +2001,9 @@ function renderLongStrategies() {
 
 function stateLabel(stateName) {
   const labels = {
+    RECOMMENDED: "推荐",
+    CAUTION: "谨慎",
+    AVOID: "回避",
     WATCH: "观察",
     BUILDING: "建仓",
     CORE: "核心",
@@ -1964,7 +2039,12 @@ function renderLongStockPool() {
     return;
   }
   meta.textContent = `${payload.variant_name} · 信号日 ${payload.signal_date} · 市场 ${payload.market_regime} · ${payload.stocks.length} 只`;
-  counts.innerHTML = Object.entries(payload.state_counts || {}).map(([key, value]) => (
+  const recommendationCounts = (payload.stocks || []).reduce((result, item) => {
+    const { level } = recommendationLevel(item);
+    result[level] = (result[level] || 0) + 1;
+    return result;
+  }, {});
+  counts.innerHTML = Object.entries(recommendationCounts).map(([key, value]) => (
     `<span class="state-pill ${key}">${stateLabel(key)} ${value}</span>`
   )).join("");
   if (!payload.stocks.length) {
@@ -1972,8 +2052,8 @@ function renderLongStockPool() {
     return;
   }
   body.innerHTML = payload.stocks.map((item) => `
-    <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload.signal_date, `${payload.variant_name} · ${stateLabel(item.state)}`))}" tabindex="0">
-      <td><span class="state-pill ${item.state}">${stateLabel(item.state)}</span></td>
+    <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload.signal_date, `${payload.variant_name} · ${recommendationLevel(item).label}`))}" tabindex="0">
+      <td>${recommendationBadge(item)}</td>
       <td>
         <strong>${item.ts_code}</strong>
         <span>${item.name || ""}</span>
@@ -1981,8 +2061,8 @@ function renderLongStockPool() {
       <td>${item.industry || "-"}</td>
       <td>
         <span class="score-stack left">
-          <strong>${item.action || "-"}</strong>
-          <em>${item.t_action || "HOLD"} · ${item.t_profile || "-"}</em>
+          <strong>${priceStateText(item)}</strong>
+          <em>${item.price_state_reason || "等待价格与趋势确认"}</em>
         </span>
       </td>
       <td>
@@ -1998,25 +2078,21 @@ function renderLongStockPool() {
       </td>
       <td>
         <span class="score-stack price-plan">
-          <strong>${fmtPrice(item.close)}</strong>
-          <em>积极建仓 <= ${fmtPrice(item.price_levels?.entry_aggressive_price)}</em>
-          <em>做T低吸 ${item.price_levels?.t_buy_text || "-"}</em>
-          <em>做T高抛 ${item.price_levels?.t_sell_text || "-"}</em>
-          <em>降仓 < ${fmtPrice(item.price_levels?.reduce_ma60_price)} · 清仓 < ${fmtPrice(item.price_levels?.exit_ma120_price)}</em>
+          ${longPricePlan(item)}
         </span>
       </td>
       <td>
         ${(() => {
           const coverage = analystCoverageText(item);
           return `
-        <span class="score-stack">
+        <span class="score-stack" title="${coverage.title || ""}">
           <strong>${coverage.main}</strong>
           <em>${coverage.sub}</em>
         </span>
           `;
         })()}
       </td>
-      <td class="reason-cell">${item.reason || item.t_reason || "-"}</td>
+      <td class="reason-cell">${item.display_reason || item.reason || "-"}</td>
     </tr>
   `).join("");
 }
