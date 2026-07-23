@@ -12,6 +12,7 @@
 
 - [系统架构与数据流](architecture.md)：模块边界、7 个工作区、并行依赖和产物。
 - [项目结构与 MySQL 存储](project_structure_and_storage.md)：SQL/Parquet 双写、快照和历史复盘。
+- [A 股分析 Skill 集成](a_share_skill_integration.md)：复用正式行情、保存不可变个股底稿，以及财报/事件后的认知迭代。
 - [数据存储审查](data_storage_review_20260617.md)：存储问题与阶段性审查结论。
 - [项目重构计划](project_restructure_plan.md)：从研究脚本向例行生产结构迁移的历史计划。
 

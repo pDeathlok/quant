@@ -899,6 +899,8 @@ class TushareDataFetcher:
             return f"{symbol}.SH"
         elif symbol.startswith("0") or symbol.startswith("3"):
             return f"{symbol}.SZ"
+        elif symbol.startswith(("4", "8", "9")):
+            return f"{symbol}.BJ"
         else:
             return symbol
     

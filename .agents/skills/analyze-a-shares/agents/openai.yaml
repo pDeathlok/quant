@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股投资分析"
+  short_description: "融合权威信源、三情景估值、量价辅助与历史认知迭代的A股研究助手"
+  default_prompt: "使用 $analyze-a-shares 分析一只A股，复用项目行情与历史研究基线，给出可复核的投资逻辑、三情景、独立量价辅助和认知变更账本；仅在最低证据门通过时给数值目标价，并保存不可变研究记录。"

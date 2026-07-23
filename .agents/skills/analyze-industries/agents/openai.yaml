@@ -1,0 +1,4 @@
+interface:
+  display_name: "行业与产业链分析"
+  short_description: "证据驱动地拆解产业链，量化国内外规模、参与者、利润池与环节潜力"
+  default_prompt: "使用 $analyze-industries 分析目标行业的完整产业链、国内外规模、主要参与者与各环节潜力。"

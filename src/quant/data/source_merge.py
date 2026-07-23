@@ -50,7 +50,7 @@ def normalize_ts_code(symbol: str) -> str:
         return f"{symbol}.SH"
     if symbol.startswith(("0", "3")):
         return f"{symbol}.SZ"
-    if symbol.startswith(("4", "8")):
+    if symbol.startswith(("4", "8", "9")):
         return f"{symbol}.BJ"
     return symbol
 
