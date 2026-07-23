@@ -13,7 +13,8 @@ PYTHONPATH=src python -m quant.research.a_share_skill_data \
   --ticker 600519.SH \
   --cutoff 2026-07-23T18:00:00+08:00 \
   --kind stock \
-  --bars 250
+  --bars 250 \
+  --output stock_ohlcv.json
 ```
 
 实现约束：
