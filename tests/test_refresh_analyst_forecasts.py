@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -66,9 +68,29 @@ def test_research_circuit_breaker_defers_remaining_symbols(monkeypatch, tmp_path
 
     assert result["failed"] == 2
     assert result["deferred"] == 2
+    assert result["failed_symbols"] == ["000001.SZ", "000002.SZ"]
+    assert result["deferred_symbols"] == ["000003.SZ", "000004.SZ"]
     assert result["circuit_open"] is True
     assert len(calls) == 4  # two attempts for each of the first two symbols
     assert Path(result["audit_path"]).is_file()
+
+
+def test_output_lock_records_owner_and_replaces_stale_empty_lock(monkeypatch, tmp_path) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    lock_path = MODULE.OUTPUT_LOCK_PATH
+    lock_path.write_text("", encoding="utf-8")
+    old_time = pd.Timestamp("2026-07-21 09:30").timestamp()
+    os.utime(lock_path, (old_time, old_time))
+    monkeypatch.setenv("ANALYST_FORECAST_LOCK_STALE_SECONDS", "60")
+
+    with MODULE.output_lock():
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        assert payload["pid"] == os.getpid()
+        assert payload["stale_lock_replaced"]["reason"] == "stale lock file without a running owner"
+
+    finished = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert finished["pid"] == os.getpid()
+    assert "finished_at" in finished
 
 
 def test_snapshot_retries_and_commits_only_valid_data(monkeypatch, tmp_path) -> None:

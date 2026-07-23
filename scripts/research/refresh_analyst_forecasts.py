@@ -19,6 +19,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime
 from datetime import timedelta
@@ -33,6 +34,7 @@ AUDIT_ROOT = RAW_DIR / "source_audit"
 OUTPUT_PATH = RAW_DIR / "analyst_forecasts.parquet"
 OUTPUT_LOCK_PATH = RAW_DIR / "analyst_forecasts.lock"
 REQUIRED_OUTPUT_COLUMNS = {"source", "ts_code", "report_date"}
+DEFAULT_LOCK_STALE_SECONDS = 2 * 60 * 60
 
 
 def load_symbols(limit: int | None = None) -> list[str]:
@@ -128,11 +130,83 @@ def output_lock():
 
     OUTPUT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        stale_lock = _stale_lock_metadata(OUTPUT_LOCK_PATH)
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                    "command": " ".join(sys.argv),
+                    "stale_lock_replaced": stale_lock,
+                },
+                ensure_ascii=False,
+            )
+        )
+        lock_file.flush()
         try:
             yield
         finally:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "finished_at": datetime.now().isoformat(timespec="seconds"),
+                        "command": " ".join(sys.argv),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            lock_file.flush()
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stale_lock_metadata(lock_path: Path) -> dict | None:
+    if not lock_path.exists():
+        return None
+    stale_after = max(60, int(os.getenv("ANALYST_FORECAST_LOCK_STALE_SECONDS", str(DEFAULT_LOCK_STALE_SECONDS))))
+    try:
+        stat = lock_path.stat()
+    except OSError:
+        return None
+    age_seconds = max(0.0, time.time() - stat.st_mtime)
+    if age_seconds < stale_after:
+        return None
+    raw = lock_path.read_text(encoding="utf-8").strip()
+    metadata: dict = {}
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                metadata = loaded
+        except json.JSONDecodeError:
+            metadata = {"raw": raw[:200]}
+    pid = metadata.get("pid")
+    running = _pid_is_running(int(pid)) if str(pid or "").isdigit() else False
+    if running:
+        return None
+    return {
+        "path": str(lock_path),
+        "age_seconds": round(age_seconds, 3),
+        "metadata": metadata,
+        "reason": "stale lock file without a running owner",
+    }
 
 
 def _validate_new_frame(frame: pd.DataFrame) -> None:
@@ -420,6 +494,8 @@ def refresh_akshare_em_research(
         "success": sum(1 for item in audits if item["status"] == "success"),
         "failed": sum(1 for item in audits if item["status"] == "failed"),
         "deferred": sum(1 for item in audits if item["status"] == "deferred"),
+        "failed_symbols": [item["ts_code"] for item in audits if item["status"] == "failed"],
+        "deferred_symbols": [item["ts_code"] for item in audits if item["status"] == "deferred"],
         "new_rows": int(new_rows),
         "total_rows": int(len(combined)),
         "total_symbols": int(combined["ts_code"].nunique()) if not combined.empty else 0,

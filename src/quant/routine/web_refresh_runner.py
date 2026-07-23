@@ -28,6 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_LOG_PATH = PROJECT_ROOT / ".run" / "daily_web_refresh.log"
 DEFAULT_PID_PATH = PROJECT_ROOT / ".run" / "daily_web_refresh.pid"
+DEFAULT_LAUNCHD_LABEL = "com.didi.quant.webapp"
 
 
 @dataclass
@@ -45,7 +46,7 @@ class RefreshRunnerConfig:
     service_log_path: Path = DEFAULT_LOG_PATH
     service_pid_path: Path = DEFAULT_PID_PATH
     runner_lock_path: Path | None = None
-    restart_service: bool = False
+    restart_service: bool = True
 
 
 @dataclass
@@ -155,6 +156,25 @@ def process_is_running(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def restart_launchd_service(
+    label: str = DEFAULT_LAUNCHD_LABEL,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> tuple[bool, str | None]:
+    """Restart the installed per-user launchd service, if it is registered."""
+
+    service = f"gui/{os.getuid()}/{label}"
+    result = run_fn(
+        ["launchctl", "kickstart", "-k", service],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True, None
+    detail = (result.stderr or result.stdout or "").strip()
+    return False, detail or f"launchctl exited with status {result.returncode}"
 
 
 def stop_service_from_pid_file(
@@ -293,14 +313,32 @@ def ensure_local_service(
         )
         if not stopped_pid_service:
             try:
-                health, _ = check_local_web_stack(client, frontend_url)
-                print_fn(
-                    "[service] 检测到外部守护器托管的前后端，保持运行: "
-                    f"api={json.dumps(health, ensure_ascii=False)} frontend={frontend_url}"
-                )
-                return None
+                check_local_web_stack(client, frontend_url)
             except Exception:
                 pass
+            else:
+                restarted, detail = restart_launchd_service()
+                if not restarted:
+                    raise RuntimeError(
+                        "检测到健康但不受 pid 文件管理的 web 服务，且无法通过 "
+                        f"launchd 重启 {DEFAULT_LAUNCHD_LABEL}: {detail}"
+                    )
+                deadline = monotonic_fn() + config.health_timeout_seconds
+                while monotonic_fn() < deadline:
+                    try:
+                        health, _ = check_local_web_stack(client, frontend_url)
+                        print_fn(
+                            "[service] 已重启 launchd 托管的前后端: "
+                            f"api={json.dumps(health, ensure_ascii=False)} "
+                            f"frontend={frontend_url}"
+                        )
+                        return None
+                    except Exception:
+                        sleep_fn(1.0)
+                raise TimeoutError(
+                    "launchd 托管的 Quant web 前后端重启后未在 "
+                    f"{config.health_timeout_seconds:.0f}s 内就绪"
+                )
     else:
         try:
             health, _ = check_local_web_stack(client, frontend_url)
@@ -618,15 +656,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--restart-service",
         dest="restart_service",
         action="store_true",
-        help="刷新前显式重启本地 web 服务；默认复用健康服务",
+        help="刷新前显式重启本地 web 服务（默认）",
     )
     restart_group.add_argument(
         "--no-restart-service",
         dest="restart_service",
         action="store_false",
-        help=argparse.SUPPRESS,
+        help="复用已健康的 web 服务；仅用于确认服务代码未变化时",
     )
-    parser.set_defaults(restart_service=False)
+    parser.set_defaults(restart_service=True)
     return parser
 
 

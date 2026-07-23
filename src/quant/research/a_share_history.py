@@ -162,6 +162,99 @@ def find_baseline_record(
     return None
 
 
+def load_research_context(
+    root: Path,
+    ticker: str,
+    before: str | datetime,
+) -> dict[str, Any]:
+    """Load prior records from the nearest full coverage through the latest baseline."""
+
+    normalized_ticker = _normalize_ticker(ticker)
+    if isinstance(before, datetime):
+        if before.tzinfo is None or before.utcoffset() is None:
+            raise ResearchHistoryError("before must include an explicit UTC offset")
+        cutoff = before.astimezone(SHANGHAI_TZ)
+    else:
+        cutoff = _parse_aware_timestamp(before, "before")
+
+    eligible = [
+        entry
+        for entry in list_research_records(root, normalized_ticker)
+        if _parse_aware_timestamp(entry.get("analysis_cutoff"), "analysis_cutoff")
+        < cutoff
+    ]
+    if not eligible:
+        return {
+            "ticker": normalized_ticker,
+            "before": cutoff.isoformat(timespec="seconds"),
+            "found": False,
+            "baseline_record_id": None,
+            "anchor_record_id": None,
+            "anchor_is_full_coverage": False,
+            "chain_complete": True,
+            "chain_warnings": [],
+            "available_record_count": 0,
+            "record_count": 0,
+            "records": [],
+        }
+
+    entries_by_id = {str(entry["record_id"]): entry for entry in eligible}
+    chain_newest_first: list[dict[str, Any]] = []
+    chain_warnings: list[str] = []
+    visited: set[str] = set()
+    current = eligible[0]
+    while True:
+        record_id = str(current["record_id"])
+        if record_id in visited:
+            chain_warnings.append(f"baseline cycle detected at {record_id}")
+            break
+        visited.add(record_id)
+        chain_newest_first.append(current)
+        if current.get("mode") == "full_coverage":
+            break
+        parent_id = current.get("baseline_record_id")
+        if parent_id is None:
+            break
+        parent = entries_by_id.get(str(parent_id))
+        if parent is None:
+            chain_warnings.append(
+                f"baseline record {parent_id} referenced by {record_id} is unavailable"
+            )
+            break
+        parent_cutoff = _parse_aware_timestamp(
+            parent.get("analysis_cutoff"), "baseline.analysis_cutoff"
+        )
+        current_cutoff = _parse_aware_timestamp(
+            current.get("analysis_cutoff"), "analysis_cutoff"
+        )
+        if parent_cutoff >= current_cutoff:
+            chain_warnings.append(
+                f"baseline record {parent_id} is not earlier than {record_id}"
+            )
+            break
+        current = parent
+
+    selected_entries = list(reversed(chain_newest_first))
+    records = [
+        load_research_record(root, normalized_ticker, str(entry["record_id"]))
+        for entry in selected_entries
+    ]
+    anchor_is_full_coverage = selected_entries[0].get("mode") == "full_coverage"
+    return {
+        "ticker": normalized_ticker,
+        "before": cutoff.isoformat(timespec="seconds"),
+        "found": True,
+        "baseline_record_id": eligible[0]["record_id"],
+        "anchor_record_id": selected_entries[0]["record_id"],
+        "anchor_is_full_coverage": anchor_is_full_coverage,
+        "chain_complete": not chain_warnings,
+        "chain_warnings": chain_warnings,
+        "available_record_count": len(eligible),
+        "record_count": len(records),
+        "records": records,
+    }
+
+
 def load_research_record(
     root: Path,
     ticker: str,
@@ -217,6 +310,32 @@ def _validate_revision(bundle: dict[str, Any], *, is_update: bool) -> None:
                 f"revision.belief_changes[{index}].classification must be one of "
                 f"{sorted(BELIEF_CHANGE_CLASSIFICATIONS)}"
             )
+    pillar_id_mappings = revision.get("pillar_id_mappings")
+    if pillar_id_mappings is not None:
+        if not isinstance(pillar_id_mappings, list):
+            raise ResearchHistoryError("revision.pillar_id_mappings must be an array")
+        for index, mapping in enumerate(pillar_id_mappings):
+            if not isinstance(mapping, dict):
+                raise ResearchHistoryError(
+                    f"revision.pillar_id_mappings[{index}] must be an object"
+                )
+            for field in (
+                "old_record_id",
+                "old_pillar_id",
+                "old_statement",
+                "new_pillar_id",
+                "reason",
+            ):
+                value = mapping.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise ResearchHistoryError(
+                        f"revision.pillar_id_mappings[{index}].{field} "
+                        "must be non-empty"
+                    )
+            if not RECORD_ID_PATTERN.fullmatch(mapping["old_record_id"]):
+                raise ResearchHistoryError(
+                    f"revision.pillar_id_mappings[{index}].old_record_id is invalid"
+                )
 
 
 def _validate_thesis(thesis: dict[str, Any]) -> None:
@@ -564,6 +683,18 @@ def parse_args() -> argparse.Namespace:
     )
     baseline_parser.add_argument("--ticker", required=True)
     baseline_parser.add_argument("--before", required=True)
+
+    context_parser = subparsers.add_parser(
+        "context",
+        help="Load full reports from the nearest full coverage through the latest baseline.",
+    )
+    context_parser.add_argument("--ticker", required=True)
+    context_parser.add_argument("--before", required=True)
+    context_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Atomically write the complete context JSON and print only a compact summary.",
+    )
     return parser.parse_args()
 
 
@@ -590,7 +721,7 @@ def main() -> int:
                 args.ticker,
                 args.record_id,
             )
-        else:
+        elif args.command == "baseline":
             baseline = find_baseline_record(args.root, args.ticker, args.before)
             result = {
                 "ticker": _normalize_ticker(args.ticker),
@@ -598,6 +729,22 @@ def main() -> int:
                 "found": baseline is not None,
                 "baseline": baseline,
             }
+        else:
+            result = load_research_context(
+                args.root,
+                args.ticker,
+                args.before,
+            )
+            if args.output is not None:
+                record_ids = [record["record_id"] for record in result["records"]]
+                output_path = atomic_write_json(result, args.output)
+                result = {
+                    key: value
+                    for key, value in result.items()
+                    if key != "records"
+                }
+                result["record_ids"] = record_ids
+                result["output_path"] = str(output_path.resolve())
     except (OSError, json.JSONDecodeError, ResearchHistoryError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

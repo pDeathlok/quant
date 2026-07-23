@@ -2,7 +2,7 @@
 
 ## 目标
 
-`analyze-a-shares` 在本项目中复用现有 Tushare、MySQL 和 Parquet 配置，不创建第二套 Token、缓存或行情口径。每次完成的个股研究保存为不可变记录，供后续财报、公司事件、行业事件和定期复盘读取。
+`analyze-a-shares` 在本项目中复用现有 Tushare、MySQL 和 Parquet 配置，不创建第二套 Token、缓存或行情口径。每次完成的个股研究保存为不可变记录；下次询问同一标的时，无论是否明确要求复盘，都必须先读取旧报告，再形成新结论。
 
 ## 历史行情适配
 
@@ -63,12 +63,21 @@ PYTHONPATH=src python -m quant.research.a_share_history template \
 PYTHONPATH=src python -m quant.research.a_share_history save research_bundle.json
 ```
 
-查询严格早于新分析截止时点的基线：
+加载严格早于新分析截止时点、从最近完整覆盖到最近基线的全部历史上下文：
 
 ```bash
-PYTHONPATH=src python -m quant.research.a_share_history baseline \
+PYTHONPATH=src python -m quant.research.a_share_history context \
   --ticker 600519.SH \
-  --before 2026-08-31T18:00:00+08:00
+  --before 2026-08-31T18:00:00+08:00 \
+  --output /tmp/a_share_context_600519.json
+```
+
+`context` 沿真实 `baseline_record_id` 链生成完整 `record.json` 和 `report.md`，写入指定文件以避免长报告被终端截断；命令行只返回记录 ID、链状态和输出路径。需要单独检查某条记录时，可按精确 `record_id` 加载：
+
+```bash
+PYTHONPATH=src python -m quant.research.a_share_history show \
+  --ticker 600519.SH \
+  --record-id 20260430T180000p0800-abcdef1234
 ```
 
 查看历史：
@@ -80,7 +89,9 @@ PYTHONPATH=src python -m quant.research.a_share_history show --ticker 600519.SH
 
 ## 认知迭代规则
 
-新记录自动挂接严格早于当前截止时点的最近记录。更新研究必须填写：
+唯一确认证券代码和本次截止时点后，Skill 必须在获取新材料前先加载历史上下文。若命中，必须读取最近完整覆盖、最近基线以及两者之间的跟进记录，提取旧结论、论点 ID、三情景、证伪条件和监测项；只展示一个历史记录 ID 不算完成回看。
+
+新记录自动挂接严格早于当前截止时点的最近记录。同标的再次分析一律作为更新研究，必须填写：
 
 - 新事实。
 - 旧论点的前后变化和分类。
@@ -88,6 +99,7 @@ PYTHONPATH=src python -m quant.research.a_share_history show --ticker 600519.SH
 - 三情景与估值变化。
 - 旧判断错误与教训。
 - 下一次检查项。
+- 迁移旧记录存在论点 ID 冲突时的 `pillar_id_mappings`。
 
 旧记录不可覆盖。相同输入重复保存时返回同一记录 ID；不同内容由内容哈希生成新记录。
 

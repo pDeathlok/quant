@@ -111,5 +111,28 @@ class ValidateSkillTests(unittest.TestCase):
         )
 
 
+class SameTickerHistoryContractTests(unittest.TestCase):
+    def test_skill_requires_history_lookup_before_new_research(self) -> None:
+        skill_text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("无论用户是否提到“复盘”", skill_text)
+        self.assertIn("在联网检索、抓取行情或形成新判断前加载历史上下文", skill_text)
+        self.assertIn("最近一次 `full_coverage` 到最近基线之间", skill_text)
+        self.assertIn("只列一个记录 ID 不算考虑了历史", skill_text)
+
+    def test_report_contract_requires_explicit_baseline_comparison(self) -> None:
+        report_contract = (
+            SKILL_DIR / "references" / "report-template.md"
+        ).read_text(encoding="utf-8")
+        review_contract = (
+            SKILL_DIR / "references" / "review-and-learning.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("不得只列 `baseline_record_id`", report_contract)
+        self.assertIn("旧论点、情景假设、证伪条件和未解决问题", report_contract)
+        self.assertIn("同标的分析前强制读取", review_contract)
+        self.assertIn("用户没有主动要求复盘，也不能跳过", review_contract)
+
+
 if __name__ == "__main__":
     unittest.main()

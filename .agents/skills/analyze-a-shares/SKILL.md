@@ -1,6 +1,6 @@
 ---
 name: analyze-a-shares
-description: 对沪深北交易所 A 股普通股上市公司进行证据驱动的基本面、估值、量价技术辅助、历史底稿复盘与认知迭代研究。用于用户要求分析 A 股个股、投资逻辑、财报/事件对预测或估值的影响、同行比较、合理价值/目标价、估值高低、反向估值、量价趋势确认、回看旧判断或在新信息后更新认知时；支持当前研究与严格防前视的历史时点研究。证据不足时保留三情景条件和公式但拒绝精确目标价。不要用于纯公告摘要、脱离基本面的纯技术荐股、交易执行、ETF/基金/债券/可转债、B/H 股单独研究或其他非普通股工具。
+description: 对沪深北交易所 A 股普通股上市公司进行证据驱动的基本面、估值、量价技术辅助、历史底稿复盘与认知迭代研究。同一标的再次被提问时，必须先读取该股之前的报告和结构化记录，以旧结论、论点、情景及证伪条件为基线再更新判断。用于用户要求分析 A 股个股、投资逻辑、财报/事件对预测或估值的影响、同行比较、合理价值/目标价、估值高低、反向估值、量价趋势确认、回看旧判断或在新信息后更新认知时；支持当前研究与严格防前视的历史时点研究。证据不足时保留三情景条件和公式但拒绝精确目标价。不要用于纯公告摘要、脱离基本面的纯技术荐股、交易执行、ETF/基金/债券/可转债、B/H 股单独研究或其他非普通股工具。
 ---
 
 # A 股投资分析
@@ -16,8 +16,9 @@ description: 对沪深北交易所 A 股普通股上市公司进行证据驱动�
 5. 对进入投资分析的任务始终给出悲观、中性、乐观三个相互一致的经营情景；只有通过最低证据门时才给数值目标价，否则给条件、公式和缺口。
 6. 将目标价格视为条件估值，不承诺收益，不代替适当性判断，不执行交易。结尾注明仅供研究与教育用途。
 7. 将量价技术分析限制为市场确认、风险和监测辅助层。它可以影响置信度与观察优先级，但不得直接改变盈利预测、估值输入、目标价或无依据的情景概率。
-8. 将每次已完成的个股投资研究保存为不可变历史记录。新财报或驱动事件出现时，先读取当时真实旧结论，再区分“新信息改变判断”“旧假设错误”“模型局限”和“尚未解决”，不得用后见之明改写旧底稿。
+8. 将每次已完成的个股投资研究保存为不可变历史记录。每次唯一确认证券代码和本次截止时点后，无论用户是否提到“复盘”、是否出现财报/事件、也无论采用何种任务模式，都必须先查询严格早于本次截止时点的同标的历史基线。
 9. 历史记录只是“当时认知”的证据，不自动证明事实正确。新报告仍须重新核验关键事实、时点和来源。
+10. 命中历史基线时不得把任务当作首次覆盖。先加载旧报告和结构化记录，再明确旧结论、论点 ID、三情景、证伪条件及监测项分别是维持、强化、弱化、失效还是尚待验证；区分“新信息改变判断”“旧假设错误”“模型局限”“噪声”和“尚未解决”，不得用后见之明改写旧底稿。
 
 ## 按需加载参考资料
 
@@ -25,6 +26,7 @@ description: 对沪深北交易所 A 股普通股上市公司进行证据驱动�
 
 按任务模式加载：
 
+- **所有模式的历史检查**：识别唯一证券代码和本次截止时点后，先查询同标的历史基线。命中时，无论最终任务模式为何，都额外读取 [review-and-learning.md](references/review-and-learning.md) 与 [report-template.md](references/report-template.md)，并加载基线的 `record.json` 和 `report.md`；未命中才标记首次建档。
 - **完整覆盖/同行/历史研究**：读取 [source-policy.md](references/source-policy.md)、[research-workflow.md](references/research-workflow.md)、[valuation-and-scenarios.md](references/valuation-and-scenarios.md)、[technical-price-volume.md](references/technical-price-volume.md)、[review-and-learning.md](references/review-and-learning.md) 和 [report-template.md](references/report-template.md)。
 - **财报/事件投资影响更新**：读取 [source-policy.md](references/source-policy.md) 与 [review-and-learning.md](references/review-and-learning.md)，再读取 [research-workflow.md](references/research-workflow.md) 中与新事实及财务口径相关的章节；先交付不超过 8 条的“新事实摘要”，每条包含事实、报告期、`available_at` 和来源。只有用户要求预测、估值或投资影响时才读取 [valuation-and-scenarios.md](references/valuation-and-scenarios.md) 与 [report-template.md](references/report-template.md)；要求市场反应或量价确认时另读 [technical-price-volume.md](references/technical-price-volume.md)。
 - **仅反向估值**：读取 [source-policy.md](references/source-policy.md)、[valuation-and-scenarios.md](references/valuation-and-scenarios.md) 和 [report-template.md](references/report-template.md)；不必读取完整财务工作流未使用的章节。
@@ -34,7 +36,8 @@ description: 对沪深北交易所 A 股普通股上市公司进行证据驱动�
 
 ## 选择任务模式
 
-- **完整覆盖（默认）**：用户只说“分析某股”时，完成业务、行业、财务质量、治理、估值、三情景、紧凑量价辅助、催化剂与风险。
+- **完整覆盖（默认）**：用户只说“分析某股”时，完成业务、行业、财务质量、治理、估值、三情景、紧凑量价辅助、催化剂与风险；若该股已有基线，则同时执行同标的再分析要求，不能重新从零叙述。
+- **同标的再分析**：只要历史查询命中，即使用户仍只说“分析某股”，也以前一期为基线，先回答“上次怎么看”，再给“这次什么事实变了、哪些判断不变、模型/估值是否调整、下一步如何验证”。用户未明确提供新事件时，触发类型使用定期复盘或其他适用类型，不得伪装成首次覆盖。
 - **财报/事件更新**：先读取严格早于本次截止时点的最近历史记录，以前一期结论为基线，明确“新事实 → 旧判断检验 → 认知变化 → 预测变化 → 估值变化”；不得只复述公告，也不得悄悄覆盖旧记录。
 - **同行比较**：先说明同行筛选标准，再统一报告期、会计口径和估值日期；不得把行业标签相同视为经济性相同。
 - **反向估值**：由当前价格反推市场隐含的增长、利润率、ROE 或资本成本，并检验其可实现性。
@@ -54,9 +57,45 @@ description: 对沪深北交易所 A 股普通股上市公司进行证据驱动�
 
 ## 执行工作流
 
-### 0. 复用项目数据并读取历史基线
+### 0. 先回看同标的历史，再复用项目数据
 
-当前工作区若提供项目集成模块，优先复用它，不另建行情 Token、缓存或存储口径：
+唯一确认证券代码和带时区的本次截止时点后，在联网检索、抓取行情或形成新判断前加载历史上下文：
+
+```bash
+PYTHONPATH=src python -m quant.research.a_share_history context \
+  --ticker 600519.SH \
+  --before 2026-07-23T18:00:00+08:00 \
+  --output /tmp/a_share_context_600519.json
+```
+
+`context` 严格排除截止时点及之后的记录，沿真实 `baseline_record_id` 链返回最近一次 `full_coverage` 到最近基线之间的完整 `record.json` 和 `report.md`。`--output` 避免长报告被终端截断；必须读取完整输出文件，不能只看命令行摘要。若 `anchor_is_full_coverage=false` 或 `chain_complete=false`，在报告中披露历史链缺口并降低依赖。这样最近记录即使只是技术、事件或单一问题跟进，也不会遮蔽更早的完整投资结论。历史时点研究不得直接使用 `latest`，以免引入未来记录。
+
+若项目版本尚无 `context` 子命令，则先查最近基线，再用 `list` 和精确 `record_id` 逐条 `show`，至少加载最近完整覆盖、最近基线及两者之间的所有更新：
+
+```bash
+PYTHONPATH=src python -m quant.research.a_share_history baseline \
+  --ticker 600519.SH \
+  --before 2026-07-23T18:00:00+08:00
+
+PYTHONPATH=src python -m quant.research.a_share_history show \
+  --ticker 600519.SH \
+  --record-id 20260430T180000p0800-abcdef1234
+```
+
+在收集新材料前形成一份内部“基线快照”，至少锁定：
+
+- `baseline_record_id`、旧分析截止、旧结论和置信度。
+- 旧论点 ID、原文命题、状态、反方和证伪条件。
+- 旧悲观/中性/乐观情景、估值输入或未给目标价的原因。
+- 旧监测项、尚未解决的问题和当时的数据缺口。
+
+命中基线时，后续报告必须逐项回应这份快照；只列一个记录 ID 不算考虑了历史。没有基线时明确写“首次建档”，不得编造上一期观点。
+
+对迁移自旧 Codex 对话的记录，以 `report.md` 原文为权威。若相邻记录复用了同一论点 ID 却表达不同命题，先按命题语义建立新旧映射并披露 ID 冲突，不得机械地把它们视为同一论点。
+
+任务结束后删除仅为本次读取创建的临时上下文文件；不得删除 `reports/a_shares/` 中的正式档案。
+
+当前工作区若提供项目集成模块，随后优先复用它，不另建行情 Token、缓存或存储口径：
 
 ```bash
 PYTHONPATH=src python -m quant.research.a_share_skill_data \
@@ -70,15 +109,7 @@ PYTHONPATH=src python -m quant.research.a_share_skill_data \
 - 本地正式数据缺失时，才通过项目既有 Tushare 配置补取；历史研究必须显式使用未复权或锚定在截止日的复权序列，不调用未声明锚点的默认前复权。
 - 项目集成模块不可用时，回到 [source-policy.md](references/source-policy.md) 的信源路由，并说明没有复用本地数据层。
 
-在收集新材料前查询历史档案：
-
-```bash
-PYTHONPATH=src python -m quant.research.a_share_history baseline \
-  --ticker 600519.SH \
-  --before 2026-07-23T18:00:00+08:00
-```
-
-有基线时加载完整旧记录和报告，锁定旧论点 ID、假设、三情景、证伪条件和监测项。没有基线时明确写“首次建档”；不得编造上一期观点。档案默认保存到 `reports/a_shares/<代码>/`，其契约见 [review-and-learning.md](references/review-and-learning.md)。
+档案默认保存到 `reports/a_shares/<代码>/`，其契约见 [review-and-learning.md](references/review-and-learning.md)。
 
 ### 1. 锁定研究对象和口径
 
@@ -176,6 +207,8 @@ PYTHONPATH=src python -m quant.research.a_share_history baseline \
 
 Flash 按“新事实 → 预期差 → 论点/预测/估值变化 → 风险与下一观察点”交付。若用户要求投资判断、预测或估值，仍须保留紧凑三情景表、变化桥接、风险和来源；纯事实更新不强制估值或三情景。
 
+只要同标的历史查询命中，Flash、Standard 和 Deep 都必须展示 `baseline_record_id`、旧截止时点、旧结论以及本次对旧论点/情景的处理。不得因用户没有说“复盘”、任务仍叫“完整覆盖”或篇幅较短而省略历史比较。
+
 ### 9. 保存不可变底稿并形成认知变更账本
 
 完成报告后按 [review-and-learning.md](references/review-and-learning.md) 生成结构化研究包并保存：
@@ -185,8 +218,9 @@ PYTHONPATH=src python -m quant.research.a_share_history save research_bundle.jso
 ```
 
 - 首次研究保存结论、论点 ID、三情景、证伪条件、监测项、证据账本、量价数据元信息和报告正文。
-- 更新研究必须保存 `baseline_record_id` 和 `revision`；项目工具会自动挂接严格早于本次截止时点的最近记录，但分析者仍须填写具体变化原因。
+- 同标的再次分析一律按更新研究保存，必须保存 `baseline_record_id` 和 `revision`；项目工具自动挂接最近记录只是防漏安全网，不能替代分析前实际读取旧报告。
 - `revision` 至少包含新事实、认知变化、模型变化、估值变化、旧判断错误与教训、下一检查项；空数组表示已检查但没有变化，不能省略字段。
+- 迁移旧记录存在论点 ID 漂移时，在 `revision.pillar_id_mappings` 保存旧记录 ID、旧论点 ID/原文、新论点 ID 和映射理由，供后续机器复用；没有冲突时可省略。
 - 旧记录不可覆盖、删除或“修正文案”。若发现旧底稿事实错误，在新记录中保留原话并注明纠正证据。
 - 保存失败不阻断当次交付，但必须在报告末尾说明未归档原因和可恢复步骤；不得声称已保存。
 
@@ -219,7 +253,7 @@ PYTHONPATH=src python -m quant.research.a_share_history save research_bundle.jso
 当前项目另提供：
 
 - `python -m quant.research.a_share_skill_data`：复用项目 `.env`、MySQL/Parquet 统一行情层，生成点时量价输入。
-- `python -m quant.research.a_share_history`：生成模板、保存不可变底稿、列出历史、加载记录和选择严格早于截止时点的基线。
+- `python -m quant.research.a_share_history`：生成模板、保存不可变底稿、列出历史、加载记录，以及读取严格早于截止时点的最近基线或完整历史上下文。
 
 业务计算脚本兼容 Python 3.9+ 且只依赖标准库。先运行脚本的 `--help`。仅把已核验输入传入脚本，并在报告中展示输入来源；脚本输出不是投资结论。修改本 Skill 后运行：
 

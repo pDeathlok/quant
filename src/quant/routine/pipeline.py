@@ -255,6 +255,21 @@ def _run_analyst_command(command: list[str], env: dict[str, str], timeout_second
         )
 
 
+def _extract_last_json_object(text: str) -> dict:
+    decoder = json.JSONDecoder()
+    parsed: dict | None = None
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and not text[index + end :].strip():
+            parsed = value
+    return parsed or {}
+
+
 def _existing_analyst_symbols(output_path: Path, source: str) -> set[str]:
     if not output_path.exists():
         return set()
@@ -374,17 +389,56 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             timeout_seconds=int(os.getenv("ROUTINE_AKSHARE_RESEARCH_TIMEOUT_SECONDS", "900")),
         )
         research_success = research_result.returncode == 0
+        research_payload = _extract_last_json_object(research_result.stdout)
+        failed_symbols = sorted(str(item) for item in (research_payload.get("failed_symbols") or []) if item)
+        deferred_symbols = sorted(str(item) for item in (research_payload.get("deferred_symbols") or []) if item)
+        degraded_symbols = sorted(set(failed_symbols) | set(deferred_symbols))
+        failure_rate = (len(degraded_symbols) / len(symbols)) if symbols else 0.0
+        soft_failure_threshold = float(os.getenv("ROUTINE_AKSHARE_RESEARCH_SOFT_FAILURE_RATE", "0.05"))
         if research_success:
             _atomic_write_json(
                 research_marker,
                 {"date": today.date().isoformat(), "symbols": symbols},
             )
         fallback_symbols = sorted(_existing_analyst_symbols(output_path, "akshare_em_research") & set(symbols))
+        fallback_missing_symbols = sorted(set(symbols) - set(fallback_symbols))
+        low_ratio_soft_failure = (
+            not research_success
+            and degraded_symbols
+            and failure_rate <= soft_failure_threshold
+        )
+        if research_success or low_ratio_soft_failure:
+            research_status = "success"
+        elif fallback_symbols:
+            research_status = "degraded"
+        else:
+            research_status = "failed"
         steps["candidate_research_reports"] = {
-            "status": "success" if research_success else ("degraded" if fallback_symbols else "failed"),
+            "status": research_status,
             "returncode": research_result.returncode,
             "symbols_requested": len(symbols),
+            "symbols_success": int(research_payload.get("success") or 0) if research_payload else None,
+            "symbols_failed": len(failed_symbols),
+            "symbols_deferred": len(deferred_symbols),
+            "failed_symbols": failed_symbols,
+            "deferred_symbols": deferred_symbols,
+            "degraded_symbols": degraded_symbols,
+            "failure_rate": round(failure_rate, 6),
+            "soft_failure_threshold": soft_failure_threshold,
             "fallback_symbols": len(fallback_symbols),
+            "fallback_symbol_list": fallback_symbols,
+            "fallback_missing_symbols": fallback_missing_symbols,
+            "coverage": {
+                "requested": len(symbols),
+                "fresh_success": int(research_payload.get("success") or 0) if research_payload else None,
+                "last_known_good": len(fallback_symbols),
+                "degraded": len(degraded_symbols),
+            },
+            "warning": (
+                f"isolated low-ratio research failures: {', '.join(degraded_symbols)}"
+                if low_ratio_soft_failure
+                else None
+            ),
             "command": " ".join(research_command),
             "stdout_tail": research_result.stdout[-2000:],
             "stderr_tail": research_result.stderr[-2000:],

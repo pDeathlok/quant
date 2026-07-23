@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from quant.routine import web_refresh_runner as runner
 
 
@@ -104,12 +106,13 @@ def test_run_refresh_workflow_rejects_second_process_lock(tmp_path: Path) -> Non
     assert str(lock_path) in result["reason"]
 
 
-def test_runner_reuses_healthy_service_by_default() -> None:
+def test_runner_restarts_service_by_default() -> None:
     config = runner.RefreshRunnerConfig()
     args = runner.build_parser().parse_args([])
 
-    assert config.restart_service is False
-    assert args.restart_service is False
+    assert config.restart_service is True
+    assert args.restart_service is True
+    assert runner.build_parser().parse_args(["--no-restart-service"]).restart_service is False
 
 
 def test_run_refresh_workflow_retries_after_failed_status(tmp_path: Path) -> None:
@@ -166,6 +169,7 @@ def test_run_refresh_workflow_retries_after_failed_status(tmp_path: Path) -> Non
         retry_delay_seconds=0,
         max_attempts=2,
         service_log_path=tmp_path / "service.log",
+        restart_service=False,
     )
 
     result = runner.run_refresh_workflow(
@@ -297,10 +301,12 @@ def test_ensure_local_service_force_restarts_pid_file_service(monkeypatch, tmp_p
     assert any("准备重启常驻 web 服务" in line for line in logs)
 
 
-def test_ensure_local_service_reuses_externally_managed_service(
+def test_ensure_local_service_restarts_launchd_managed_service(
     monkeypatch, tmp_path: Path
 ) -> None:
     responses = [
+        FakeResponse({"status": "ok", "service": "quant-webapp"}),
+        FakeResponse("<html>quant</html>"),
         FakeResponse({"status": "ok", "service": "quant-webapp"}),
         FakeResponse("<html>quant</html>"),
     ]
@@ -309,6 +315,7 @@ def test_ensure_local_service_reuses_externally_managed_service(
     logs: list[str] = []
 
     monkeypatch.setattr(runner, "stop_service_from_pid_file", lambda *args, **kwargs: False)
+    monkeypatch.setattr(runner, "restart_launchd_service", lambda: (True, None))
 
     config = runner.RefreshRunnerConfig(
         project_root=tmp_path,
@@ -323,7 +330,38 @@ def test_ensure_local_service_reuses_externally_managed_service(
     )
 
     assert process is None
-    assert any("外部守护器托管" in line for line in logs)
+    assert any("已重启 launchd 托管" in line for line in logs)
+
+
+def test_ensure_local_service_fails_if_external_service_cannot_restart(
+    monkeypatch, tmp_path: Path
+) -> None:
+    session = FakeSession(
+        [
+            FakeResponse({"status": "ok", "service": "quant-webapp"}),
+            FakeResponse("<html>quant</html>"),
+        ]
+    )
+    client = runner.RefreshApiClient("http://127.0.0.1:8088/api", session=session)
+
+    monkeypatch.setattr(runner, "stop_service_from_pid_file", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        runner,
+        "restart_launchd_service",
+        lambda: (False, "service not registered"),
+    )
+    config = runner.RefreshRunnerConfig(
+        project_root=tmp_path,
+        service_log_path=tmp_path / "service.log",
+        service_pid_path=tmp_path / "service.pid",
+    )
+
+    with pytest.raises(RuntimeError, match="无法通过 launchd 重启"):
+        runner.ensure_local_service(
+            config=config,
+            client=client,
+            force_restart=True,
+        )
 
 
 def test_run_refresh_workflow_fails_when_trade_day_unknown(tmp_path: Path) -> None:

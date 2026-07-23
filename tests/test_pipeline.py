@@ -151,6 +151,63 @@ def test_daily_analyst_timeout_uses_last_known_good_research(monkeypatch, tmp_pa
     assert not (tmp_path / "data/raw/analyst_research_refresh_status.json").exists()
 
 
+def test_daily_analyst_low_ratio_research_failures_are_isolated(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "data/raw/analyst_forecasts.parquet"
+    output.parent.mkdir(parents=True)
+    today = pd.Timestamp.now().normalize()
+    symbols = [f"{index:06d}.SZ" for index in range(1, 54)]
+    pd.DataFrame(
+        {
+            "source": ["akshare_em_snapshot", *["akshare_em_research"] * 52],
+            "ts_code": [symbols[0], *symbols[:52]],
+            "report_date": [today, *[today - pd.Timedelta(days=7)] * 52],
+        }
+    ).to_parquet(output, index=False)
+    snapshot_dir = tmp_path / "data/long_stock_pool_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "tea.json").write_text(
+        json.dumps(
+            {
+                "variant": "tea",
+                "stocks": [{"ts_code": symbol, "state": "CORE"} for symbol in symbols],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Result:
+        returncode = 1
+        stderr = ""
+        stdout = (
+            "akshare_em_research progress: 53/53 success=52 failed=1 deferred=0\n"
+            + json.dumps(
+                {
+                    "source": "akshare_em_research",
+                    "symbols_requested": 53,
+                    "success": 52,
+                    "failed": 1,
+                    "deferred": 0,
+                    "failed_symbols": [symbols[-1]],
+                    "deferred_symbols": [],
+                },
+                indent=2,
+            )
+        )
+
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("ROUTINE_REFRESH_CANDIDATE_RESEARCH", "1")
+    monkeypatch.setattr(pipeline.subprocess, "run", lambda command, **kwargs: Result())
+
+    result = pipeline._refresh_analyst_forecast_snapshot()
+
+    assert result["status"] == "success"
+    step = result["steps"]["candidate_research_reports"]
+    assert step["status"] == "success"
+    assert step["failed_symbols"] == [symbols[-1]]
+    assert step["failure_rate"] < step["soft_failure_threshold"]
+    assert "isolated low-ratio" in step["warning"]
+
+
 def test_daily_candidate_report_refresh_requires_explicit_external_opt_in(monkeypatch, tmp_path) -> None:
     output = tmp_path / "data/raw/analyst_forecasts.parquet"
     output.parent.mkdir(parents=True)
