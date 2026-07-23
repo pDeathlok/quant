@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_daily_plan, write_daily_plan
@@ -174,6 +175,7 @@ WEB_WORKSPACE_SNAPSHOT_TABLE = "web_workspace_snapshots"
 WEB_WORKSPACE_SNAPSHOT_DIR = PROJECT_ROOT / "data/workspace_snapshots"
 CONVERTIBLE_BOND_GRID_PLAN_PATH = PROJECT_ROOT / "data/web/convertible_bond_grid_plan.json"
 REFRESH_STATUS_PATH = PROJECT_ROOT / "data/routine/latest_refresh_status.json"
+REFRESH_MANIFEST_ROOT = PROJECT_ROOT / "data/routine"
 REFRESH_RUNNING_STALE_SECONDS = 6 * 60 * 60
 REFRESH_NO_PROGRESS_STALE_SECONDS = 30 * 60
 SIMILAR_PATTERNS_TIMEOUT_SECONDS = 45 * 60
@@ -375,6 +377,12 @@ def _similar_pattern_vector_cache_refresh_decision(
         due, reason = True, "forced"
     elif not cache_files:
         due, reason = True, "cache_missing"
+    elif int(metadata.get("errors") or 0) > 0:
+        due, reason = True, "previous_refresh_errors"
+    elif metadata.get("cached_files") is not None and int(metadata["cached_files"]) != len(cache_files):
+        due, reason = True, "cache_file_count_changed"
+    elif any(path.stat().st_size == 0 for path in cache_files):
+        due, reason = True, "empty_cache_file"
     elif pd.isna(refreshed_at):
         due, reason = True, "refresh_time_missing"
     elif current - refreshed_at.to_pydatetime() >= timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS):
@@ -434,11 +442,38 @@ CHAN_MODEL_SUMMARY_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_summary
 
 
 def _persist_refresh_status_unlocked() -> None:
-    REFRESH_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REFRESH_STATUS_PATH.write_text(
-        json.dumps(_REFRESH_STATUS, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    if (
+        _REFRESH_STATUS.get("status") in {"success", "failed"}
+        and _REFRESH_STATUS.get("run_id")
+        and not _REFRESH_STATUS.get("manifest_path")
+    ):
+        try:
+            _write_terminal_refresh_manifest_unlocked()
+        except Exception as exc:
+            _REFRESH_STATUS["manifest_error"] = str(exc)
+    atomic_write_json(_REFRESH_STATUS, REFRESH_STATUS_PATH)
+
+
+def _write_terminal_refresh_manifest_unlocked() -> Path | None:
+    if _REFRESH_STATUS.get("status") not in {"success", "failed"}:
+        return None
+    run_id = str(_REFRESH_STATUS.get("run_id") or "").strip()
+    if not run_id:
+        return None
+    started_at = _parse_refresh_timestamp(_REFRESH_STATUS.get("started_at")) or datetime.now()
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip("-") or "run"
+    run_dir = REFRESH_MANIFEST_ROOT / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{safe_run_id}"
+    manifest_path = run_dir / "manifest.json"
+    _REFRESH_STATUS["manifest_path"] = str(manifest_path)
+    if manifest_path.exists():
+        return manifest_path
+    payload = {
+        "schema_version": 1,
+        "kind": "web_daily_refresh",
+        **_REFRESH_STATUS,
+    }
+    atomic_write_json(payload, manifest_path)
+    return manifest_path
 
 
 def _load_persisted_refresh_status() -> dict[str, Any] | None:
@@ -518,7 +553,11 @@ def _input_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
         return False
     if scope in {"all", "long"}:
         analyst = (reference.get("steps") or {}).get("analyst_forecast_snapshot") or {}
-        if analyst.get("status") not in {"success", "skipped"}:
+        # A degraded analyst refresh explicitly means a last-known-good
+        # snapshot is available and the reference stage had no critical error.
+        # Treat it as a reusable input checkpoint; otherwise an unrelated
+        # downstream retry needlessly repeats every market-data request.
+        if analyst.get("status") not in {"success", "skipped", "degraded"}:
             return False
     return True
 
@@ -3179,6 +3218,15 @@ def refresh_similar_pattern_analysis(progress_callback=None, *, force_vector_cac
             workers=max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "4"))),
             progress_callback=progress_callback,
         )
+        cache_errors = cache_audit[cache_audit["status"].eq("error")]
+        if not cache_errors.empty:
+            examples = ", ".join(
+                f"{row.get('symbol', '?')}: {row.get('error', 'unknown error')}"
+                for row in cache_errors.head(3).to_dict("records")
+            )
+            raise RuntimeError(
+                f"相似走势周级向量缓存构建失败: errors={len(cache_errors)}; {examples}"
+            )
         cache_metadata = _write_similar_pattern_vector_cache_metadata(
             refreshed_at=datetime.now(),
             source_trade_date=source_trade_date,
@@ -3204,6 +3252,14 @@ def refresh_similar_pattern_analysis(progress_callback=None, *, force_vector_cac
         vector_cache_dir=SIMILAR_PATTERN_VECTOR_CACHE_DIR,
         progress_callback=progress_callback,
     )
+    missing_targets = [symbol for symbol in symbols if symbol not in results]
+    if missing_targets:
+        preview = ", ".join(missing_targets[:5])
+        suffix = "..." if len(missing_targets) > 5 else ""
+        raise RuntimeError(
+            f"相似走势未生成全部自选股目标结果: missing={len(missing_targets)}/{len(symbols)} "
+            f"({preview}{suffix})"
+        )
     validation = _read_similar_pattern_validation()
     global_model_selection = validation.get("model_selection") or {}
     next_day_policy = (global_model_selection.get("next_1d", {}).get("selected") or {})
@@ -3742,6 +3798,19 @@ def _write_strategy_pool_snapshots(payload: dict[str, Any], include_extended: bo
     return written
 
 
+def _run_post_snapshot_cache_cleanup(results: dict[str, Any]) -> dict[str, Any]:
+    """Enforce retention after the refresh writes its newest snapshot version."""
+
+    summary = run_cache_cleanup(PROJECT_ROOT)
+    results["cache_cleanup_after_snapshot"] = summary
+    sql_status = str((summary.get("sql_snapshots") or {}).get("status") or "")
+    if summary.get("status") != "success" or sql_status in {"failed", "partial"}:
+        errors = summary.get("errors") or []
+        detail = "; ".join(str(error) for error in errors[:3]) or f"sql_status={sql_status or 'unknown'}"
+        raise RuntimeError(f"快照写入后缓存保留清理失败: {detail}")
+    return summary
+
+
 def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELECTOR_LIMIT) -> dict[str, Any]:
     rows = payload.get("stocks") or []
     complete_total = int(payload.get("total_stock_count") or len(rows))
@@ -4045,16 +4114,19 @@ def _build_chan_model_strategy_payload(top_n: int = 20, signal_date: str | None 
     scored = pd.read_parquet(CHAN_MODEL_SCORED_PATH)
     strategy_frame = add_chan_model_strategy_columns(scored)
     if signal_date is None:
-        CHAN_MODEL_STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
-        strategy_frame.to_parquet(CHAN_MODEL_STRATEGY_SCORED_PATH, index=False)
-        strategy_frame.to_csv(CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_scored.csv", index=False)
+        atomic_write_parquet(strategy_frame, CHAN_MODEL_STRATEGY_SCORED_PATH, index=False)
+        atomic_write_csv(
+            strategy_frame,
+            CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_scored.csv",
+            index=False,
+        )
 
     candidates = select_chan_model_candidates(strategy_frame, trade_date=signal_date, top_n=top_n)
     if signal_date is None:
-        candidates.to_csv(CHAN_MODEL_LATEST_CANDIDATES_PATH, index=False)
+        atomic_write_csv(candidates, CHAN_MODEL_LATEST_CANDIDATES_PATH, index=False)
     summary = summarize_chan_model_strategy(strategy_frame)
     if signal_date is None:
-        summary.to_csv(CHAN_MODEL_SUMMARY_PATH, index=False)
+        atomic_write_csv(summary, CHAN_MODEL_SUMMARY_PATH, index=False)
 
     signal_date = (
         str(pd.to_datetime(candidates["date"].iloc[0]).date())
@@ -5900,9 +5972,30 @@ def _progress_steps(scope: str | None = None) -> list[dict[str, Any]]:
             "label": REFRESH_STEP_DEFINITIONS[key]["label"],
             "status": "pending",
             "percent": REFRESH_STEP_DEFINITIONS[key]["percent"],
+            "started_at": None,
+            "finished_at": None,
+            "elapsed_seconds": None,
         }
         for key in REFRESH_SCOPE_STEPS[normalized]
     ]
+
+
+def _mark_refresh_step_started(step: dict[str, Any], now: datetime) -> None:
+    step.setdefault("started_at", None)
+    step.setdefault("finished_at", None)
+    step.setdefault("elapsed_seconds", None)
+    if step["started_at"] is None:
+        step["started_at"] = now.isoformat(timespec="seconds")
+
+
+def _mark_refresh_step_finished(step: dict[str, Any], now: datetime) -> None:
+    _mark_refresh_step_started(step, now)
+    step["finished_at"] = now.isoformat(timespec="seconds")
+    started_at = _parse_refresh_timestamp(step["started_at"])
+    step["elapsed_seconds"] = round(
+        max(0.0, (now - started_at).total_seconds()) if started_at else 0.0,
+        3,
+    )
 
 
 def _set_refresh_progress(
@@ -5919,19 +6012,30 @@ def _set_refresh_progress(
     with _REFRESH_LOCK:
         if not _owned_refresh_context_active_unlocked():
             return
+        now = datetime.now()
         steps = list(_REFRESH_STATUS.get("steps") or _progress_steps())
+        for step in steps:
+            step.setdefault("started_at", None)
+            step.setdefault("finished_at", None)
+            step.setdefault("elapsed_seconds", None)
         if step_key:
             seen_current = False
             for step in steps:
                 if step["key"] == step_key:
-                    step["status"] = step_status or ("running" if status == "running" else status)
+                    next_step_status = step_status or ("running" if status == "running" else status)
+                    step["status"] = next_step_status
+                    _mark_refresh_step_started(step, now)
+                    if next_step_status in {"success", "failed"}:
+                        _mark_refresh_step_finished(step, now)
                     seen_current = True
                 elif complete_previous and not seen_current and step["status"] in {"pending", "running"}:
                     step["status"] = "success"
+                    _mark_refresh_step_finished(step, now)
             if step_status == "success":
                 for step in steps:
                     if step["key"] == step_key:
                         step["status"] = "success"
+                        _mark_refresh_step_finished(step, now)
         next_percent = percent if percent is not None else _REFRESH_STATUS.get("percent", 0)
         if status == "running":
             next_percent = max(int(_REFRESH_STATUS.get("percent", 0) or 0), int(next_percent or 0))
@@ -5944,11 +6048,20 @@ def _set_refresh_progress(
                 "steps": steps,
                 "result": result,
                 "error": error,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_at": now.isoformat(timespec="seconds"),
             }
         )
         if status in {"success", "failed"}:
-            _REFRESH_STATUS["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            _REFRESH_STATUS["finished_at"] = now.isoformat(timespec="seconds")
+            started_at = _parse_refresh_timestamp(_REFRESH_STATUS.get("started_at"))
+            _REFRESH_STATUS["elapsed_seconds"] = round(
+                max(0.0, (now - started_at).total_seconds()) if started_at else 0.0,
+                3,
+            )
+            try:
+                _write_terminal_refresh_manifest_unlocked()
+            except Exception as exc:
+                _REFRESH_STATUS["manifest_error"] = str(exc)
         _persist_refresh_status_unlocked()
 
 
@@ -6012,6 +6125,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
             "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
             "strategy_pools": written_pools,
         }
+        _run_post_snapshot_cache_cleanup(results)
         return results
 
     _build_tea_master_stock_pool_cached.cache_clear()
@@ -6114,6 +6228,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
     }
     if "long_stock_pool" in results:
         results["snapshot"]["long_stock_pools"] = results["long_stock_pool"].get("variants")
+    _run_post_snapshot_cache_cleanup(results)
     return results
 
 
@@ -6141,6 +6256,25 @@ def _run_latest_refresh_job(
     _REFRESH_CONTEXT.run_id = refresh_run_id
     resume_tail = _tail_resume_ready(resume_status, refresh_scope)
     resume_inputs = not resume_tail and _input_resume_ready(resume_status, refresh_scope)
+    early_workspace_executor: ThreadPoolExecutor | None = None
+    early_workspace_futures: dict[Any, tuple[str, str]] = {}
+    early_workspace_results_lock = threading.Lock()
+    workspace_failure_step: str | None = None
+
+    def shutdown_early_workspaces(*, cancel_pending: bool) -> None:
+        nonlocal early_workspace_executor
+        if early_workspace_executor is None:
+            return
+        if cancel_pending:
+            for pending_future in early_workspace_futures:
+                if not pending_future.done():
+                    pending_future.cancel()
+        early_workspace_executor.shutdown(
+            wait=True,
+            cancel_futures=cancel_pending,
+        )
+        early_workspace_executor = None
+
     try:
         with _REFRESH_LOCK:
             current_run_id = _REFRESH_STATUS.get("run_id")
@@ -6179,20 +6313,75 @@ def _run_latest_refresh_job(
         )
         results["cache_cleanup"] = cache_cleanup
         if resume_tail:
-            results = _resume_tail_refresh_from_cached_selector(refresh_scope, resume_status)
-            results["cache_cleanup"] = cache_cleanup
-            _set_refresh_progress(
-                status="success",
-                step_key="snapshot",
-                message="刷新任务完成，所有工作区数据与策略结果已生成",
-                percent=100,
-                result=results,
-            )
-            with _REFRESH_LOCK:
-                for step in _REFRESH_STATUS["steps"]:
-                    step["status"] = "success"
-                _persist_refresh_status_unlocked()
-            return
+            try:
+                results = _resume_tail_refresh_from_cached_selector(refresh_scope, resume_status)
+            except RuntimeError as exc:
+                if not str(exc).startswith("断点续跑快照已过期:"):
+                    raise
+                # A stale selector snapshot is not a terminal failure when the
+                # same-day source inputs are still valid. Fall back to the
+                # compute-stage checkpoint and regenerate the selector before
+                # retrying downstream workspaces.
+                resume_tail = False
+                resume_inputs = _input_resume_ready(resume_status, refresh_scope)
+                if not resume_inputs:
+                    expected_date = pd.to_datetime(
+                        _incremental_daily_start(), format="%Y%m%d"
+                    ).normalize()
+
+                    def recovered_artifact_current(path: Path) -> bool:
+                        if not path.exists():
+                            return False
+                        try:
+                            dates = pd.read_parquet(path, columns=["date"])["date"]
+                            latest = pd.to_datetime(dates, errors="coerce").max()
+                            return pd.notna(latest) and latest.normalize() == expected_date
+                        except Exception:
+                            return False
+
+                    recovered_paths = {
+                        "feature_cache": PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet",
+                        "family_signal_cache": PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
+                        "extended_signal_cache": PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
+                        "model_score": PROJECT_ROOT
+                        / "reports/b1/research/xgb_project_vars_strategy/latest_z_skill_model_scored_candidates.parquet",
+                    }
+                    recovered = {
+                        key: recovered_artifact_current(path) for key, path in recovered_paths.items()
+                    }
+                    if not all(recovered.values()):
+                        raise
+                    resume_inputs = True
+                    results = {
+                        "refresh_data": {"status": "success", "checkpoint_recovered": True},
+                        "refresh_daily_basic": {"status": "success", "checkpoint_recovered": True},
+                        "refresh_reference_inputs": {"status": "success", "checkpoint_recovered": True},
+                        "feature_cache": {"status": "success", "checkpoint_recovered": True},
+                        "signal_cache": {"status": "success", "checkpoint_recovered": True},
+                        "model_score": {"status": "success", "checkpoint_recovered": True},
+                    }
+                else:
+                    results = dict((resume_status or {}).get("result") or {})
+                results["tail_resume_fallback"] = {
+                    "status": "success",
+                    "reason": str(exc),
+                    "action": "recompute_from_same_day_inputs",
+                }
+                results["cache_cleanup"] = cache_cleanup
+            else:
+                results["cache_cleanup"] = cache_cleanup
+                _set_refresh_progress(
+                    status="success",
+                    step_key="snapshot",
+                    message="刷新任务完成，所有工作区数据与策略结果已生成",
+                    percent=100,
+                    result=results,
+                )
+                with _REFRESH_LOCK:
+                    for step in _REFRESH_STATUS["steps"]:
+                        step["status"] = "success"
+                    _persist_refresh_status_unlocked()
+                return
 
         if not resume_inputs:
             _set_refresh_progress(step_key="refresh_data", message=f"{refresh_label}：正在共享拉取 Tushare 最新日线数据", percent=10)
@@ -6236,6 +6425,100 @@ def _run_latest_refresh_job(
             complete_previous=False,
         )
         _clear_selector_caches()
+
+        # These workspaces only need the refreshed shared inputs. Start their
+        # network-heavy work before the CPU-bound short-selector branch and
+        # join the same futures at the normal downstream barrier.
+        if refresh_scope == "all":
+            early_signal_date = pd.to_datetime(
+                _incremental_daily_start(), format="%Y%m%d"
+            ).date().isoformat()
+            early_trade_date = early_signal_date.replace("-", "")
+            early_jobs = [
+                (
+                    "convertible_bond_plan",
+                    lambda: get_convertible_bond_grid_plan(
+                        early_trade_date,
+                        18,
+                        True,
+                    ),
+                    "可转债策略计划刷新失败",
+                    "可转债策略计划已提前刷新完成",
+                ),
+                (
+                    "convertible_bond_allotment",
+                    lambda: get_convertible_bond_allotments(80, 90, True, "pipeline"),
+                    "配债股数据刷新失败",
+                    "配债股数据已提前刷新完成",
+                ),
+                (
+                    "byd_daily_plan",
+                    lambda: get_byd_daily_strategy(refresh=True),
+                    "BYD 做T日线计划刷新失败",
+                    "BYD 做T日线计划已提前刷新完成",
+                ),
+            ]
+
+            def run_early_workspace(
+                step_key: str,
+                operation,
+                success_message: str,
+            ) -> Any:
+                payload = operation()
+                with early_workspace_results_lock:
+                    if step_key == "convertible_bond_plan":
+                        results[step_key] = {
+                            "status": "success",
+                            "trade_date": payload.get("trade_date") or early_signal_date,
+                            "candidates": len(payload.get("candidates") or payload.get("items") or []),
+                            "data_refresh": payload.get("data_refresh"),
+                        }
+                    elif step_key == "convertible_bond_allotment":
+                        results[step_key] = {
+                            "status": "success",
+                            "asof": payload.get("asof"),
+                            "records": len(payload.get("records") or []),
+                        }
+                    else:
+                        planned_t = payload.get("planned_t") or {}
+                        results[step_key] = {
+                            "status": "success",
+                            "signal_date": planned_t.get("signal_date"),
+                            "alerts": len(payload.get("alerts") or []),
+                        }
+                _set_refresh_progress(
+                    step_key=step_key,
+                    step_status="success",
+                    message=success_message,
+                    percent=40,
+                    complete_previous=False,
+                )
+                return payload
+
+            pending_early_jobs = [
+                item
+                for item in early_jobs
+                if (results.get(item[0]) or {}).get("status") != "success"
+            ]
+            if pending_early_jobs:
+                early_workspace_executor = ThreadPoolExecutor(
+                    max_workers=len(pending_early_jobs),
+                    thread_name_prefix="quant-early-workspace",
+                )
+                for step_key, operation, failure_message, success_message in pending_early_jobs:
+                    _set_refresh_progress(
+                        step_key=step_key,
+                        message=f"共享数据已就绪，后台提前执行 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
+                        percent=35,
+                        complete_previous=False,
+                    )
+                    future = early_workspace_executor.submit(
+                        run_early_workspace,
+                        step_key,
+                        operation,
+                        success_message,
+                    )
+                    early_workspace_futures[future] = (step_key, failure_message)
 
         if refresh_scope not in {"all", "short"}:
             signal_date = pd.to_datetime(_incremental_daily_start(), format="%Y%m%d").date().isoformat()
@@ -6360,20 +6643,71 @@ def _run_latest_refresh_job(
 
         _set_refresh_progress(
             step_key="feature_cache",
-            message="正在并行增量构建 B1 特征缓存与全市场规则信号",
+            message="正在依次增量构建 B1 特征缓存与全市场规则信号",
             percent=35,
             complete_previous=False,
         )
         _set_refresh_progress(
             step_key="signal_cache",
-            message="正在并行增量构建 B1 特征缓存与全市场规则信号",
+            message="正在依次增量构建 B1 特征缓存与全市场规则信号",
             percent=35,
             complete_previous=False,
         )
-        daily_plan_ready = False
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(
+        expected_incremental_date = pd.to_datetime(
+            _incremental_daily_start(), format="%Y%m%d"
+        ).normalize()
+
+        def artifact_current(path: Path) -> bool:
+            if not path.exists():
+                return False
+            try:
+                dates = pd.read_parquet(path, columns=["date"])["date"]
+                latest = pd.to_datetime(dates, errors="coerce").max()
+                return pd.notna(latest) and latest.normalize() == expected_incremental_date
+            except Exception:
+                return False
+
+        feature_ready = (
+            resume_inputs
+            and (results.get("feature_cache") or {}).get("status") == "success"
+            and artifact_current(PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet")
+        )
+        signal_ready = resume_inputs and all(
+            artifact_current(path)
+            for path in (
+                PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
+                PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
+            )
+        )
+        if feature_ready:
+            results["feature_cache"]["checkpoint_reused"] = True
+            _set_refresh_progress(
+                step_key="feature_cache",
+                step_status="success",
+                message="已复用同日 B1 特征缓存检查点",
+                percent=45,
+                complete_previous=False,
+            )
+        if signal_ready:
+            results["signal_cache"] = {
+                "status": "success",
+                "checkpoint_reused": True,
+                "date": expected_incremental_date.date().isoformat(),
+            }
+            _set_refresh_progress(
+                step_key="signal_cache",
+                step_status="success",
+                message="已复用同日全市场规则信号检查点",
+                percent=68,
+                complete_previous=False,
+            )
+
+        # Each task creates its own CPU-bound process pool. A single outer
+        # worker prevents nested pools from contending for the same cores.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            futures = {}
+            if not feature_ready:
+                futures[executor.submit(
                     build_features,
                     progress_callback=lambda percent, message: _set_refresh_progress(
                         step_key="feature_cache",
@@ -6381,8 +6715,9 @@ def _run_latest_refresh_job(
                         percent=percent,
                         complete_previous=False,
                     ),
-                ): ("feature_cache", "B1 特征缓存刷新失败"),
-                executor.submit(
+                )] = ("feature_cache", "B1 特征缓存刷新失败")
+            if not signal_ready:
+                futures[executor.submit(
                     refresh_strategy_signal_cache,
                     progress_callback=lambda percent, message: _set_refresh_progress(
                         step_key="signal_cache",
@@ -6390,8 +6725,7 @@ def _run_latest_refresh_job(
                         percent=max(46, min(68, percent)),
                         complete_previous=False,
                     ),
-                ): ("signal_cache", "策略规则信号重建失败"),
-            }
+                )] = ("signal_cache", "策略规则信号重建失败")
             for future in as_completed(futures):
                 result_key, failure_message = futures[future]
                 results[result_key] = future.result()
@@ -6404,57 +6738,98 @@ def _run_latest_refresh_job(
                     percent=45 if result_key == "feature_cache" else 68,
                     complete_previous=False,
                 )
-                if result_key == "feature_cache" and not daily_plan_ready:
-                    _set_refresh_progress(
-                        step_key="daily_plan",
-                        message="正在生成最新策略每日计划",
-                        percent=46,
-                        complete_previous=False,
-                    )
-                    results["generate_daily_plan"] = generate_daily_plan()
-                    results["generate_dashboard"] = generate_dashboard()
-                    _set_refresh_progress(
-                        step_key="daily_plan",
-                        step_status="success",
-                        message="最新策略每日计划已生成",
-                        percent=50,
-                        complete_previous=False,
-                    )
-                    daily_plan_ready = True
 
-        if not daily_plan_ready:
-            _set_refresh_progress(
-                step_key="daily_plan",
-                message="正在生成最新策略每日计划",
-                percent=50,
-                complete_previous=False,
-            )
-            results["generate_daily_plan"] = generate_daily_plan()
-            results["generate_dashboard"] = generate_dashboard()
-            _set_refresh_progress(
-                step_key="daily_plan",
-                step_status="success",
-                message="最新策略每日计划已生成",
-                percent=50,
-                complete_previous=False,
-            )
-
-        _set_refresh_progress(step_key="model_score", message="正在计算当日策略模型分", percent=70)
-        results["model_score"] = score_latest_models()
-        if results["model_score"].get("status") == "failed":
-            raise RuntimeError(results["model_score"].get("stderr_tail") or "当日策略模型分计算失败")
-        results["refresh_chan_model_scores"] = refresh_chan_model_scores(
-            progress_callback=lambda percent, message: _set_refresh_progress(
-                step_key="chan_model_strategy",
-                message=message,
-                percent=percent,
-                complete_previous=False,
-            )
+        # Generate independent outputs together after both upstream caches are
+        # complete. Model and Chan scoring are capped at four workers each so
+        # their combined CPU budget fits the 10-core production host.
+        _set_refresh_progress(
+            step_key="daily_plan",
+            message="正在并行生成每日计划、Dashboard、模型分与缠论评分",
+            percent=50,
+            complete_previous=False,
         )
-        if results["refresh_chan_model_scores"].get("status") == "failed":
-            raise RuntimeError(
-                results["refresh_chan_model_scores"].get("stderr_tail") or "缠论实时评分刷新失败"
+        model_score_ready = resume_inputs and (results.get("model_score") or {}).get("status") == "success"
+        _set_refresh_progress(
+            step_key="model_score",
+            message="已复用同日策略模型分检查点" if model_score_ready else "正在计算当日策略模型分",
+            percent=70,
+            complete_previous=False,
+        )
+        if model_score_ready:
+            results["model_score"]["checkpoint_reused"] = True
+            _set_refresh_progress(
+                step_key="model_score",
+                step_status="success",
+                message="已复用同日策略模型分检查点",
+                percent=70,
+                complete_previous=False,
             )
+        _set_refresh_progress(
+            step_key="chan_model_strategy",
+            message="正在并行刷新缠论实时评分",
+            percent=72,
+            complete_previous=False,
+        )
+        model_score_workers = min(
+            4,
+            max(1, int(os.getenv("ROUTINE_MODEL_SCORE_WORKERS", "4"))),
+        )
+        chan_score_workers = min(
+            4,
+            max(1, int(os.getenv("ROUTINE_CHAN_WORKERS", "4"))),
+        )
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="quant-daily-output") as executor:
+            output_futures = {
+                executor.submit(generate_daily_plan): (
+                    "generate_daily_plan",
+                    "最新策略每日计划生成失败",
+                ),
+                executor.submit(generate_dashboard, allow_incompatible=True): (
+                    "generate_dashboard",
+                    "B1 Dashboard 生成失败",
+                ),
+                executor.submit(
+                    refresh_chan_model_scores,
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="chan_model_strategy",
+                        message=message,
+                        percent=percent,
+                        complete_previous=False,
+                    ),
+                    workers=chan_score_workers,
+                ): ("refresh_chan_model_scores", "缠论实时评分刷新失败"),
+            }
+            if not model_score_ready:
+                output_futures[
+                    executor.submit(score_latest_models, workers=model_score_workers)
+                ] = ("model_score", "当日策略模型分计算失败")
+
+            for future in as_completed(output_futures):
+                result_key, failure_message = output_futures[future]
+                payload = future.result()
+                results[result_key] = payload
+                if payload.get("status") == "failed":
+                    raise RuntimeError(payload.get("stderr_tail") or failure_message)
+                if result_key == "model_score":
+                    _set_refresh_progress(
+                        step_key="model_score",
+                        step_status="success",
+                        message="当日策略模型分计算完成",
+                        percent=70,
+                        complete_previous=False,
+                    )
+
+        _set_refresh_progress(
+            step_key="daily_plan",
+            step_status="success",
+            message=(
+                "最新策略每日计划已生成；正式 B1 历史看板因模型兼容门禁保留上一有效版本"
+                if results["generate_dashboard"].get("status") == "skipped"
+                else "最新策略每日计划与 Dashboard 已生成"
+            ),
+            percent=72,
+            complete_previous=False,
+        )
         _clear_selector_caches()
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
@@ -6506,6 +6881,7 @@ def _run_latest_refresh_job(
                 "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
                 "strategy_pools": written_pools,
             }
+            _run_post_snapshot_cache_cleanup(results)
             _set_refresh_progress(
                 status="success",
                 step_key="snapshot",
@@ -6523,44 +6899,28 @@ def _run_latest_refresh_job(
         _build_long_stock_pool_cached.cache_clear()
         long_variants = ["tea", "tea_safe", "v44"]
         signal_date = full_payload.get("signal_date")
-        trade_date = str(signal_date).replace("-", "") if signal_date else None
         _set_refresh_progress(
             step_key="chan_model_strategy",
-            message="正在并行计算长线、缠论、可转债、配债股、BYD 与相似走势工作区",
+            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
             percent=92,
             complete_previous=False,
         )
         _set_refresh_progress(
             step_key="long_stock_pool",
-            message="正在并行计算长线、缠论、可转债、配债股、BYD 与相似走势工作区",
-            percent=92,
-            complete_previous=False,
-        )
-        _set_refresh_progress(
-            step_key="convertible_bond_plan",
-            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
-            percent=92,
-            complete_previous=False,
-        )
-        _set_refresh_progress(
-            step_key="convertible_bond_allotment",
-            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
-            percent=92,
-            complete_previous=False,
-        )
-        _set_refresh_progress(
-            step_key="byd_daily_plan",
-            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
+            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
             percent=92,
             complete_previous=False,
         )
         _set_refresh_progress(
             step_key="similar_patterns",
-            message="正在并行计算长线、可转债、配债股、BYD 与相似走势工作区",
+            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
             percent=92,
             complete_previous=False,
         )
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        with ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="quant-late-workspace",
+        ) as executor:
             futures = {
                 executor.submit(get_chan_model_strategy_plan, 20, True, signal_date): (
                     "chan_model_strategy",
@@ -6570,34 +6930,19 @@ def _run_latest_refresh_job(
                     "long_stock_pool",
                     "长线策略股票池生成失败",
                 ),
-                executor.submit(get_convertible_bond_grid_plan, trade_date, 18, bool(trade_date)): (
-                    "convertible_bond_plan",
-                    "可转债策略计划刷新失败",
-                ),
-                executor.submit(get_convertible_bond_allotments, 80, 90, True, "pipeline"): (
-                    "convertible_bond_allotment",
-                    "配债股数据刷新失败",
-                ),
-                executor.submit(get_byd_daily_strategy, refresh=True): ("byd_daily_plan", "BYD 做T日线计划刷新失败"),
                 executor.submit(_run_similar_pattern_analysis_isolated): (
                     "similar_patterns",
                     "相似走势决策台刷新失败",
                 ),
             }
+            futures.update(early_workspace_futures)
             for future in as_completed(futures):
                 result_key, failure_message = futures[future]
                 try:
                     payload = future.result()
                 except Exception as exc:
-                    _set_refresh_progress(
-                        status="failed",
-                        step_key=result_key,
-                        step_status="failed",
-                        message="刷新任务失败",
-                        error=f"{failure_message}: {exc}\n{traceback.format_exc(limit=5)}",
-                        complete_previous=False,
-                    )
-                    raise
+                    workspace_failure_step = result_key
+                    raise RuntimeError(f"{failure_message}: {exc}") from exc
                 if result_key == "long_stock_pool":
                     results[result_key] = {"status": "success", "variants": payload}
                 elif result_key == "chan_model_strategy":
@@ -6634,20 +6979,20 @@ def _run_latest_refresh_job(
                         "signal_date": planned_t.get("signal_date"),
                         "alerts": len(payload.get("alerts") or []),
                     }
-                _set_refresh_progress(
-                    step_key=result_key,
-                    step_status="success",
-                    message=f"{failure_message.removesuffix('失败')}完成",
-                    percent={
-                        "chan_model_strategy": 93,
-                        "long_stock_pool": 94,
-                        "convertible_bond_plan": 95,
-                        "convertible_bond_allotment": 96,
-                        "byd_daily_plan": 97,
-                        "similar_patterns": 97,
-                    }[result_key],
-                    complete_previous=False,
-                )
+                if future not in early_workspace_futures:
+                    _set_refresh_progress(
+                        step_key=result_key,
+                        step_status="success",
+                        message=f"{failure_message.removesuffix('失败')}完成",
+                        percent={
+                            "chan_model_strategy": 93,
+                            "long_stock_pool": 94,
+                            "similar_patterns": 97,
+                        }[result_key],
+                        complete_previous=False,
+                    )
+
+        shutdown_early_workspaces(cancel_pending=False)
 
         _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
         written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
@@ -6657,6 +7002,7 @@ def _run_latest_refresh_job(
             "strategy_pools": written_pools,
             "long_stock_pools": results["long_stock_pool"]["variants"],
         }
+        _run_post_snapshot_cache_cleanup(results)
 
         _set_refresh_progress(
             status="success",
@@ -6669,14 +7015,19 @@ def _run_latest_refresh_job(
             for step in _REFRESH_STATUS["steps"]:
                 step["status"] = "success"
     except Exception as exc:
+        # Let running early work finish (and merge any successful checkpoint
+        # payloads) before persisting the terminal failure state. This avoids
+        # background threads mutating results after the run has ended.
+        shutdown_early_workspaces(cancel_pending=True)
         _set_refresh_progress(
             status="failed",
-            step_key=_REFRESH_STATUS.get("current_step"),
+            step_key=workspace_failure_step or _REFRESH_STATUS.get("current_step"),
             message="刷新任务失败",
             result=results if "results" in locals() else None,
             error=f"{exc}\n{traceback.format_exc(limit=5)}",
         )
     finally:
+        shutdown_early_workspaces(cancel_pending=True)
         if getattr(_REFRESH_CONTEXT, "run_id", None) == refresh_run_id:
             delattr(_REFRESH_CONTEXT, "run_id")
 

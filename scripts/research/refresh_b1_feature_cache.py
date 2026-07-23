@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 from quant.features.variable_library import merge_daily_basic_features
+from quant.data.atomic_io import atomic_write_parquet
 from train_b1_tushare_models import assign_symbol_splits, build_dataset
 
 
@@ -92,8 +93,7 @@ def main() -> None:
     )
     combined = assign_symbol_splits(combined, args.oot_start, args.test_size, args.random_state)
 
-    args.dataset_out.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(args.dataset_out, index=False)
+    atomic_write_parquet(combined, args.dataset_out, index=False)
 
     result = {
         "status": "success",

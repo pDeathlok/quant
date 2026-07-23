@@ -12,6 +12,7 @@ conservative assumption is stop first.
 from __future__ import annotations
 
 import argparse
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,10 +42,24 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "reports/b1/research"
 DEFAULT_CANDIDATE_CACHE = PROJECT_ROOT / "data/features/b1/candidates_strict_no_volume_20240101.parquet"
 DEFAULT_FEATURE_CACHE = PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet"
 
+FORMAL_MODEL_DIR = Path(
+    os.getenv("B1_FORMAL_MODEL_DIR", str(PROJECT_ROOT / "models/production/b1"))
+)
+
+
+def _formal_model_path(primary: str, legacy: str | None = None) -> Path:
+    primary_path = FORMAL_MODEL_DIR / primary
+    if primary_path.exists() or legacy is None:
+        return primary_path
+    return FORMAL_MODEL_DIR / legacy
+
+
 MODEL_PATHS = {
-    "up8_es": PROJECT_ROOT / "models/production/b1/up8_es.joblib",
-    "up10": PROJECT_ROOT / "models/production/b1/up10.joblib",
-    "down3_es": PROJECT_ROOT / "models/production/b1/down3_es.joblib",
+    "up5_es": _formal_model_path("up5_es.joblib"),
+    "up8_es": _formal_model_path("up8_es.joblib"),
+    "up10": _formal_model_path("up10_es.joblib", "up10.joblib"),
+    "down2_es": _formal_model_path("down2_es.joblib"),
+    "down3_es": _formal_model_path("down3_es.joblib"),
 }
 
 MODEL_SELECTED_FEATURES: set[str] | None = None
@@ -200,11 +215,14 @@ def predict_models(df: pd.DataFrame) -> pd.DataFrame:
     for pred_col, model_path in MODEL_PATHS.items():
         model = joblib.load(model_path)
         feature_cols = list(model.feature_names_in_)
-        selected = [
-            col
-            for col, keep in zip(feature_cols, model.named_steps["feature_selection"].get_support())
-            if keep
-        ]
+        if getattr(model, "selected_features_", None) is not None:
+            selected = list(model.selected_features_)
+        else:
+            selected = [
+                col
+                for col, keep in zip(feature_cols, model.named_steps["feature_selection"].get_support())
+                if keep
+            ]
         missing_selected = [col for col in selected if col not in out.columns]
         if missing_selected:
             raise ValueError(f"{model_path} missing selected feature columns: {missing_selected[:10]}")
@@ -213,19 +231,23 @@ def predict_models(df: pd.DataFrame) -> pd.DataFrame:
                 out[col] = 0.0
         X = out[feature_cols].replace([np.inf, -np.inf], np.nan)
         pred = pd.Series(np.nan, index=out.index, dtype=float)
-        if "imputer" in getattr(model, "named_steps", {}):
+        if hasattr(model, "imputer") or "imputer" in getattr(model, "named_steps", {}):
             pred.loc[X.index] = model.predict_proba(X)[:, 1]
         else:
             valid = ~X.isna().any(axis=1)
             pred.loc[valid] = model.predict_proba(X.loc[valid])[:, 1]
         out[f"pred_{pred_col}"] = pred
 
+    # Keep both the legacy formal-dashboard name and the unified research name.
+    # Downstream strategy calibration uses the explicit ``_es`` suffix.
+    out["pred_up10_es"] = out["pred_up10"]
     out["entry_score"] = (
         0.60 * out["pred_up8_es"]
         + 0.30 * out["pred_up10"]
         - 0.35 * out["pred_down3_es"]
     )
-    return out.dropna(subset=["pred_up8_es", "pred_up10", "pred_down3_es", "entry_score"]).copy()
+    required_predictions = [f"pred_{name}" for name in MODEL_PATHS]
+    return out.dropna(subset=[*required_predictions, "entry_score"]).copy()
 
 
 def get_model_selected_features() -> set[str]:
@@ -235,9 +257,12 @@ def get_model_selected_features() -> set[str]:
     selected: set[str] = set()
     for model_path in MODEL_PATHS.values():
         model = joblib.load(model_path)
-        feature_cols = list(model.feature_names_in_)
-        support = model.named_steps["feature_selection"].get_support()
-        selected.update(col for col, keep in zip(feature_cols, support) if keep)
+        if getattr(model, "selected_features_", None) is not None:
+            selected.update(model.selected_features_)
+        else:
+            feature_cols = list(model.feature_names_in_)
+            support = model.named_steps["feature_selection"].get_support()
+            selected.update(col for col, keep in zip(feature_cols, support) if keep)
     MODEL_SELECTED_FEATURES = selected
     return selected
 

@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -53,6 +54,55 @@ SUSPENDED_STATUS = "no_trade_suspended"
 BATCH_NO_TRADE_STATUS = "no_trade_in_batch"
 TUSHARE_DAILY_ROW_LIMIT = 6000
 DEFAULT_BATCH_MAX_TRADE_DATES = 30
+DEFAULT_BATCH_MIN_COVERAGE_RATE = 0.97
+
+
+class MarketBatchCoverageError(RuntimeError):
+    """Raised before publication when a market-wide response is materially incomplete."""
+
+
+def _validate_market_batch_coverage(
+    market: pd.DataFrame,
+    target_symbols: set[str],
+    trade_dates: list[str],
+    minimum_rate: float,
+) -> dict[str, Any]:
+    if not 0 < minimum_rate <= 1:
+        raise ValueError(f"market batch minimum coverage must be in (0, 1], got {minimum_rate}")
+    expected = len(target_symbols)
+    if expected == 0:
+        raise MarketBatchCoverageError("market batch has no expected symbols")
+
+    date_values = market["trade_date"].astype(str)
+    details: dict[str, dict[str, int | float]] = {}
+    failures: list[str] = []
+    for trade_date in trade_dates:
+        actual_symbols = set(
+            market.loc[date_values == trade_date, "ts_code"].dropna().astype(str)
+        ) & target_symbols
+        actual = len(actual_symbols)
+        coverage_rate = actual / expected
+        missing = expected - actual
+        details[trade_date] = {
+            "symbols": actual,
+            "missing_symbols": missing,
+            "coverage_rate": round(coverage_rate, 6),
+        }
+        if coverage_rate < minimum_rate:
+            failures.append(
+                f"{trade_date}: {actual}/{expected} ({coverage_rate:.2%}), missing={missing}"
+            )
+
+    if failures:
+        raise MarketBatchCoverageError(
+            "Tushare daily market coverage below "
+            f"{minimum_rate:.2%}: {'; '.join(failures)}"
+        )
+    return {
+        "minimum_rate": minimum_rate,
+        "expected_symbols": expected,
+        "trade_dates": details,
+    }
 
 
 class RequestLimiter:
@@ -309,7 +359,7 @@ def _refresh_symbols_by_trade_date(
     retry_base_delay: float,
     retry_max_delay: float,
     retry_jitter: float,
-) -> tuple[list[DailyRefreshAudit], int, dict[str, int | str]]:
+) -> tuple[list[DailyRefreshAudit], int, dict[str, Any]]:
     """Refresh raw daily bars with one Tushare request per open trade date."""
 
     tushare = TushareDataFetcher(cache_dir=cache_dir / "tushare")
@@ -356,6 +406,18 @@ def _refresh_symbols_by_trade_date(
     )
     target_symbols = set(name_by_symbol)
     market = market[market["ts_code"].isin(target_symbols)].copy()
+    minimum_coverage_rate = float(
+        os.getenv(
+            "ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE",
+            str(DEFAULT_BATCH_MIN_COVERAGE_RATE),
+        )
+    )
+    coverage = _validate_market_batch_coverage(
+        market,
+        target_symbols,
+        trade_dates,
+        minimum_coverage_rate,
+    )
     row_counts = market.groupby("ts_code", sort=False).size().to_dict()
 
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
@@ -366,6 +428,7 @@ def _refresh_symbols_by_trade_date(
     except Exception as exc:
         storage_stats = {"rows": 0, "sql_rows": 0, "parquet_partitions": 0, "table": "market_daily"}
         storage_error = str(exc)
+    storage_stats["coverage"] = coverage
     audits: list[DailyRefreshAudit] = []
     for symbol, name in symbols:
         key = normalize_ts_code(symbol)
@@ -638,7 +701,7 @@ def refresh_daily_data(
 
     refresh_mode = "per_symbol"
     market_daily_requests = 0
-    batch_storage: dict[str, int | str] = {}
+    batch_storage: dict[str, Any] = {}
     batch_fallback_reason: str | None = None
     if adjust is None:
         try:

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping, TextIO
 
 import requests
 
@@ -42,7 +44,8 @@ class RefreshRunnerConfig:
     max_attempts: int = 3
     service_log_path: Path = DEFAULT_LOG_PATH
     service_pid_path: Path = DEFAULT_PID_PATH
-    restart_service: bool = True
+    runner_lock_path: Path | None = None
+    restart_service: bool = False
 
 
 @dataclass
@@ -51,6 +54,38 @@ class TradeDayDecision:
     reason: str
     trade_date: str
     raw: dict[str, Any] | None = None
+    error: bool = False
+
+
+class RefreshRunnerBusyError(RuntimeError):
+    """Raised when another daily web refresh runner already owns the lock."""
+
+
+@contextmanager
+def acquire_runner_lock(lock_path: Path) -> Iterator[TextIO]:
+    """Hold a non-blocking process lock for the complete orchestration lifecycle."""
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.seek(0)
+            owner = handle.read().strip() or "unknown"
+            raise RefreshRunnerBusyError(
+                f"已有每日更新进程持有锁 {lock_path}，owner={owner}"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({"pid": os.getpid(), "started_at": time.time()}))
+        handle.flush()
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 class RefreshApiClient:
@@ -211,6 +246,7 @@ def decide_trade_day(
             should_run=False,
             reason=f"无法可靠确认 {trade_date} 是否为 A 股交易日: {exc}",
             trade_date=trade_date,
+            error=True,
         )
 
     if cal.empty:
@@ -399,7 +435,7 @@ def wait_for_terminal_status(
         sleep_fn(config.poll_seconds)
 
 
-def run_refresh_workflow(
+def _run_refresh_workflow_locked(
     config: RefreshRunnerConfig,
     target_date: date | None = None,
     session: requests.Session | None = None,
@@ -413,6 +449,13 @@ def run_refresh_workflow(
 
     decision = decide_trade_day(target_date=target_date, fetcher_factory=fetcher_factory)
     print_fn(f"[trade-day] {decision.reason}")
+    if decision.error:
+        return {
+            "status": "failed",
+            "trade_date": decision.trade_date,
+            "reason": decision.reason,
+            "attempts": 0,
+        }
     if not decision.should_run:
         return {
             "status": "skipped",
@@ -490,6 +533,7 @@ def run_refresh_workflow(
                 "error_summary": summarize_error(terminal),
                 "result": terminal_result,
                 "cache_cleanup": cache_cleanup,
+                "manifest_path": terminal.get("manifest_path"),
             }
 
         if attempts >= config.max_attempts:
@@ -502,6 +546,7 @@ def run_refresh_workflow(
                 "failed_count": extract_failed_count(terminal),
                 "error_summary": summarize_error(terminal),
                 "result": terminal.get("result"),
+                "manifest_path": terminal.get("manifest_path"),
             }
 
         print_fn(
@@ -520,6 +565,32 @@ def run_refresh_workflow(
         sleep_fn(config.retry_delay_seconds)
 
     raise RuntimeError("刷新重试流程意外结束")
+
+
+def run_refresh_workflow(
+    config: RefreshRunnerConfig,
+    target_date: date | None = None,
+    session: requests.Session | None = None,
+    fetcher_factory: Callable[..., TushareDataFetcher] = TushareDataFetcher,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    print_fn: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    lock_path = config.runner_lock_path or config.project_root / ".run" / "daily_web_refresh.lock"
+    try:
+        with acquire_runner_lock(lock_path):
+            return _run_refresh_workflow_locked(
+                config=config,
+                target_date=target_date,
+                session=session,
+                fetcher_factory=fetcher_factory,
+                sleep_fn=sleep_fn,
+                monotonic_fn=monotonic_fn,
+                print_fn=print_fn,
+            )
+    except RefreshRunnerBusyError as exc:
+        print_fn(f"[lock] {exc}")
+        return {"status": "busy", "reason": str(exc), "attempts": 0}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -542,11 +613,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-attempts", type=int, default=3, help="最多触发刷新次数")
     parser.add_argument("--log-file", default=str(DEFAULT_LOG_PATH), help="服务启动日志路径")
     parser.add_argument("--pid-file", default=str(DEFAULT_PID_PATH), help="常驻后台服务 pid 文件路径")
-    parser.add_argument(
-        "--no-restart-service",
+    restart_group = parser.add_mutually_exclusive_group()
+    restart_group.add_argument(
+        "--restart-service",
+        dest="restart_service",
         action="store_true",
-        help="不在刷新前重启本地 web 服务，调试时使用",
+        help="刷新前显式重启本地 web 服务；默认复用健康服务",
     )
+    restart_group.add_argument(
+        "--no-restart-service",
+        dest="restart_service",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.set_defaults(restart_service=False)
     return parser
 
 
@@ -564,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:
         max_attempts=args.max_attempts,
         service_log_path=Path(args.log_file).expanduser().resolve(),
         service_pid_path=Path(args.pid_file).expanduser().resolve(),
-        restart_service=not args.no_restart_service,
+        restart_service=args.restart_service,
     )
     result = run_refresh_workflow(config=config)
     print(json.dumps(result, ensure_ascii=False, indent=2))

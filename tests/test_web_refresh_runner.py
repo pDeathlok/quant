@@ -76,6 +76,42 @@ def test_decide_trade_day_skips_closed_day() -> None:
     assert "跳过刷新" in decision.reason
 
 
+def test_decide_trade_day_marks_calendar_failure_as_error() -> None:
+    def raise_fetcher():
+        raise RuntimeError("calendar unavailable")
+
+    decision = runner.decide_trade_day(
+        target_date=date(2026, 7, 15),
+        fetcher_factory=raise_fetcher,
+    )
+
+    assert decision.should_run is False
+    assert decision.error is True
+    assert "无法可靠确认" in decision.reason
+
+
+def test_run_refresh_workflow_rejects_second_process_lock(tmp_path: Path) -> None:
+    lock_path = tmp_path / "daily-refresh.lock"
+    config = runner.RefreshRunnerConfig(
+        project_root=tmp_path,
+        runner_lock_path=lock_path,
+    )
+
+    with runner.acquire_runner_lock(lock_path):
+        result = runner.run_refresh_workflow(config=config, print_fn=lambda _: None)
+
+    assert result["status"] == "busy"
+    assert str(lock_path) in result["reason"]
+
+
+def test_runner_reuses_healthy_service_by_default() -> None:
+    config = runner.RefreshRunnerConfig()
+    args = runner.build_parser().parse_args([])
+
+    assert config.restart_service is False
+    assert args.restart_service is False
+
+
 def test_run_refresh_workflow_retries_after_failed_status(tmp_path: Path) -> None:
     responses = [
         FakeResponse({"status": "ok", "service": "quant-webapp"}),
@@ -290,7 +326,7 @@ def test_ensure_local_service_reuses_externally_managed_service(
     assert any("外部守护器托管" in line for line in logs)
 
 
-def test_run_refresh_workflow_skips_when_trade_day_unknown(tmp_path: Path) -> None:
+def test_run_refresh_workflow_fails_when_trade_day_unknown(tmp_path: Path) -> None:
     logs: list[str] = []
     env_path = tmp_path / ".env"
     env_path.write_text("", encoding="utf-8")
@@ -306,7 +342,7 @@ def test_run_refresh_workflow_skips_when_trade_day_unknown(tmp_path: Path) -> No
         print_fn=logs.append,
     )
 
-    assert result["status"] == "skipped"
+    assert result["status"] == "failed"
     assert "无法可靠确认" in result["reason"]
 
 

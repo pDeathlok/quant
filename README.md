@@ -41,22 +41,27 @@ TUSHARE_TOKEN=your_token
 
 ## 每日任务
 
-执行完整日常刷新，不运行正式组合回测：
+生产环境的每日更新统一走 Web 编排入口：
 
 ```bash
-PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
+python scripts/run_daily_web_refresh.py
+# 等价入口
+PYTHONPATH=src python -m quant.routine.cli web-refresh
 ```
+
+兼容命令 `daily --refresh-data` 现在也会委托给同一套 Web 编排；只有显式增加
+`--direct-pipeline` 才会运行旧的进程内流水线，供维护和诊断使用。
 
 执行顺序为：
 
-1. 按保留策略清理请求缓存、研究缓存、历史快照和例行运行记录。
-2. 串行刷新共享 Tushare 行情。
-3. 并行构建特征缓存和规则信号缓存。
-4. 生成模型评分、短线股票池和例行产物。
-5. 并行刷新缠论、长线、可转债、配债股、BYD 做T、相似走势 6 个工作区。
-6. 将每个步骤写入 `data/routine/<运行时间>/manifest.json`。
+1. 获取跨进程单实例锁，并用交易日历确认当天是否执行。
+2. 复用健康的 Web 服务，通过 API 启动与页面“更新全部”一致的任务。
+3. 按保留策略清理缓存，再串行刷新共享 Tushare 行情与参考数据。
+4. 串行构建特征缓存和规则信号缓存，避免两套进程池争抢 CPU、内存与磁盘带宽。
+5. 共享数据就绪后先并行启动可转债、配债股和 BYD 做T；特征与规则信号完成后，并行生成每日计划、Dashboard、模型评分与缠论评分，再计算短线股票池和剩余工作区。
+6. 原子发布正式文件，并将步骤状态、起止时间、耗时和结果写入 `data/routine/<运行时间>_<run_id>/manifest.json`。
 
-短线策略由主流水线生成，因此这套流程覆盖全部 7 个 Tab。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述命令。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
+短线策略由主流水线生成，因此这套流程覆盖全部 7 个 Tab。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述统一入口。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
 
 ## 配置
 
@@ -75,12 +80,14 @@ PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
 | `MARKET_DATA_SQL_WRITE_TIMEOUT` | `60` | MySQL 写入超时，单位秒 |
 | `ROUTINE_DAILY_WORKERS` | `4` | 日线刷新并发数 |
 | `ROUTINE_DAILY_SLEEP` | `0.08` | Tushare 请求间隔，单位秒 |
+| `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.97` | 每个交易日全市场批量响应的最低股票覆盖率；低于阈值拒绝批量发布并逐股兜底 |
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日刷新的并发数 |
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔，单位秒 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
+| `ROUTINE_MODEL_SCORE_WORKERS` | `4` | Web 每日更新中策略模型评分的 worker 数；与缠论评分并行时上限为 4 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | 特征计算执行器；CPU 密集计算默认使用多进程 |
 | `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量特征与 `daily_basic` 的最低匹配率；低于阈值阻断发布 |
-| `ROUTINE_CHAN_WORKERS` | `8` | 缠论增量候选扫描并发数 |
+| `ROUTINE_CHAN_WORKERS` | `4` | 缠论增量候选扫描并发数；Web 每日更新与模型评分并行时上限为 4 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 六个下游工作区的最大并发数 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似走势向量缓存并发数 |
 | `SIMILAR_PATTERN_FORCE_VECTOR_CACHE` | 空 | 设为 `1` 时强制重建相似走势全市场参考库；日常无需设置 |

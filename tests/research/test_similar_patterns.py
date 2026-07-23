@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from quant.research.similar_patterns import (
     SimilarPatternConfig,
+    analyze_targets_by_threshold,
     apply_probability_calibration,
     build_stock_vector_cache,
     build_pattern_vector,
@@ -25,6 +26,7 @@ from quant.research.similar_patterns import (
     summarize_forecast,
     summarize_status_probs,
 )
+from quant.data import MarketDataStore, MarketDataStoreConfig
 
 
 def test_normalize_daily_frame_accepts_tushare_schema() -> None:
@@ -68,6 +70,39 @@ def test_normalize_daily_frame_removes_ex_right_price_jump() -> None:
     assert np.isclose(daily["close"].pct_change().iloc[1], 0.01)
     assert np.isclose(daily["close"].pct_change().iloc[2], 0.0)
     assert np.isclose(daily.iloc[-1]["close"], 33.67)
+
+
+def test_threshold_analysis_loads_target_from_partitioned_daily_store(tmp_path: Path) -> None:
+    dates = pd.bdate_range("2025-01-02", periods=380)
+    close = np.linspace(10, 18, len(dates)) + np.sin(np.arange(len(dates)) / 8)
+    frame = pd.DataFrame(
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": dates.strftime("%Y%m%d"),
+            "date": dates,
+            "name": "测试",
+            "open": close * 0.99,
+            "high": close * 1.02,
+            "low": close * 0.98,
+            "close": close,
+            "vol": np.linspace(1000, 2500, len(dates)),
+            "pct_chg": pd.Series(close).pct_change().fillna(0).to_numpy() * 100,
+        }
+    )
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=tmp_path))
+    store.write_market_batch(frame)
+    daily_dir = tmp_path / "daily"
+
+    results = analyze_targets_by_threshold(
+        daily_dir,
+        pd.DataFrame({"ts_code": ["000001.SZ"], "name": ["测试"], "industry": ["银行"]}),
+        SimilarPatternConfig(similarity_threshold=0.055),
+        target_symbols=["000001.SZ"],
+        max_symbols=0,
+    )
+
+    assert not (daily_dir / "000001.SZ.parquet").exists()
+    assert results["000001.SZ"].target.target_date == dates[-1]
 
 
 def test_build_pattern_vector_has_stable_length() -> None:
@@ -182,6 +217,59 @@ def test_stock_vector_cache_roundtrip(tmp_path: Path) -> None:
     assert np.isfinite(cached["fwd_1d"][-1])
     assert np.isnan(cached["fwd_20d"][-1])
     assert np.isnan(cached["fwd_60d"][-1])
+
+
+def test_stock_vector_cache_supports_partitioned_daily_source(tmp_path: Path) -> None:
+    dates = pd.bdate_range("2025-01-02", periods=380)
+    close = np.linspace(10, 20, len(dates))
+    frame = pd.DataFrame(
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": dates.strftime("%Y%m%d"),
+            "date": dates,
+            "name": "测试",
+            "open": close * 0.99,
+            "high": close * 1.02,
+            "low": close * 0.98,
+            "close": close,
+            "vol": np.linspace(1000, 2500, len(dates)),
+            "pct_chg": pd.Series(close).pct_change().fillna(0).to_numpy() * 100,
+        }
+    )
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=tmp_path))
+    store.write_market_batch(frame)
+    synthetic_path = tmp_path / "daily/000001.SZ.parquet"
+    cache_dir = tmp_path / "cache"
+    config = SimilarPatternConfig(max_candidates_per_symbol=3, candidate_step_days=5)
+
+    first = build_stock_vector_cache(synthetic_path, {}, config, cache_dir)
+    second = build_stock_vector_cache(synthetic_path, {}, config, cache_dir)
+    next_date = dates[-1] + pd.offsets.BDay()
+    store.write_market_batch(
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": [next_date.strftime("%Y%m%d")],
+                "date": [next_date],
+                "name": ["测试"],
+                "open": [20.0],
+                "high": [20.5],
+                "low": [19.8],
+                "close": [20.3],
+                "vol": [2600.0],
+                "pct_chg": [1.5],
+            }
+        )
+    )
+    third = build_stock_vector_cache(synthetic_path, {}, config, cache_dir)
+
+    assert not synthetic_path.exists()
+    assert first["status"] == "built"
+    assert second["status"] == "cache_hit"
+    assert third["status"] == "built"
+    assert load_stock_vector_cache(Path(third["cache_path"]))["source_fingerprint"].startswith(
+        "partitioned:"
+    )
 
 
 def test_stock_vector_cache_rebuilds_when_daily_source_changes(tmp_path: Path) -> None:

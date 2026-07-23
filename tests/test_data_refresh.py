@@ -183,6 +183,14 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
         "sql_rows": 0,
         "parquet_partitions": 1,
         "table": "market_daily",
+        "coverage": {
+            "minimum_rate": 0.97,
+            "expected_symbols": 2,
+            "trade_dates": {
+                "20260605": {"symbols": 2, "missing_symbols": 0, "coverage_rate": 1.0},
+                "20260606": {"symbols": 2, "missing_symbols": 0, "coverage_rate": 1.0},
+            },
+        },
     }
     assert sorted((tmp_path / "daily_partitioned").glob("year_month=*/data.parquet"))
 
@@ -211,6 +219,24 @@ def test_market_daily_batch_rejects_possible_row_limit_truncation(monkeypatch):
             retry_base_delay=0,
             retry_max_delay=0,
             retry_jitter=0,
+        )
+
+
+def test_market_daily_batch_rejects_incomplete_symbol_coverage() -> None:
+    market = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000002.SZ", "000003.SZ"],
+            "trade_date": ["20260605", "20260605", "20260605"],
+        }
+    )
+    expected = {f"00000{index}.SZ" for index in range(1, 6)}
+
+    with pytest.raises(data_refresh.MarketBatchCoverageError, match="3/5"):
+        data_refresh._validate_market_batch_coverage(
+            market,
+            expected,
+            ["20260605"],
+            minimum_rate=0.8,
         )
 
 

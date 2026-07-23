@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant.data.tushare_fetcher import TushareDataFetcher
+from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
+from quant.data.tushare_fetcher import TushareDataFetcher, validate_daily_basic_frame
 from quant.routine.data_refresh import RequestLimiter, _is_retryable_error
 from quant.routine.paths import PROJECT_ROOT
 
@@ -52,9 +53,8 @@ def fetch_one_trade_date(
         try:
             limiter.wait()
             fetcher = TushareDataFetcher(cache_dir=cache_dir)
-            df = fetcher.get_daily_basic(trade_date)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            df.to_parquet(output_path, index=False)
+            df = validate_daily_basic_frame(fetcher.get_daily_basic(trade_date), trade_date)
+            atomic_write_parquet(df, output_path, index=False)
             return {
                 "trade_date": trade_date,
                 "source": "tushare",
@@ -66,7 +66,8 @@ def fetch_one_trade_date(
             }
         except Exception as exc:
             last_error = str(exc)
-            if attempt >= attempts or not _is_retryable_error(last_error):
+            retryable = _is_retryable_error(last_error) or "daily_basic" in last_error
+            if attempt >= attempts or not retryable:
                 return {
                     "trade_date": trade_date,
                     "source": "tushare",
@@ -131,7 +132,7 @@ def refresh_daily_basic(
     audit_dir.mkdir(parents=True, exist_ok=True)
     audit_path = audit_dir / "daily_basic_audit.csv"
     audit_df = pd.DataFrame(audits)
-    audit_df.to_csv(audit_path, index=False)
+    atomic_write_csv(audit_df, audit_path, index=False)
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_policy": "tushare_only_daily_basic",
@@ -148,7 +149,7 @@ def refresh_daily_basic(
         "retries": retries,
     }
     manifest_path = audit_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(manifest, manifest_path)
     return manifest
 
 

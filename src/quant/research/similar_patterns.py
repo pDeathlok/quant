@@ -167,6 +167,21 @@ def vector_cache_path(cache_dir: Path, symbol: str, config: SimilarPatternConfig
     return cache_dir / vector_cache_key(config) / f"{safe_symbol}.npz"
 
 
+def partitioned_daily_source_fingerprint(daily_dir: Path) -> str | None:
+    """Return one stable fingerprint for the cross-sectional parquet partitions."""
+    partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
+    partition_paths = sorted(partition_root.glob("year_month=*/data.parquet"))
+    if not partition_paths:
+        return None
+    digest = hashlib.sha1()
+    for path in partition_paths:
+        source_stat = path.stat()
+        digest.update(path.parent.name.encode("utf-8"))
+        digest.update(str(source_stat.st_mtime_ns).encode("ascii"))
+        digest.update(str(source_stat.st_size).encode("ascii"))
+    return f"partitioned:{digest.hexdigest()}"
+
+
 def save_stock_vector_cache(
     cache_path: Path,
     symbol: str,
@@ -178,6 +193,7 @@ def save_stock_vector_cache(
     config: SimilarPatternConfig,
     source_mtime_ns: int,
     source_size: int,
+    source_fingerprint: str,
 ) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     dates = np.array([pd.Timestamp(daily.iloc[idx]["date"]).strftime("%Y-%m-%d") for idx in indices])
@@ -239,6 +255,7 @@ def save_stock_vector_cache(
         vectors=matrix.astype(np.float32),
         source_mtime_ns=np.array(source_mtime_ns, dtype=np.int64),
         source_size=np.array(source_size, dtype=np.int64),
+        source_fingerprint=np.array(source_fingerprint),
         **future,
     )
 
@@ -267,6 +284,9 @@ def load_stock_vector_cache(cache_path: Path) -> dict[str, object]:
             "source_size": int(data["source_size"].item())
             if "source_size" in data.files
             else None,
+            "source_fingerprint": str(data["source_fingerprint"].item())
+            if "source_fingerprint" in data.files
+            else None,
         }
 
 
@@ -276,16 +296,31 @@ def build_stock_vector_cache(
     config: SimilarPatternConfig,
     cache_dir: Path,
     force: bool = False,
+    source_fingerprint: str | None = None,
 ) -> dict[str, object]:
     symbol = path.stem
     cache_path = vector_cache_path(cache_dir, symbol, config)
-    source_stat = path.stat()
+    source_stat = path.stat() if path.exists() else None
+    effective_source_fingerprint = source_fingerprint
+    if effective_source_fingerprint is None and source_stat is not None:
+        effective_source_fingerprint = (
+            f"file:{source_stat.st_mtime_ns}:{source_stat.st_size}"
+        )
+    if effective_source_fingerprint is None:
+        effective_source_fingerprint = partitioned_daily_source_fingerprint(path.parent)
     if cache_path.exists() and not force:
         cached = load_stock_vector_cache(cache_path)
-        if (
-            cached.get("source_mtime_ns") == source_stat.st_mtime_ns
+        fingerprint_matches = (
+            effective_source_fingerprint is not None
+            and cached.get("source_fingerprint") == effective_source_fingerprint
+        )
+        legacy_file_stat_matches = (
+            source_stat is not None
+            and cached.get("source_fingerprint") is None
+            and cached.get("source_mtime_ns") == source_stat.st_mtime_ns
             and cached.get("source_size") == source_stat.st_size
-        ):
+        )
+        if fingerprint_matches or legacy_file_stat_matches:
             return {
                 "symbol": symbol,
                 "status": "cache_hit",
@@ -318,8 +353,9 @@ def build_stock_vector_cache(
             indices,
             matrix,
             config,
-            source_mtime_ns=source_stat.st_mtime_ns,
-            source_size=source_stat.st_size,
+            source_mtime_ns=source_stat.st_mtime_ns if source_stat is not None else -1,
+            source_size=source_stat.st_size if source_stat is not None else -1,
+            source_fingerprint=effective_source_fingerprint or "unavailable",
         )
         return {
             "symbol": symbol,
@@ -339,9 +375,18 @@ def build_stock_vector_cache(
         }
 
 
-def _build_stock_vector_cache_worker(args: tuple[str, dict[str, object], SimilarPatternConfig, str, bool]) -> dict[str, object]:
-    path_text, info, config, cache_dir_text, force = args
-    return build_stock_vector_cache(Path(path_text), info, config, Path(cache_dir_text), force)
+def _build_stock_vector_cache_worker(
+    args: tuple[str, dict[str, object], SimilarPatternConfig, str, bool, str | None],
+) -> dict[str, object]:
+    path_text, info, config, cache_dir_text, force, source_fingerprint = args
+    return build_stock_vector_cache(
+        Path(path_text),
+        info,
+        config,
+        Path(cache_dir_text),
+        force,
+        source_fingerprint,
+    )
 
 
 def _should_use_thread_pool_for_vector_cache() -> bool:
@@ -369,7 +414,18 @@ def build_vector_caches_parallel(
     target_symbols = {symbol.upper() for symbol in (target_symbols or set())}
     files = [path for path in files if path.stem.upper() not in target_symbols]
     basic_map = basic.set_index("ts_code").to_dict("index") if not basic.empty else {}
-    tasks = [(str(path), basic_map.get(path.stem, {}), config, str(cache_dir), force) for path in files]
+    source_fingerprint = partitioned_daily_source_fingerprint(daily_dir)
+    tasks = [
+        (
+            str(path),
+            basic_map.get(path.stem, {}),
+            config,
+            str(cache_dir),
+            force,
+            source_fingerprint,
+        )
+        for path in files
+    ]
 
     records: list[dict[str, object]] = []
     started = perf_counter()
@@ -832,11 +888,13 @@ def analyze_targets_by_threshold(
     if config.similarity_threshold is None:
         raise ValueError("similarity_threshold is required for threshold mode")
 
+    files = list_partitioned_symbol_paths(daily_dir)
+    symbol_paths = {path.stem.upper(): path for path in files}
     target_contexts: dict[str, dict[str, object]] = {}
     for symbol in target_symbols:
-        target_path = daily_dir / f"{symbol}.parquet"
-        if not target_path.exists():
-            print(f"missing target daily file: {target_path}", flush=True)
+        target_path = symbol_paths.get(symbol.upper())
+        if target_path is None:
+            print(f"missing target daily data: {symbol}", flush=True)
             continue
         daily = load_daily_file(target_path)
         target_contexts[symbol] = prepare_target_context(symbol, daily, config, basic, target_date)
@@ -847,7 +905,6 @@ def analyze_targets_by_threshold(
     target_symbol_set = {symbol.upper() for symbol in target_contexts}
     target_matches: dict[str, list[dict[str, object]]] = {symbol: [] for symbol in target_contexts}
 
-    files = list_partitioned_symbol_paths(daily_dir)
     if max_symbols is not None:
         files = files[:max_symbols]
     basic_map = basic.set_index("ts_code").to_dict("index") if not basic.empty else {}

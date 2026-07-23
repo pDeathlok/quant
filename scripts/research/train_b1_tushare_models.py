@@ -101,13 +101,12 @@ def process_daily_frame(args: tuple[str, pd.DataFrame, str]) -> pd.DataFrame | N
             compute_if_missing=True,
             persist_missing=False,
         )
-        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
-        factors = pd.concat([btd.calculate_factors_single_stock(df), shared[shared_cols]], axis=1)
-        factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
-        labels = create_b1_labels(df, forward_days=5, exit_aware=True, use_new_labels=True)
-        result = pd.concat([df, factors, labels], axis=1)
-
-        price = build_continuous_ohlc(result)
+        # The B1 gate is much cheaper than the full project factor set and the
+        # forward-label build.  During an incremental daily refresh only a tiny
+        # fraction of symbols pass the gate, so reject the rest before doing
+        # the expensive work.  The mask intentionally uses the same continuous
+        # OHLC and shared KDJ definitions as the full path below.
+        price = build_continuous_ohlc(df)
         pct_change = price["close"].pct_change() * 100
         amplitude = (price["high"] - price["low"]) / price["low"].replace(0, np.nan) * 100
         b1_signal = (
@@ -115,8 +114,17 @@ def process_daily_frame(args: tuple[str, pd.DataFrame, str]) -> pd.DataFrame | N
             & (pct_change <= 2)
             & (amplitude < 7)
             & (project_calc_bbi(price["close"]) > price["close"].rolling(60, min_periods=20).mean())
-            & (result["kdj_d_j"] < 0)
+            & (shared["kdj_d_j"] < 0)
         )
+        if not bool((b1_signal & (df["date"] >= start_ts)).any()):
+            return None
+
+        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
+        factors = pd.concat([btd.calculate_factors_single_stock(df), shared[shared_cols]], axis=1)
+        factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
+        labels = create_b1_labels(df, forward_days=5, exit_aware=True, use_new_labels=True)
+        result = pd.concat([df, factors, labels], axis=1)
+
         keep_cols = [
             "ts_code",
             "trade_date",
@@ -490,6 +498,11 @@ def main() -> None:
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--dataset-out", type=Path, default=PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet")
+    parser.add_argument(
+        "--reuse-dataset",
+        action="store_true",
+        help="Train from dataset-out without rebuilding market features.",
+    )
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "models/research/b1_xgb_project_vars")
     parser.add_argument("--report-dir", type=Path, default=PROJECT_ROOT / "reports/b1/research/xgb_project_vars")
     parser.add_argument("--select-k", type=int, default=0, help="0 means use all available factors; positive values enable SelectKBest")
@@ -507,20 +520,27 @@ def main() -> None:
         f"multiplier={args.auto_worker_multiplier}, max_auto={args.max_auto_workers})",
         flush=True,
     )
-    data = build_dataset(
-        args.daily_dir,
-        args.start,
-        workers=workers,
-        limit=args.limit,
-        executor_type=args.executor,
-        adaptive_workers=args.adaptive_workers,
-        min_workers=args.min_workers,
-        max_workers=args.max_auto_workers,
-        worker_step=args.worker_step,
-        load_target=args.load_target,
-        load_hard_limit=args.load_hard_limit,
-    )
-    data = merge_daily_basic_features(data, args.daily_basic_dir)
+    if args.reuse_dataset:
+        if not args.dataset_out.exists():
+            raise FileNotFoundError(f"Training dataset does not exist: {args.dataset_out}")
+        data = pd.read_parquet(args.dataset_out)
+        data["date"] = pd.to_datetime(data["date"], errors="coerce")
+        print(f"reusing training dataset: {args.dataset_out} rows={len(data)}", flush=True)
+    else:
+        data = build_dataset(
+            args.daily_dir,
+            args.start,
+            workers=workers,
+            limit=args.limit,
+            executor_type=args.executor,
+            adaptive_workers=args.adaptive_workers,
+            min_workers=args.min_workers,
+            max_workers=args.max_auto_workers,
+            worker_step=args.worker_step,
+            load_target=args.load_target,
+            load_hard_limit=args.load_hard_limit,
+        )
+        data = merge_daily_basic_features(data, args.daily_basic_dir)
     data = assign_symbol_splits(data, args.oot_start, args.test_size, args.random_state)
     validate_label_splits(data)
     args.dataset_out.parent.mkdir(parents=True, exist_ok=True)

@@ -109,7 +109,6 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        start_new_session=True,
     )
     stdout_lines: list[str] = []
     progress_pattern = re.compile(r"refresh progress: (\d+)/(\d+) done, success=(\d+), failed=(\d+)")
@@ -431,7 +430,6 @@ def build_features(progress_callback=None) -> dict:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        start_new_session=True,
     )
     stdout_lines: list[str] = []
     progress_pattern = re.compile(r"processed (\d+)/(\d+) daily files, frames=(\d+)")
@@ -479,7 +477,6 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        start_new_session=True,
     )
     stdout_lines: list[str] = []
     progress_pattern = re.compile(r"(family|z-skill) signals: (\d+)/(\d+) (?:files|symbols)")
@@ -535,10 +532,11 @@ def score_latest_models(workers: int = 8) -> dict:
     }
 
 
-def refresh_chan_model_scores(progress_callback=None) -> dict:
+def refresh_chan_model_scores(progress_callback=None, workers: int | None = None) -> dict:
     started = time.monotonic()
     scored_path = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
     manifest_path = scored_path.parent / "live_refresh_manifest.json"
+    candidate_path = PROJECT_ROOT / "reports/chan_daily/chan_daily_candidates.parquet"
     end_date = _incremental_daily_start()
     start_date = end_date
     if scored_path.exists():
@@ -563,10 +561,18 @@ def refresh_chan_model_scores(progress_callback=None) -> dict:
         "--daily-basic-dir",
         "data/raw/daily_basic",
         "--max-workers",
-        os.getenv("ROUTINE_CHAN_WORKERS", "8"),
-        "--rebuild-candidates",
+        str(workers or int(os.getenv("ROUTINE_CHAN_WORKERS", "8"))),
         "--skip-backfill-snapshots",
     ]
+    candidate_latest = pd.NaT
+    if candidate_path.exists():
+        try:
+            candidate_dates = pd.read_parquet(candidate_path, columns=["date"])["date"]
+            candidate_latest = pd.to_datetime(candidate_dates, errors="coerce").max()
+        except Exception:
+            candidate_latest = pd.NaT
+    if pd.isna(candidate_latest) or candidate_latest.normalize() < pd.to_datetime(end_date).normalize():
+        command.append("--rebuild-candidates")
     env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
     previous_manifest_mtime = manifest_path.stat().st_mtime_ns if manifest_path.exists() else None
     result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
@@ -592,6 +598,7 @@ def refresh_chan_model_scores(progress_callback=None) -> dict:
         "end_date": end_date,
         "processed_through": manifest.get("processed_through"),
         "manifest_path": str(manifest_path),
+        "candidate_checkpoint_reused": "--rebuild-candidates" not in command,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
@@ -608,8 +615,26 @@ def run_selected_strategies() -> dict:
     }
 
 
-def generate_dashboard() -> dict:
-    output = write_dashboard_json()
+def generate_dashboard(*, allow_incompatible: bool = False) -> dict:
+    """Publish the formal B1 dashboard when its model audit is valid.
+
+    The daily refresh does not retrain or recalibrate the formal B1 models.  An
+    incompatible audit must therefore keep blocking publication, but it should
+    not prevent independent daily strategies from being refreshed.
+    """
+
+    try:
+        output = write_dashboard_json()
+    except RuntimeError as exc:
+        if allow_incompatible and str(exc).startswith(
+            "B1 dashboard publication blocked by model compatibility audit:"
+        ):
+            return {
+                "status": "skipped",
+                "reason": str(exc),
+                "output_preserved": str(PROJECT_ROOT / "web/data/dashboard.json"),
+            }
+        raise
     return {"status": "success", "output": str(output)}
 
 
@@ -763,7 +788,10 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
             include_financials=True,
         )
         require_complete("refresh_reference_inputs", allow_skipped=skip_data)
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # Both jobs fan out into their own CPU-bound process pools. Running the
+        # pools at the same time oversubscribes the machine and is materially
+        # slower than letting each pool use the worker budget in turn.
+        with ThreadPoolExecutor(max_workers=1) as executor:
             upstream_futures = {
                 executor.submit(build_features): "build_features",
                 executor.submit(refresh_strategy_signal_cache): "refresh_strategy_signal_cache",
@@ -784,12 +812,18 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
         with ThreadPoolExecutor(max_workers=2) as executor:
             output_futures = {
                 executor.submit(generate_daily_plan): "generate_daily_plan",
-                executor.submit(generate_dashboard): "generate_dashboard",
+                executor.submit(
+                    generate_dashboard,
+                    allow_incompatible=skip_backtest,
+                ): "generate_dashboard",
             }
             for future in as_completed(output_futures):
                 step_name = output_futures[future]
                 results[step_name] = future.result()
-                require_complete(step_name)
+                require_complete(
+                    step_name,
+                    allow_skipped=step_name == "generate_dashboard" and skip_backtest,
+                )
         results["refresh_daily_web_workspaces"] = refresh_daily_web_workspaces()
         failed_workspaces = [
             name

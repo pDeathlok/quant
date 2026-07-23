@@ -16,14 +16,14 @@ MODEL_COMPATIBILITY_PATH = REPORTS_DIR / "model_compatibility_audit.json"
 
 
 COMBO_TO_STRATEGY = {
-    "stable_up8_055_down3_055_trail4_dd2_sl15_T7": "b1_stable",
-    "aggressive_up8_065_down3_050_trail5_dd2_sl15_T9": "b1_aggressive",
+    "stable_up10_020_down3_040_fixed8_sl15_T5": "b1_stable",
+    "aggressive_up8_070_down3_045_expiry_T9": "b1_aggressive",
     "baseline_up8_055_trail5_dd2_sl2_T9": "b1_baseline",
 }
 
 COMBO_TO_NAME = {
-    "stable_up8_055_down3_055_trail4_dd2_sl15_T7": "B1 稳健版",
-    "aggressive_up8_065_down3_050_trail5_dd2_sl15_T9": "B1 进攻版",
+    "stable_up10_020_down3_040_fixed8_sl15_T5": "B1 稳健版",
+    "aggressive_up8_070_down3_045_expiry_T9": "B1 进攻版",
     "baseline_up8_055_trail5_dd2_sl2_T9": "B1 旧基准",
 }
 

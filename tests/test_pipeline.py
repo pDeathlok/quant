@@ -4,6 +4,7 @@ import time
 import json
 
 import pandas as pd
+import pytest
 
 from quant.routine import pipeline
 from quant.webapp import services
@@ -213,6 +214,36 @@ def test_chan_refresh_requires_current_completion_manifest(monkeypatch, tmp_path
     assert current["processed_through"] == "2026-07-21"
 
 
+def test_chan_refresh_uses_explicit_worker_budget(monkeypatch, tmp_path) -> None:
+    report_dir = tmp_path / "reports/chan_daily/model_filter"
+    manifest_path = report_dir / "live_refresh_manifest.json"
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260723")
+
+    class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        report_dir.mkdir(parents=True)
+        manifest_path.write_text(
+            json.dumps({"processed_through": "2026-07-23"}),
+            encoding="utf-8",
+        )
+        return Result()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", run)
+
+    result = pipeline.refresh_chan_model_scores(workers=3)
+
+    command = captured["command"]
+    assert command[command.index("--max-workers") + 1] == "3"
+    assert result["status"] == "success"
+
+
 def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -235,8 +266,40 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     command = captured["command"]
     kwargs = captured["kwargs"]
     assert command[command.index("--executor") + 1] == "processes"
-    assert kwargs["start_new_session"] is True
+    assert "start_new_session" not in kwargs
     assert result["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda: pipeline.refresh_data(dry_run=False),
+        lambda: pipeline.refresh_strategy_signal_cache(workers=1),
+    ],
+)
+def test_pipeline_subprocesses_stay_in_web_service_process_group(
+    monkeypatch,
+    operation,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    class FakeProcess:
+        stdout = io.StringIO("")
+
+        def __init__(self, command, **kwargs) -> None:
+            self.stdout = io.StringIO("")
+            captured.append(kwargs)
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260721")
+
+    result = operation()
+
+    assert result["status"] == "success"
+    assert "start_new_session" not in captured[0]
 
 
 def test_daily_web_workspaces_refreshes_every_non_short_tab_in_parallel(monkeypatch) -> None:
@@ -322,7 +385,7 @@ def test_daily_web_workspaces_isolates_individual_failure(monkeypatch) -> None:
     assert result["similar_patterns"]["status"] == "success"
 
 
-def test_daily_pipeline_parallelizes_independent_stages(monkeypatch, tmp_path) -> None:
+def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, tmp_path) -> None:
     active = 0
     max_active = 0
     call_order: list[str] = []
@@ -364,7 +427,7 @@ def test_daily_pipeline_parallelizes_independent_stages(monkeypatch, tmp_path) -
     monkeypatch.setattr(pipeline, "score_latest_models", lambda: {"status": "success"})
     monkeypatch.setattr(pipeline, "refresh_chan_model_scores", lambda: {"status": "success"})
     monkeypatch.setattr(pipeline, "generate_daily_plan", parallel_step)
-    monkeypatch.setattr(pipeline, "generate_dashboard", parallel_step)
+    monkeypatch.setattr(pipeline, "generate_dashboard", lambda **kwargs: parallel_step())
     monkeypatch.setattr(pipeline, "refresh_daily_web_workspaces", lambda: {"status": "success"})
     monkeypatch.setattr(pipeline, "write_run_manifest", lambda results, strategies: tmp_path / "manifest.json")
 

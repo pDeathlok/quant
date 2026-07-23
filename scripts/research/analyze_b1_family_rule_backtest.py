@@ -21,6 +21,7 @@ import pandas as pd
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.atomic_io import atomic_write_parquet
 from quant.features.daily_factor_layer import attach_daily_base_factors
 from quant.features.variable_library import build_continuous_ohlc
 from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
@@ -564,8 +565,7 @@ def build_signal_candidates(
     else:
         raise RuntimeError("No family signal candidates built")
     combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
-    SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(SIGNAL_CACHE, index=False)
+    atomic_write_parquet(combined, SIGNAL_CACHE, index=False)
     return combined
 
 

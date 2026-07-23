@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -19,7 +20,9 @@ from analyze_b1_entry_exit_grid import (
 
 CANDIDATE_PATH = PROJECT_ROOT / "data/features/b1/candidates_strict_no_volume_20240101.parquet"
 DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
-OUTPUT_DIR = PROJECT_ROOT / "reports/b1/current"
+OUTPUT_DIR = Path(
+    os.getenv("B1_FORMAL_OUTPUT_DIR", str(PROJECT_ROOT / "reports/b1/current"))
+).expanduser().resolve()
 REPORT_PATH = OUTPUT_DIR / "backtest.md"
 
 
@@ -27,38 +30,38 @@ REPORT_PATH = OUTPUT_DIR / "backtest.md"
 class FormalCombo:
     name: str
     description: str
-    min_up8: float
+    min_up8: float | None
     max_down3: float | None
     exit_rule: ExitRule
+    min_up5: float | None = None
+    min_up10: float | None = None
+    max_down2: float | None = None
 
 
 COMBOS = [
     FormalCombo(
-        name="stable_up8_055_down3_055_trail4_dd2_sl15_T7",
-        description="稳健版：pred_up8_es>=0.55 + pred_down3_es<=0.55 + 4%目标后2%回撤止盈 + 1.5%止损 + T+7到期",
-        min_up8=0.55,
-        max_down3=0.55,
+        name="stable_up10_020_down3_040_fixed8_sl15_T5",
+        description="稳健版：pred_up10_es>=0.20 + pred_down3_es<=0.40 + 8%止盈 + 1.5%止损 + T+5到期",
+        min_up8=None,
+        min_up10=0.20,
+        max_down3=0.40,
         exit_rule=ExitRule(
-            "trail_target4%_dd2%_sl1.5%_T7",
-            "trailing",
-            hold_days=6,
-            take_profit=0.04,
+            "fixed_tp8%_sl1.5%_T5",
+            "fixed",
+            hold_days=4,
+            take_profit=0.08,
             stop_loss=0.015,
-            trail_drawdown=0.02,
         ),
     ),
     FormalCombo(
-        name="aggressive_up8_065_down3_050_trail5_dd2_sl15_T9",
-        description="进攻版：pred_up8_es>=0.65 + pred_down3_es<=0.50 + 5%目标后2%回撤止盈 + 1.5%止损 + T+9到期",
-        min_up8=0.65,
-        max_down3=0.50,
+        name="aggressive_up8_070_down3_045_expiry_T9",
+        description="进攻版：pred_up8_es>=0.70 + pred_down3_es<=0.45 + T+9收盘到期退出",
+        min_up8=0.70,
+        max_down3=0.45,
         exit_rule=ExitRule(
-            "trail_target5%_dd2%_sl1.5%_T9",
-            "trailing",
+            "expiry_T9_close",
+            "expiry",
             hold_days=8,
-            take_profit=0.05,
-            stop_loss=0.015,
-            trail_drawdown=0.02,
         ),
     ),
     FormalCombo(
@@ -98,7 +101,15 @@ def drawdown_window(trades: pd.DataFrame) -> tuple[str, str, float]:
 
 
 def combo_mask(df: pd.DataFrame, combo: FormalCombo) -> pd.Series:
-    mask = df["pred_up8_es"] >= combo.min_up8
+    mask = pd.Series(True, index=df.index)
+    if combo.min_up5 is not None:
+        mask &= df["pred_up5_es"] >= combo.min_up5
+    if combo.min_up8 is not None:
+        mask &= df["pred_up8_es"] >= combo.min_up8
+    if combo.min_up10 is not None:
+        mask &= df["pred_up10_es"] >= combo.min_up10
+    if combo.max_down2 is not None:
+        mask &= df["pred_down2_es"] <= combo.max_down2
     if combo.max_down3 is not None:
         mask &= df["pred_down3_es"] <= combo.max_down3
     return mask
@@ -120,12 +131,8 @@ def main() -> None:
         "candidate_rows": int(len(candidates)),
         "candidate_date_min": str(candidates["date"].min().date()),
         "candidate_date_max": str(candidates["date"].max().date()),
-        "stable_threshold_rows": int(
-            ((candidates["pred_up8_es"] >= 0.55) & (candidates["pred_down3_es"] <= 0.55)).sum()
-        ),
-        "aggressive_threshold_rows": int(
-            ((candidates["pred_up8_es"] >= 0.65) & (candidates["pred_down3_es"] <= 0.50)).sum()
-        ),
+        "stable_threshold_rows": int(combo_mask(candidates, COMBOS[0]).sum()),
+        "aggressive_threshold_rows": int(combo_mask(candidates, COMBOS[1]).sum()),
         "status": "valid",
     }
     if compatibility["stable_threshold_rows"] < 30 or compatibility["aggressive_threshold_rows"] < 10:
@@ -139,6 +146,10 @@ def main() -> None:
             json.dumps(compatibility, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         raise RuntimeError(compatibility["reason"])
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "model_compatibility_audit.json").write_text(
+        json.dumps(compatibility, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     print("adding future prices")
     candidates = add_future_prices(candidates, DAILY_DIR, max_hold_days=8)
@@ -182,7 +193,10 @@ def main() -> None:
                     "period": period_name,
                     "combo": combo.name,
                     "description": combo.description,
+                    "entry_min_up5": combo.min_up5,
                     "entry_min_up8": combo.min_up8,
+                    "entry_min_up10": combo.min_up10,
+                    "entry_max_down2": combo.max_down2,
                     "entry_max_down3": combo.max_down3,
                     "exit_rule": combo.exit_rule.name,
                     "max_dd_start": dd_start,
@@ -194,6 +208,24 @@ def main() -> None:
 
     summary = pd.DataFrame(summary_rows)
     details = pd.concat(detail_frames, ignore_index=True)
+    oot_validation = {}
+    for combo in COMBOS[:2]:
+        row = summary[(summary["period"] == "oot_2025plus") & (summary["combo"] == combo.name)].iloc[0]
+        oot_validation[combo.name] = {
+            "trades": int(row["trades"]),
+            "avg_return_pct": float(row["avg_return_pct"]),
+            "profit_factor": float(row["profit_factor"]),
+            "passed": bool(row["trades"] >= 30 and row["avg_return_pct"] > 0 and row["profit_factor"] > 1),
+        }
+    compatibility["strategy_validation"] = oot_validation
+    if not all(item["passed"] for item in oot_validation.values()):
+        compatibility["status"] = "incompatible"
+        compatibility["reason"] = "Calibrated formal strategies failed the OOT return gate."
+    (OUTPUT_DIR / "model_compatibility_audit.json").write_text(
+        json.dumps(compatibility, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if compatibility["status"] != "valid":
+        raise RuntimeError(compatibility["reason"])
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     summary_path = OUTPUT_DIR / "summary.csv"
     detail_path = OUTPUT_DIR / "trades.csv"
@@ -230,7 +262,7 @@ def main() -> None:
 
     with REPORT_PATH.open("w", encoding="utf-8") as f:
         f.write("# B1 两个正式组合回测\n\n")
-        f.write("本次回测使用 2026-06-05 新版 B1 候选池：已删除“当日成交量大于上一日成交量”条件，买入使用固定模型阈值，达不到阈值则空仓。\n\n")
+        f.write("本次回测使用统一 B1 特征候选池和五个正式 XGBoost 模型；阈值按 2025 校准、2026 独立验证，达不到阈值则空仓。\n\n")
         f.write("## 1. 回测组合\n\n")
         for combo in COMBOS:
             f.write(f"- `{combo.name}`：{combo.description}\n")
@@ -245,13 +277,13 @@ def main() -> None:
         f.write(fmt_table(summary[summary["period"] == "oot_2025plus"], ["combo", "max_dd_start", "max_dd_end", "max_dd_value_pct"]))
         f.write("\n\n")
         f.write("## 5. 解读\n\n")
-        stable = oot[oot["combo"] == "stable_up8_055_down3_055_trail4_dd2_sl15_T7"].iloc[0]
-        aggressive = oot[oot["combo"] == "aggressive_up8_065_down3_050_trail5_dd2_sl15_T9"].iloc[0]
+        stable = oot[oot["combo"] == "stable_up10_020_down3_040_fixed8_sl15_T5"].iloc[0]
+        aggressive = oot[oot["combo"] == "aggressive_up8_070_down3_045_expiry_T9"].iloc[0]
         baseline = oot[oot["combo"] == "baseline_up8_055_trail5_dd2_sl2_T9"].iloc[0]
         f.write(f"- 稳健版相对基准，交易次数从 `{baseline.trades:.0f}` 降到 `{stable.trades:.0f}`，胜率从 `{baseline.win_rate:.2%}` 到 `{stable.win_rate:.2%}`，最大回撤从 `{baseline.max_drawdown_pct:.2f}%` 到 `{stable.max_drawdown_pct:.2f}%`。\n")
         f.write(f"- 进攻版交易更少，样本外 `{aggressive.trades:.0f}` 笔，平均单笔收益 `{aggressive.avg_return_pct:.2f}%`，胜率 `{aggressive.win_rate:.2%}`，最大回撤 `{aggressive.max_drawdown_pct:.2f}%`。\n")
-        f.write("- 两个正式组合都显著降低了止损率，说明 `pred_down3_es` 风险过滤确实在减少“先跌破止损”的交易。\n")
-        f.write("- 如果目标是降低回撤并保持较高交易频率，优先看稳健版；如果目标是提高单笔收益和胜率，可以进一步研究进攻版，但要接受交易机会明显减少。\n\n")
+        f.write("- 稳健版用固定止损约束单笔风险；进攻版不设盘中止损，依赖严格入场阈值和 T+9 到期退出，因此尾部波动更大。\n")
+        f.write("- 如果目标是降低回撤并保持较高交易频率，优先看稳健版；进攻版只适合低频观察，并需接受样本更少和回撤更大的风险。\n\n")
         f.write(f"输出文件：`{summary_path}`、`{detail_path}`。\n")
 
     print(f"wrote {summary_path}")

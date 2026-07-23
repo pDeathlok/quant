@@ -28,14 +28,14 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 if str(PROJECT_ROOT / "scripts/research") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts/research"))
 
-from backtest_chan_daily import build_candidates
+from backtest_chan_daily import build_candidates, read_daily_file
 from train_chan_daily_models import (
     BASE_FEATURES,
     add_candidate_cross_section_ranks,
     add_stock_features,
     read_daily_basic_features,
-    read_daily_file,
 )
+from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
 from quant.features.market_sentiment import (
     build_limit_proxy_features,
     normalize_ts_code,
@@ -206,12 +206,16 @@ def _add_predictions(data: pd.DataFrame, models: dict[str, dict[str, Any]]) -> p
 def _write_strategy_outputs(scored: pd.DataFrame, output_dir: Path, top_n: int) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     strategy_frame = add_chan_model_strategy_columns(scored)
-    strategy_frame.to_parquet(output_dir / "chan_model_strategy_scored.parquet", index=False)
-    strategy_frame.to_csv(output_dir / "chan_model_strategy_scored.csv", index=False)
+    atomic_write_parquet(
+        strategy_frame,
+        output_dir / "chan_model_strategy_scored.parquet",
+        index=False,
+    )
+    atomic_write_csv(strategy_frame, output_dir / "chan_model_strategy_scored.csv", index=False)
     candidates = select_chan_model_candidates(strategy_frame, top_n=top_n)
-    candidates.to_csv(output_dir / "chan_model_latest_candidates.csv", index=False)
+    atomic_write_csv(candidates, output_dir / "chan_model_latest_candidates.csv", index=False)
     summary = summarize_chan_model_strategy(strategy_frame)
-    summary.to_csv(output_dir / "chan_model_strategy_summary.csv", index=False)
+    atomic_write_csv(summary, output_dir / "chan_model_strategy_summary.csv", index=False)
     return {
         "latest_signal_date": pd.to_datetime(candidates["date"].iloc[0]).strftime("%Y-%m-%d") if not candidates.empty else None,
         "latest_candidates": int(len(candidates)),
@@ -241,8 +245,8 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
             keep="last",
         )
         args.report_dir.mkdir(parents=True, exist_ok=True)
-        candidates.to_parquet(candidate_path, index=False)
-        candidates.to_csv(candidate_path.with_suffix(".csv"), index=False)
+        atomic_write_parquet(candidates, candidate_path, index=False)
+        atomic_write_csv(candidates, candidate_path.with_suffix(".csv"), index=False)
     else:
         candidates = pd.read_parquet(args.report_dir / "chan_daily_candidates.parquet")
 
@@ -266,8 +270,8 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
     combined = pd.concat([historical, live_scored], ignore_index=True, sort=False)
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
     combined = combined.sort_values(["date", "symbol"]).reset_index(drop=True)
-    combined.to_parquet(args.scored_path, index=False)
-    combined.to_csv(args.scored_path.with_suffix(".csv"), index=False)
+    atomic_write_parquet(combined, args.scored_path, index=False)
+    atomic_write_csv(combined, args.scored_path.with_suffix(".csv"), index=False)
 
     strategy_meta = _write_strategy_outputs(combined, args.output_dir, args.top_n)
 
@@ -298,20 +302,16 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
         "snapshots": snapshot_results,
     }
     manifest_path = args.scored_path.parent / DEFAULT_REFRESH_MANIFEST_PATH.name
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "processed_through": args.end,
-                "daily_dir": str(args.daily_dir),
-                "daily_basic_dir": str(args.daily_basic_dir),
-                "live_rows": result["live_rows"],
-                "combined_max_date": result["combined_max_date"],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    atomic_write_json(
+        {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "processed_through": args.end,
+            "daily_dir": str(args.daily_dir),
+            "daily_basic_dir": str(args.daily_basic_dir),
+            "live_rows": result["live_rows"],
+            "combined_max_date": result["combined_max_date"],
+        },
+        manifest_path,
     )
     result["manifest_path"] = str(manifest_path)
     return result

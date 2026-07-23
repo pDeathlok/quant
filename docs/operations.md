@@ -60,12 +60,13 @@ curl --fail http://127.0.0.1:8088/api/health
 推荐生产命令：
 
 ```bash
-PYTHONPATH=src python -m quant.routine.cli daily --refresh-data --skip-backtest
+python scripts/run_daily_web_refresh.py
+# 等价：PYTHONPATH=src python -m quant.routine.cli web-refresh
 ```
 
-- `--refresh-data`：真实访问 Tushare；省略时数据刷新为 dry-run，但后续仍使用本地数据重建产物。
-- `--skip-backtest`：跳过正式组合回测，缩短日常刷新时间。
-- 不加 `--skip-backtest` 时会运行 `scripts/research/analyze_b1_formal_combos.py`。
+- 该入口与页面“更新全部”共用 Web 编排、断点续跑和状态记录。
+- 兼容命令 `daily --refresh-data` 会委托到这个入口，不再维护第二套生产步骤。
+- 只有维护或诊断时才使用 `daily --direct-pipeline`；它不会替代生产调度。
 
 命令结束时输出 manifest 路径。也可以查找最近一次：
 
@@ -74,6 +75,30 @@ find data/routine -name manifest.json -type f -print | sort | tail -1
 ```
 
 打开该 JSON，确认关键步骤 `status` 为 `success`；主动跳过的数据刷新或回测会显示 `skipped`。
+
+## B1 正式模型兼容与发布
+
+正式回测使用 `models/production/b1/` 下的五个统一模型：`up5_es`、`up8_es`、`up10_es`、`down2_es`、`down3_es`。模型必须使用与 `data/features/b1/training_xgb_project_vars.parquet` 一致的统一特征定义；旧 67 维 sklearn 模型只保留在归档目录，不再参与正式预测。
+
+发布新模型时先写入候选目录并完成三层验证：模型 test/OOT AUC、2025 校准与 2026 独立验证、正式组合全量回测。正式组合还必须通过 `reports/b1/current/model_compatibility_audit.json` 中的样本量、平均收益和 PF 门禁，状态为 `valid` 后才允许生成仪表盘。失败时日常流水线可以临时跳过该仪表盘，但不得把失败报告覆盖为正式结果。
+
+从已审计特征缓存快速重训候选模型：
+
+```bash
+PYTHONPATH=src:scripts/research python scripts/research/train_b1_tushare_models.py \
+  --reuse-dataset \
+  --dataset-out data/features/b1/training_xgb_project_vars.parquet \
+  --model-dir models/research/b1_candidate \
+  --report-dir reports/b1/research/b1_candidate
+```
+
+候选验证可通过 `B1_FORMAL_MODEL_DIR` 和 `B1_FORMAL_OUTPUT_DIR` 隔离模型与报告；不要直接覆盖 `reports/b1/current`：
+
+```bash
+B1_FORMAL_MODEL_DIR=models/research/b1_candidate \
+B1_FORMAL_OUTPUT_DIR=reports/b1/candidate \
+PYTHONPATH=src:scripts/research python scripts/research/analyze_b1_formal_combos.py
+```
 
 ## 调度说明
 
@@ -88,7 +113,7 @@ find data/routine -name manifest.json -type f -print | sort | tail -1
 调度命令本体为：
 
 ```bash
-cd /absolute/path/to/quant && .venv/bin/python -m quant.routine.cli daily --refresh-data --skip-backtest
+cd /absolute/path/to/quant && .venv/bin/python scripts/run_daily_web_refresh.py
 ```
 
 把 `/absolute/path/to/quant` 替换为部署机器上的仓库绝对路径。不要把 Token 或数据库密码直接写进调度配置；保存在权限受控的 `.env` 中。
@@ -128,14 +153,16 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 脚本默认行为：
 
 1. 读取项目 `.env`。
-2. 用 Tushare `trade_cal` 判断当天是否为 A 股交易日；不是交易日或无法可靠确认时直接跳过。
-3. 默认先按 `.run/daily_web_refresh.pid` 重启由该脚本启动的本地 web 服务。如果检测到 Web 服务由 `launchd` 等外部守护器托管，则保持现有服务，避免重复启动和端口冲突。
-4. 检查 `http://127.0.0.1:8088/api/health` 和前端首页 `http://127.0.0.1:8088/`，确认前后端已就绪。
-5. 触发 `POST /api/selector/refresh-latest`，作用域默认 `all`。
-6. 轮询 `/api/selector/refresh-latest/status` 并打印进度。
-7. 若终态为 `failed/error`，自动再次触发刷新。服务端会优先复用已有的断点续跑能力。
-8. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应 `data/raw/daily_basic/YYYYMMDD.parquet` 正式文件存在且非空时才删除旧缓存，避免误删唯一副本。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
-9. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
+2. 获取 `.run/daily_web_refresh.lock` 跨进程锁；已有任务运行时立即返回 `busy`，不启动第二套写盘任务。
+3. 用 Tushare `trade_cal` 判断当天是否为 A 股交易日；非交易日跳过，无法可靠确认时按失败处理。
+4. 默认复用健康的本地 Web 服务；仅显式传入 `--restart-service` 时才会在刷新前重启脚本托管的服务。
+5. 检查 `http://127.0.0.1:8088/api/health` 和前端首页 `http://127.0.0.1:8088/`，确认前后端已就绪。
+6. 触发 `POST /api/selector/refresh-latest`，作用域默认 `all`。
+7. 轮询 `/api/selector/refresh-latest/status` 并打印进度。
+8. 若终态为 `failed/error`，自动再次触发刷新。服务端会优先复用已有的断点续跑能力。
+9. 每次终态都会保存独立的 `data/routine/<运行时间>_<run_id>/manifest.json`，其中包含每一步的状态、起止时间、耗时、结果和错误；`latest_refresh_status.json` 只作为最新状态指针。
+10. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应 `data/raw/daily_basic/YYYYMMDD.parquet` 正式文件存在且非空时才删除旧缓存，避免误删唯一副本。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
+11. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
 
 清理逻辑也会在 `daily` CLI 开始前执行。需要单独维护或立即释放空间时可运行：
 
@@ -209,14 +236,15 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_FINANCIAL_PERIODS` | `4` | 每日通过 Tushare VIP 重拉的最近报告期数 |
 | `ROUTINE_FINANCIAL_SLEEP` | `0.15` | 财务 VIP 请求之间的最小间隔秒数 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 内存或 CPU 紧张时降低 |
+| `ROUTINE_MODEL_SCORE_WORKERS` | `4` | 策略模型评分 worker；Web 每日更新并行阶段上限为 4 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | CPU 密集的特征计算默认使用多进程；调试时可改为 `threads` |
 | `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量候选与 `daily_basic` 匹配率门禁；不建议调低 |
-| `ROUTINE_CHAN_WORKERS` | `8` | 缠论增量候选扫描并发数；内存或 CPU 紧张时降低 |
+| `ROUTINE_CHAN_WORKERS` | `4` | 缠论增量候选扫描并发数；Web 每日更新并行阶段上限为 4 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 下游接口限频或机器负载高时降低 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似向量计算占用高时降低 |
 | `SIMILAR_PATTERN_FORCE_VECTOR_CACHE` | 空 | 设为 `1` 可在下一次相似走势刷新时强制重建全市场参考库；正常每日任务无需设置 |
 
-一次运行同时包含多层并发。不要盲目把每个并发参数都调大；优先观察内存、CPU、Tushare 限频和 MySQL 写入延迟。
+一次运行同时包含多层并发。B1 特征缓存与全市场规则信号各自会使用多进程，外层默认依次执行，避免两个进程池争抢同一批 CPU；可转债、配债股和 BYD 做T 在共享数据就绪后提前并行。每日计划、Dashboard、模型评分与缠论评分也会并行，其中两类评分各自最多使用 4 个 worker。不要盲目把每个并发参数都调大；优先观察内存、CPU、Tushare 限频和 MySQL 写入延迟。
 
 日线正式存储为 MySQL `market_daily` 与年月分区 Parquet 镜像。每日刷新只更新当天所在月份，旧的 `data/raw/daily/*.parquet` 逐股票文件和 `daily_XXXXXX_XX` MySQL 分表不再使用。
 
