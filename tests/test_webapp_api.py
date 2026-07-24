@@ -1114,7 +1114,11 @@ def test_similar_pattern_refresh_reuses_current_weekly_library_but_analyzes_live
 
     assert calls == {"cache": 0, "analysis": 1}
     assert payload["cache"]["reference_library_refreshed"] is False
-    assert payload["cache"]["reference_library_reason"] == "weekly_cache_current"
+    assert payload["cache"]["reference_library_reason"] in {
+        "waiting_for_friday_close",
+        "waiting_for_friday_trade_close",
+        "friday_close_window_already_refreshed",
+    }
     assert payload["cache"]["reused"] == 1
 
 
@@ -1141,7 +1145,10 @@ def test_similar_pattern_refresh_rejects_missing_watchlist_targets(monkeypatch, 
         services.refresh_similar_pattern_analysis()
 
 
-def test_similar_pattern_weekly_library_becomes_due_after_seven_days(monkeypatch, tmp_path) -> None:
+def test_similar_pattern_weekly_library_waits_for_friday_close_after_seven_days(
+    monkeypatch,
+    tmp_path,
+) -> None:
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
@@ -1155,8 +1162,74 @@ def test_similar_pattern_weekly_library_becomes_due_after_seven_days(monkeypatch
         now=datetime(2026, 7, 21, 8, 0, 0)
     )
 
+    assert decision["due"] is False
+    assert decision["reason"] == "waiting_for_friday_close"
+    assert decision["next_refresh_at"] == "2026-07-24T15:00:00"
+
+
+def test_similar_pattern_weekly_library_becomes_due_on_friday_after_close(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps({"refreshed_at": "2026-07-20T20:25:57", "cached_files": 1}),
+        encoding="utf-8",
+    )
+
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 24, 15, 1, 0)
+    )
+
     assert decision["due"] is True
-    assert decision["reason"] == "weekly_interval_elapsed"
+    assert decision["reason"] == "friday_close_window"
+
+
+def test_similar_pattern_weekly_library_waits_when_friday_is_not_trade_date(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps({"refreshed_at": "2026-07-20T20:25:57", "cached_files": 1}),
+        encoding="utf-8",
+    )
+
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 24, 15, 1, 0),
+        source_trade_date="2026-07-23",
+    )
+
+    assert decision["due"] is False
+    assert decision["reason"] == "waiting_for_friday_trade_close"
+
+
+def test_similar_pattern_weekly_library_does_not_rebuild_twice_in_friday_window(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps({"refreshed_at": "2026-07-24T15:05:00", "cached_files": 1}),
+        encoding="utf-8",
+    )
+
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 24, 16, 0, 0)
+    )
+
+    assert decision["due"] is False
+    assert decision["reason"] == "friday_close_window_already_refreshed"
+    assert decision["next_refresh_at"] == "2026-07-31T15:00:00"
 
 
 def test_similar_pattern_weekly_library_rebuilds_when_cache_count_changes(monkeypatch, tmp_path) -> None:

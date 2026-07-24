@@ -75,6 +75,40 @@ def test_research_circuit_breaker_defers_remaining_symbols(monkeypatch, tmp_path
     assert Path(result["audit_path"]).is_file()
 
 
+def test_research_treats_eastmoney_missing_info_code_as_no_data(monkeypatch, tmp_path) -> None:
+    _configure_paths(monkeypatch, tmp_path)
+    calls = []
+
+    def missing_payload(*, symbol):
+        calls.append(symbol)
+        raise KeyError("infoCode")
+
+    monkeypatch.setitem(sys.modules, "akshare", types.SimpleNamespace(stock_research_report_em=missing_payload))
+    monkeypatch.setattr(MODULE.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(MODULE.random, "uniform", lambda *_: 0.0)
+
+    result = MODULE.refresh_akshare_em_research(
+        None,
+        0.1,
+        3,
+        symbols=["600177.SH", "600178.SH"],
+        refresh_existing=True,
+        circuit_breaker_failures=1,
+    )
+
+    assert result["success"] == 0
+    assert result["failed"] == 0
+    assert result["deferred"] == 0
+    assert result["no_data"] == 2
+    assert result["failed_symbols"] == []
+    assert result["no_data_symbols"] == ["600177.SH", "600178.SH"]
+    assert result["circuit_open"] is False
+    assert calls == ["600177", "600178"]
+    audit = pd.read_csv(result["audit_path"])
+    assert audit["status"].tolist() == ["no_data", "no_data"]
+    assert audit["attempts"].tolist() == [1, 1]
+
+
 def test_output_lock_records_owner_and_replaces_stale_empty_lock(monkeypatch, tmp_path) -> None:
     _configure_paths(monkeypatch, tmp_path)
     lock_path = MODULE.OUTPUT_LOCK_PATH

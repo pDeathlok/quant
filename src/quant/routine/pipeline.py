@@ -392,6 +392,7 @@ def _refresh_analyst_forecast_snapshot() -> dict:
         research_payload = _extract_last_json_object(research_result.stdout)
         failed_symbols = sorted(str(item) for item in (research_payload.get("failed_symbols") or []) if item)
         deferred_symbols = sorted(str(item) for item in (research_payload.get("deferred_symbols") or []) if item)
+        no_data_symbols = sorted(str(item) for item in (research_payload.get("no_data_symbols") or []) if item)
         degraded_symbols = sorted(set(failed_symbols) | set(deferred_symbols))
         failure_rate = (len(degraded_symbols) / len(symbols)) if symbols else 0.0
         soft_failure_threshold = float(os.getenv("ROUTINE_AKSHARE_RESEARCH_SOFT_FAILURE_RATE", "0.05"))
@@ -420,8 +421,10 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             "symbols_success": int(research_payload.get("success") or 0) if research_payload else None,
             "symbols_failed": len(failed_symbols),
             "symbols_deferred": len(deferred_symbols),
+            "symbols_no_data": len(no_data_symbols),
             "failed_symbols": failed_symbols,
             "deferred_symbols": deferred_symbols,
+            "no_data_symbols": no_data_symbols,
             "degraded_symbols": degraded_symbols,
             "failure_rate": round(failure_rate, 6),
             "soft_failure_threshold": soft_failure_threshold,
@@ -431,6 +434,7 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             "coverage": {
                 "requested": len(symbols),
                 "fresh_success": int(research_payload.get("success") or 0) if research_payload else None,
+                "no_data": len(no_data_symbols),
                 "last_known_good": len(fallback_symbols),
                 "degraded": len(degraded_symbols),
             },

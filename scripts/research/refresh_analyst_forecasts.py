@@ -271,6 +271,12 @@ def retry_delay(base_seconds: float, attempt: int) -> float:
     return base + random.uniform(0.0, min(1.0, base * 0.25))
 
 
+def is_eastmoney_empty_research_response_error(exc: Exception) -> bool:
+    """AkShare raises KeyError('infoCode') when Eastmoney omits the report payload."""
+
+    return isinstance(exc, KeyError) and str(exc).strip("\"'") == "infoCode"
+
+
 def refresh_akshare_em_snapshot(sleep_seconds: float = 0.5, retries: int = 3) -> dict:
     import akshare as ak
 
@@ -456,10 +462,15 @@ def refresh_akshare_em_research(
                 break
             except Exception as exc:
                 error = str(exc)
+                if is_eastmoney_empty_research_response_error(exc):
+                    status = "no_data"
+                    break
                 if attempt > retries:
                     break
                 time.sleep(retry_delay(sleep_seconds, attempt))
         if status == "success":
+            consecutive_failures = 0
+        elif status == "no_data":
             consecutive_failures = 0
         else:
             consecutive_failures += 1
@@ -474,9 +485,10 @@ def refresh_akshare_em_research(
             ok = sum(1 for item in audits if item["status"] == "success")
             failed = sum(1 for item in audits if item["status"] == "failed")
             deferred = sum(1 for item in audits if item["status"] == "deferred")
+            no_data = sum(1 for item in audits if item["status"] == "no_data")
             print(
                 f"akshare_em_research progress: {index}/{len(symbols)} "
-                f"success={ok} failed={failed} deferred={deferred}",
+                f"success={ok} failed={failed} deferred={deferred} no_data={no_data}",
                 flush=True,
             )
         if not circuit_open:
@@ -494,8 +506,10 @@ def refresh_akshare_em_research(
         "success": sum(1 for item in audits if item["status"] == "success"),
         "failed": sum(1 for item in audits if item["status"] == "failed"),
         "deferred": sum(1 for item in audits if item["status"] == "deferred"),
+        "no_data": sum(1 for item in audits if item["status"] == "no_data"),
         "failed_symbols": [item["ts_code"] for item in audits if item["status"] == "failed"],
         "deferred_symbols": [item["ts_code"] for item in audits if item["status"] == "deferred"],
+        "no_data_symbols": [item["ts_code"] for item in audits if item["status"] == "no_data"],
         "new_rows": int(new_rows),
         "total_rows": int(len(combined)),
         "total_symbols": int(combined["ts_code"].nunique()) if not combined.empty else 0,

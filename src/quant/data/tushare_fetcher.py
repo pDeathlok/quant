@@ -7,6 +7,8 @@ Tushare数据获取器
 使用前需要设置环境变量 TUSHARE_TOKEN 或在配置文件中设置
 """
 
+from __future__ import annotations
+
 import os
 import time
 from typing import Dict, List, Optional, Union

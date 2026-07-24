@@ -291,6 +291,8 @@ SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analy
 SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
 SIMILAR_PATTERN_VALIDATION_PATH = PROJECT_ROOT / "reports/similar_patterns/validation_2025/calibration.json"
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS = 7
+SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY = 4  # Friday
+SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR = 15
 SIMILAR_PATTERN_VECTOR_CACHE_METADATA = "_refresh_metadata.json"
 CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH = PROJECT_ROOT / "data/routine/convertible_bond_allotments_latest.json"
 SIMILAR_PATTERN_DEFAULT_WATCHLIST = ["002594.SZ", "002788.SZ"]
@@ -337,6 +339,43 @@ def _read_similar_pattern_vector_cache_metadata() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _next_similar_pattern_vector_cache_refresh_at(current: datetime) -> datetime:
+    candidate = current.replace(
+        hour=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    days_until_refresh = (SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY - current.weekday()) % 7
+    candidate = candidate + timedelta(days=days_until_refresh)
+    if candidate <= current:
+        candidate = candidate + timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS)
+    return candidate
+
+
+def _similar_pattern_vector_cache_in_refresh_window(current: datetime) -> bool:
+    return (
+        current.weekday() == SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY
+        and current.hour >= SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR
+    )
+
+
+def _similar_pattern_vector_cache_refreshed_this_window(
+    refreshed_at: pd.Timestamp,
+    current: datetime,
+) -> bool:
+    if pd.isna(refreshed_at) or not _similar_pattern_vector_cache_in_refresh_window(current):
+        return False
+    return refreshed_at.to_pydatetime().date() == current.date()
+
+
+def _similar_pattern_source_date_is_current(source_trade_date: str | None, current: datetime) -> bool:
+    if not source_trade_date:
+        return True
+    parsed = pd.to_datetime(source_trade_date, errors="coerce")
+    return pd.notna(parsed) and parsed.date() == current.date()
+
+
 def _latest_similar_pattern_target_date(symbols: list[str]) -> str | None:
     """Read only watchlist files; target vectors themselves are still built live later."""
     latest: pd.Timestamp | None = None
@@ -355,6 +394,7 @@ def _similar_pattern_vector_cache_refresh_decision(
     *,
     force: bool = False,
     now: datetime | None = None,
+    source_trade_date: str | None = None,
 ) -> dict[str, Any]:
     state_dir = _similar_pattern_vector_cache_state_dir()
     cache_files = list(state_dir.glob("*.npz")) if state_dir.exists() else []
@@ -385,16 +425,19 @@ def _similar_pattern_vector_cache_refresh_decision(
         due, reason = True, "empty_cache_file"
     elif pd.isna(refreshed_at):
         due, reason = True, "refresh_time_missing"
-    elif current - refreshed_at.to_pydatetime() >= timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS):
-        due, reason = True, "weekly_interval_elapsed"
+    elif _similar_pattern_vector_cache_refreshed_this_window(refreshed_at, current):
+        due, reason = False, "friday_close_window_already_refreshed"
+    elif _similar_pattern_vector_cache_in_refresh_window(current):
+        if _similar_pattern_source_date_is_current(source_trade_date, current):
+            due, reason = True, "friday_close_window"
+        else:
+            due, reason = False, "waiting_for_friday_trade_close"
     else:
-        due, reason = False, "weekly_cache_current"
+        due, reason = False, "waiting_for_friday_close"
 
-    next_refresh_at = None
-    if pd.notna(refreshed_at):
-        next_refresh_at = (
-            refreshed_at.to_pydatetime() + timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS)
-        ).isoformat(timespec="seconds")
+    next_refresh_at = _next_similar_pattern_vector_cache_refresh_at(current).isoformat(
+        timespec="seconds"
+    )
     return {
         "due": due,
         "reason": reason,
@@ -3207,7 +3250,10 @@ def refresh_similar_pattern_analysis(progress_callback=None, *, force_vector_cac
     symbols = _read_similar_pattern_watchlist_symbols()
     basic = _stock_basic_for_similar_patterns()
     source_trade_date = _latest_similar_pattern_target_date(symbols)
-    cache_schedule = _similar_pattern_vector_cache_refresh_decision(force=force_vector_cache)
+    cache_schedule = _similar_pattern_vector_cache_refresh_decision(
+        force=force_vector_cache,
+        source_trade_date=source_trade_date,
+    )
     if cache_schedule["due"]:
         cache_audit = build_vector_caches_parallel(
             DAILY_DIR,
@@ -3320,11 +3366,12 @@ def refresh_similar_pattern_analysis(progress_callback=None, *, force_vector_cac
             "reference_library_reason": cache_schedule["reason"],
             "reference_library_refreshed_at": cache_metadata.get("refreshed_at"),
             "reference_library_next_refresh_at": (
-                datetime.fromisoformat(str(cache_metadata["refreshed_at"]))
-                + timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS)
-            ).isoformat(timespec="seconds")
-            if cache_metadata.get("refreshed_at")
-            else None,
+                _next_similar_pattern_vector_cache_refresh_at(
+                    datetime.fromisoformat(str(cache_metadata["refreshed_at"]))
+                ).isoformat(timespec="seconds")
+                if cache_refreshed and cache_metadata.get("refreshed_at")
+                else cache_schedule.get("next_refresh_at")
+            ),
             "reference_library_source_trade_date": cache_metadata.get("source_trade_date"),
             "target_vectors": "live_from_latest_daily_data",
         },

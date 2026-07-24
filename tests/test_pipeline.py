@@ -208,6 +208,64 @@ def test_daily_analyst_low_ratio_research_failures_are_isolated(monkeypatch, tmp
     assert "isolated low-ratio" in step["warning"]
 
 
+def test_daily_analyst_no_data_research_symbols_are_not_degraded(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "data/raw/analyst_forecasts.parquet"
+    output.parent.mkdir(parents=True)
+    today = pd.Timestamp.now().normalize()
+    symbols = ["600177.SH", "600178.SH"]
+    pd.DataFrame(
+        {
+            "source": ["akshare_em_snapshot"],
+            "ts_code": [symbols[0]],
+            "report_date": [today],
+        }
+    ).to_parquet(output, index=False)
+    snapshot_dir = tmp_path / "data/long_stock_pool_snapshots"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "tea.json").write_text(
+        json.dumps(
+            {
+                "variant": "tea",
+                "stocks": [{"ts_code": symbol, "state": "CORE"} for symbol in symbols],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(
+            {
+                "source": "akshare_em_research",
+                "symbols_requested": 2,
+                "success": 1,
+                "failed": 0,
+                "deferred": 0,
+                "no_data": 1,
+                "failed_symbols": [],
+                "deferred_symbols": [],
+                "no_data_symbols": [symbols[0]],
+            },
+            indent=2,
+        )
+
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("ROUTINE_REFRESH_CANDIDATE_RESEARCH", "1")
+    monkeypatch.setattr(pipeline.subprocess, "run", lambda command, **kwargs: Result())
+
+    result = pipeline._refresh_analyst_forecast_snapshot()
+
+    assert result["status"] == "success"
+    step = result["steps"]["candidate_research_reports"]
+    assert step["status"] == "success"
+    assert step["symbols_no_data"] == 1
+    assert step["no_data_symbols"] == [symbols[0]]
+    assert step["degraded_symbols"] == []
+    assert step["failure_rate"] == 0.0
+    assert step["warning"] is None
+
+
 def test_daily_candidate_report_refresh_requires_explicit_external_opt_in(monkeypatch, tmp_path) -> None:
     output = tmp_path / "data/raw/analyst_forecasts.parquet"
     output.parent.mkdir(parents=True)
