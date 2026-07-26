@@ -106,12 +106,13 @@ def test_run_refresh_workflow_rejects_second_process_lock(tmp_path: Path) -> Non
     assert str(lock_path) in result["reason"]
 
 
-def test_runner_restarts_service_by_default() -> None:
+def test_runner_reuses_service_by_default_and_supports_explicit_restart() -> None:
     config = runner.RefreshRunnerConfig()
     args = runner.build_parser().parse_args([])
 
-    assert config.restart_service is True
-    assert args.restart_service is True
+    assert config.restart_service is False
+    assert args.restart_service is False
+    assert runner.build_parser().parse_args(["--restart-service"]).restart_service is True
     assert runner.build_parser().parse_args(["--no-restart-service"]).restart_service is False
 
 

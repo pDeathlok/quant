@@ -18,6 +18,11 @@
 #     trend, and risk are strong.
 #   - Growth exposure is allowed in risk_on markets through a capped sleeve,
 #     instead of weakening the defensive core rules.
+release:
+  lifecycle: production
+  consumer: quant.webapp.services
+  selection_field: strategies[].backtest.variant
+
 strategies:
   - id: l1_market_regime_quality
     name: L1 市场趋势质量长期版

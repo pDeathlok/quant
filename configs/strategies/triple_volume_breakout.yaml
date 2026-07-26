@@ -7,6 +7,10 @@
 #   - 扩展候选池使用 2.5 倍量锚点，覆盖更多机会。
 #   - 保守主策略使用 3.0 倍量锚点，是扩展候选池中的高质量子层。
 #   - 同一股票同日同时命中时，以保守主策略的分数和操作计划为准。
+release:
+  lifecycle: production
+  consumer: quant.strategies.custom.triple_volume_breakout
+
 strategy:
   id: triple_volume_breakout
   name: 三倍量缩量盘整突破

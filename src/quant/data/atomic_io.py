@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,26 @@ def atomic_write_json(payload: Any, target: Path, *, indent: int = 2) -> Path:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        _publish(temp_path, target)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return target
+
+
+def atomic_link_or_copy(source: Path, target: Path) -> Path:
+    """Atomically publish an alias, preferring a zero-copy hard link."""
+
+    source = Path(source)
+    target = Path(target)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = _temporary_path(target)
+    try:
+        try:
+            os.link(source, temp_path)
+        except OSError:
+            shutil.copy2(source, temp_path)
         _publish(temp_path, target)
     finally:
         temp_path.unlink(missing_ok=True)

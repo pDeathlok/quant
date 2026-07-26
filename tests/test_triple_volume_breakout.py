@@ -6,8 +6,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant.strategies.custom.triple_volume_breakout import add_triple_volume_breakout_signals
-from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
+from quant.strategies.custom.triple_volume_breakout import (
+    add_triple_volume_breakout_signals,
+    add_triple_volume_strategy_pool_signals,
+    load_triple_volume_variants,
+)
 
 
 def test_triple_volume_breakout_signal_detects_shrink_consolidation_breakout():
@@ -141,3 +144,38 @@ def test_triple_volume_strategy_pool_scores_expanded_and_conservative_tiers():
     assert out.loc[hit_idx, "signal_tvb_conservative"] == 1
     assert out.loc[hit_idx, "tvb_tier"] == "conservative"
     assert out.loc[hit_idx, "tvb_volume_multiple"] == 3.0
+
+
+def test_triple_volume_variants_are_loaded_from_yaml(tmp_path: Path):
+    config = tmp_path / "strategy.yaml"
+    config.write_text(
+        """
+strategy:
+  enabled: true
+  variants:
+    - id: conservative
+      name: Conservative
+      tier: conservative
+      volume_multiple: 4.0
+      signal_mode: avg_pre_shrink_bull_no60
+      base_score: 90
+      buy_plan: buy
+      sell_plan: sell
+      backtest_2024: {trades: 2, avg_return_pct: 1.0}
+    - id: expanded
+      name: Expanded
+      tier: expanded
+      volume_multiple: 2.0
+      signal_mode: avg_pre_shrink_bull_no60
+      base_score: 70
+      buy_plan: buy
+      sell_plan: sell
+      backtest_2024: {trades: 3, avg_return_pct: 0.5}
+""",
+        encoding="utf-8",
+    )
+
+    variants = load_triple_volume_variants(config)
+
+    assert [variant.id for variant in variants] == ["conservative", "expanded"]
+    assert [variant.volume_multiple for variant in variants] == [4.0, 2.0]

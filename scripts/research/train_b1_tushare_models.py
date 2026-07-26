@@ -78,8 +78,11 @@ def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
     return process_daily_frame((path.stem, df, start_date))
 
 
-def process_daily_frame(args: tuple[str, pd.DataFrame, str]) -> pd.DataFrame | None:
-    symbol, df, start_date = args
+def process_daily_frame(
+    args: tuple[str, pd.DataFrame, str] | tuple[str, pd.DataFrame, str, bool],
+) -> pd.DataFrame | None:
+    symbol, df, start_date, *options = args
+    raise_errors = bool(options[0]) if options else False
     try:
         start_ts = pd.to_datetime(start_date)
         history_start = start_ts - pd.Timedelta(days=450)
@@ -140,6 +143,8 @@ def process_daily_frame(args: tuple[str, pd.DataFrame, str]) -> pd.DataFrame | N
         out = result.loc[(result["date"] >= start_ts) & b1_signal, present].copy()
         return out if len(out) else None
     except Exception as exc:
+        if raise_errors:
+            raise RuntimeError(f"{symbol}: {exc}") from exc
         print(f"skip {symbol}: {exc}", flush=True)
         return None
 
@@ -156,6 +161,8 @@ def build_dataset(
     worker_step: int = 16,
     load_target: float = 0.80,
     load_hard_limit: float = 1.20,
+    max_symbol_error_rate: float | None = None,
+    allow_empty: bool = False,
 ) -> pd.DataFrame:
     start_ts = pd.to_datetime(start_date)
     history_start = (start_ts - pd.Timedelta(days=450)).strftime("%Y%m%d")
@@ -163,24 +170,42 @@ def build_dataset(
     market = store.read_market_range(daily_dir.name, start_date=history_start)
     if market.empty:
         raise RuntimeError(f"No canonical Tushare daily rows found for {history_start}+")
+    source_dates = pd.to_datetime(
+        market.get("date", market.get("trade_date")),
+        errors="coerce",
+    )
+    source_latest_trade_date = source_dates.max()
     symbols = sorted(market["ts_code"].dropna().astype(str).unique().tolist())
     if limit:
         symbols = symbols[:limit]
         market = market[market["ts_code"].astype(str).isin(symbols)]
 
     frames: list[pd.DataFrame] = []
+    symbol_errors: list[str] = []
     tasks = [
-        (str(symbol), group.reset_index(drop=True), start_date)
+        (str(symbol), group.reset_index(drop=True), start_date, True)
         for symbol, group in market.groupby("ts_code", sort=True)
     ]
     executor_cls = ThreadPoolExecutor if executor_type == "threads" else ProcessPoolExecutor
 
-    def consume_batch(batch: list[tuple[str, pd.DataFrame, str]], batch_workers: int, processed_before: int) -> tuple[int, float]:
+    def consume_batch(
+        batch: list[tuple[str, pd.DataFrame, str, bool]],
+        batch_workers: int,
+        processed_before: int,
+    ) -> tuple[int, float]:
         started = perf_counter()
         with executor_cls(max_workers=batch_workers) as executor:
-            futures = [executor.submit(process_daily_frame, task) for task in batch]
+            futures = {
+                executor.submit(process_daily_frame, task): task[0]
+                for task in batch
+            }
             for offset, future in enumerate(as_completed(futures), start=1):
-                frame = future.result()
+                symbol = futures[future]
+                try:
+                    frame = future.result()
+                except Exception as exc:
+                    symbol_errors.append(f"{symbol}: {exc}")
+                    frame = None
                 if frame is not None and len(frame):
                     frames.append(frame)
                 n = processed_before + offset
@@ -223,10 +248,40 @@ def build_dataset(
             )
             current_workers = next_workers
 
-    if not frames:
+    allowed_error_rate = (
+        float(os.getenv("B1_FEATURE_MAX_SYMBOL_ERROR_RATE", "0.001"))
+        if max_symbol_error_rate is None
+        else float(max_symbol_error_rate)
+    )
+    error_rate = len(symbol_errors) / max(len(tasks), 1)
+    if error_rate > allowed_error_rate:
+        samples = "; ".join(symbol_errors[:10])
+        raise RuntimeError(
+            "B1 feature coverage gate failed: "
+            f"errors={len(symbol_errors)}/{len(tasks)} ({error_rate:.4%}) "
+            f"> allowed={allowed_error_rate:.4%}; samples={samples}"
+        )
+    if not frames and not allow_empty:
         raise RuntimeError("No B1 training rows were produced")
-    data = pd.concat(frames, ignore_index=True).sort_values(["date", "symbol"]).reset_index(drop=True)
-    return data.replace([np.inf, -np.inf], np.nan)
+    if frames:
+        data = (
+            pd.concat(frames, ignore_index=True)
+            .sort_values(["date", "symbol"])
+            .reset_index(drop=True)
+            .replace([np.inf, -np.inf], np.nan)
+        )
+    else:
+        data = pd.DataFrame()
+    data.attrs["source_symbol_count"] = len(tasks)
+    data.attrs["source_latest_trade_date"] = (
+        source_latest_trade_date.strftime("%Y-%m-%d")
+        if pd.notna(source_latest_trade_date)
+        else None
+    )
+    data.attrs["symbol_error_count"] = len(symbol_errors)
+    data.attrs["symbol_error_rate"] = error_rate
+    data.attrs["symbol_error_samples"] = symbol_errors[:10]
+    return data
 
 
 class AucGapEarlyStopping(TrainingCallback):

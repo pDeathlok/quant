@@ -93,7 +93,9 @@ class TushareDataFetcher:
         symbol: str,
         start_date: str,
         end_date: str,
-        adjust: str = "qfq"
+        adjust: str = "qfq",
+        *,
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
         """
         获取股票日线数据
@@ -111,11 +113,11 @@ class TushareDataFetcher:
         ts_code = self._normalize_symbol(symbol)
         
         cache_key = f"tushare_{ts_code}_{start_date}_{end_date}_{adjust}"
-        if cache_key in self._memory_cache:
+        if not force_refresh and cache_key in self._memory_cache:
             return self._memory_cache[cache_key]
         
         file_path = self.cache_dir / f"{cache_key}.parquet"
-        if file_path.exists():
+        if not force_refresh and file_path.exists():
             df = pd.read_parquet(file_path)
             self._memory_cache[cache_key] = df
             return df
@@ -164,7 +166,7 @@ class TushareDataFetcher:
         df = df.sort_values('date').reset_index(drop=True)
         
         # 保存缓存
-        df.to_parquet(file_path, index=False)
+        atomic_write_parquet(df, file_path, index=False)
         self._memory_cache[cache_key] = df
         
         return df

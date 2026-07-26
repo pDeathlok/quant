@@ -11,8 +11,11 @@ meant for daily bars and assumes T+0 signal, T+1 open entry in research scripts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import yaml
 
 from quant.features.variable_library import build_continuous_ohlc
 
@@ -31,44 +34,50 @@ class TripleVolumeVariant:
     description: str
 
 
-TRIPLE_VOLUME_VARIANTS = [
-    TripleVolumeVariant(
-        id="tvb_conservative_v3_bull_no60",
-        name="三倍量突破 保守主策略",
-        volume_multiple=3.0,
-        signal_mode="avg_pre_shrink_bull_no60",
-        tier="conservative",
-        base_score=92.0,
-        buy_plan="T+1 开盘观察；若高开过大或跌破信号日低点则放弃，优先小仓试错。",
-        sell_plan="固定止盈 5%；盘中硬止损 2.5%；最长持有到 T+9；若提前跌破信号日突破结构则减仓或退出。",
-        metrics={
-            "trades": 18,
-            "avg_return_pct": 2.396637,
-            "win_rate": 0.722222,
-            "max_drawdown_pct": -7.423568,
-            "profit_factor": 4.160687,
-        },
-        description="3倍量锚点；突破日前平均缩量；MA5>MA10>MA20 且 MA20 上行；不强制 MA60。",
-    ),
-    TripleVolumeVariant(
-        id="tvb_expanded_v25_bull_no60",
-        name="三倍量突破 扩展候选池",
-        volume_multiple=2.5,
-        signal_mode="avg_pre_shrink_bull_no60",
-        tier="expanded",
-        base_score=78.0,
-        buy_plan="T+1 开盘观察；只作为扩展候选，需结合市场环境、成交额和板块强度二次确认。",
-        sell_plan="优先沿用固定止盈 5%、硬止损 2.5%、最长 T+9；弱于保守层，仓位应低一档。",
-        metrics={
-            "trades": 35,
-            "avg_return_pct": 1.845164,
-            "win_rate": 0.628571,
-            "max_drawdown_pct": -14.194666,
-            "profit_factor": 3.014726,
-        },
-        description="2.5倍量锚点；覆盖保守主策略，增加样本但回撤更高，需降仓和过滤。",
-    ),
-]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+TRIPLE_VOLUME_CONFIG_PATH = (
+    PROJECT_ROOT / "configs/strategies/triple_volume_breakout.yaml"
+)
+
+
+def load_triple_volume_variants(
+    path: Path = TRIPLE_VOLUME_CONFIG_PATH,
+) -> list[TripleVolumeVariant]:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    strategy = payload.get("strategy") or {}
+    if not strategy.get("enabled", True):
+        raise ValueError(f"triple-volume strategy is disabled in {path}")
+    variants: list[TripleVolumeVariant] = []
+    for raw in strategy.get("variants") or []:
+        metrics = raw.get("backtest_2024") or {}
+        variants.append(
+            TripleVolumeVariant(
+                id=str(raw["id"]),
+                name=str(raw["name"]),
+                volume_multiple=float(raw["volume_multiple"]),
+                signal_mode=str(raw["signal_mode"]),
+                tier=str(raw["tier"]),
+                base_score=float(raw["base_score"]),
+                buy_plan=str(raw["buy_plan"]),
+                sell_plan=str(raw["sell_plan"]),
+                metrics={
+                    key: float(value) if key != "trades" else int(value)
+                    for key, value in metrics.items()
+                },
+                description=str(raw.get("description", "")),
+            )
+        )
+    if {variant.tier for variant in variants} != {"conservative", "expanded"}:
+        raise ValueError(
+            f"{path} must define exactly the conservative and expanded tiers"
+        )
+    return sorted(
+        variants,
+        key=lambda variant: 0 if variant.tier == "conservative" else 1,
+    )
+
+
+TRIPLE_VOLUME_VARIANTS = load_triple_volume_variants()
 
 
 def _normalize_daily_frame(df: pd.DataFrame) -> pd.DataFrame:

@@ -46,7 +46,7 @@ class RefreshRunnerConfig:
     service_log_path: Path = DEFAULT_LOG_PATH
     service_pid_path: Path = DEFAULT_PID_PATH
     runner_lock_path: Path | None = None
-    restart_service: bool = True
+    restart_service: bool = False
 
 
 @dataclass
@@ -503,11 +503,20 @@ def _run_refresh_workflow_locked(
         }
 
     client = RefreshApiClient(config.base_url, session=session)
+    force_restart = config.restart_service
+    if force_restart:
+        try:
+            active_status = client.get_status()
+        except Exception:
+            active_status = {}
+        if active_status.get("status") in {"running", "queued"}:
+            force_restart = False
+            print_fn("[service] 检测到活动刷新任务，跳过显式服务重启并接管监控")
     service_process = ensure_local_service(
         config=config,
         client=client,
         env=env_values,
-        force_restart=config.restart_service,
+        force_restart=force_restart,
         sleep_fn=sleep_fn,
         monotonic_fn=monotonic_fn,
         print_fn=print_fn,
@@ -656,15 +665,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--restart-service",
         dest="restart_service",
         action="store_true",
-        help="刷新前显式重启本地 web 服务（默认）",
+        help="刷新前显式重启本地 web 服务；活动刷新任务存在时自动跳过",
     )
     restart_group.add_argument(
         "--no-restart-service",
         dest="restart_service",
         action="store_false",
-        help="复用已健康的 web 服务；仅用于确认服务代码未变化时",
+        help="复用已健康的 web 服务（默认）",
     )
-    parser.set_defaults(restart_service=True)
+    parser.set_defaults(restart_service=False)
     return parser
 
 

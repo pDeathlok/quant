@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -41,6 +40,7 @@ from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exi
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from analyze_z_skill_entry_exit_backtest import OpenFilter, apply_open_filter, build_open_filters
 from quant.data.source_merge import normalize_tushare_daily
+from quant.data.atomic_io import atomic_link_or_copy
 from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc
 from quant.ml.label_maker import create_b1_labels
@@ -820,7 +820,7 @@ def main() -> None:
         model_report_path = args.output_dir / f"z_skill_model_training_report_{timestamp}.csv"
         latest_model_report = args.output_dir / "latest_z_skill_model_training_report.csv"
         model_report.to_csv(model_report_path, index=False)
-        model_report.to_csv(latest_model_report, index=False)
+        atomic_link_or_copy(model_report_path, latest_model_report)
 
     print("adding model predictions", flush=True)
     predicted = add_predictions(data, models, signals)
@@ -839,17 +839,19 @@ def main() -> None:
     detail_path = args.output_dir / f"z_skill_model_trade_samples_{timestamp}.csv"
     latest_detail = args.output_dir / "latest_z_skill_model_trade_samples.csv"
     summary.to_csv(summary_path, index=False)
-    summary.to_csv(latest_summary, index=False)
+    atomic_link_or_copy(summary_path, latest_summary)
     playbooks.to_csv(playbook_path, index=False)
-    playbooks.to_csv(latest_playbook, index=False)
+    atomic_link_or_copy(playbook_path, latest_playbook)
     latest_scored = write_latest_scored_candidates(predicted, signals, playbooks, args.output_dir)
     if not details.empty:
         details.to_csv(detail_path, index=False)
-        details.to_csv(latest_detail, index=False)
+        atomic_link_or_copy(detail_path, latest_detail)
+    else:
+        latest_detail.unlink(missing_ok=True)
 
     report_path = write_report(model_report, summary, playbooks, args.output_dir, timestamp)
     latest_report = args.output_dir / "latest_z_skill_model_entry_exit_backtest.md"
-    shutil.copyfile(report_path, latest_report)
+    atomic_link_or_copy(report_path, latest_report)
     metadata = {
         "timestamp": timestamp,
         "signals": signals,

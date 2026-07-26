@@ -17,7 +17,6 @@ assumption.
 from __future__ import annotations
 
 import argparse
-import shutil
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,8 +28,8 @@ import pandas as pd
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from quant.data import MarketDataStore, MarketDataStoreConfig
-from quant.data.atomic_io import atomic_write_parquet
-from quant.features.daily_factor_layer import attach_z_skill_base_factors
+from quant.data.atomic_io import atomic_link_or_copy, atomic_write_parquet
+from quant.features.daily_factor_layer import Z_CONSUMER_ALIASES, attach_z_skill_base_factors
 from quant.features.variable_library import build_continuous_ohlc
 
 
@@ -111,7 +110,13 @@ def build_exit_rules() -> list[ExitRule]:
     return rules
 
 
-def _normalize_daily(path: Path, start_date: str, source_frame: pd.DataFrame | None = None) -> pd.DataFrame:
+def _normalize_daily(
+    path: Path,
+    start_date: str,
+    source_frame: pd.DataFrame | None = None,
+    *,
+    factors_attached: bool = False,
+) -> pd.DataFrame:
     df = source_frame.copy() if source_frame is not None else pd.read_parquet(path)
     if df.empty:
         return pd.DataFrame()
@@ -143,7 +148,12 @@ def _normalize_daily(path: Path, start_date: str, source_frame: pd.DataFrame | N
     if len(out) < 130:
         return pd.DataFrame()
     symbol = str(out["ts_code"].dropna().iloc[-1]) if out["ts_code"].notna().any() else path.stem
-    out = attach_z_skill_base_factors(out, symbol=symbol, persist_missing=False)
+    if factors_attached:
+        for target, source in Z_CONSUMER_ALIASES.items():
+            if source in out.columns:
+                out[target] = out[source]
+    else:
+        out = attach_z_skill_base_factors(out, symbol=symbol, persist_missing=False)
     price = build_continuous_ohlc(out)
     for col in ["open", "high", "low", "close"]:
         out[col] = price[col]
@@ -360,12 +370,24 @@ def process_file(path: Path, start_date: str) -> pd.DataFrame | None:
         return None
 
 
-def process_frame(symbol: str, frame: pd.DataFrame, start_date: str) -> pd.DataFrame | None:
+def process_frame(
+    symbol: str,
+    frame: pd.DataFrame,
+    start_date: str,
+    *,
+    factors_attached: bool = False,
+    raise_errors: bool = False,
+) -> pd.DataFrame | None:
     """Build z-skill signals from an in-memory canonical symbol slice."""
 
     path = Path(f"{symbol}.parquet")
     try:
-        df = _normalize_daily(path, start_date, source_frame=frame)
+        df = _normalize_daily(
+            path,
+            start_date,
+            source_frame=frame,
+            factors_attached=factors_attached,
+        )
         if df.empty:
             return None
         signals = compute_z_skill_flags(df)
@@ -373,6 +395,8 @@ def process_frame(symbol: str, frame: pd.DataFrame, start_date: str) -> pd.DataF
         signals = signals[signals[signal_cols].any(axis=1)].copy()
         return signals if not signals.empty else None
     except Exception as exc:
+        if raise_errors:
+            raise RuntimeError(f"{symbol}: {exc}") from exc
         print(f"skip {symbol}: {exc}", flush=True)
         return None
 
@@ -747,16 +771,18 @@ def main() -> None:
     latest_detail = args.output_dir / "latest_z_skill_trade_samples.csv"
 
     summary.to_csv(csv_path, index=False)
-    summary.to_csv(latest_csv, index=False)
+    atomic_link_or_copy(csv_path, latest_csv)
     playbooks.to_csv(playbook_path, index=False)
-    playbooks.to_csv(latest_playbook, index=False)
+    atomic_link_or_copy(playbook_path, latest_playbook)
     if not details.empty:
         details.to_csv(detail_path, index=False)
-        details.to_csv(latest_detail, index=False)
+        atomic_link_or_copy(detail_path, latest_detail)
+    else:
+        latest_detail.unlink(missing_ok=True)
 
     report_path = write_report(summary, playbooks, args.output_dir, timestamp)
     latest_report = args.output_dir / "latest_z_skill_entry_exit_backtest.md"
-    shutil.copyfile(report_path, latest_report)
+    atomic_link_or_copy(report_path, latest_report)
 
     print(f"summary: {csv_path}", flush=True)
     print(f"playbook: {playbook_path}", flush=True)

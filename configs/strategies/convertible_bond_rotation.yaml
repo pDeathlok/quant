@@ -4,6 +4,10 @@
 #   - Tushare cb_basic: 基础资料、剩余规模、评级、转股起止日
 #   - Tushare cb_daily: 日行情、成交额、转股溢价率
 #   - Tushare cb_call: 强赎/赎回风险过滤
+release:
+  lifecycle: production
+  consumer: quant.routine.convertible_bond_plan
+
 strategy:
   id: cb_double_low_rotation
   name: 可转债双低轮动

@@ -125,13 +125,25 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
             )
     returncode = process.wait()
     stdout = "".join(stdout_lines)
+    manifest = _extract_last_json_object(stdout)
+    expected_trade_date = str(manifest.get("expected_trade_date") or "")
+    dataset_trade_date = str(manifest.get("dataset_trade_date") or "")
+    complete = (
+        returncode == 0
+        and manifest.get("status") == "success"
+        and bool(expected_trade_date)
+        and dataset_trade_date == expected_trade_date
+    )
     return {
-        "status": "success" if returncode == 0 else "failed",
+        **manifest,
+        "status": "success" if complete else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
         "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
+        "expected_trade_date": expected_trade_date or None,
+        "dataset_trade_date": dataset_trade_date or None,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
@@ -504,13 +516,27 @@ def build_features(progress_callback=None) -> dict:
             )
     returncode = process.wait()
     stdout = "".join(stdout_lines)
+    manifest = _extract_last_json_object(stdout)
+    source_latest_trade_date = str(manifest.get("source_latest_trade_date") or "")
+    expected_trade_date = pd.to_datetime(
+        _incremental_daily_start(),
+        format="%Y%m%d",
+    ).strftime("%Y-%m-%d")
+    complete = (
+        returncode == 0
+        and manifest.get("status") == "success"
+        and source_latest_trade_date == expected_trade_date
+    )
     return {
-        "status": "success" if returncode == 0 else "failed",
+        **manifest,
+        "status": "success" if complete else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
         "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
+        "expected_trade_date": expected_trade_date,
+        "source_latest_trade_date": source_latest_trade_date or None,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
@@ -537,35 +563,43 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         bufsize=1,
     )
     stdout_lines: list[str] = []
-    progress_pattern = re.compile(r"(family|z-skill) signals: (\d+)/(\d+) (?:files|symbols)")
+    progress_pattern = re.compile(r"combined signals: (\d+)/(\d+) symbols")
     assert process.stdout is not None
     for line in process.stdout:
         stdout_lines.append(line)
         match = progress_pattern.search(line)
         if match and progress_callback is not None:
-            phase, done_text, total_text = match.groups()
+            done_text, total_text = match.groups()
             done = int(done_text)
             total = int(total_text)
             ratio = done / total if total else 0
-            if phase == "family":
-                percent = 50 + int(ratio * 7)
-                label = "核心策略规则信号"
-            else:
-                percent = 57 + int(ratio * 8)
-                label = "扩展策略规则信号"
             progress_callback(
-                percent=percent,
-                message=f"正在增量重建{label}：{done}/{total}",
+                percent=50 + int(ratio * 15),
+                message=f"正在单次扫描并行重建核心/扩展策略信号：{done}/{total}",
             )
     returncode = process.wait()
     stdout = "".join(stdout_lines)
+    manifest = _extract_last_json_object(stdout)
+    expected_trade_date = pd.to_datetime(
+        _incremental_daily_start(),
+        format="%Y%m%d",
+    ).strftime("%Y-%m-%d")
+    processed_through_date = str(manifest.get("processed_through_date") or "")
+    complete = (
+        returncode == 0
+        and manifest.get("status") == "success"
+        and processed_through_date == expected_trade_date
+    )
     return {
-        "status": "success" if returncode == 0 else "failed",
+        **manifest,
+        "status": "success" if complete else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
         "stderr_tail": stdout[-4000:] if returncode else "",
         "command": " ".join(command),
         "start_date": start_date,
+        "expected_trade_date": expected_trade_date,
+        "processed_through_date": processed_through_date or None,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant.data.atomic_io import atomic_write_json
 from quant.routine.paths import REPORTS_DIR, WEB_DATA_DIR
 
 
@@ -84,7 +85,5 @@ def build_dashboard_payload(summary_path: Path = SUMMARY_PATH, trades_path: Path
 
 
 def write_dashboard_json(output_path: Path = DASHBOARD_PATH) -> Path:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = build_dashboard_payload()
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return output_path
+    return atomic_write_json(payload, output_path)

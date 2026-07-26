@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import json
 import re
@@ -21,6 +22,12 @@ TUSHARE_SINGLE_SYMBOL_CACHE_PATTERN = re.compile(
 TUSHARE_DAILY_BASIC_CACHE_PATTERN = re.compile(
     r"^tushare_daily_basic_(\d{8})\.parquet$"
 )
+TUSHARE_CB_DAILY_CACHE_PATTERN = re.compile(
+    r"^tushare_cb_daily_(\d{8})_all_all_all\.parquet$"
+)
+CONSOLIDATED_CB_DAILY_PATTERN = re.compile(
+    r"^cb_daily_(\d{8})_(\d{8})\.parquet$"
+)
 SIMILAR_PATTERN_SMOKE_CACHE_DIRECTORIES = (
     "vector_cache_smoke",
     "vector_cache_model_smoke",
@@ -34,6 +41,24 @@ SOURCE_AUDIT_MAX_RUNS = 10
 ROUTINE_RUN_RETENTION_DAYS = 14
 ROUTINE_RUN_MAX_RUNS = 5
 RUN_DIRECTORY_PATTERN = re.compile(r"^(\d{8}_\d{6})(?:_|$)")
+B1_REPORT_TIMESTAMP_PATTERN = re.compile(
+    r"^(?P<prefix>.+)_(?P<timestamp>\d{8}_\d{6})(?P<suffix>\.[^.]+)$"
+)
+B1_REPORT_RETENTION_VERSIONS = 2
+B1_REPORT_LARGE_SAMPLE_RETENTION_VERSIONS = 1
+B1_REPORT_LARGE_SAMPLE_PREFIXES = {
+    "z_skill_trade_samples",
+    "z_skill_model_trade_samples",
+}
+B1_REPORT_LATEST_ALIASES = {
+    ("z_skill_trade_samples", ".csv"): "latest_z_skill_trade_samples.csv",
+    ("z_skill_model_trade_samples", ".csv"): "latest_z_skill_model_trade_samples.csv",
+    (
+        "b1_xgb_entry_exit_grid_non_overlap_summary",
+        ".csv",
+    ): "latest_non_overlap_summary.csv",
+    ("b1_xgb_entry_exit_grid_summary", ".csv"): "latest_summary.csv",
+}
 SQL_SNAPSHOT_TABLES = (
     {
         "name": "selector_snapshots",
@@ -367,6 +392,138 @@ def _cleanup_timestamped_directories(
     }
 
 
+def _cleanup_cb_daily_request_cache(root: Path, errors: list[str]) -> dict[str, Any]:
+    data_dir = root / "data/convertible_bond/tushare"
+    consolidated_ranges: list[tuple[date, date]] = []
+    for path in data_dir.glob("cb_daily_*.parquet"):
+        match = CONSOLIDATED_CB_DAILY_PATTERN.fullmatch(path.name)
+        if match is None or not path.is_file() or path.stat().st_size <= 0:
+            continue
+        try:
+            consolidated_ranges.append(
+                (
+                    datetime.strptime(match.group(1), "%Y%m%d").date(),
+                    datetime.strptime(match.group(2), "%Y%m%d").date(),
+                )
+            )
+        except ValueError:
+            continue
+
+    deleted_files = 0
+    reclaimed_bytes = 0
+    protected_files = 0
+    cache_dir = data_dir / "tushare_cache"
+    for path in sorted(cache_dir.glob("tushare_cb_daily_*.parquet")):
+        match = TUSHARE_CB_DAILY_CACHE_PATTERN.fullmatch(path.name)
+        if match is None:
+            continue
+        try:
+            request_date = datetime.strptime(match.group(1), "%Y%m%d").date()
+        except ValueError:
+            continue
+        if not any(start <= request_date <= end for start, end in consolidated_ranges):
+            protected_files += 1
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            deleted_files += 1
+            reclaimed_bytes += size
+        except OSError as exc:
+            errors.append(f"tushare_cb_daily:{path.name}:{exc}")
+    return {
+        "consolidated_ranges": [
+            {"start": start.isoformat(), "end": end.isoformat()}
+            for start, end in sorted(consolidated_ranges)
+        ],
+        "deleted_files": deleted_files,
+        "protected_outside_consolidated_range": protected_files,
+        "reclaimed_bytes": reclaimed_bytes,
+    }
+
+
+def _cleanup_b1_research_reports(root: Path, errors: list[str]) -> dict[str, Any]:
+    from quant.data.atomic_io import atomic_link_or_copy
+
+    report_dir = root / "reports/b1/research/xgb_project_vars_strategy"
+    groups: dict[tuple[str, str], list[tuple[datetime, Path]]] = {}
+    if report_dir.exists():
+        for path in report_dir.iterdir():
+            if not path.is_file():
+                continue
+            match = B1_REPORT_TIMESTAMP_PATTERN.fullmatch(path.name)
+            if match is None:
+                continue
+            try:
+                timestamp = datetime.strptime(match.group("timestamp"), "%Y%m%d_%H%M%S")
+            except ValueError:
+                continue
+            key = (match.group("prefix"), match.group("suffix"))
+            groups.setdefault(key, []).append((timestamp, path))
+
+    deleted_files = 0
+    reclaimed_bytes = 0
+    linked_latest_files = 0
+    deduplicated_bytes = 0
+    kept_versions: dict[str, list[str]] = {}
+    for key, records in sorted(groups.items()):
+        records.sort(reverse=True)
+        retention_versions = (
+            B1_REPORT_LARGE_SAMPLE_RETENTION_VERSIONS
+            if key[0] in B1_REPORT_LARGE_SAMPLE_PREFIXES
+            else B1_REPORT_RETENTION_VERSIONS
+        )
+        kept = records[:retention_versions]
+        kept_versions[f"{key[0]}{key[1]}"] = [path.name for _, path in kept]
+        for _, path in records[retention_versions:]:
+            try:
+                stat = path.stat()
+                path.unlink()
+                deleted_files += 1
+                if stat.st_nlink == 1:
+                    reclaimed_bytes += stat.st_size
+            except OSError as exc:
+                errors.append(f"b1_research_report:{path.name}:{exc}")
+
+        if not kept:
+            continue
+        latest_name = B1_REPORT_LATEST_ALIASES.get(key, f"latest_{key[0]}{key[1]}")
+        latest_path = report_dir / latest_name
+        newest_path = kept[0][1]
+        if not latest_path.is_file():
+            continue
+        try:
+            latest_stat = latest_path.stat()
+            newest_stat = newest_path.stat()
+            if (
+                (latest_stat.st_dev, latest_stat.st_ino)
+                == (newest_stat.st_dev, newest_stat.st_ino)
+            ):
+                continue
+            if latest_stat.st_size != newest_stat.st_size:
+                continue
+            if not filecmp.cmp(latest_path, newest_path, shallow=False):
+                continue
+            atomic_link_or_copy(newest_path, latest_path)
+            linked_latest_files += 1
+            if latest_stat.st_nlink == 1:
+                deduplicated_bytes += latest_stat.st_size
+        except OSError as exc:
+            errors.append(f"b1_research_report_link:{latest_name}:{exc}")
+
+    return {
+        "retention_versions": B1_REPORT_RETENTION_VERSIONS,
+        "large_sample_retention_versions": B1_REPORT_LARGE_SAMPLE_RETENTION_VERSIONS,
+        "groups": len(groups),
+        "kept_versions": kept_versions,
+        "deleted_files": deleted_files,
+        "linked_latest_files": linked_latest_files,
+        "reclaimed_bytes": reclaimed_bytes + deduplicated_bytes,
+        "deleted_reclaimed_bytes": reclaimed_bytes,
+        "deduplicated_bytes": deduplicated_bytes,
+    }
+
+
 def _cleanup_sql_snapshots(root: Path, today: date, errors: list[str]) -> dict[str, Any]:
     try:
         from sqlalchemy import bindparam, inspect, text
@@ -376,7 +533,10 @@ def _cleanup_sql_snapshots(root: Path, today: date, errors: list[str]) -> dict[s
         return {"status": "skipped", "reason": "sqlalchemy unavailable", "deleted_rows": 0}
 
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=root / "data"))
-    if not store.config.sql_url:
+    if (
+        store.config.backend not in {"mysql", "sql"}
+        or not store.config.sql_url
+    ):
         return {"status": "skipped", "reason": "sql backend disabled", "deleted_rows": 0}
     engine = None
     table_summaries: dict[str, Any] = {}
@@ -589,6 +749,8 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
             "max_runs": ROUTINE_RUN_MAX_RUNS,
         }
     )
+    convertible_bond_requests = _cleanup_cb_daily_request_cache(root, errors)
+    b1_research_reports = _cleanup_b1_research_reports(root, errors)
     sql_snapshots = _cleanup_sql_snapshots(root, today, errors)
 
     reclaimed_bytes = (
@@ -600,6 +762,8 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
         + snapshots["reclaimed_bytes"]
         + source_audit["reclaimed_bytes"]
         + routine_runs["reclaimed_bytes"]
+        + convertible_bond_requests["reclaimed_bytes"]
+        + b1_research_reports["reclaimed_bytes"]
     )
     return {
         "status": "success" if not errors else "partial",
@@ -635,6 +799,8 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
         "snapshots": snapshots,
         "source_audit": source_audit,
         "routine_runs": routine_runs,
+        "convertible_bond_request_cache": convertible_bond_requests,
+        "b1_research_reports": b1_research_reports,
         "sql_snapshots": sql_snapshots,
         "reclaimed_bytes": reclaimed_bytes,
         "errors": errors,

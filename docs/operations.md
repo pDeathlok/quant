@@ -78,9 +78,9 @@ find data/routine -name manifest.json -type f -print | sort | tail -1
 
 ## B1 正式模型兼容与发布
 
-正式回测使用 `models/production/b1/` 下的五个统一模型：`up5_es`、`up8_es`、`up10_es`、`down2_es`、`down3_es`。模型必须使用与 `data/features/b1/training_xgb_project_vars.parquet` 一致的统一特征定义；旧 67 维 sklearn 模型只保留在归档目录，不再参与正式预测。
+正式回测使用 `models/production/b1/` 下的五个统一模型：`up5_es`、`up8_es`、`up10_es`、`down2_es`、`down3_es`。模型必须使用与 `data/features/b1/training_xgb_project_vars.parquet` 一致的统一特征定义；生产目录只保留当前发布，旧模型不再作为运行时回退。
 
-发布新模型时先写入候选目录并完成三层验证：模型 test/OOT AUC、2025 校准与 2026 独立验证、正式组合全量回测。正式组合还必须通过 `reports/b1/current/model_compatibility_audit.json` 中的样本量、平均收益和 PF 门禁，状态为 `valid` 后才允许生成仪表盘。失败时日常流水线可以临时跳过该仪表盘，但不得把失败报告覆盖为正式结果。
+发布新模型时先写入候选目录并完成三层验证：模型 test/OOT AUC、2025 校准与 2026 独立验证、正式组合全量回测。正式组合还必须通过 `reports/b1/current/model_compatibility_audit.json` 中的样本量、平均收益和 PF 门禁，状态为 `valid` 后才允许生成每日计划。`configs/strategies/b1_selected.yaml` 是发布 ID、模型目录、阈值和退出规则的唯一正式来源；正式回测和 Web 每日计划共同消费它。
 
 从已审计特征缓存快速重训候选模型：
 
@@ -161,7 +161,7 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 7. 轮询 `/api/selector/refresh-latest/status` 并打印进度。
 8. 若终态为 `failed/error`，自动再次触发刷新。服务端会优先复用已有的断点续跑能力。
 9. 每次终态都会保存独立的 `data/routine/<运行时间>_<run_id>/manifest.json`，其中包含每一步的状态、起止时间、耗时、结果和错误；`latest_refresh_status.json` 只作为最新状态指针。
-10. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应 `data/raw/daily_basic/YYYYMMDD.parquet` 正式文件存在且非空时才删除旧缓存，避免误删唯一副本。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
+10. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应正式文件存在且非空时才删除。已被合并可转债日线覆盖的逐日请求缓存会删除；B1 时间戳研究报告每类保留最近 2 版，可重建的超大 trade-samples 只保留最新 1 版，内容相同的 `latest` 文件使用硬链接去重。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
 11. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
 
 清理逻辑也会在 `daily` CLI 开始前执行。需要单独维护或立即释放空间时可运行：
@@ -215,7 +215,7 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 - `--no-progress-timeout 2100`：本地监控无进展超时秒数。
 - `--log-file .run/daily_web_refresh.log`：自动启动 web 服务时的日志文件。
 - `--pid-file .run/daily_web_refresh.pid`：常驻后台 web 服务的 pid 文件。
-- `--no-restart-service`：调试时复用已有服务；例行任务不要加这个参数。
+- `--restart-service`：仅在明确需要重启脚本托管的 Web 服务时使用；若已有刷新任务运行，脚本会跳过重启并接管监控。
 - `--frontend-url http://127.0.0.1:8088/`：前端首页健康检查地址；默认由 `--base-url` 推导。
 
 ## 资源与限流配置
@@ -228,10 +228,12 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_DAILY_FINAL_RETRY_ROUNDS` | `2` | 最终失败较多时谨慎增加 |
 | `ROUTINE_DAILY_FINAL_RETRY_WORKERS` | `4` | 限频时降低 |
 | `ROUTINE_DAILY_FINAL_RETRY_SLEEP` | `0.8` | 最终重试仍限频时提高 |
+| `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.995` | 单交易日全市场行情覆盖率门禁；低于阈值阻断发布 |
 | `MARKET_DATA_SQL_BATCH_SIZE` | `5000` | 统一行情表批量 upsert 行数；遇到 `max_allowed_packet` 限制时降低 |
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日拉取的并发数；限频时降低 |
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔；限频时提高 |
 | `ROUTINE_DAILY_BASIC_RETRIES` | `3` | `daily_basic` 单日失败重试次数 |
+| `ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE` | `0.98` | `daily_basic` 相对当日正式行情股票数的最低覆盖率 |
 | `TUSHARE_STOCK_BASIC_TTL_HOURS` | `24` | `stock_basic` 请求缓存最长有效时间；同一流水线内复用，避免重复请求 |
 | `ROUTINE_FINANCIAL_PERIODS` | `4` | 每日通过 Tushare VIP 重拉的最近报告期数 |
 | `ROUTINE_FINANCIAL_SLEEP` | `0.15` | 财务 VIP 请求之间的最小间隔秒数 |
@@ -239,6 +241,7 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_MODEL_SCORE_WORKERS` | `4` | 策略模型评分 worker；Web 每日更新并行阶段上限为 4 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | CPU 密集的特征计算默认使用多进程；调试时可改为 `threads` |
 | `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量候选与 `daily_basic` 匹配率门禁；不建议调低 |
+| `B1_FEATURE_MAX_SYMBOL_ERROR_RATE` | `0.001` | B1 特征构建允许的单股异常比例；超过即失败 |
 | `ROUTINE_CHAN_WORKERS` | `4` | 缠论增量候选扫描并发数；Web 每日更新并行阶段上限为 4 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 下游接口限频或机器负载高时降低 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似向量计算占用高时降低 |
@@ -252,7 +255,9 @@ B1-family 与 z-skill 的生产信号刷新一次读取统一行情分区，再�
 
 日线和 `daily_basic` 完成后，流水线还会刷新因子参考数据：`stock_basic` 每日缓存复用并同步，沪深300按最新日期回看 10 天增量合并，`fina_indicator` / `income` / `cashflow` 通过 VIP 接口重拉最近 4 个报告期，并更新 `v44` 使用的全市场分析师一致预期快照。同一交易日重试会复用已成功的财务和分析师快照检查点。所有写入都使用业务唯一键去重和临时文件原子替换；审计位于 `data/raw/source_audit/*_reference_data/manifest.json`。
 
-若任务在共享数据刷新之后失败，当天重试会直接复用已通过门禁的日线、`daily_basic` 和参考数据，从特征计算阶段续跑；若核心与扩展股票池已经完成，则从下游工作区或快照阶段续跑。跨日任务不会复用旧检查点。
+若任务在共享数据刷新之后失败，当天重试会直接复用已通过门禁的日线、`daily_basic` 和参考数据，从特征计算阶段续跑；复用前必须同时满足源清单预期交易日、本地统一行情日期和 `daily_basic` 日期一致。若核心与扩展股票池已经完成，则从下游工作区或快照阶段续跑。缺少源检查点或日期不一致时会重新执行源刷新，不从下游产物反推“源已成功”。跨日任务不会复用旧检查点。
+
+长线、茶大和三倍量策略的当前生产选择也来自 `configs/strategies/*.yaml`；每日刷新清缓存时重新加载。可转债趋势增强 YAML 明确标记为 `research_only`，不会被误认为 Web 生产策略。
 
 ## 常见故障
 

@@ -19,7 +19,7 @@ PYTHONPATH=src:scripts/research python scripts/research/refresh_daily_factor_lay
   --executor processes
 ```
 
-日常不强制先运行该命令：各消费者采用写穿缓存，缺失时会自动构建。预热的作用是把首次计算移到消费者启动之前，使后续步骤全部命中缓存。
+日常不运行该命令：生产信号刷新一次读取统一行情，并在每只股票的共享 DataFrame 上计算一次公共因子，再同时生成 family 与 z-skill 信号。预热命令只用于需要物化年度因子分区的手工研究，不是 Web 每日更新的前置条件。
 
 可通过 `DAILY_FACTOR_ROOT` 临时切换缓存目录；默认目录为 `data/features/daily_factor_layer`。
 

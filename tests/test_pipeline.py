@@ -366,6 +366,14 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
         stdout = io.StringIO("")
 
         def __init__(self, command, **kwargs) -> None:
+            self.stdout = io.StringIO(
+                json.dumps(
+                    {
+                        "status": "success",
+                        "source_latest_trade_date": "2026-07-21",
+                    }
+                )
+            )
             captured["command"] = command
             captured["kwargs"] = kwargs
 
@@ -375,6 +383,7 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     monkeypatch.delenv("ROUTINE_FEATURE_EXECUTOR", raising=False)
     monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(pipeline, "_incremental_feature_start", lambda: "20260721")
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260721")
 
     result = pipeline.build_features()
 
@@ -402,7 +411,18 @@ def test_pipeline_subprocesses_stay_in_web_service_process_group(
         stdout = io.StringIO("")
 
         def __init__(self, command, **kwargs) -> None:
-            self.stdout = io.StringIO("")
+            if "quant.routine.data_refresh" in command:
+                payload = {
+                    "status": "success",
+                    "expected_trade_date": "20260721",
+                    "dataset_trade_date": "20260721",
+                }
+            else:
+                payload = {
+                    "status": "success",
+                    "processed_through_date": "2026-07-21",
+                }
+            self.stdout = io.StringIO(json.dumps(payload))
             captured.append(kwargs)
 
         def wait(self) -> int:

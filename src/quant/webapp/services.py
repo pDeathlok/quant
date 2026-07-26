@@ -4,6 +4,7 @@ import json
 import re
 import ast
 import hashlib
+import importlib
 import importlib.util
 import multiprocessing as mp
 import os
@@ -25,6 +26,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
 from quant.data.tushare_fetcher import TushareDataFetcher
@@ -204,6 +206,45 @@ TEA_LONG_VARIANTS = {
     "tea": "core14_soft_plus",
     "tea_safe": "core14_soft_spread",
 }
+
+
+def _selected_yaml_variant(path: Path, strategy_id: str) -> str:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    strategies = payload.get("strategies") or []
+    matches = [
+        item
+        for item in strategies
+        if str(item.get("id")) == strategy_id and bool(item.get("enabled", True))
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{path} expected one enabled strategy {strategy_id}, found {len(matches)}"
+        )
+    variant = str((matches[0].get("backtest") or {}).get("variant") or "")
+    if not variant:
+        raise ValueError(f"{path} strategy {strategy_id} has no backtest.variant")
+    return variant
+
+
+def _reload_production_strategy_configs() -> None:
+    global add_triple_volume_strategy_pool_signals
+
+    LONG_VARIANTS["v44"] = _selected_yaml_variant(
+        PROJECT_ROOT / "configs/strategies/long_dividend_quality.yaml",
+        "l1_market_regime_quality",
+    )
+    tea_variant = _selected_yaml_variant(
+        PROJECT_ROOT / "configs/strategies/tea_master_long.yaml",
+        "tea_master_regime_grid",
+    )
+    LONG_VARIANTS["tea"] = tea_variant
+    TEA_LONG_VARIANTS["tea"] = tea_variant
+    module_name = "quant.strategies.custom.triple_volume_breakout"
+    module = importlib.import_module(module_name)
+    module = importlib.reload(module)
+    add_triple_volume_strategy_pool_signals = (
+        module.add_triple_volume_strategy_pool_signals
+    )
 LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 40
 _REFRESH_LOCK = threading.Lock()
 _REFRESH_CONTEXT = threading.local()
@@ -576,6 +617,20 @@ def _tail_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
     return step_map.get("selector_extended") == "success" and step_map.get("snapshot") != "success"
 
 
+def _source_expected_trade_date(results: dict[str, Any] | None) -> str | None:
+    refresh_data = (results or {}).get("refresh_data") or {}
+    expected = str(refresh_data.get("expected_trade_date") or "").replace("-", "")
+    if len(expected) == 8 and expected.isdigit():
+        return expected
+    return None
+
+
+def _local_market_trade_date() -> str | None:
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    latest = store.latest_dataset_trade_date(DAILY_DIR.name)
+    return latest.strftime("%Y%m%d") if latest is not None else None
+
+
 def _input_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
     """Reuse same-day source refreshes after a downstream stage fails."""
 
@@ -585,12 +640,23 @@ def _input_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
     if started_at is None or started_at.date() != datetime.now().date():
         return False
     results = status.get("result") or {}
-    if (results.get("refresh_data") or {}).get("status") != "success":
+    refresh_data = results.get("refresh_data") or {}
+    if refresh_data.get("status") != "success":
+        return False
+    expected_trade_date = _source_expected_trade_date(results)
+    if expected_trade_date is None or _local_market_trade_date() != expected_trade_date:
         return False
     if scope in {"all", "short", "chan", "long"} and (
         results.get("refresh_daily_basic") or {}
     ).get("status") != "success":
         return False
+    if scope in {"all", "short", "chan", "long"}:
+        basic_date = str(
+            (results.get("refresh_daily_basic") or {}).get("latest_trade_date")
+            or ""
+        ).replace("-", "")
+        if basic_date != expected_trade_date:
+            return False
     reference = results.get("refresh_reference_inputs") or {}
     if reference.get("status") != "success":
         return False
@@ -5783,11 +5849,7 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
         cached = pd.read_parquet(FAMILY_SIGNAL_CACHE)
         cached["date"] = pd.to_datetime(cached["date"])
         if signal_date:
-            target = pd.to_datetime(signal_date)
-            available = cached[cached["date"] <= target]["date"]
-            if available.empty:
-                return {}
-            selected_date = available.max()
+            selected_date = pd.to_datetime(signal_date)
         else:
             selected_date = cached["date"].max()
         latest_rows = cached[cached["date"] == selected_date].copy()
@@ -5804,11 +5866,7 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
     features = pd.read_parquet(FEATURE_PATH)
     features["date"] = pd.to_datetime(features["date"])
     if signal_date:
-        target = pd.to_datetime(signal_date)
-        available = features[features["date"] <= target]["date"]
-        if available.empty:
-            return {}
-        latest_date = available.max()
+        latest_date = pd.to_datetime(signal_date)
     else:
         latest_date = features["date"].max()
     signal_rows: dict[str, list[dict[str, Any]]] = {}
@@ -5844,11 +5902,7 @@ def _family_profiles_for_date(signal_date: str | None = None) -> dict[str, dict[
     cached = pd.read_parquet(FAMILY_SIGNAL_CACHE)
     cached["date"] = pd.to_datetime(cached["date"])
     if signal_date:
-        target = pd.to_datetime(signal_date)
-        available = cached[cached["date"] <= target]["date"]
-        if available.empty:
-            return {}
-        selected_date = available.max()
+        selected_date = pd.to_datetime(signal_date)
     else:
         selected_date = cached["date"].max()
     latest_rows = cached[cached["date"] == selected_date].copy()
@@ -5882,17 +5936,13 @@ def _latest_extended_signals(signal_date: str | None) -> dict[str, dict[str, Any
     if cached_signals:
         return cached_signals
     signals = build_extended_daily_signals(DAILY_DIR, signal_date=signal_date, max_workers=32)
-    EXTENDED_SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    EXTENDED_SIGNAL_CACHE.write_text(
-        json.dumps(
-            {
-                "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "signal_date": signal_date,
-                "signals": signals,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    atomic_write_json(
+        {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "signal_date": signal_date,
+            "signals": signals,
+        },
+        EXTENDED_SIGNAL_CACHE,
     )
     return signals
 
@@ -5921,10 +5971,7 @@ def _extended_signals_from_candidate_cache(signal_date: str | None) -> dict[str,
         target = pd.to_datetime(signal_date, errors="coerce")
         if pd.isna(target):
             return {}
-        available = cached[cached["date"] <= target]["date"]
-        if available.empty:
-            return {}
-        selected_date = available.max()
+        selected_date = target
     else:
         selected_date = cached["date"].max()
     latest = cached[cached["date"] == selected_date].copy()
@@ -5973,6 +6020,7 @@ def _extended_signals_from_candidate_cache(signal_date: str | None) -> dict[str,
 
 
 def _clear_selector_caches() -> None:
+    _reload_production_strategy_configs()
     for func in [
         _extended_playbooks,
         _extended_model_playbooks,
@@ -5988,11 +6036,24 @@ def _clear_selector_caches() -> None:
         _latest_extended_signals,
         _load_live_long_base_cached,
         _load_live_long_base_full_cached,
+        _selector_buy_hold_score_artifact,
+        _selector_score_calibration,
+        _selector_buy_hold_models,
+        _selector_model_feature_rows,
+        _selector_model_score_date,
+        _stock_basic_map,
+        _long_research_module,
+        _tea_master_research_module,
     ]:
         try:
             func.cache_clear()
         except AttributeError:
             pass
+    for module_name in (
+        "quant_long_dividend_quality_research",
+        "quant_tea_master_long_research",
+    ):
+        sys.modules.pop(module_name, None)
 
 
 def _normalize_refresh_scope(scope: str | None = None) -> str:
@@ -6154,10 +6215,15 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
 
     if not signal_date:
         raise RuntimeError("断点续跑失败：未找到可复用的短线快照 signal_date")
-    from quant.routine.pipeline import _incremental_daily_start
-
+    expected_trade_date = _source_expected_trade_date(results)
+    if (
+        expected_trade_date is None
+        or _local_market_trade_date() != expected_trade_date
+    ):
+        raise RuntimeError("断点续跑快照已过期: source checkpoint is missing or stale")
     expected_signal_date = pd.to_datetime(
-        _incremental_daily_start(), format="%Y%m%d"
+        expected_trade_date,
+        format="%Y%m%d",
     ).date().isoformat()
     if str(signal_date) != expected_signal_date:
         raise RuntimeError(
@@ -6288,7 +6354,6 @@ def _run_latest_refresh_job(
         build_features,
         generate_dashboard,
         generate_daily_plan,
-        _incremental_daily_start,
         refresh_chan_model_scores,
         refresh_data,
         refresh_daily_basic_data,
@@ -6372,41 +6437,10 @@ def _run_latest_refresh_job(
                 resume_tail = False
                 resume_inputs = _input_resume_ready(resume_status, refresh_scope)
                 if not resume_inputs:
-                    expected_date = pd.to_datetime(
-                        _incremental_daily_start(), format="%Y%m%d"
-                    ).normalize()
-
-                    def recovered_artifact_current(path: Path) -> bool:
-                        if not path.exists():
-                            return False
-                        try:
-                            dates = pd.read_parquet(path, columns=["date"])["date"]
-                            latest = pd.to_datetime(dates, errors="coerce").max()
-                            return pd.notna(latest) and latest.normalize() == expected_date
-                        except Exception:
-                            return False
-
-                    recovered_paths = {
-                        "feature_cache": PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet",
-                        "family_signal_cache": PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
-                        "extended_signal_cache": PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
-                        "model_score": PROJECT_ROOT
-                        / "reports/b1/research/xgb_project_vars_strategy/latest_z_skill_model_scored_candidates.parquet",
-                    }
-                    recovered = {
-                        key: recovered_artifact_current(path) for key, path in recovered_paths.items()
-                    }
-                    if not all(recovered.values()):
-                        raise
-                    resume_inputs = True
-                    results = {
-                        "refresh_data": {"status": "success", "checkpoint_recovered": True},
-                        "refresh_daily_basic": {"status": "success", "checkpoint_recovered": True},
-                        "refresh_reference_inputs": {"status": "success", "checkpoint_recovered": True},
-                        "feature_cache": {"status": "success", "checkpoint_recovered": True},
-                        "signal_cache": {"status": "success", "checkpoint_recovered": True},
-                        "model_score": {"status": "success", "checkpoint_recovered": True},
-                    }
+                    # Source checkpoints without an independent expected trade
+                    # date are not safe to recover from downstream artifacts.
+                    # Restart the source stages instead.
+                    results = {}
                 else:
                     results = dict((resume_status or {}).get("result") or {})
                 results["tail_resume_fallback"] = {
@@ -6472,14 +6506,23 @@ def _run_latest_refresh_job(
             complete_previous=False,
         )
         _clear_selector_caches()
+        expected_trade_date = _source_expected_trade_date(results)
+        local_trade_date = _local_market_trade_date()
+        if expected_trade_date is None or local_trade_date != expected_trade_date:
+            raise RuntimeError(
+                "行情新鲜度门禁失败: "
+                f"expected={expected_trade_date} actual={local_trade_date}"
+            )
+        expected_signal_date = pd.to_datetime(
+            expected_trade_date,
+            format="%Y%m%d",
+        ).date().isoformat()
 
         # These workspaces only need the refreshed shared inputs. Start their
         # network-heavy work before the CPU-bound short-selector branch and
         # join the same futures at the normal downstream barrier.
         if refresh_scope == "all":
-            early_signal_date = pd.to_datetime(
-                _incremental_daily_start(), format="%Y%m%d"
-            ).date().isoformat()
+            early_signal_date = expected_signal_date
             early_trade_date = early_signal_date.replace("-", "")
             early_jobs = [
                 (
@@ -6512,6 +6555,22 @@ def _run_latest_refresh_job(
                 success_message: str,
             ) -> Any:
                 payload = operation()
+                if step_key == "convertible_bond_plan":
+                    actual_date = str(payload.get("trade_date") or "").replace("-", "")
+                    if actual_date != early_trade_date:
+                        raise RuntimeError(
+                            "可转债计划日期未更新到目标交易日: "
+                            f"expected={early_trade_date} actual={actual_date}"
+                        )
+                elif step_key == "byd_daily_plan":
+                    actual_date = str(
+                        (payload.get("planned_t") or {}).get("signal_date") or ""
+                    ).replace("-", "")
+                    if actual_date != early_trade_date:
+                        raise RuntimeError(
+                            "BYD 日线计划日期未更新到目标交易日: "
+                            f"expected={early_trade_date} actual={actual_date}"
+                        )
                 with early_workspace_results_lock:
                     if step_key == "convertible_bond_plan":
                         results[step_key] = {
@@ -6568,7 +6627,7 @@ def _run_latest_refresh_job(
                     early_workspace_futures[future] = (step_key, failure_message)
 
         if refresh_scope not in {"all", "short"}:
-            signal_date = pd.to_datetime(_incremental_daily_start(), format="%Y%m%d").date().isoformat()
+            signal_date = expected_signal_date
             trade_date = str(signal_date).replace("-", "") if signal_date else None
             if refresh_scope == "chan":
                 _set_refresh_progress(step_key="chan_model_strategy", message="正在生成缠论模型策略候选", percent=92)
@@ -6585,6 +6644,11 @@ def _run_latest_refresh_job(
                         results["refresh_chan_model_scores"].get("stderr_tail") or "缠论实时评分刷新失败"
                     )
                 payload = get_chan_model_strategy_plan(top_n=20, refresh=True, signal_date=signal_date)
+                if str(payload.get("signal_date") or "") != signal_date:
+                    raise RuntimeError(
+                        "缠论结果日期未更新到目标交易日: "
+                        f"expected={signal_date} actual={payload.get('signal_date')}"
+                    )
                 results["chan_model_strategy"] = {
                     "status": "success",
                     "signal_date": payload.get("signal_date"),
@@ -6615,6 +6679,12 @@ def _run_latest_refresh_job(
             elif refresh_scope == "cb":
                 _set_refresh_progress(step_key="convertible_bond_plan", message="正在刷新可转债策略计划", percent=92)
                 payload = get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date))
+                actual_date = str(payload.get("trade_date") or "").replace("-", "")
+                if actual_date != trade_date:
+                    raise RuntimeError(
+                        "可转债计划日期未更新到目标交易日: "
+                        f"expected={trade_date} actual={actual_date}"
+                    )
                 results["convertible_bond_plan"] = {
                     "status": "success",
                     "trade_date": payload.get("trade_date") or signal_date,
@@ -6647,6 +6717,12 @@ def _run_latest_refresh_job(
                 _set_refresh_progress(step_key="byd_daily_plan", message="正在刷新 BYD 做T日线计划", percent=92)
                 payload = get_byd_daily_strategy(refresh=True)
                 planned_t = payload.get("planned_t") or {}
+                actual_date = str(planned_t.get("signal_date") or "").replace("-", "")
+                if actual_date != trade_date:
+                    raise RuntimeError(
+                        "BYD 日线计划日期未更新到目标交易日: "
+                        f"expected={trade_date} actual={actual_date}"
+                    )
                 results["byd_daily_plan"] = {
                     "status": "success",
                     "signal_date": planned_t.get("signal_date"),
@@ -6701,7 +6777,8 @@ def _run_latest_refresh_job(
             complete_previous=False,
         )
         expected_incremental_date = pd.to_datetime(
-            _incremental_daily_start(), format="%Y%m%d"
+            expected_trade_date,
+            format="%Y%m%d",
         ).normalize()
 
         def artifact_current(path: Path) -> bool:
@@ -6881,9 +6958,6 @@ def _run_latest_refresh_job(
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
         core_payload = get_stock_selector_payload(use_cache=False)
-        expected_signal_date = pd.to_datetime(
-            _incremental_daily_start(), format="%Y%m%d"
-        ).date().isoformat()
         if str(core_payload.get("signal_date") or "") != expected_signal_date:
             raise RuntimeError(
                 "核心策略结果日期未更新到最新交易日: "
@@ -6993,6 +7067,12 @@ def _run_latest_refresh_job(
                 if result_key == "long_stock_pool":
                     results[result_key] = {"status": "success", "variants": payload}
                 elif result_key == "chan_model_strategy":
+                    if str(payload.get("signal_date") or "") != expected_signal_date:
+                        raise RuntimeError(
+                            "缠论结果日期未更新到目标交易日: "
+                            f"expected={expected_signal_date} "
+                            f"actual={payload.get('signal_date')}"
+                        )
                     results[result_key] = {
                         "status": "success",
                         "signal_date": payload.get("signal_date"),

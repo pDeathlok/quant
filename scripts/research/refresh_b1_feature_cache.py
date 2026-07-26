@@ -70,12 +70,21 @@ def main() -> None:
         worker_step=args.worker_step,
         load_target=args.load_target,
         load_hard_limit=args.load_hard_limit,
+        allow_empty=True,
     )
-    incremental = merge_daily_basic_features(
-        incremental,
-        args.daily_basic_dir,
-        min_match_rate=float(os.getenv("ROUTINE_DAILY_BASIC_MIN_MATCH_RATE", "0.98")),
-    )
+    coverage = {
+        "source_symbol_count": int(incremental.attrs.get("source_symbol_count", 0)),
+        "source_latest_trade_date": incremental.attrs.get("source_latest_trade_date"),
+        "symbol_error_count": int(incremental.attrs.get("symbol_error_count", 0)),
+        "symbol_error_rate": float(incremental.attrs.get("symbol_error_rate", 0.0)),
+        "symbol_error_samples": list(incremental.attrs.get("symbol_error_samples", [])),
+    }
+    if not incremental.empty:
+        incremental = merge_daily_basic_features(
+            incremental,
+            args.daily_basic_dir,
+            min_match_rate=float(os.getenv("ROUTINE_DAILY_BASIC_MIN_MATCH_RATE", "0.98")),
+        )
 
     if args.dataset_out.exists():
         existing = pd.read_parquet(args.dataset_out)
@@ -84,6 +93,12 @@ def main() -> None:
         combined = pd.concat([kept, incremental], ignore_index=True, sort=False)
     else:
         combined = incremental
+
+    if combined.empty:
+        raise RuntimeError(
+            "B1 feature cache has no historical rows and the incremental window "
+            "produced no signals"
+        )
 
     combined["date"] = pd.to_datetime(combined["date"])
     combined = (
@@ -100,6 +115,7 @@ def main() -> None:
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "incremental_start_date": start_ts.strftime("%Y-%m-%d"),
         "incremental_rows": int(len(incremental)),
+        **coverage,
         "daily_basic_match_rate": float(incremental["turnover_rate"].notna().mean())
         if "turnover_rate" in incremental.columns and len(incremental)
         else 0.0,

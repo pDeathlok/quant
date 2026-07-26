@@ -260,9 +260,22 @@ def normalize_daily_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
 
 
-def compute_signal_flags(df: pd.DataFrame) -> pd.DataFrame:
+def compute_signal_flags(
+    df: pd.DataFrame,
+    *,
+    factors_attached: bool = False,
+) -> pd.DataFrame:
     symbol = str(df["symbol"].dropna().iloc[-1]) if "symbol" in df.columns and df["symbol"].notna().any() else ""
-    out = attach_daily_base_factors(df, symbol=symbol, compute_if_missing=True, persist_missing=False)
+    out = (
+        df.copy()
+        if factors_attached
+        else attach_daily_base_factors(
+            df,
+            symbol=symbol,
+            compute_if_missing=True,
+            persist_missing=False,
+        )
+    )
 
     price = build_continuous_ohlc(out)
     close = price["close"]
@@ -485,7 +498,13 @@ def process_file(path: Path) -> pd.DataFrame | None:
         return None
 
 
-def process_frame(symbol: str, frame: pd.DataFrame) -> pd.DataFrame | None:
+def process_frame(
+    symbol: str,
+    frame: pd.DataFrame,
+    *,
+    factors_attached: bool = False,
+    raise_errors: bool = False,
+) -> pd.DataFrame | None:
     """Build family signals without reopening storage for every symbol."""
 
     try:
@@ -495,11 +514,13 @@ def process_frame(symbol: str, frame: pd.DataFrame) -> pd.DataFrame | None:
         if "name" in df.columns:
             names = df["name"].fillna("").astype(str)
             df = df[~names.str.upper().str.contains("ST") & ~names.str.contains("退")].copy()
-        signals = compute_signal_flags(df)
+        signals = compute_signal_flags(df, factors_attached=factors_attached)
         signal_cols = [spec.name for spec in build_signal_specs()]
         signals = signals[signals[signal_cols].any(axis=1)].copy()
         return signals if not signals.empty else None
     except Exception as exc:
+        if raise_errors:
+            raise RuntimeError(f"{symbol}: {exc}") from exc
         print(f"skip {symbol}: {exc}", flush=True)
         return None
 

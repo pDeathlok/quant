@@ -80,13 +80,15 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 | `MARKET_DATA_SQL_WRITE_TIMEOUT` | `60` | MySQL 写入超时，单位秒 |
 | `ROUTINE_DAILY_WORKERS` | `4` | 日线刷新并发数 |
 | `ROUTINE_DAILY_SLEEP` | `0.08` | Tushare 请求间隔，单位秒 |
-| `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.97` | 每个交易日全市场批量响应的最低股票覆盖率；低于阈值拒绝批量发布并逐股兜底 |
+| `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.995` | 每个交易日全市场批量响应的最低股票覆盖率；低于阈值拒绝发布 |
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日刷新的并发数 |
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔，单位秒 |
+| `ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE` | `0.98` | `daily_basic` 相对当日正式行情股票数的最低覆盖率 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
 | `ROUTINE_MODEL_SCORE_WORKERS` | `4` | Web 每日更新中策略模型评分的 worker 数；与缠论评分并行时上限为 4 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | 特征计算执行器；CPU 密集计算默认使用多进程 |
 | `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量特征与 `daily_basic` 的最低匹配率；低于阈值阻断发布 |
+| `B1_FEATURE_MAX_SYMBOL_ERROR_RATE` | `0.001` | B1 特征构建单股异常率上限；超过即阻断发布 |
 | `ROUTINE_CHAN_WORKERS` | `4` | 缠论增量候选扫描并发数；Web 每日更新与模型评分并行时上限为 4 |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 六个下游工作区的最大并发数 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似走势向量缓存并发数 |

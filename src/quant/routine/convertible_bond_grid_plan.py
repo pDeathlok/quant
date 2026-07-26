@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import json
 import time
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -11,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant.data.atomic_io import atomic_write_json
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.routine.paths import PROJECT_ROOT
 from quant.strategies.convertible_bond.backtest import _active_basic, _active_call, _prepare_basic, _prepare_call
@@ -737,9 +737,4 @@ def build_convertible_bond_grid_plan(
 def write_convertible_bond_grid_plan(output_path: Path | None = None, trade_date: str | None = None) -> Path:
     payload = build_convertible_bond_grid_plan(trade_date=trade_date)
     output_path = output_path or PROJECT_ROOT / "data/web/convertible_bond_grid_plan.json"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return output_path
+    return atomic_write_json(payload, output_path)

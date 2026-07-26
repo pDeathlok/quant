@@ -47,13 +47,22 @@ def _stub_successful_global_refresh(
         "error": None,
     }
     success = lambda *args, **kwargs: {"status": "success"}
+    source_success = lambda *args, **kwargs: {
+        "status": "success",
+        "expected_trade_date": "20260723",
+        "dataset_trade_date": "20260723",
+    }
+    daily_basic_success = lambda *args, **kwargs: {
+        "status": "success",
+        "latest_trade_date": "20260723",
+    }
     monkeypatch.setattr(services, "_REFRESH_STATUS", status)
     monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
     monkeypatch.setattr(services, "_write_terminal_refresh_manifest_unlocked", lambda: None)
     monkeypatch.setattr(services, "run_cache_cleanup", lambda project_root: {"status": "success"})
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260723")
-    monkeypatch.setattr(pipeline, "refresh_data", success)
-    monkeypatch.setattr(pipeline, "refresh_daily_basic_data", success)
+    monkeypatch.setattr(pipeline, "refresh_data", source_success)
+    monkeypatch.setattr(pipeline, "refresh_daily_basic_data", daily_basic_success)
     monkeypatch.setattr(pipeline, "refresh_reference_inputs", success)
     monkeypatch.setattr(pipeline, "build_features", build_features or success)
     monkeypatch.setattr(pipeline, "refresh_strategy_signal_cache", success)
@@ -124,6 +133,9 @@ def _stub_successful_global_refresh(
         def __init__(self, config):
             self.config = type("Config", (), {"sql_url": None})()
 
+        def latest_dataset_trade_date(self, dataset):
+            return pd.Timestamp("2026-07-23")
+
     monkeypatch.setattr(services, "MarketDataStoreConfig", DummyStoreConfig)
     monkeypatch.setattr(services, "MarketDataStore", DummyStore)
     return status
@@ -185,6 +197,32 @@ def test_return_model_scores_use_fixed_historical_reference(monkeypatch) -> None
     assert rows[0]["historical_buy_score"] < rows[1]["historical_buy_score"]
     assert rows[1]["historical_buy_score"] < 100.0
     assert rows[0]["buy_score_source"] == "historical_return_model"
+
+
+def test_family_signal_cache_does_not_fall_back_to_prior_trade_date(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "family.parquet"
+    pd.DataFrame(
+        {
+            "symbol": ["000001.SZ"],
+            "date": [pd.Timestamp("2026-07-23")],
+            "signal_b1": [1],
+        }
+    ).to_parquet(cache, index=False)
+    monkeypatch.setattr(services, "FAMILY_SIGNAL_CACHE", cache)
+    monkeypatch.setattr(
+        services,
+        "_model_scored_candidates_for_date",
+        lambda signal_date: {},
+    )
+    services._family_signals_for_date.cache_clear()
+
+    signals = services._family_signals_for_date("2026-07-24")
+
+    assert signals == {}
+    services._family_signals_for_date.cache_clear()
 
 
 @pytest.mark.parametrize("mode", ["buy", "hold"])
@@ -938,6 +976,7 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
     monkeypatch.setattr(services, "as_completed", lambda futures: list(futures))
     monkeypatch.setattr(services, "_set_refresh_progress", lambda **kwargs: None)
     monkeypatch.setattr("quant.routine.pipeline._incremental_daily_start", lambda: "20260720")
+    monkeypatch.setattr(services, "_local_market_trade_date", lambda: "20260720")
     monkeypatch.setattr(
         services,
         "get_stock_selector_payload",
@@ -970,7 +1009,13 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
                 {"key": "selector_extended", "status": "success"},
                 {"key": "snapshot", "status": "failed"},
             ],
-            "result": {},
+            "result": {
+                "refresh_data": {
+                    "status": "success",
+                    "expected_trade_date": "20260720",
+                    "dataset_trade_date": "20260720",
+                }
+            },
         },
     )
 
@@ -1000,14 +1045,22 @@ def test_post_snapshot_cleanup_failure_is_not_silently_ignored(monkeypatch) -> N
     assert results["cache_cleanup_after_snapshot"]["status"] == "partial"
 
 
-def test_same_day_failed_run_can_reuse_completed_source_inputs() -> None:
+def test_same_day_failed_run_can_reuse_completed_source_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_local_market_trade_date", lambda: "20260724")
     today = pd.Timestamp.now().isoformat()
     status = {
         "status": "failed",
         "started_at": today,
         "result": {
-            "refresh_data": {"status": "success"},
-            "refresh_daily_basic": {"status": "success"},
+            "refresh_data": {
+                "status": "success",
+                "expected_trade_date": "20260724",
+                "dataset_trade_date": "20260724",
+            },
+            "refresh_daily_basic": {
+                "status": "success",
+                "latest_trade_date": "20260724",
+            },
             "refresh_reference_inputs": {
                 "status": "success",
                 "steps": {"analyst_forecast_snapshot": {"status": "success"}},
@@ -1021,13 +1074,21 @@ def test_same_day_failed_run_can_reuse_completed_source_inputs() -> None:
     assert services._input_resume_ready(status, "all") is False
 
 
-def test_same_day_failed_run_reuses_degraded_analyst_fallback() -> None:
+def test_same_day_failed_run_reuses_degraded_analyst_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_local_market_trade_date", lambda: "20260724")
     status = {
         "status": "failed",
         "started_at": pd.Timestamp.now().isoformat(),
         "result": {
-            "refresh_data": {"status": "success"},
-            "refresh_daily_basic": {"status": "success"},
+            "refresh_data": {
+                "status": "success",
+                "expected_trade_date": "20260724",
+                "dataset_trade_date": "20260724",
+            },
+            "refresh_daily_basic": {
+                "status": "success",
+                "latest_trade_date": "20260724",
+            },
             "refresh_reference_inputs": {
                 "status": "success",
                 "critical_errors": [],

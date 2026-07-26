@@ -59,7 +59,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _process_symbol(args: tuple[str, pd.DataFrame, list[str], pd.Timestamp]) -> pd.DataFrame | None:
+def _process_symbol(
+    args: tuple[str, pd.DataFrame, list[str], pd.Timestamp],
+) -> tuple[pd.DataFrame | None, str | None]:
     path_str, signal_rows, signals, target_date = args
     path = Path(path_str)
     try:
@@ -69,10 +71,13 @@ def _process_symbol(args: tuple[str, pd.DataFrame, list[str], pd.Timestamp]) -> 
         daily = daily.sort_values("date").reset_index(drop=True)
         daily = daily[(daily["date"] >= history_start) & (daily["date"] <= target_date)].reset_index(drop=True)
         if len(daily) < 130 or daily["date"].max() < target_date:
-            return None
+            return None, (
+                f"{path.stem}: insufficient/current daily history "
+                f"rows={len(daily)} latest={daily['date'].max() if not daily.empty else None}"
+            )
         name = str(daily["name"].dropna().iloc[0]) if "name" in daily.columns and daily["name"].notna().any() else ""
         if "ST" in name.upper() or "退" in name:
-            return None
+            return None, f"{path.stem}: target signal belongs to ST/delisting stock"
 
         shared = attach_daily_base_factors(
             daily,
@@ -91,14 +96,15 @@ def _process_symbol(args: tuple[str, pd.DataFrame, list[str], pd.Timestamp]) -> 
 
         row = result[result["date"] == target_date].copy()
         if row.empty:
-            return None
+            return None, f"{path.stem}: missing factor row for {target_date.date()}"
         signal_rows = signal_rows.copy()
         signal_rows["date"] = pd.to_datetime(signal_rows["date"])
         merged = row.merge(signal_rows[["symbol", "date", *signals]], on=["symbol", "date"], how="inner")
-        return merged if not merged.empty else None
+        if merged.empty:
+            return None, f"{path.stem}: signal/factor merge produced no row"
+        return merged, None
     except Exception as exc:
-        print(f"skip {path.name}: {exc}", flush=True)
-        return None
+        return None, f"{path.stem}: {exc}"
 
 
 def build_latest_dataset(daily_dir: Path, signals: list[str], start_date: str, target_date: str | None, workers: int) -> pd.DataFrame:
@@ -107,7 +113,7 @@ def build_latest_dataset(daily_dir: Path, signals: list[str], start_date: str, t
     target_ts = pd.Timestamp(target_date) if target_date else signal_df["date"].max()
     target_rows = signal_df[signal_df["date"] == target_ts].copy()
     if target_rows.empty:
-        return pd.DataFrame(columns=["symbol", "date", *signals])
+        raise RuntimeError(f"No signal candidates found for target date {target_ts.date()}")
 
     by_symbol = {symbol: group[["symbol", "date", *signals]].copy() for symbol, group in target_rows.groupby("symbol")}
     suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
@@ -116,18 +122,32 @@ def build_latest_dataset(daily_dir: Path, signals: list[str], start_date: str, t
         for path in list_partitioned_symbol_paths(daily_dir)
         if path.name.endswith(suffixes) and path.stem in by_symbol
     ]
+    missing_files = sorted(set(by_symbol) - {path.stem for path in files})
+    if missing_files:
+        raise RuntimeError(
+            "Missing canonical daily files for model-scoring candidates: "
+            f"{missing_files[:20]} (count={len(missing_files)})"
+        )
     frames: list[pd.DataFrame] = []
+    errors: list[str] = []
     started = perf_counter()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = [executor.submit(_process_symbol, (str(path), by_symbol[path.stem], signals, target_ts)) for path in files]
         for n, future in enumerate(as_completed(futures), start=1):
-            frame = future.result()
+            frame, error = future.result()
             if frame is not None and len(frame):
                 frames.append(frame)
+            if error:
+                errors.append(error)
             if n % 500 == 0 or n == len(futures):
                 print(f"  latest model scoring features: {n}/{len(futures)} files frames={len(frames)}", flush=True)
+    if errors:
+        raise RuntimeError(
+            "Latest model scoring did not cover every candidate symbol: "
+            f"{errors[:20]} (count={len(errors)}/{len(files)})"
+        )
     if not frames:
-        return pd.DataFrame(columns=["symbol", "date", *signals])
+        raise RuntimeError(f"No model-scoring feature rows produced for {target_ts.date()}")
     data = pd.concat(frames, ignore_index=True).replace([np.inf, -np.inf], np.nan)
     print(f"latest scoring dataset rows={len(data):,} date={target_ts.date()} elapsed={perf_counter() - started:.1f}s", flush=True)
     return data
@@ -154,7 +174,7 @@ def main() -> None:
     models, _ = load_models(signals, args.model_dir, args.output_dir)
     data = build_latest_dataset(args.daily_dir, signals, args.start_date, args.target_date, args.workers)
     data = ensure_model_features(data, models)
-    predicted = add_predictions(data, models, signals) if not data.empty else data
+    predicted = add_predictions(data, models, signals)
     playbook_path = args.output_dir / "latest_z_skill_model_operational_playbook.csv"
     if not playbook_path.exists():
         raise FileNotFoundError(f"Missing model playbook: {playbook_path}")
@@ -164,7 +184,7 @@ def main() -> None:
     result = {
         "status": "success",
         "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "target_date": None if data.empty else pd.to_datetime(data["date"]).max().strftime("%Y-%m-%d"),
+        "target_date": pd.to_datetime(data["date"]).max().strftime("%Y-%m-%d"),
         "candidate_rows": int(len(data)),
         "scored_rows": int(len(scored)),
         "model_pass_rows": int(scored["model_pass"].fillna(False).sum()) if "model_pass" in scored.columns else 0,

@@ -2,6 +2,10 @@
 #
 # 参考“均线系统 + 趋势强度 + 短期动量 + 六脉神剑 + 波段状态”的思路，
 # 用可从 Tushare cb_daily 复现的日线技术因子实现，区别于双低策略。
+release:
+  lifecycle: research_only
+  consumer: scripts.research.backtest_convertible_bond_trend_enhanced
+
 strategy:
   id: cb_trend_enhanced
   name: 可转债趋势增强

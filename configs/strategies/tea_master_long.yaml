@@ -3,6 +3,11 @@
 # Strategy documents:
 #   docs/strategies/tea_master_trading_strategy.md
 #   docs/strategies/tea_master_long_strategy_record.md
+release:
+  lifecycle: production
+  consumer: quant.webapp.services
+  selection_field: strategies[].backtest.variant
+
 strategies:
   - id: tea_master_regime_grid
     name: 茶大长线趋势网格策略

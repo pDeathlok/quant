@@ -184,7 +184,7 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
         "parquet_partitions": 1,
         "table": "market_daily",
         "coverage": {
-            "minimum_rate": 0.97,
+                "minimum_rate": 0.995,
             "expected_symbols": 2,
             "trade_dates": {
                 "20260605": {"symbols": 2, "missing_symbols": 0, "coverage_rate": 1.0},

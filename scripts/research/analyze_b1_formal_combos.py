@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import json
 import os
 from pathlib import Path
 
@@ -12,9 +11,16 @@ from analyze_b1_entry_exit_grid import (
     ExitRule,
     PROJECT_ROOT,
     add_future_prices,
-    predict_models,
     simulate_exit,
     summarize_returns,
+)
+from quant.data.atomic_io import atomic_write_csv, atomic_write_json
+from quant.routine.b1_daily_plan import predict_models as predict_release_models
+from quant.routine.paths import CONFIG_PATH
+from quant.routine.strategies import (
+    ExitConfig,
+    StrategyConfig,
+    load_strategy_release,
 )
 
 
@@ -24,6 +30,10 @@ OUTPUT_DIR = Path(
     os.getenv("B1_FORMAL_OUTPUT_DIR", str(PROJECT_ROOT / "reports/b1/current"))
 ).expanduser().resolve()
 REPORT_PATH = OUTPUT_DIR / "backtest.md"
+RELEASE = load_strategy_release(CONFIG_PATH, include_disabled=True)
+FORMAL_MODEL_DIR = Path(
+    os.getenv("B1_FORMAL_MODEL_DIR", str(PROJECT_ROOT / RELEASE.model_dir))
+).expanduser().resolve()
 
 
 @dataclass(frozen=True)
@@ -38,46 +48,52 @@ class FormalCombo:
     max_down2: float | None = None
 
 
+def _pct(value: float | None) -> str:
+    if value is None:
+        return "0"
+    percent = value * 100
+    return str(int(percent)) if percent.is_integer() else f"{percent:g}"
+
+
+def _exit_rule(config: ExitConfig) -> ExitRule:
+    hold = config.hold_days + 1
+    if config.kind == "expiry":
+        name = f"expiry_T{hold}_close"
+    elif config.kind == "fixed":
+        name = f"fixed_tp{_pct(config.take_profit)}%_sl{_pct(config.stop_loss)}%_T{hold}"
+    elif config.kind == "trailing":
+        name = (
+            f"trail_target{_pct(config.take_profit)}%_dd{_pct(config.trail_drawdown)}%"
+            f"_sl{_pct(config.stop_loss)}%_T{hold}"
+        )
+    else:
+        raise ValueError(f"unsupported formal B1 exit kind: {config.kind}")
+    return ExitRule(
+        name,
+        config.kind,
+        hold_days=config.hold_days,
+        take_profit=config.take_profit,
+        stop_loss=config.stop_loss,
+        trail_drawdown=config.trail_drawdown,
+    )
+
+
+def _formal_combo(strategy: StrategyConfig) -> FormalCombo:
+    return FormalCombo(
+        name=strategy.backtest_combo,
+        description=f"{strategy.name}：{strategy.description}",
+        min_up5=strategy.entry.min_up5,
+        min_up8=strategy.entry.min_up8,
+        min_up10=strategy.entry.min_up10,
+        max_down2=strategy.entry.max_down2,
+        max_down3=strategy.entry.max_down3,
+        exit_rule=_exit_rule(strategy.exit),
+    )
+
+
 COMBOS = [
-    FormalCombo(
-        name="stable_up10_020_down3_040_fixed8_sl15_T5",
-        description="稳健版：pred_up10_es>=0.20 + pred_down3_es<=0.40 + 8%止盈 + 1.5%止损 + T+5到期",
-        min_up8=None,
-        min_up10=0.20,
-        max_down3=0.40,
-        exit_rule=ExitRule(
-            "fixed_tp8%_sl1.5%_T5",
-            "fixed",
-            hold_days=4,
-            take_profit=0.08,
-            stop_loss=0.015,
-        ),
-    ),
-    FormalCombo(
-        name="aggressive_up8_070_down3_045_expiry_T9",
-        description="进攻版：pred_up8_es>=0.70 + pred_down3_es<=0.45 + T+9收盘到期退出",
-        min_up8=0.70,
-        max_down3=0.45,
-        exit_rule=ExitRule(
-            "expiry_T9_close",
-            "expiry",
-            hold_days=8,
-        ),
-    ),
-    FormalCombo(
-        name="baseline_up8_055_trail5_dd2_sl2_T9",
-        description="对照基准：pred_up8_es>=0.55 + 5%目标后2%回撤止盈 + 2%止损 + T+9到期",
-        min_up8=0.55,
-        max_down3=None,
-        exit_rule=ExitRule(
-            "trail_target5%_dd2%_sl2%_T9",
-            "trailing",
-            hold_days=8,
-            take_profit=0.05,
-            stop_loss=0.02,
-            trail_drawdown=0.02,
-        ),
-    ),
+    _formal_combo(strategy)
+    for strategy in RELEASE.strategies
 ]
 
 
@@ -124,10 +140,23 @@ def main() -> None:
     candidates = pd.read_parquet(CANDIDATE_PATH)
     candidates["date"] = pd.to_datetime(candidates["date"])
     candidates = candidates[candidates["date"] >= pd.Timestamp("2024-01-01")].copy()
-    candidates = predict_models(candidates)
+    candidates = predict_release_models(
+        candidates,
+        model_dir=FORMAL_MODEL_DIR,
+        model_names=RELEASE.model_names,
+    )
+    candidates["pred_up10"] = candidates["pred_up10_es"]
+    candidates["entry_score"] = (
+        0.60 * candidates["pred_up8_es"]
+        + 0.30 * candidates["pred_up10_es"]
+        - 0.35 * candidates["pred_down3_es"]
+    )
 
     compatibility = {
         "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "release_id": RELEASE.id,
+        "strategy_config": str(CONFIG_PATH),
+        "model_dir": str(FORMAL_MODEL_DIR),
         "candidate_rows": int(len(candidates)),
         "candidate_date_min": str(candidates["date"].min().date()),
         "candidate_date_max": str(candidates["date"].max().date()),
@@ -142,14 +171,10 @@ def main() -> None:
             "retrain and recalibrate before publishing a replacement backtest."
         )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        (OUTPUT_DIR / "model_compatibility_audit.json").write_text(
-            json.dumps(compatibility, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        atomic_write_json(compatibility, OUTPUT_DIR / "model_compatibility_audit.json")
         raise RuntimeError(compatibility["reason"])
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / "model_compatibility_audit.json").write_text(
-        json.dumps(compatibility, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    atomic_write_json(compatibility, OUTPUT_DIR / "model_compatibility_audit.json")
 
     print("adding future prices")
     candidates = add_future_prices(candidates, DAILY_DIR, max_hold_days=8)
@@ -221,16 +246,14 @@ def main() -> None:
     if not all(item["passed"] for item in oot_validation.values()):
         compatibility["status"] = "incompatible"
         compatibility["reason"] = "Calibrated formal strategies failed the OOT return gate."
-    (OUTPUT_DIR / "model_compatibility_audit.json").write_text(
-        json.dumps(compatibility, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    atomic_write_json(compatibility, OUTPUT_DIR / "model_compatibility_audit.json")
     if compatibility["status"] != "valid":
         raise RuntimeError(compatibility["reason"])
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     summary_path = OUTPUT_DIR / "summary.csv"
     detail_path = OUTPUT_DIR / "trades.csv"
-    summary.to_csv(summary_path, index=False)
-    details.to_csv(detail_path, index=False)
+    atomic_write_csv(summary, summary_path, index=False)
+    atomic_write_csv(details, detail_path, index=False)
 
     oot = summary[summary["period"] == "oot_2025plus"].copy()
     display_cols = [

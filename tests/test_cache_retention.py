@@ -148,6 +148,59 @@ def test_cleanup_daily_caches_keeps_two_complete_long_cache_versions(tmp_path: P
     assert summary["long_strategy"]["deleted_files"] == 2
 
 
+def test_cleanup_daily_caches_removes_cb_requests_covered_by_consolidated_data(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data/convertible_bond/tushare"
+    _write_with_mtime(
+        data_dir / "cb_daily_20200101_20260714.parquet",
+        datetime(2026, 7, 15),
+    )
+    covered = data_dir / "tushare_cache/tushare_cb_daily_20260714_all_all_all.parquet"
+    outside = data_dir / "tushare_cache/tushare_cb_daily_20191231_all_all_all.parquet"
+    _write_with_mtime(covered, datetime(2026, 7, 14), size=51)
+    _write_with_mtime(outside, datetime(2026, 7, 14), size=52)
+
+    summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
+
+    assert not covered.exists()
+    assert outside.exists()
+    assert summary["convertible_bond_request_cache"]["deleted_files"] == 1
+    assert summary["convertible_bond_request_cache"][
+        "protected_outside_consolidated_range"
+    ] == 1
+    assert summary["convertible_bond_request_cache"]["reclaimed_bytes"] == 51
+
+
+def test_cleanup_daily_caches_caps_and_hardlinks_b1_research_reports(
+    tmp_path: Path,
+) -> None:
+    report_dir = tmp_path / "reports/b1/research/xgb_project_vars_strategy"
+    oldest = report_dir / "z_skill_trade_samples_20260712_120000.csv"
+    previous = report_dir / "z_skill_trade_samples_20260713_120000.csv"
+    newest = report_dir / "z_skill_trade_samples_20260714_120000.csv"
+    latest = report_dir / "latest_z_skill_trade_samples.csv"
+    _write_with_mtime(oldest, datetime(2026, 7, 12), size=11)
+    _write_with_mtime(previous, datetime(2026, 7, 13), size=12)
+    _write_with_mtime(newest, datetime(2026, 7, 14), size=13)
+    _write_with_mtime(latest, datetime(2026, 7, 14), size=13)
+
+    summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
+
+    assert not oldest.exists()
+    assert not previous.exists()
+    assert newest.exists()
+    assert latest.exists()
+    assert (latest.stat().st_dev, latest.stat().st_ino) == (
+        newest.stat().st_dev,
+        newest.stat().st_ino,
+    )
+    reports = summary["b1_research_reports"]
+    assert reports["deleted_files"] == 2
+    assert reports["linked_latest_files"] == 1
+    assert reports["reclaimed_bytes"] == 36
+
+
 def test_cleanup_daily_caches_caps_snapshot_versions_and_keeps_newest_old_result(
     tmp_path: Path,
 ) -> None:
