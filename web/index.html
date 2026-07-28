@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v3" />
   </head>
   <body>
     <div class="app selector-app">
@@ -878,6 +878,7 @@
     <div id="watchlistContextMenu" class="watchlist-context-menu" role="menu" hidden>
       <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
       <button type="button" role="menuitem" data-watchlist-context-pin hidden>置顶</button>
+      <button type="button" role="menuitem" data-watchlist-context-alert hidden>设置提醒</button>
     </div>
     <div id="watchlistToast" class="watchlist-toast" role="status" aria-live="polite"></div>
     <div id="similarNoteTooltip" class="similar-note-tooltip" role="tooltip" hidden>
@@ -906,6 +907,33 @@
         </div>
       </form>
     </dialog>
-    <script src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1"></script>
+    <dialog id="watchlistAlertDialog" class="watchlist-alert-dialog" aria-labelledby="watchlistAlertTitle">
+      <form id="watchlistAlertForm" method="dialog">
+        <div class="watchlist-alert-dialog-head">
+          <div>
+            <p class="eyebrow">Watchlist Alert</p>
+            <h3 id="watchlistAlertTitle">设置提醒</h3>
+            <p id="watchlistAlertMeta" class="subline"></p>
+          </div>
+          <button id="watchlistAlertClose" class="similar-note-close" type="button" aria-label="关闭提醒设置">×</button>
+        </div>
+        <div class="watchlist-alert-options">
+          <label class="watchlist-alert-enabled">
+            <input id="watchlistAlertEnabled" type="checkbox" checked />
+            <span>启用提醒</span>
+          </label>
+          <button type="button" data-watchlist-alert-add-reminder>＋ 添加提醒</button>
+        </div>
+        <div id="watchlistAlertReminders" class="watchlist-alert-reminders"></div>
+        <div class="watchlist-alert-dialog-actions">
+          <span>每只股票最多 20 个提醒，每个提醒最多 20 条条件；从第二行开始选择 AND/OR。</span>
+          <div>
+            <button type="button" data-dialog-secondary id="watchlistAlertCancel">取消</button>
+            <button id="watchlistAlertSave" type="submit">保存提醒</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+    <script src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v3"></script>
   </body>
 </html>

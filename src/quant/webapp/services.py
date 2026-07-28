@@ -16,7 +16,7 @@ import threading
 import traceback
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -249,6 +249,11 @@ LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 40
 _REFRESH_LOCK = threading.Lock()
 _REFRESH_CONTEXT = threading.local()
 _REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
+_SIMILAR_PATTERN_REFRESH_GUARD = threading.Lock()
+_SIMILAR_PATTERN_REFRESH_INFLIGHT: tuple[
+    tuple[tuple[str, ...], bool],
+    Future[dict[str, Any]],
+] | None = None
 _REFRESH_STATUS: dict[str, Any] = {
     "status": "idle",
     "run_id": None,
@@ -340,6 +345,19 @@ SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR = 15
 SIMILAR_PATTERN_VECTOR_CACHE_METADATA = "_refresh_metadata.json"
 CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH = PROJECT_ROOT / "data/routine/convertible_bond_allotments_latest.json"
 SIMILAR_PATTERN_DEFAULT_WATCHLIST = ["002594.SZ", "002788.SZ"]
+WATCHLIST_ALERT_INDICATORS = {
+    "ret_20d",
+    "drawdown_60d",
+    "vol_ratio20",
+    "dist_ma20",
+    "dist_ma60",
+    "opportunity_score",
+    "holding_score",
+}
+WATCHLIST_ALERT_OPERATORS = {"gt", "eq", "lt"}
+WATCHLIST_ALERT_MAX_REMINDERS = 20
+WATCHLIST_ALERT_MAX_CONDITIONS = 20
+WATCHLIST_ALERT_NOTE_MAX_LENGTH = 1_000
 SIMILAR_PATTERN_CONFIG = SimilarPatternConfig(
     candidate_step_days=5,
     candidate_start_date="2018-01-01",
@@ -2926,8 +2944,138 @@ def _stock_profile_from_basic(symbol: str, basic: pd.DataFrame | None = None) ->
     return {"symbol": symbol, "name": symbol, "industry": ""}
 
 
+def _normalize_watch_alert_conditions(
+    raw_conditions: Any,
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw_conditions, list):
+        if strict:
+            raise ValueError("提醒条件必须是列表")
+        return []
+    if len(raw_conditions) > WATCHLIST_ALERT_MAX_CONDITIONS:
+        if strict:
+            raise ValueError(f"每个提醒最多设置 {WATCHLIST_ALERT_MAX_CONDITIONS} 条条件")
+        raw_conditions = raw_conditions[:WATCHLIST_ALERT_MAX_CONDITIONS]
+
+    normalized: list[dict[str, Any]] = []
+    for index, raw_condition in enumerate(raw_conditions):
+        if not isinstance(raw_condition, dict):
+            if strict:
+                raise ValueError("提醒条件格式无效")
+            continue
+        kind = str(raw_condition.get("kind") or "")
+        if kind not in {"price", "indicator"}:
+            if strict:
+                raise ValueError("提醒条件类型必须是价格或指标")
+            continue
+        operator = str(raw_condition.get("operator") or "")
+        if operator not in WATCHLIST_ALERT_OPERATORS:
+            if strict:
+                raise ValueError("提醒条件运算符无效")
+            continue
+        conjunction = str(raw_condition.get("conjunction") or "and").lower()
+        if conjunction not in {"and", "or"}:
+            if strict:
+                raise ValueError("条件关系必须是 and 或 or")
+            conjunction = "and"
+        try:
+            value = float(raw_condition.get("value"))
+        except (TypeError, ValueError):
+            if strict:
+                raise ValueError("提醒阈值必须是数字")
+            continue
+        if not np.isfinite(value) or (kind == "price" and value <= 0):
+            if strict:
+                raise ValueError("价格阈值必须大于 0" if kind == "price" else "指标阈值必须是有限数字")
+            continue
+        condition_id = str(raw_condition.get("id") or f"condition-{index + 1}").strip()[:64]
+        condition: dict[str, Any] = {
+            "id": condition_id or f"condition-{index + 1}",
+            "conjunction": "and" if index == 0 else conjunction,
+            "kind": kind,
+            "operator": operator,
+            "value": value,
+        }
+        if kind == "indicator":
+            indicator = str(raw_condition.get("indicator") or "")
+            if indicator not in WATCHLIST_ALERT_INDICATORS:
+                if strict:
+                    raise ValueError("不支持该指标提醒")
+                continue
+            condition["indicator"] = indicator
+        normalized.append(condition)
+    return normalized
+
+
+def _normalize_watch_alert_reminders(
+    raw_reminders: Any,
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw_reminders, list):
+        if strict:
+            raise ValueError("提醒列表格式无效")
+        return []
+    if len(raw_reminders) > WATCHLIST_ALERT_MAX_REMINDERS:
+        if strict:
+            raise ValueError(f"每只股票最多设置 {WATCHLIST_ALERT_MAX_REMINDERS} 个提醒")
+        raw_reminders = raw_reminders[:WATCHLIST_ALERT_MAX_REMINDERS]
+
+    normalized: list[dict[str, Any]] = []
+    for index, raw_reminder in enumerate(raw_reminders):
+        if not isinstance(raw_reminder, dict):
+            if strict:
+                raise ValueError("提醒格式无效")
+            continue
+        note = str(raw_reminder.get("note") or "").strip()
+        if len(note) > WATCHLIST_ALERT_NOTE_MAX_LENGTH:
+            if strict:
+                raise ValueError(f"提醒备注不能超过 {WATCHLIST_ALERT_NOTE_MAX_LENGTH} 个字符")
+            note = note[:WATCHLIST_ALERT_NOTE_MAX_LENGTH]
+        conditions = _normalize_watch_alert_conditions(
+            raw_reminder.get("conditions", []),
+            strict=strict,
+        )
+        if not conditions:
+            if strict:
+                raise ValueError("每个提醒至少需要一个条件")
+            continue
+        reminder_id = str(raw_reminder.get("id") or f"reminder-{index + 1}").strip()[:64]
+        normalized.append(
+            {
+                "id": reminder_id or f"reminder-{index + 1}",
+                "note": note,
+                "conditions": conditions,
+            }
+        )
+    return normalized
+
+
+def _normalize_watch_alert_config(raw_config: Any, *, strict: bool = False) -> dict[str, Any]:
+    if not isinstance(raw_config, dict):
+        if strict:
+            raise ValueError("提醒设置格式无效")
+        raw_config = {}
+    reminders = _normalize_watch_alert_reminders(
+        raw_config.get("reminders", []),
+        strict=strict,
+    )
+    updated_at = str(raw_config.get("updated_at") or "")
+    return {
+        "enabled": bool(raw_config.get("enabled", True)) and bool(reminders),
+        "reminders": reminders,
+        "updated_at": updated_at,
+    }
+
+
 def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
-    default = {"symbols": list(SIMILAR_PATTERN_DEFAULT_WATCHLIST), "notes": {}, "pinned": []}
+    default = {
+        "symbols": list(SIMILAR_PATTERN_DEFAULT_WATCHLIST),
+        "notes": {},
+        "pinned": [],
+        "alerts": {},
+    }
     if not SIMILAR_PATTERN_WATCHLIST_PATH.exists():
         return default
     try:
@@ -2964,8 +3112,15 @@ def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
     raw_pinned = payload.get("pinned", []) if isinstance(payload, dict) else []
     pinned_values = raw_pinned if isinstance(raw_pinned, list) else []
     pinned = [symbol for symbol in symbols if symbol in {str(item).strip().upper().replace("_", ".") for item in pinned_values}]
+    raw_alerts = payload.get("alerts", {}) if isinstance(payload, dict) else {}
+    alerts = {}
+    if isinstance(raw_alerts, dict):
+        for symbol in symbols:
+            alert_config = _normalize_watch_alert_config(raw_alerts.get(symbol, {}))
+            if alert_config["reminders"]:
+                alerts[symbol] = alert_config
     ordered_symbols = pinned + [symbol for symbol in symbols if symbol not in pinned]
-    return {"symbols": ordered_symbols, "notes": notes, "pinned": pinned}
+    return {"symbols": ordered_symbols, "notes": notes, "pinned": pinned, "alerts": alerts}
 
 
 def _read_similar_pattern_watchlist_symbols() -> list[str]:
@@ -2982,6 +3137,11 @@ def _write_similar_pattern_watchlist_state(state: dict[str, Any]) -> None:
     SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     symbols = list(dict.fromkeys(state.get("symbols", [])))
     pinned_set = set(state.get("pinned", []))
+    alerts = {}
+    for symbol in symbols:
+        alert_config = _normalize_watch_alert_config(state.get("alerts", {}).get(symbol, {}))
+        if alert_config["reminders"]:
+            alerts[symbol] = alert_config
     payload = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "symbols": symbols,
@@ -2991,6 +3151,7 @@ def _write_similar_pattern_watchlist_state(state: dict[str, Any]) -> None:
             for symbol in symbols
             if symbol in state["notes"]
         },
+        "alerts": alerts,
     }
     SIMILAR_PATTERN_WATCHLIST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -3005,6 +3166,13 @@ def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> li
         profile["note"] = note.get("content", "")
         profile["note_updated_at"] = note.get("updated_at", "")
         profile["pinned"] = symbol in state["pinned"]
+        alert_config = _normalize_watch_alert_config(state["alerts"].get(symbol, {}))
+        profile["alerts"] = alert_config
+        profile["alert_count"] = len(alert_config["reminders"])
+        profile["alert_condition_count"] = sum(
+            len(reminder["conditions"])
+            for reminder in alert_config["reminders"]
+        )
         profile.update(scores.get(symbol, {}))
         profiles.append(profile)
     return profiles
@@ -3045,6 +3213,7 @@ def remove_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
     state["symbols"] = [item for item in state["symbols"] if item != normalized]
     state["pinned"] = [item for item in state["pinned"] if item != normalized]
     state["notes"].pop(normalized, None)
+    state["alerts"].pop(normalized, None)
     _write_similar_pattern_watchlist_state(state)
     return get_similar_pattern_watchlist()
 
@@ -3096,6 +3265,21 @@ def save_similar_pattern_watch_note(symbol: str, content: str) -> dict[str, Any]
         }
     else:
         state["notes"].pop(normalized, None)
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def save_similar_pattern_watch_alerts(symbol: str, config: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        raise ValueError(f"股票不在自选池中: {normalized}")
+    cleaned = _normalize_watch_alert_config(config, strict=True)
+    if cleaned["reminders"]:
+        cleaned["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        state["alerts"][normalized] = cleaned
+    else:
+        state["alerts"].pop(normalized, None)
     _write_similar_pattern_watchlist_state(state)
     return get_similar_pattern_watchlist()
 
@@ -3341,8 +3525,12 @@ def _attach_watchlist_strategy_hits(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def refresh_similar_pattern_analysis(progress_callback=None, *, force_vector_cache: bool = False) -> dict[str, Any]:
-    symbols = _read_similar_pattern_watchlist_symbols()
+def _refresh_similar_pattern_analysis_once(
+    symbols: list[str],
+    progress_callback=None,
+    *,
+    force_vector_cache: bool = False,
+) -> dict[str, Any]:
     basic = _stock_basic_for_similar_patterns()
     source_trade_date = _latest_similar_pattern_target_date(symbols)
     cache_schedule = _similar_pattern_vector_cache_refresh_decision(
@@ -3477,6 +3665,70 @@ def refresh_similar_pattern_analysis(progress_callback=None, *, force_vector_cac
     return payload
 
 
+def refresh_similar_pattern_analysis(
+    progress_callback=None,
+    *,
+    force_vector_cache: bool = False,
+) -> dict[str, Any]:
+    """Run one analysis per watchlist revision and share it with concurrent callers."""
+    global _SIMILAR_PATTERN_REFRESH_INFLIGHT
+
+    requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
+    requested_key = (requested_symbols, bool(force_vector_cache))
+
+    while True:
+        with _SIMILAR_PATTERN_REFRESH_GUARD:
+            active = _SIMILAR_PATTERN_REFRESH_INFLIGHT
+            if active is None:
+                future: Future[dict[str, Any]] = Future()
+                _SIMILAR_PATTERN_REFRESH_INFLIGHT = (requested_key, future)
+                owner = True
+                active_key = requested_key
+            else:
+                active_key, future = active
+                owner = False
+
+        if owner:
+            try:
+                payload = _refresh_similar_pattern_analysis_once(
+                    list(requested_symbols),
+                    progress_callback=progress_callback,
+                    force_vector_cache=force_vector_cache,
+                )
+            except BaseException as exc:
+                future.set_exception(exc)
+                raise
+            else:
+                future.set_result(payload)
+                return payload
+            finally:
+                with _SIMILAR_PATTERN_REFRESH_GUARD:
+                    if (
+                        _SIMILAR_PATTERN_REFRESH_INFLIGHT is not None
+                        and _SIMILAR_PATTERN_REFRESH_INFLIGHT[1] is future
+                    ):
+                        _SIMILAR_PATTERN_REFRESH_INFLIGHT = None
+
+        if active_key == requested_key:
+            payload = future.result()
+            return {
+                **payload,
+                "cache": {
+                    **(payload.get("cache") or {}),
+                    "coalesced": True,
+                },
+            }
+
+        # A different watchlist revision is being calculated. Let it finish,
+        # then re-read the latest revision and start or join its refresh.
+        try:
+            future.result()
+        except Exception:
+            pass
+        requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
+        requested_key = (requested_symbols, bool(force_vector_cache))
+
+
 def _similar_patterns_worker(result_queue: mp.Queue) -> None:
     def emit_progress(message: str) -> None:
         result_queue.put({"type": "progress", "message": message})
@@ -3557,12 +3809,23 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
         ]
         watchlist_symbols = _read_similar_pattern_watchlist_symbols()
         if cached is not None:
+            result_by_symbol = {
+                str(item.get("target", {}).get("symbol") or "").upper(): item
+                for item in cached.get("results", [])
+                if item.get("target", {}).get("symbol")
+            }
+            cached["results"] = [
+                result_by_symbol[symbol]
+                for symbol in watchlist_symbols
+                if symbol in result_by_symbol
+            ]
             cached = _attach_watchlist_strategy_hits(cached)
             cached["watchlist"] = _similar_pattern_watchlist_profiles(
                 _stock_basic_for_similar_patterns()
             )
             cached.setdefault("config", {}).update(_similarity_score_config())
             cached["cache"] = {
+                **(cached.get("cache") or {}),
                 "hit": True,
                 "backend": "json",
                 "stale": not _is_daily_payload_current(cached),

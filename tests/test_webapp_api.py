@@ -1415,6 +1415,62 @@ def test_similar_pattern_refresh_rejects_missing_watchlist_targets(monkeypatch, 
         services.refresh_similar_pattern_analysis()
 
 
+def test_similar_pattern_refresh_coalesces_concurrent_requests(monkeypatch) -> None:
+    read_count = 0
+    compute_count = 0
+    read_lock = threading.Lock()
+    second_request_started = threading.Event()
+    computation_started = threading.Event()
+    release_computation = threading.Event()
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    monkeypatch.setattr(services, "_SIMILAR_PATTERN_REFRESH_INFLIGHT", None)
+
+    def fake_symbols() -> list[str]:
+        nonlocal read_count
+        with read_lock:
+            read_count += 1
+            if read_count >= 2:
+                second_request_started.set()
+        return ["002594.SZ"]
+
+    def fake_refresh_once(symbols, progress_callback=None, *, force_vector_cache=False):
+        nonlocal compute_count
+        compute_count += 1
+        computation_started.set()
+        assert release_computation.wait(timeout=3)
+        return {
+            "generated_at": "2026-07-28T13:21:53",
+            "results": [{"target": {"symbol": symbols[0]}}],
+            "cache": {"backend": "generated"},
+        }
+
+    monkeypatch.setattr(services, "_read_similar_pattern_watchlist_symbols", fake_symbols)
+    monkeypatch.setattr(services, "_refresh_similar_pattern_analysis_once", fake_refresh_once)
+
+    def invoke_refresh() -> None:
+        try:
+            results.append(services.refresh_similar_pattern_analysis())
+        except BaseException as exc:  # pragma: no cover - diagnostic collection
+            errors.append(exc)
+
+    first = threading.Thread(target=invoke_refresh)
+    second = threading.Thread(target=invoke_refresh)
+    first.start()
+    assert computation_started.wait(timeout=3)
+    second.start()
+    assert second_request_started.wait(timeout=3)
+    release_computation.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+
+    assert errors == []
+    assert compute_count == 1
+    assert len(results) == 2
+    assert sum(bool(item["cache"].get("coalesced")) for item in results) == 1
+
+
 def test_similar_pattern_weekly_library_waits_for_friday_close_after_seven_days(
     monkeypatch,
     tmp_path,
@@ -1777,6 +1833,176 @@ def test_watchlist_note_rejects_stock_outside_watchlist(monkeypatch, tmp_path) -
         services.save_similar_pattern_watch_note("000001.SZ", "观察")
 
 
+def test_watchlist_independent_reminders_with_notes_are_persisted(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        '{"symbols":["002594.SZ"],"notes":{},"pinned":[]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(
+            [{"ts_code": "002594.SZ", "name": "比亚迪", "industry": "汽车整车"}]
+        ),
+    )
+    monkeypatch.setattr(services, "_watchlist_buy_hold_scores", lambda symbols: {})
+
+    payload = services.save_similar_pattern_watch_alerts(
+        "002594.SZ",
+        {
+            "enabled": True,
+            "reminders": [
+                {
+                    "id": "reminder-1",
+                    "note": "突破前高并放量",
+                    "conditions": [
+                        {
+                            "id": "price-high",
+                            "conjunction": "and",
+                            "kind": "price",
+                            "operator": "gt",
+                            "value": 118.5,
+                        },
+                        {
+                            "id": "volume",
+                            "conjunction": "and",
+                            "kind": "indicator",
+                            "indicator": "vol_ratio20",
+                            "operator": "gt",
+                            "value": 1.8,
+                        },
+                    ],
+                },
+                {
+                    "id": "reminder-2",
+                    "note": "回撤或评分进入关注区",
+                    "conditions": [
+                        {
+                            "id": "drawdown",
+                            "conjunction": "and",
+                            "kind": "indicator",
+                            "indicator": "drawdown_60d",
+                            "operator": "lt",
+                            "value": -8,
+                        },
+                        {
+                            "id": "buy-score",
+                            "conjunction": "or",
+                            "kind": "indicator",
+                            "indicator": "opportunity_score",
+                            "operator": "gt",
+                            "value": 75,
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+
+    alerts = payload["stocks"][0]["alerts"]
+    persisted = json.loads(watchlist_path.read_text(encoding="utf-8"))
+    assert alerts["enabled"] is True
+    assert len(alerts["reminders"]) == 2
+    assert alerts["reminders"][0]["note"] == "突破前高并放量"
+    assert alerts["reminders"][1]["conditions"][1]["conjunction"] == "or"
+    assert alerts["updated_at"]
+    assert payload["stocks"][0]["alert_count"] == 2
+    assert payload["stocks"][0]["alert_condition_count"] == 4
+    assert persisted["alerts"]["002594.SZ"]["reminders"][0]["conditions"][1]["indicator"] == "vol_ratio20"
+
+
+def test_watchlist_alert_api_accepts_reminder_notes_and_condition_logic(monkeypatch) -> None:
+    captured = {}
+
+    def fake_save(symbol, config):
+        captured.update({"symbol": symbol, "config": config})
+        return {"stocks": []}
+
+    monkeypatch.setattr(webapp_api, "save_similar_pattern_watch_alerts", fake_save)
+    response = client.put(
+        "/api/similar-patterns/watchlist/002594.SZ/alerts",
+        json={
+            "enabled": True,
+            "reminders": [
+                {
+                    "id": "reminder-1",
+                    "note": "价格或涨幅满足",
+                    "conditions": [
+                        {
+                            "id": "p1",
+                            "conjunction": "and",
+                            "kind": "price",
+                            "operator": "gt",
+                            "value": 120,
+                        },
+                        {
+                            "id": "i1",
+                            "conjunction": "or",
+                            "kind": "indicator",
+                            "indicator": "ret_20d",
+                            "operator": "lt",
+                            "value": -5,
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    invalid = client.put(
+        "/api/similar-patterns/watchlist/002594.SZ/alerts",
+        json={
+            "reminders": [
+                {
+                    "id": "bad",
+                    "conditions": [
+                        {
+                            "id": "bad-condition",
+                            "kind": "price",
+                            "operator": "gte",
+                            "value": 100,
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["symbol"] == "002594.SZ"
+    assert captured["config"]["reminders"][0]["note"] == "价格或涨幅满足"
+    assert captured["config"]["reminders"][0]["conditions"][1]["conjunction"] == "or"
+    assert captured["config"]["reminders"][0]["conditions"][1]["indicator"] == "ret_20d"
+    assert invalid.status_code == 422
+
+
+def test_legacy_watchlist_alert_shape_is_discarded(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        json.dumps(
+            {
+                "symbols": ["002594.SZ"],
+                "alerts": {
+                    "002594.SZ": {
+                        "enabled": True,
+                        "logic": "and",
+                        "price_rules": [{"id": "old", "operator": "gte", "value": 100}],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+
+    state = services._read_similar_pattern_watchlist_state()
+
+    assert state["alerts"] == {}
+
+
 def test_watchlist_order_and_pins_are_persisted(monkeypatch, tmp_path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(
@@ -1935,6 +2161,45 @@ def test_similar_pattern_tab_serves_stale_cache_without_blocking_refresh(monkeyp
     assert calls == []
     assert payload["generated_at"].startswith("2026-06-28")
     assert payload["cache"]["stale"] is True
+
+
+def test_similar_pattern_cache_filters_results_removed_from_watchlist(monkeypatch) -> None:
+    monkeypatch.setattr(
+        services,
+        "_read_similar_pattern_analysis_cache",
+        lambda: {
+            "generated_at": "2026-07-28T13:21:53",
+            "results": [
+                {"target": {"symbol": "002594.SZ"}},
+                {"target": {"symbol": "000792.SZ"}},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        services,
+        "_read_similar_pattern_watchlist_symbols",
+        lambda: ["002594.SZ"],
+    )
+    monkeypatch.setattr(
+        services,
+        "_similar_pattern_watchlist_profiles",
+        lambda basic=None: [{"symbol": "002594.SZ"}],
+    )
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        services,
+        "_attach_watchlist_strategy_hits",
+        lambda payload: payload,
+    )
+
+    payload = services.get_similar_pattern_analysis()
+
+    assert [item["target"]["symbol"] for item in payload["results"]] == ["002594.SZ"]
+    assert payload["cache"]["watchlist_changed"] is True
 
 
 def test_vector_cache_builder_uses_thread_pool_in_daemon_process(monkeypatch, tmp_path) -> None:

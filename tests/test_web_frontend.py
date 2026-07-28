@@ -59,6 +59,18 @@ def test_watchlist_stocks_have_persistent_note_editor() -> None:
     assert ".similar-note-dialog" in STYLES_CSS
 
 
+def test_watchlist_mutations_keep_previous_analysis_during_background_refresh() -> None:
+    assert "similarRefreshPromise: null" in APP_JS
+    assert "similarPendingRemovals: new Set()" in APP_JS
+    assert "function mergeSimilarPayloadWithWatchlist" in APP_JS
+    assert "正在后台刷新，当前显示上次结果" in APP_JS
+    assert "if (state.similarRefreshPromise) return state.similarRefreshPromise;" in APP_JS
+    assert "if (state.similarPendingRemovals.has(symbol)) return;" in APP_JS
+    assert "const SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS = 45 * 60 * 1000;" in APP_JS
+    assert "timeoutMs: SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS" in APP_JS
+    assert "state.similarPayload = null;" not in APP_JS
+
+
 def test_strategy_watchlist_add_includes_default_source_note() -> None:
     assert "function compactWatchlistDate(value)" in APP_JS
     assert "function watchlistSourceNote(dateValue, sourceText)" in APP_JS
@@ -104,12 +116,42 @@ def test_watchlist_rows_support_persistent_drag_order_and_pin_menu() -> None:
     assert 'await fetchJson("/similar-patterns/watchlist/order", {' in APP_JS
     assert '/pin`, {' in APP_JS
     assert 'data-watchlist-pinned="${item.pinned ? "true" : "false"}"' in APP_JS
-    assert 'title="按住拖动排序；右键可置顶"' in APP_JS
+    assert 'title="按住拖动排序；右键可置顶或设置提醒"' in APP_JS
     assert "function reorderSimilarWatchRows(sourceSymbol, targetSymbol, placeAfter = false)" in APP_JS
     assert 'event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)' in APP_JS
     assert "data-watchlist-context-pin" in INDEX_HTML
     assert ".similar-stock-cell .watchlist-pin-badge" in STYLES_CSS
     assert "20260720-watchlist-reorder-v5" in INDEX_HTML
+
+
+def test_watchlist_context_menu_opens_multi_condition_alert_dialog() -> None:
+    assert "data-watchlist-context-alert" in INDEX_HTML
+    assert 'id="watchlistAlertDialog"' in INDEX_HTML
+    assert 'id="watchlistAlertReminders"' in INDEX_HTML
+    assert "data-watchlist-alert-add-reminder" in INDEX_HTML
+    assert "data-alert-reminder-note" in APP_JS
+    assert "data-alert-condition-kind" in APP_JS
+    assert "data-alert-condition-conjunction" in APP_JS
+    assert "data-alert-condition-operator" in APP_JS
+    assert "data-alert-condition-add" in APP_JS
+    assert "AND · 并且" in APP_JS
+    assert "OR · 或者" in APP_JS
+    assert "大于 ＞" in APP_JS
+    assert "等于 ＝" in APP_JS
+    assert "小于 ＜" in APP_JS
+    assert "/alerts`, {" in APP_JS
+    assert "function evaluateWatchlistAlert(item" in APP_JS
+    assert "watchlistAlertBell(item, alertState)" in APP_JS
+    assert "data-watchlist-alert-bell" in APP_JS
+    assert "openWatchlistAlertDialog(alertBell.dataset.watchlistAlertBell)" in APP_JS
+    assert "announceTriggeredWatchlistAlerts" not in APP_JS
+    assert "提醒已触发：" not in APP_JS
+    assert ".watchlist-alert-dialog" in STYLES_CSS
+    assert ".watchlist-alert-reminder-note" in STYLES_CSS
+    assert ".watchlist-alert-condition-actions" in STYLES_CSS
+    assert ".watchlist-alert-bell.triggered" in STYLES_CSS
+    assert ".watchlist-alert-bell-body" in STYLES_CSS
+    assert "watchlist-alerts-v3" in INDEX_HTML
 
 
 def test_similar_cases_explain_and_display_forecast_weight_ranking() -> None:

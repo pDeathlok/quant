@@ -32,10 +32,22 @@ const state = {
   similarLoading: false,
   similarError: "",
   similarSelectedSymbol: null,
+  similarRefreshPromise: null,
+  similarPendingRemovals: new Set(),
   loading: false,
 };
 
 const API_BASE = "/api";
+const SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS = 45 * 60 * 1000;
+const WATCHLIST_ALERT_INDICATORS = {
+  ret_20d: { label: "20日涨跌幅", unit: "%", source: "snapshot" },
+  drawdown_60d: { label: "60日回撤", unit: "%", source: "snapshot" },
+  vol_ratio20: { label: "20日量比", unit: "倍", source: "snapshot" },
+  dist_ma20: { label: "距20日均线", unit: "%", source: "snapshot" },
+  dist_ma60: { label: "距60日均线", unit: "%", source: "snapshot" },
+  opportunity_score: { label: "买入评分", unit: "分", source: "watchlist" },
+  holding_score: { label: "持有评分", unit: "分", source: "watchlist" },
+};
 const REFRESH_STATUS_STORAGE_KEY = "quant.selector.latestRefreshStatus";
 const BYD_HOLDING_STORAGE_KEY = "quant.byd.holding.v1";
 const WORKSPACE_TAB_ORDER_STORAGE_KEY = "quant.workspaceTabOrder.v1";
@@ -710,27 +722,45 @@ async function loadSelector(options = {}) {
   }
 }
 
-async function loadSimilarPatterns(options = {}) {
+function mergeSimilarPayloadWithWatchlist(payload, watchlist) {
+  const stocks = Array.isArray(watchlist) ? watchlist : [];
+  const symbols = new Set(stocks.map((item) => item.symbol));
+  return {
+    ...(payload || {}),
+    watchlist: stocks,
+    results: (payload?.results || []).filter((item) => symbols.has(item.target?.symbol)),
+    config: payload?.config || {},
+  };
+}
+
+function syncSimilarLoadingControls() {
+  const refreshButton = document.querySelector("#similarRefreshButton");
+  const addButton = document.querySelector('#similarAddForm button[type="submit"]');
+  if (refreshButton) {
+    refreshButton.disabled = state.similarLoading;
+    refreshButton.textContent = state.similarLoading ? "刷新中" : "刷新分析";
+  }
+  if (addButton) addButton.disabled = state.similarLoading;
+}
+
+async function loadSimilarPatternsOnce(options = {}) {
   state.similarLoading = true;
   state.similarError = "";
   renderSimilarPatternsPage();
   try {
     const watchlistPayload = await fetchJson("/similar-patterns/watchlist");
-    state.similarPayload = {
+    state.similarPayload = mergeSimilarPayloadWithWatchlist({
       ...(state.similarPayload || {}),
       generated_at: state.similarPayload?.generated_at || watchlistPayload.updated_at,
-      watchlist: watchlistPayload.stocks || [],
-      results: state.similarPayload?.results || [],
-      config: state.similarPayload?.config || {},
-    };
+    }, watchlistPayload.stocks || []);
     renderSimilarPatternsPage();
     const path = options.refresh ? "/similar-patterns/analysis?refresh=true" : "/similar-patterns/analysis";
-    const analysisPayload = await fetchJson(path, workspaceRequestOptions(options));
+    const requestOptions = options.refresh
+      ? { ...workspaceRequestOptions(options), timeoutMs: SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS }
+      : workspaceRequestOptions(options);
+    const analysisPayload = await fetchJson(path, requestOptions);
     const latestWatchlist = state.similarPayload?.watchlist || watchlistPayload.stocks || analysisPayload.watchlist || [];
-    state.similarPayload = {
-      ...analysisPayload,
-      watchlist: latestWatchlist,
-    };
+    state.similarPayload = mergeSimilarPayloadWithWatchlist(analysisPayload, latestWatchlist);
     const results = state.similarPayload.results || [];
     if (!state.similarSelectedSymbol && results.length) {
       state.similarSelectedSymbol = results[0].target?.symbol || null;
@@ -748,20 +778,38 @@ async function loadSimilarPatterns(options = {}) {
   }
 }
 
+function loadSimilarPatterns(options = {}) {
+  if (state.similarRefreshPromise) return state.similarRefreshPromise;
+  const request = loadSimilarPatternsOnce(options);
+  const sharedRequest = request.finally(() => {
+    if (state.similarRefreshPromise === sharedRequest) state.similarRefreshPromise = null;
+  });
+  state.similarRefreshPromise = sharedRequest;
+  return sharedRequest;
+}
+
 async function addSimilarWatchSymbol(symbol, options = {}) {
-  await fetchJson("/similar-patterns/watchlist", {
+  const payload = await fetchJson("/similar-patterns/watchlist", {
     method: "POST",
     body: JSON.stringify({ symbol, note: options.note || "" }),
   });
-  state.similarPayload = null;
+  applySimilarWatchlistPayload(payload);
   if (options.refresh !== false) await loadSimilarPatterns({ refresh: true });
 }
 
 async function removeSimilarWatchSymbol(symbol) {
-  await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" });
-  if (state.similarSelectedSymbol === symbol) state.similarSelectedSymbol = null;
-  state.similarPayload = null;
-  await loadSimilarPatterns({ refresh: true });
+  if (state.similarPendingRemovals.has(symbol)) return;
+  state.similarPendingRemovals.add(symbol);
+  renderSimilarPatternsPage();
+  try {
+    const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+    if (state.similarSelectedSymbol === symbol) state.similarSelectedSymbol = null;
+    applySimilarWatchlistPayload(payload);
+    await loadSimilarPatterns({ refresh: true });
+  } finally {
+    state.similarPendingRemovals.delete(symbol);
+    renderSimilarPatternsPage();
+  }
 }
 
 async function saveSimilarWatchNote(symbol, content) {
@@ -777,8 +825,15 @@ async function saveSimilarWatchNote(symbol, content) {
 }
 
 function applySimilarWatchlistPayload(payload) {
-  if (!state.similarPayload) return;
-  state.similarPayload.watchlist = payload.stocks || [];
+  const currentPayload = {
+    ...(state.similarPayload || {}),
+    generated_at: state.similarPayload?.generated_at || payload.updated_at,
+  };
+  state.similarPayload = mergeSimilarPayloadWithWatchlist(currentPayload, payload.stocks || []);
+  const symbols = new Set(state.similarPayload.watchlist.map((item) => item.symbol));
+  if (state.similarSelectedSymbol && !symbols.has(state.similarSelectedSymbol)) {
+    state.similarSelectedSymbol = null;
+  }
   renderSimilarPatternsPage();
 }
 
@@ -798,6 +853,124 @@ async function setSimilarWatchPinned(symbol, pinned) {
   });
   applySimilarWatchlistPayload(payload);
   return payload;
+}
+
+async function saveSimilarWatchAlerts(symbol, alerts) {
+  const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}/alerts`, {
+    method: "PUT",
+    body: JSON.stringify(alerts),
+  });
+  applySimilarWatchlistPayload(payload);
+  return payload;
+}
+
+function watchlistAlertConfig(item) {
+  const alerts = item?.alerts || {};
+  return {
+    enabled: Boolean(alerts.enabled),
+    reminders: Array.isArray(alerts.reminders) ? alerts.reminders : [],
+    updated_at: alerts.updated_at || "",
+  };
+}
+
+function watchlistAlertNumber(value) {
+  if (value === null || value === undefined || value === "") return Number.NaN;
+  return Number(value);
+}
+
+function watchlistAlertMetricValue(item, result, indicator) {
+  const definition = WATCHLIST_ALERT_INDICATORS[indicator];
+  if (!definition) return Number.NaN;
+  const source = definition.source === "watchlist" ? item : (result?.latest_snapshot || {});
+  return watchlistAlertNumber(source?.[indicator]);
+}
+
+function watchlistAlertConditionState(currentValue, condition) {
+  const threshold = Number(condition?.value);
+  const available = Number.isFinite(currentValue) && Number.isFinite(threshold);
+  const triggered = available && (
+    condition.operator === "lt"
+      ? currentValue < threshold
+      : condition.operator === "eq"
+        ? Math.abs(currentValue - threshold) < 1e-8
+        : currentValue > threshold
+  );
+  return { available, triggered };
+}
+
+function evaluateWatchlistReminder(item, result, reminder) {
+  const conditions = (reminder.conditions || []).map((condition) => ({
+    ...condition,
+    currentValue: condition.kind === "indicator"
+      ? watchlistAlertMetricValue(item, result, condition.indicator)
+      : watchlistAlertNumber(result?.latest_snapshot?.close),
+  })).map((condition) => ({
+    ...condition,
+    ...watchlistAlertConditionState(condition.currentValue, condition),
+  }));
+  const andGroups = [];
+  conditions.forEach((condition, index) => {
+    if (!andGroups.length || (index > 0 && condition.conjunction === "or")) {
+      andGroups.push([]);
+    }
+    andGroups[andGroups.length - 1].push(condition);
+  });
+  return {
+    ...reminder,
+    configured: conditions.length > 0,
+    availableCount: conditions.filter((condition) => condition.available).length,
+    triggered: andGroups.length > 0
+      && andGroups.some((group) => group.every((condition) => condition.triggered)),
+    conditions,
+  };
+}
+
+function evaluateWatchlistAlert(item, result = similarResultForSymbol(item?.symbol)) {
+  const config = watchlistAlertConfig(item);
+  const reminders = config.reminders.map((reminder, reminderIndex) => ({
+    ...evaluateWatchlistReminder(item, result, reminder),
+    reminderIndex,
+  }));
+  const triggeredReminders = config.enabled
+    ? reminders.filter((reminder) => reminder.triggered)
+    : [];
+  return {
+    ...config,
+    configured: reminders.length > 0,
+    count: reminders.length,
+    conditionCount: reminders.reduce((total, reminder) => total + reminder.conditions.length, 0),
+    triggered: triggeredReminders.length > 0,
+    triggeredReminders,
+    reminders,
+  };
+}
+
+function watchlistAlertBell(item, alertState) {
+  const className = alertState.triggered
+    ? "triggered"
+    : alertState.configured
+      ? (alertState.enabled ? "configured" : "disabled")
+      : "empty";
+  const status = alertState.triggered
+    ? `${alertState.triggeredReminders.length} 个提醒已触发`
+    : alertState.configured
+      ? (alertState.enabled ? `已设置 ${alertState.count} 个提醒` : "提醒已停用")
+      : "尚未设置提醒";
+  const name = item?.name || item?.symbol || "股票";
+  return `
+    <button
+      type="button"
+      class="watchlist-alert-bell ${className}"
+      data-watchlist-alert-bell="${escapeHtml(item?.symbol || "")}"
+      aria-label="${escapeHtml(`${name}：${status}，点击设置提醒`)}"
+      title="${escapeHtml(`${status}，点击设置`)}"
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="watchlist-alert-bell-body" d="M6 9a6 6 0 0 1 12 0v3.5c0 1.8.7 3.5 2 4.8l.7.7H3.3l.7-.7c1.3-1.3 2-3 2-4.8V9Z"></path>
+        <path d="M9.5 20a2.7 2.7 0 0 0 5 0"></path>
+      </svg>
+    </button>
+  `;
 }
 
 const similarActionClass = (action) => {
@@ -923,6 +1096,7 @@ function renderSimilarPatternsPage() {
   const modelMeta = document.querySelector("#similarModelMeta");
   const signalSummary = document.querySelector("#similarSignalSummary");
   if (!meta || !watchlist || !overview || !scenarioRows || !modelList || !topRows) return;
+  syncSimilarLoadingControls();
 
   if (state.similarLoading && !payload) {
     meta.textContent = "正在计算自选池相似走势";
@@ -957,10 +1131,23 @@ function renderSimilarPatternsPage() {
   const totalStrategyHits = resonantResults.reduce((total, item) => total + watchlistStrategyHits(item).length, 0);
   const bullishCount = results.filter((item) => similarDecision(item, "next_1d").signal === "bullish").length;
   const rankedWatch = [...watch];
+  const alertEntries = rankedWatch.map((item) => ({
+    item,
+    alertState: evaluateWatchlistAlert(item),
+  }));
+  const alertStateBySymbol = new Map(alertEntries.map(({ item, alertState }) => [item.symbol, alertState]));
+  const configuredAlertCount = alertEntries.reduce((total, { alertState }) => total + alertState.count, 0);
+  const triggeredAlertEntries = alertEntries.filter(({ alertState }) => alertState.triggered);
+  const triggeredReminderCount = triggeredAlertEntries.reduce(
+    (total, { alertState }) => total + alertState.triggeredReminders.length,
+    0,
+  );
   meta.textContent = state.similarError
     ? `分析加载失败，笔记仍可编辑 · 自选 ${watch.length} 只`
     : state.similarLoading
-      ? `自选 ${watch.length} 只 · 正在加载分析，笔记可先编辑`
+      ? results.length
+        ? `自选 ${watch.length} 只 · 正在后台刷新，当前显示上次结果`
+        : `自选 ${watch.length} 只 · 正在加载分析，笔记可先编辑`
       : `更新于 ${payload.generated_at || "-"} · 全池统一策略 · T+1 观望区 ${payload.config?.signal_bearish_max ?? 45}%～${payload.config?.signal_bullish_min ?? 55}% · 自选 ${watch.length} 只`;
   if (watchCount) watchCount.textContent = `${watch.length} 只股票`;
   if (signalSummary) {
@@ -978,7 +1165,7 @@ function renderSimilarPatternsPage() {
       <article class="similar-summary-card">
         <span>当前自选</span>
         <strong>${watch.length} <small>只</small></strong>
-        <em>优先查看带“策略命中”的股票</em>
+        <em>${configuredAlertCount ? `${configuredAlertCount} 个提醒 · ${triggeredReminderCount} 个触发` : "优先查看带“策略命中”的股票"}</em>
       </article>
     `;
   }
@@ -998,6 +1185,8 @@ function renderSimilarPatternsPage() {
     const buyScore = rawBuyScore == null ? Number.NaN : Number(rawBuyScore);
     const holdScore = rawHoldScore == null ? Number.NaN : Number(rawHoldScore);
     const scoreDate = item.score_date || "-";
+    const removePending = state.similarPendingRemovals.has(item.symbol);
+    const alertState = alertStateBySymbol.get(item.symbol) || evaluateWatchlistAlert(item, result);
     return `
       <tr
         class="similar-watch-row ${selectedClass} ${resonanceClass} ${item.pinned ? "is-pinned" : ""}"
@@ -1008,10 +1197,10 @@ function renderSimilarPatternsPage() {
         data-watchlist-pinned="${item.pinned ? "true" : "false"}"
         draggable="true"
         tabindex="0"
-        title="按住拖动排序；右键可置顶"
+        title="按住拖动排序；右键可置顶或设置提醒"
       >
         <td class="similar-stock-cell">
-          <strong>${item.name || item.symbol}${item.pinned ? `<span class="watchlist-pin-badge">置顶</span>` : ""}</strong>
+          <strong>${item.name || item.symbol}${item.pinned ? `<span class="watchlist-pin-badge">置顶</span>` : ""}${watchlistAlertBell(item, alertState)}</strong>
           <span>${item.symbol} · ${item.industry || "-"}</span>
           <em>${target.target_date || "-"}</em>
         </td>
@@ -1055,7 +1244,11 @@ function renderSimilarPatternsPage() {
             </a>
           ` : `<span class="xueqiu-stock-unavailable">—</span>`}
         </td>
-        <td class="similar-row-actions"><button type="button" data-similar-remove="${item.symbol}">删除</button></td>
+        <td class="similar-row-actions">
+          <button type="button" data-similar-remove="${item.symbol}" ${state.similarLoading || removePending ? "disabled" : ""}>
+            ${removePending ? "删除中" : "删除"}
+          </button>
+        </td>
       </tr>
     `;
   }).join("") || `<tr><td colspan="10" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
@@ -3109,6 +3302,8 @@ let watchlistContextTarget = null;
 let watchlistToastTimer = null;
 let similarWatchDragSymbol = "";
 let suppressSimilarWatchRowClick = false;
+let watchlistAlertDraft = null;
+let watchlistAlertRuleSequence = 0;
 
 function hideWatchlistContextMenu() {
   const menu = document.querySelector("#watchlistContextMenu");
@@ -3138,11 +3333,13 @@ function openWatchlistContextMenu(target, clientX, clientY) {
   };
   const addButton = menu.querySelector("[data-watchlist-context-add]");
   const pinButton = menu.querySelector("[data-watchlist-context-pin]");
+  const alertButton = menu.querySelector("[data-watchlist-context-alert]");
   if (addButton) addButton.hidden = watchlistContextTarget.inWatchlist;
   if (pinButton) {
     pinButton.hidden = !watchlistContextTarget.inWatchlist;
     pinButton.textContent = watchlistContextTarget.pinned ? "取消置顶" : "置顶";
   }
+  if (alertButton) alertButton.hidden = !watchlistContextTarget.inWatchlist;
   menu.hidden = false;
   const width = menu.offsetWidth || 150;
   const height = menu.offsetHeight || 44;
@@ -3203,6 +3400,319 @@ document.querySelector("[data-watchlist-context-pin]")?.addEventListener("click"
   }
 });
 
+function nextWatchlistAlertId(kind) {
+  watchlistAlertRuleSequence += 1;
+  return `${kind}-${Date.now().toString(36)}-${watchlistAlertRuleSequence}`;
+}
+
+function watchlistAlertOperatorOptions(selected) {
+  return `
+    <option value="gt" ${selected === "gt" ? "selected" : ""}>大于 ＞</option>
+    <option value="eq" ${selected === "eq" ? "selected" : ""}>等于 ＝</option>
+    <option value="lt" ${selected === "lt" ? "selected" : ""}>小于 ＜</option>
+  `;
+}
+
+function watchlistAlertConjunctionOptions(selected) {
+  return `
+    <option value="and" ${selected === "and" ? "selected" : ""}>AND · 并且</option>
+    <option value="or" ${selected === "or" ? "selected" : ""}>OR · 或者</option>
+  `;
+}
+
+function watchlistAlertIndicatorOptions(selected) {
+  return Object.entries(WATCHLIST_ALERT_INDICATORS).map(([key, definition]) => `
+    <option value="${key}" ${selected === key ? "selected" : ""}>${definition.label}</option>
+  `).join("");
+}
+
+function formatWatchlistAlertCurrent(value, kind, indicator = "") {
+  const numeric = watchlistAlertNumber(value);
+  if (!Number.isFinite(numeric)) return "当前值：等待分析数据";
+  if (kind === "price") return `当前值：${fmtPrice(numeric)}`;
+  const definition = WATCHLIST_ALERT_INDICATORS[indicator] || {};
+  const digits = indicator === "vol_ratio20" ? 2 : 1;
+  return `当前值：${numeric.toFixed(digits)}${definition.unit || ""}`;
+}
+
+function syncWatchlistAlertDraftFromForm() {
+  if (!watchlistAlertDraft) return;
+  watchlistAlertDraft.enabled = Boolean(document.querySelector("#watchlistAlertEnabled")?.checked);
+  watchlistAlertDraft.reminders = [...document.querySelectorAll("[data-watchlist-alert-reminder]")].map((card) => ({
+    id: card.dataset.alertReminderId,
+    note: card.querySelector("[data-alert-reminder-note]")?.value ?? "",
+    conditions: [...card.querySelectorAll("[data-watchlist-alert-condition]")].map((row, index) => ({
+      id: row.dataset.alertConditionId,
+      conjunction: index === 0
+        ? "and"
+        : (row.querySelector("[data-alert-condition-conjunction]")?.value === "or" ? "or" : "and"),
+      kind: row.querySelector("[data-alert-condition-kind]")?.value === "indicator" ? "indicator" : "price",
+      indicator: row.querySelector("[data-alert-condition-indicator]")?.value || "ret_20d",
+      operator: row.querySelector("[data-alert-condition-operator]")?.value || "gt",
+      value: row.querySelector("[data-alert-condition-value]")?.value ?? "",
+    })),
+  }));
+}
+
+function defaultWatchlistAlertCondition() {
+  return {
+    id: nextWatchlistAlertId("condition"),
+    conjunction: "and",
+    kind: "price",
+    indicator: "ret_20d",
+    operator: "gt",
+    value: "",
+  };
+}
+
+function renderWatchlistAlertCondition(item, result, condition, index) {
+  const currentValue = condition.kind === "indicator"
+    ? watchlistAlertMetricValue(item, result, condition.indicator)
+    : result?.latest_snapshot?.close;
+  const currentLabel = formatWatchlistAlertCurrent(currentValue, condition.kind, condition.indicator);
+  return `
+    <div class="watchlist-alert-condition" data-watchlist-alert-condition data-alert-condition-id="${escapeHtml(condition.id)}">
+      ${index === 0 ? `
+        <div class="watchlist-alert-join-first">当</div>
+      ` : `
+        <label class="watchlist-alert-join">
+          <span>关系</span>
+          <select data-alert-condition-conjunction>${watchlistAlertConjunctionOptions(condition.conjunction)}</select>
+        </label>
+      `}
+      <label class="watchlist-alert-condition-type">
+        <span>类型</span>
+        <select data-alert-condition-kind>
+          <option value="price" ${condition.kind === "price" ? "selected" : ""}>价格</option>
+          <option value="indicator" ${condition.kind === "indicator" ? "selected" : ""}>指标</option>
+        </select>
+        <small>${currentLabel}</small>
+      </label>
+      <label class="watchlist-alert-indicator-select" ${condition.kind === "indicator" ? "" : "hidden"}>
+        <span>指标</span>
+        <select data-alert-condition-indicator>${watchlistAlertIndicatorOptions(condition.indicator)}</select>
+      </label>
+      <label>
+        <span>比较</span>
+        <select data-alert-condition-operator>${watchlistAlertOperatorOptions(condition.operator)}</select>
+      </label>
+      <label>
+        <span>数值</span>
+        <input
+          data-alert-condition-value
+          type="number"
+          ${condition.kind === "price" ? 'min="0.001"' : ""}
+          step="0.001"
+          required
+          value="${escapeHtml(condition.value)}"
+          placeholder="请输入数值"
+        />
+      </label>
+      <div class="watchlist-alert-condition-actions">
+        <button type="button" data-alert-condition-add aria-label="在下方新增条件">＋</button>
+        <button type="button" data-alert-condition-remove aria-label="删除当前条件">−</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderWatchlistAlertDraft() {
+  if (!watchlistAlertDraft) return;
+  const item = similarWatchItem(watchlistAlertDraft.symbol);
+  const result = similarResultForSymbol(watchlistAlertDraft.symbol);
+  const reminders = document.querySelector("#watchlistAlertReminders");
+  const enabled = document.querySelector("#watchlistAlertEnabled");
+  if (!reminders || !enabled) return;
+  enabled.checked = watchlistAlertDraft.enabled;
+  reminders.innerHTML = watchlistAlertDraft.reminders.map((reminder, reminderIndex) => `
+    <section class="watchlist-alert-reminder" data-watchlist-alert-reminder data-alert-reminder-id="${escapeHtml(reminder.id)}">
+      <div class="watchlist-alert-reminder-head">
+        <div>
+          <h4>提醒 ${reminderIndex + 1}</h4>
+          <span>${reminder.conditions.length} 条条件</span>
+        </div>
+        <button type="button" data-alert-reminder-remove>删除提醒</button>
+      </div>
+      <label class="watchlist-alert-reminder-note">
+        <span>提醒备注</span>
+        <input
+          type="text"
+          maxlength="1000"
+          data-alert-reminder-note
+          value="${escapeHtml(reminder.note)}"
+          placeholder="例如：突破前高后关注量能"
+        />
+      </label>
+      <div class="watchlist-alert-conditions">
+        ${reminder.conditions.map((condition, index) => renderWatchlistAlertCondition(item, result, condition, index)).join("")}
+      </div>
+    </section>
+  `).join("") || `
+    <div class="watchlist-alert-empty">
+      <strong>还没有提醒</strong>
+      <span>点击“添加提醒”创建提醒 1，并设置价格或指标条件。</span>
+    </div>
+  `;
+}
+
+function openWatchlistAlertDialog(symbol) {
+  const item = similarWatchItem(symbol);
+  const dialog = document.querySelector("#watchlistAlertDialog");
+  if (!item || !dialog) return;
+  const alerts = watchlistAlertConfig(item);
+  const alertState = evaluateWatchlistAlert(item);
+  watchlistAlertDraft = {
+    symbol,
+    name: item.name || symbol,
+    enabled: alertState.configured ? alerts.enabled : true,
+    reminders: alerts.reminders.map((reminder) => ({
+      ...reminder,
+      conditions: reminder.conditions.map((condition) => ({ ...condition })),
+    })),
+  };
+  document.querySelector("#watchlistAlertTitle").textContent = `${watchlistAlertDraft.name} · 提醒设置`;
+  document.querySelector("#watchlistAlertMeta").textContent = `${symbol} · 每个提醒独立判断，可填写自己的备注`;
+  renderWatchlistAlertDraft();
+  dialog.showModal();
+  const focusSelector = watchlistAlertDraft.reminders.length
+    ? "[data-alert-reminder-note]"
+    : "[data-watchlist-alert-add-reminder]";
+  window.setTimeout(() => document.querySelector(focusSelector)?.focus(), 0);
+}
+
+function closeWatchlistAlertDialog() {
+  const dialog = document.querySelector("#watchlistAlertDialog");
+  if (dialog?.open) dialog.close();
+  watchlistAlertDraft = null;
+}
+
+document.querySelector("[data-watchlist-context-alert]")?.addEventListener("click", () => {
+  const target = watchlistContextTarget;
+  if (!target?.inWatchlist) return;
+  hideWatchlistContextMenu();
+  openWatchlistAlertDialog(target.symbol);
+});
+
+document.querySelector("[data-watchlist-alert-add-reminder]")?.addEventListener("click", () => {
+  if (!watchlistAlertDraft) return;
+  syncWatchlistAlertDraftFromForm();
+  if (watchlistAlertDraft.reminders.length >= 20) {
+    showWatchlistToast("每只股票最多设置 20 个提醒", "error");
+    return;
+  }
+  const reminder = {
+    id: nextWatchlistAlertId("reminder"),
+    note: "",
+    conditions: [defaultWatchlistAlertCondition()],
+  };
+  watchlistAlertDraft.reminders.push(reminder);
+  renderWatchlistAlertDraft();
+  window.setTimeout(() => {
+    document.querySelector(`[data-alert-reminder-id="${reminder.id}"] [data-alert-reminder-note]`)?.focus();
+  }, 0);
+});
+
+document.querySelector("#watchlistAlertDialog")?.addEventListener("click", (event) => {
+  if (!watchlistAlertDraft) {
+    if (event.target === event.currentTarget) closeWatchlistAlertDialog();
+    return;
+  }
+  const reminderCard = event.target.closest("[data-watchlist-alert-reminder]");
+  const reminderId = reminderCard?.dataset.alertReminderId;
+  if (event.target.closest("[data-alert-reminder-remove]") && reminderId) {
+    syncWatchlistAlertDraftFromForm();
+    watchlistAlertDraft.reminders = watchlistAlertDraft.reminders.filter((reminder) => reminder.id !== reminderId);
+    renderWatchlistAlertDraft();
+    return;
+  }
+  const conditionRow = event.target.closest("[data-watchlist-alert-condition]");
+  const conditionId = conditionRow?.dataset.alertConditionId;
+  if (event.target.closest("[data-alert-condition-add]") && reminderId && conditionId) {
+    syncWatchlistAlertDraftFromForm();
+    const reminder = watchlistAlertDraft.reminders.find((item) => item.id === reminderId);
+    if (!reminder) return;
+    if (reminder.conditions.length >= 20) {
+      showWatchlistToast("每个提醒最多设置 20 条条件", "error");
+      return;
+    }
+    const index = reminder.conditions.findIndex((condition) => condition.id === conditionId);
+    const condition = defaultWatchlistAlertCondition();
+    reminder.conditions.splice(index + 1, 0, condition);
+    renderWatchlistAlertDraft();
+    window.setTimeout(() => {
+      document.querySelector(`[data-alert-condition-id="${condition.id}"] [data-alert-condition-conjunction]`)?.focus();
+    }, 0);
+    return;
+  }
+  if (event.target.closest("[data-alert-condition-remove]") && reminderId && conditionId) {
+    syncWatchlistAlertDraftFromForm();
+    const reminder = watchlistAlertDraft.reminders.find((item) => item.id === reminderId);
+    if (!reminder) return;
+    if (reminder.conditions.length === 1) {
+      showWatchlistToast("每个提醒至少保留一条条件", "error");
+      return;
+    }
+    reminder.conditions = reminder.conditions.filter((condition) => condition.id !== conditionId);
+    renderWatchlistAlertDraft();
+    return;
+  }
+  if (event.target === event.currentTarget) closeWatchlistAlertDialog();
+});
+
+document.querySelector("#watchlistAlertReminders")?.addEventListener("change", (event) => {
+  if (!event.target.matches("[data-alert-condition-kind], [data-alert-condition-indicator]")) return;
+  syncWatchlistAlertDraftFromForm();
+  renderWatchlistAlertDraft();
+});
+
+document.querySelector("#watchlistAlertClose")?.addEventListener("click", closeWatchlistAlertDialog);
+document.querySelector("#watchlistAlertCancel")?.addEventListener("click", closeWatchlistAlertDialog);
+document.querySelector("#watchlistAlertDialog")?.addEventListener("cancel", () => {
+  watchlistAlertDraft = null;
+});
+
+document.querySelector("#watchlistAlertForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!watchlistAlertDraft) return;
+  syncWatchlistAlertDraftFromForm();
+  const reminders = watchlistAlertDraft.reminders.map((reminder) => ({
+    ...reminder,
+    note: reminder.note.trim(),
+    conditions: reminder.conditions.map((condition, index) => ({
+      ...condition,
+      conjunction: index === 0 ? "and" : condition.conjunction,
+      value: Number(condition.value),
+      ...(condition.kind === "price" ? { indicator: undefined } : {}),
+    })),
+  }));
+  const invalidCondition = reminders.flatMap((reminder) => reminder.conditions).find((condition) => (
+    !Number.isFinite(condition.value) || (condition.kind === "price" && condition.value <= 0)
+  ));
+  if (invalidCondition) {
+    showWatchlistToast("请填写有效的提醒阈值", "error");
+    return;
+  }
+  const symbol = watchlistAlertDraft.symbol;
+  const count = reminders.length;
+  const conditionCount = reminders.reduce((total, reminder) => total + reminder.conditions.length, 0);
+  const button = document.querySelector("#watchlistAlertSave");
+  button.disabled = true;
+  button.textContent = "保存中";
+  try {
+    await saveSimilarWatchAlerts(symbol, {
+      enabled: watchlistAlertDraft.enabled && count > 0,
+      reminders,
+    });
+    closeWatchlistAlertDialog();
+    showWatchlistToast(count ? `已保存 ${count} 个提醒、${conditionCount} 条条件` : "提醒设置已清空");
+  } catch (error) {
+    showWatchlistToast(error.message || "提醒保存失败", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存提醒";
+  }
+});
+
 document.addEventListener("click", (event) => {
   if (!event.target.closest("#watchlistContextMenu")) hideWatchlistContextMenu();
 });
@@ -3227,16 +3737,10 @@ document.querySelector("#similarAddForm")?.addEventListener("submit", async (eve
 });
 
 document.querySelector("#similarRefreshButton")?.addEventListener("click", async () => {
-  const button = document.querySelector("#similarRefreshButton");
-  button.disabled = true;
-  button.textContent = "刷新中";
   try {
     await loadSimilarPatterns({ refresh: true });
   } catch (error) {
     showError(error);
-  } finally {
-    button.disabled = false;
-    button.textContent = "刷新分析";
   }
 });
 
@@ -3290,6 +3794,11 @@ document.querySelector("#similarNoteForm")?.addEventListener("submit", async (ev
 
 document.querySelector("#similarPage")?.addEventListener("click", (event) => {
   if (event.target.closest("[data-similar-xueqiu]")) return;
+  const alertBell = event.target.closest("[data-watchlist-alert-bell]");
+  if (alertBell) {
+    openWatchlistAlertDialog(alertBell.dataset.watchlistAlertBell);
+    return;
+  }
   const retryButton = event.target.closest("[data-similar-retry]");
   if (retryButton) {
     loadSimilarPatterns().catch(showError);

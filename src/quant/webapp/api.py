@@ -27,6 +27,7 @@ from quant.webapp.services import (
     refresh_chan_model_strategy_plan,
     refresh_dashboard,
     remove_similar_pattern_watch_symbol,
+    save_similar_pattern_watch_alerts,
     save_similar_pattern_watch_note,
     set_similar_pattern_watch_pin,
     start_latest_refresh,
@@ -60,6 +61,43 @@ class SimilarPatternWatchOrderRequest(BaseModel):
 
 class SimilarPatternWatchPinRequest(BaseModel):
     pinned: bool = True
+
+
+class SimilarPatternWatchAlertConditionRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    conjunction: Literal["and", "or"] = "and"
+    kind: Literal["price", "indicator"]
+    indicator: (
+        Literal[
+            "ret_20d",
+            "drawdown_60d",
+            "vol_ratio20",
+            "dist_ma20",
+            "dist_ma60",
+            "opportunity_score",
+            "holding_score",
+        ]
+        | None
+    ) = None
+    operator: Literal["gt", "eq", "lt"]
+    value: float = Field(allow_inf_nan=False)
+
+
+class SimilarPatternWatchAlertReminderRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    note: str = Field(default="", max_length=1_000)
+    conditions: list[SimilarPatternWatchAlertConditionRequest] = Field(
+        min_length=1,
+        max_length=20,
+    )
+
+
+class SimilarPatternWatchAlertsRequest(BaseModel):
+    enabled: bool = True
+    reminders: list[SimilarPatternWatchAlertReminderRequest] = Field(
+        default_factory=list,
+        max_length=20,
+    )
 
 
 @router.get("/health")
@@ -356,6 +394,19 @@ def update_similar_pattern_watchlist_pin(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"自选股置顶保存失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/{symbol}/alerts")
+def update_similar_pattern_watchlist_alerts(
+    symbol: str,
+    body: SimilarPatternWatchAlertsRequest,
+) -> dict[str, Any]:
+    try:
+        return save_similar_pattern_watch_alerts(symbol, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选股提醒保存失败: {exc}") from exc
 
 
 @router.get("/similar-patterns/analysis")
