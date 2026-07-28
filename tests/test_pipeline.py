@@ -437,6 +437,86 @@ def test_pipeline_subprocesses_stay_in_web_service_process_group(
     assert "start_new_session" not in captured[0]
 
 
+def test_strategy_signal_cache_reports_family_and_z_skill_progress(monkeypatch) -> None:
+    progress: list[tuple[int, str]] = []
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs) -> None:
+            self.stdout = io.StringIO(
+                "\n".join(
+                    [
+                        "  family signals: 500/1000 symbols",
+                        "  z-skill signals: 250/500 symbols",
+                        json.dumps(
+                            {
+                                "status": "success",
+                                "processed_through_date": "2026-07-21",
+                            }
+                        ),
+                    ]
+                )
+            )
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260721")
+
+    result = pipeline.refresh_strategy_signal_cache(
+        workers=1,
+        progress_callback=lambda percent, message: progress.append((percent, message)),
+    )
+
+    assert result["status"] == "success"
+    assert progress == [
+        (51, "正在重建核心策略规则信号：500/1000"),
+        (62, "正在重建扩展形态策略信号：250/500"),
+    ]
+
+
+def test_model_scoring_uses_batched_processes_and_exposes_manifest(
+    monkeypatch,
+) -> None:
+    captured: list[str] = []
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "status": "success",
+                "executor_type": "processes",
+                "batch_size": 8,
+                "feature_elapsed_seconds": 73.4,
+                "elapsed_seconds": 76.8,
+            }
+        )
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured.extend(command)
+        return Result()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    monkeypatch.setenv("ROUTINE_MODEL_SCORE_EXECUTOR", "processes")
+    monkeypatch.setenv("ROUTINE_MODEL_SCORE_BATCH_SIZE", "8")
+
+    result = pipeline.score_latest_models(workers=4)
+
+    assert captured[-6:] == [
+        "--workers",
+        "4",
+        "--executor",
+        "processes",
+        "--batch-size",
+        "8",
+    ]
+    assert result["status"] == "success"
+    assert result["executor_type"] == "processes"
+    assert result["feature_elapsed_seconds"] == 73.4
+    assert result["script_elapsed_seconds"] == 76.8
+
+
 def test_daily_web_workspaces_refreshes_every_non_short_tab_in_parallel(monkeypatch) -> None:
     calls: list[str] = []
     calls_lock = threading.Lock()

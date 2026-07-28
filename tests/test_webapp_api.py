@@ -516,6 +516,215 @@ def test_terminal_refresh_writes_immutable_manifest_with_step_timings(
     assert manifest_path.read_text(encoding="utf-8") == original
 
 
+def test_checkpoint_reused_step_has_zero_attempt_elapsed(
+    monkeypatch,
+) -> None:
+    status = {
+        "status": "running",
+        "run_id": "resume-attempt",
+        "attempt": 2,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "steps": services._progress_steps("short"),
+        "percent": 35,
+    }
+    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+    services._REFRESH_CONTEXT.run_id = status["run_id"]
+    try:
+        services._set_refresh_progress(
+            step_key="refresh_data",
+            step_status="success",
+            message="checkpoint reused",
+            percent=35,
+            complete_previous=False,
+            checkpoint_reused=True,
+        )
+    finally:
+        delattr(services._REFRESH_CONTEXT, "run_id")
+
+    step = next(
+        item
+        for item in status["steps"]
+        if item["key"] == "refresh_data"
+    )
+    assert step["status"] == "success"
+    assert step["checkpoint_reused"] is True
+    assert step["elapsed_seconds"] == 0.0
+    assert step["started_at"] == step["finished_at"]
+
+
+def test_resumed_refresh_starts_independent_attempt_timing(
+    monkeypatch,
+) -> None:
+    old_steps = services._progress_steps("all")
+    old_steps[0].update(
+        {
+            "status": "success",
+            "started_at": "2026-07-27T15:00:00",
+            "finished_at": "2026-07-27T15:05:00",
+            "elapsed_seconds": 300.0,
+        }
+    )
+    status = {
+        "status": "failed",
+        "run_id": "old-run",
+        "attempt": 1,
+        "started_at": "2026-07-27T15:00:00",
+        "finished_at": "2026-07-27T15:30:00",
+        "elapsed_seconds": 1800.0,
+        "updated_at": "2026-07-27T15:30:00",
+        "message": "failed",
+        "percent": 35,
+        "current_step": "feature_cache",
+        "steps": old_steps,
+        "scope": "all",
+        "result": {},
+        "error": "old failure",
+        "manifest_path": "/tmp/old-run/manifest.json",
+    }
+
+    class InlineThread:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
+    monkeypatch.setattr(
+        services,
+        "_refresh_resume_ready",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(services.threading, "Thread", InlineThread)
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+
+    payload = services.start_latest_refresh("all")
+
+    assert payload["status"] == "queued"
+    assert payload["run_id"] != "old-run"
+    assert payload["attempt"] == 2
+    assert payload["started_at"] != "2026-07-27T15:00:00"
+    assert payload["resumed_from"] == {
+        "run_id": "old-run",
+        "attempt": 1,
+        "started_at": "2026-07-27T15:00:00",
+        "finished_at": "2026-07-27T15:30:00",
+        "elapsed_seconds": 1800.0,
+        "manifest_path": "/tmp/old-run/manifest.json",
+    }
+    assert all(step["started_at"] is None for step in payload["steps"])
+    assert all(step["elapsed_seconds"] is None for step in payload["steps"])
+    assert all(
+        step["checkpoint_reused"] is False
+        for step in payload["steps"]
+    )
+
+
+def test_input_resume_marks_only_reused_steps_as_checkpoints(
+    monkeypatch,
+) -> None:
+    status = _stub_successful_global_refresh(monkeypatch)
+    source_started_at = pd.Timestamp.now().isoformat()
+    resume_status = {
+        "status": "failed",
+        "run_id": "source-attempt",
+        "attempt": 1,
+        "started_at": source_started_at,
+        "finished_at": source_started_at,
+        "elapsed_seconds": 900.0,
+        "steps": services._progress_steps("all"),
+        "result": {
+            "refresh_data": {
+                "status": "success",
+                "expected_trade_date": "20260723",
+                "dataset_trade_date": "20260723",
+            },
+            "refresh_daily_basic": {
+                "status": "success",
+                "latest_trade_date": "20260723",
+            },
+            "refresh_reference_inputs": {
+                "status": "success",
+                "steps": {
+                    "analyst_forecast_snapshot": {"status": "success"}
+                },
+            },
+            "feature_cache": {"status": "success"},
+            "model_score": {"status": "success"},
+        },
+    }
+    monkeypatch.setattr(
+        services.pd,
+        "read_parquet",
+        lambda *args, **kwargs: pd.DataFrame(
+            {"date": [pd.Timestamp("2026-07-23")]}
+        ),
+    )
+
+    services._run_latest_refresh_job(
+        "all",
+        resume_status=resume_status,
+        run_id="resumed-run",
+    )
+
+    assert status["status"] == "success"
+    assert status["attempt"] == 2
+    assert status["started_at"] != source_started_at
+    step_map = {
+        step["key"]: step
+        for step in status["steps"]
+    }
+    for key in (
+        "refresh_data",
+        "feature_cache",
+        "signal_cache",
+        "model_score",
+    ):
+        assert step_map[key]["checkpoint_reused"] is True
+        assert step_map[key]["elapsed_seconds"] == 0.0
+    assert step_map["daily_plan"]["checkpoint_reused"] is False
+
+
+def test_starting_refresh_clears_stale_manifest_path(monkeypatch, tmp_path) -> None:
+    stale_manifest = tmp_path / "old" / "manifest.json"
+    status = {
+        "status": "failed",
+        "run_id": "old-run",
+        "started_at": "2026-07-23T17:00:00",
+        "finished_at": "2026-07-23T17:30:00",
+        "updated_at": "2026-07-23T17:30:00",
+        "message": "failed",
+        "percent": 35,
+        "current_step": "feature_cache",
+        "steps": services._progress_steps("all"),
+        "scope": "all",
+        "scope_label": "全部工作区",
+        "result": None,
+        "error": "old error",
+        "manifest_path": str(stale_manifest),
+        "manifest_error": "old manifest error",
+    }
+
+    class InlineThread:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
+    monkeypatch.setattr(services, "_refresh_resume_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(services.threading, "Thread", InlineThread)
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+
+    payload = services.start_latest_refresh("all")
+
+    assert payload["status"] == "queued"
+    assert payload["manifest_path"] is None
+    assert payload["manifest_error"] is None
+
+
 def test_health_endpoint_reports_service_status() -> None:
     response = client.get("/api/health")
 

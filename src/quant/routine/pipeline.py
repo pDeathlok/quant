@@ -563,19 +563,28 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         bufsize=1,
     )
     stdout_lines: list[str] = []
-    progress_pattern = re.compile(r"combined signals: (\d+)/(\d+) symbols")
+    progress_pattern = re.compile(r"(combined|family|z-skill) signals: (\d+)/(\d+) symbols")
     assert process.stdout is not None
     for line in process.stdout:
         stdout_lines.append(line)
         match = progress_pattern.search(line)
         if match and progress_callback is not None:
-            done_text, total_text = match.groups()
+            phase, done_text, total_text = match.groups()
             done = int(done_text)
             total = int(total_text)
             ratio = done / total if total else 0
+            if phase == "family":
+                percent = 46 + int(ratio * 10)
+                label = "核心策略规则信号"
+            elif phase == "z-skill":
+                percent = 56 + int(ratio * 12)
+                label = "扩展形态策略信号"
+            else:
+                percent = 50 + int(ratio * 15)
+                label = "核心/扩展策略信号"
             progress_callback(
-                percent=50 + int(ratio * 15),
-                message=f"正在单次扫描并行重建核心/扩展策略信号：{done}/{total}",
+                percent=percent,
+                message=f"正在重建{label}：{done}/{total}",
             )
     returncode = process.wait()
     stdout = "".join(stdout_lines)
@@ -606,20 +615,32 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
 
 def score_latest_models(workers: int = 8) -> dict:
     started = time.monotonic()
+    executor_type = os.getenv(
+        "ROUTINE_MODEL_SCORE_EXECUTOR",
+        "processes",
+    )
+    batch_size = os.getenv("ROUTINE_MODEL_SCORE_BATCH_SIZE", "8")
     command = [
         sys.executable,
         "scripts/research/score_latest_strategy_models.py",
         "--workers",
         str(workers),
+        "--executor",
+        executor_type,
+        "--batch-size",
+        batch_size,
     ]
     env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
     result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
+    manifest = _extract_last_json_object(result.stdout)
     return {
+        **manifest,
         "status": "success" if result.returncode == 0 else "failed",
         "returncode": result.returncode,
         "stdout_tail": result.stdout[-4000:],
         "stderr_tail": result.stderr[-4000:],
         "command": " ".join(command),
+        "script_elapsed_seconds": manifest.get("elapsed_seconds"),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 

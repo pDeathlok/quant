@@ -252,6 +252,8 @@ _REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
 _REFRESH_STATUS: dict[str, Any] = {
     "status": "idle",
     "run_id": None,
+    "attempt": 0,
+    "resumed_from": None,
     "started_at": None,
     "finished_at": None,
     "updated_at": None,
@@ -581,6 +583,32 @@ def _ensure_refresh_scope(status: dict[str, Any]) -> dict[str, Any]:
     scoped["scope"] = scope
     scoped["scope_label"] = REFRESH_SCOPE_LABELS[scope]
     return scoped
+
+
+def _refresh_attempt_number(
+    resume_status: dict[str, Any] | None,
+) -> int:
+    if not resume_status:
+        return 1
+    try:
+        return max(1, int(resume_status.get("attempt") or 1)) + 1
+    except (TypeError, ValueError):
+        return 2
+
+
+def _refresh_resume_source(
+    resume_status: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not resume_status:
+        return None
+    return {
+        "run_id": resume_status.get("run_id"),
+        "attempt": max(1, _refresh_attempt_number(resume_status) - 1),
+        "started_at": resume_status.get("started_at"),
+        "finished_at": resume_status.get("finished_at"),
+        "elapsed_seconds": resume_status.get("elapsed_seconds"),
+        "manifest_path": resume_status.get("manifest_path"),
+    }
 
 
 def _parse_refresh_timestamp(value: Any) -> datetime | None:
@@ -6083,6 +6111,7 @@ def _progress_steps(scope: str | None = None) -> list[dict[str, Any]]:
             "started_at": None,
             "finished_at": None,
             "elapsed_seconds": None,
+            "checkpoint_reused": False,
         }
         for key in REFRESH_SCOPE_STEPS[normalized]
     ]
@@ -6092,6 +6121,7 @@ def _mark_refresh_step_started(step: dict[str, Any], now: datetime) -> None:
     step.setdefault("started_at", None)
     step.setdefault("finished_at", None)
     step.setdefault("elapsed_seconds", None)
+    step.setdefault("checkpoint_reused", False)
     if step["started_at"] is None:
         step["started_at"] = now.isoformat(timespec="seconds")
 
@@ -6106,6 +6136,18 @@ def _mark_refresh_step_finished(step: dict[str, Any], now: datetime) -> None:
     )
 
 
+def _mark_refresh_step_checkpoint_reused(
+    step: dict[str, Any],
+    now: datetime,
+) -> None:
+    timestamp = now.isoformat(timespec="seconds")
+    step["status"] = "success"
+    step["started_at"] = timestamp
+    step["finished_at"] = timestamp
+    step["elapsed_seconds"] = 0.0
+    step["checkpoint_reused"] = True
+
+
 def _set_refresh_progress(
     *,
     status: str = "running",
@@ -6116,6 +6158,7 @@ def _set_refresh_progress(
     result: Any = None,
     error: str | None = None,
     complete_previous: bool = True,
+    checkpoint_reused: bool = False,
 ) -> None:
     with _REFRESH_LOCK:
         if not _owned_refresh_context_active_unlocked():
@@ -6126,20 +6169,25 @@ def _set_refresh_progress(
             step.setdefault("started_at", None)
             step.setdefault("finished_at", None)
             step.setdefault("elapsed_seconds", None)
+            step.setdefault("checkpoint_reused", False)
         if step_key:
             seen_current = False
             for step in steps:
                 if step["key"] == step_key:
                     next_step_status = step_status or ("running" if status == "running" else status)
-                    step["status"] = next_step_status
-                    _mark_refresh_step_started(step, now)
-                    if next_step_status in {"success", "failed"}:
-                        _mark_refresh_step_finished(step, now)
+                    if checkpoint_reused:
+                        _mark_refresh_step_checkpoint_reused(step, now)
+                    else:
+                        step["checkpoint_reused"] = False
+                        step["status"] = next_step_status
+                        _mark_refresh_step_started(step, now)
+                        if next_step_status in {"success", "failed"}:
+                            _mark_refresh_step_finished(step, now)
                     seen_current = True
                 elif complete_previous and not seen_current and step["status"] in {"pending", "running"}:
                     step["status"] = "success"
                     _mark_refresh_step_finished(step, now)
-            if step_status == "success":
+            if step_status == "success" and not checkpoint_reused:
                 for step in steps:
                     if step["key"] == step_key:
                         step["status"] = "success"
@@ -6394,12 +6442,30 @@ def _run_latest_refresh_job(
                 return
             if current_run_id == refresh_run_id and _REFRESH_STATUS.get("status") in {"success", "failed"}:
                 return
+            attempt_started_at = (
+                _REFRESH_STATUS.get("started_at")
+                if current_run_id == refresh_run_id
+                else None
+            ) or datetime.now().isoformat(timespec="seconds")
+            attempt_steps = list(
+                _REFRESH_STATUS.get("steps")
+                if current_run_id == refresh_run_id
+                else []
+            ) or _progress_steps(refresh_scope)
             _REFRESH_STATUS.update(
                 {
                     "status": "running",
                     "run_id": refresh_run_id,
-                    "started_at": (resume_status or {}).get("started_at")
-                    or datetime.now().isoformat(timespec="seconds"),
+                    "attempt": (
+                        _REFRESH_STATUS.get("attempt")
+                        if current_run_id == refresh_run_id
+                        else None
+                    )
+                    or _refresh_attempt_number(resume_status),
+                    "resumed_from": _REFRESH_STATUS.get("resumed_from")
+                    if current_run_id == refresh_run_id
+                    else _refresh_resume_source(resume_status),
+                    "started_at": attempt_started_at,
                     "finished_at": None,
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
                     "message": (
@@ -6411,13 +6477,25 @@ def _run_latest_refresh_job(
                     ),
                     "percent": 90 if resume_tail else 35 if resume_inputs else 1,
                     "current_step": "similar_patterns" if resume_tail else "feature_cache" if resume_inputs else "refresh_data",
-                    "steps": list((resume_status or {}).get("steps") or _progress_steps(refresh_scope)),
+                    "steps": attempt_steps,
                     "scope": refresh_scope,
                     "scope_label": refresh_label,
                     "result": None,
                     "error": None,
+                    "manifest_path": None,
+                    "manifest_error": None,
                 }
             )
+            if resume_tail:
+                reused_keys = {
+                    str(step.get("key") or "")
+                    for step in (resume_status or {}).get("steps") or []
+                    if step.get("status") == "success"
+                }
+                now = datetime.now()
+                for step in _REFRESH_STATUS["steps"]:
+                    if step.get("key") in reused_keys:
+                        _mark_refresh_step_checkpoint_reused(step, now)
             _persist_refresh_status_unlocked()
         cache_cleanup = run_cache_cleanup(PROJECT_ROOT)
         results: dict[str, Any] = (
@@ -6501,9 +6579,14 @@ def _run_latest_refresh_job(
         _set_refresh_progress(
             step_key="refresh_data",
             step_status="success",
-            message="Tushare 最新日线数据已拉取完成",
+            message=(
+                "已复用同日 Tushare 数据检查点"
+                if resume_inputs
+                else "Tushare 最新日线数据已拉取完成"
+            ),
             percent=35,
             complete_previous=False,
+            checkpoint_reused=resume_inputs,
         )
         _clear_selector_caches()
         expected_trade_date = _source_expected_trade_date(results)
@@ -6811,6 +6894,7 @@ def _run_latest_refresh_job(
                 message="已复用同日 B1 特征缓存检查点",
                 percent=45,
                 complete_previous=False,
+                checkpoint_reused=True,
             )
         if signal_ready:
             results["signal_cache"] = {
@@ -6824,6 +6908,7 @@ def _run_latest_refresh_job(
                 message="已复用同日全市场规则信号检查点",
                 percent=68,
                 complete_previous=False,
+                checkpoint_reused=True,
             )
 
         # Each task creates its own CPU-bound process pool. A single outer
@@ -6887,6 +6972,7 @@ def _run_latest_refresh_job(
                 message="已复用同日策略模型分检查点",
                 percent=70,
                 complete_previous=False,
+                checkpoint_reused=True,
             )
         _set_refresh_progress(
             step_key="chan_model_strategy",
@@ -7190,23 +7276,28 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
             name=f"quant-{refresh_scope}-refresh",
             daemon=True,
         )
+        attempt_started_at = datetime.now().isoformat(timespec="seconds")
         _REFRESH_STATUS.update(
             {
                 "status": "queued",
                 "run_id": run_id,
-                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "attempt": _refresh_attempt_number(resume_status),
+                "resumed_from": _refresh_resume_source(resume_status),
+                "started_at": attempt_started_at,
                 "finished_at": None,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_at": attempt_started_at,
                 "message": f"{refresh_label}刷新任务已进入后台队列"
                 if not resume_status
                 else f"{refresh_label}检测到断点，已进入自动续跑队列",
                 "percent": 0 if not resume_status else int(resume_status.get("percent") or 35),
                 "current_step": None if not resume_status else str(resume_status.get("current_step") or "feature_cache"),
-                "steps": list((resume_status or {}).get("steps") or _progress_steps(refresh_scope)),
+                "steps": _progress_steps(refresh_scope),
                 "scope": refresh_scope,
                 "scope_label": refresh_label,
                 "result": None,
                 "error": None,
+                "manifest_path": None,
+                "manifest_error": None,
             }
         )
         _persist_refresh_status_unlocked()

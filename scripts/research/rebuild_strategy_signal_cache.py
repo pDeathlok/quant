@@ -8,9 +8,11 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -24,7 +26,11 @@ import analyze_z_skill_entry_exit_backtest as z_skills
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_parquet
-from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.daily_factor_layer import (
+    DEFAULT_FACTOR_ROOT,
+    attach_daily_base_factors,
+    attach_daily_signal_factors,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +47,17 @@ def parse_args() -> argparse.Namespace:
         "--incremental-start-date",
         default=None,
         help="只重建并替换该日期之后的缓存；不传且缓存有效时直接复用。",
+    )
+    parser.add_argument(
+        "--factor-mode",
+        choices=("stateful", "legacy"),
+        default=os.getenv("ROUTINE_SIGNAL_FACTOR_MODE", "stateful"),
+        help="stateful 持久化滚动状态；legacy 保留原全窗口重算用于对照。",
+    )
+    parser.add_argument(
+        "--factor-root",
+        type=Path,
+        default=DEFAULT_FACTOR_ROOT,
     )
     return parser.parse_args()
 
@@ -96,6 +113,8 @@ def _process_symbol(
     symbol: str,
     frame: pd.DataFrame,
     rebuild_start: str,
+    factor_mode: str = "stateful",
+    factor_root: Path = DEFAULT_FACTOR_ROOT,
 ) -> dict[str, Any]:
     """Compute shared factors once, then fan into both signal families."""
 
@@ -108,19 +127,39 @@ def _process_symbol(
                 & ~names.str.contains("退")
             ].copy()
         if len(normalized) < 160:
-            return {"symbol": symbol, "family": None, "extended": None, "errors": []}
-        factored = attach_daily_base_factors(
-            normalized,
-            symbol=symbol,
-            compute_if_missing=True,
-            persist_missing=False,
-        )
+            return {
+                "symbol": symbol,
+                "family": None,
+                "extended": None,
+                "errors": [],
+                "factor_cache_mode": "insufficient_history",
+            }
+        if factor_mode == "stateful":
+            factored = attach_daily_signal_factors(
+                normalized,
+                symbol=symbol,
+                factor_root=factor_root,
+                persist_missing=True,
+            )
+            factor_cache_mode = factored.attrs.get(
+                "signal_factor_cache_mode",
+                "unknown",
+            )
+        else:
+            factored = attach_daily_base_factors(
+                normalized,
+                symbol=symbol,
+                compute_if_missing=True,
+                persist_missing=False,
+            )
+            factor_cache_mode = "legacy_full"
     except Exception as exc:
         return {
             "symbol": symbol,
             "family": None,
             "extended": None,
             "errors": [f"shared_factors: {exc}"],
+            "factor_cache_mode": "error",
         }
 
     errors: list[str] = []
@@ -150,6 +189,7 @@ def _process_symbol(
         "family": family,
         "extended": extended,
         "errors": errors,
+        "factor_cache_mode": factor_cache_mode,
     }
 
 
@@ -183,6 +223,7 @@ def _merge_incremental_cache(
 
 
 def main() -> None:
+    started = perf_counter()
     args = parse_args()
     family_columns = {spec.name for spec in family_rules.build_signal_specs()}
     extended_columns = {spec.key for spec in z_skills.build_signal_specs()}
@@ -248,11 +289,15 @@ def main() -> None:
                 symbol,
                 frame,
                 rebuild_from.strftime("%Y-%m-%d"),
+                args.factor_mode,
+                args.factor_root,
             )
             for symbol, frame in tasks
         ]
+        factor_cache_modes: Counter[str] = Counter()
         for index, future in enumerate(as_completed(futures), start=1):
             result = future.result()
+            factor_cache_modes[result["factor_cache_mode"]] += 1
             if result["family"] is not None and not result["family"].empty:
                 family_frames.append(result["family"])
             if result["extended"] is not None and not result["extended"].empty:
@@ -307,6 +352,10 @@ def main() -> None:
         "symbol_errors": len(symbol_errors),
         "symbol_error_rate": round(error_rate, 6),
         "symbol_error_examples": symbol_errors[:20],
+        "factor_mode": args.factor_mode,
+        "factor_cache_modes": dict(sorted(factor_cache_modes.items())),
+        "factor_root": str(args.factor_root),
+        "elapsed_seconds": perf_counter() - started,
         "family": family_summary,
         "extended": extended_summary,
         "family_cache": str(family_rules.SIGNAL_CACHE),
