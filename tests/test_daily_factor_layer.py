@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -200,6 +202,84 @@ def test_signal_factor_state_rebuilds_after_historical_revision(
     actual = layer.attach_daily_signal_factors(revised, "000001.SZ")
     expected = layer.attach_daily_signal_factors(
         revised,
+        "000001.SZ",
+        persist_missing=False,
+    )
+
+    assert actual.attrs["signal_factor_cache_mode"] == "invalidated_rebuild"
+    _assert_signal_factors_equal(actual, expected)
+
+
+def test_signal_factor_state_rebuilds_after_historical_date_deletion(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    daily = _daily()
+    factor_root = tmp_path / "factors"
+    monkeypatch.setenv("DAILY_FACTOR_ROOT", str(factor_root))
+    layer.attach_daily_signal_factors(daily, "000001.SZ")
+
+    deleted_date = daily.loc[daily.index[-30], "date"]
+    revised = daily.drop(index=daily.index[-30]).reset_index(drop=True)
+    actual = layer.attach_daily_signal_factors(revised, "000001.SZ")
+    expected = layer.attach_daily_signal_factors(
+        revised,
+        "000001.SZ",
+        persist_missing=False,
+    )
+
+    assert actual.attrs["signal_factor_cache_mode"] == "invalidated_rebuild"
+    _assert_signal_factors_equal(actual, expected)
+    stored = layer.load_daily_signal_factors(
+        "000001.SZ",
+        factor_root,
+    )
+    assert deleted_date not in set(stored["date"])
+    reused = layer.attach_daily_signal_factors(revised, "000001.SZ")
+    assert reused.attrs["signal_factor_cache_mode"] == "cache_hit"
+
+
+def test_signal_factor_state_reconciles_removed_latest_date(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    daily = _daily()
+    factor_root = tmp_path / "factors"
+    monkeypatch.setenv("DAILY_FACTOR_ROOT", str(factor_root))
+    layer.attach_daily_signal_factors(daily, "000001.SZ")
+
+    revised = daily.iloc[:-1].copy()
+    actual = layer.attach_daily_signal_factors(revised, "000001.SZ")
+    stored = layer.load_daily_signal_factors(
+        "000001.SZ",
+        factor_root,
+    )
+
+    assert actual.attrs["signal_factor_cache_mode"] == "invalidated_rebuild"
+    assert stored["date"].max() == revised["date"].max()
+    reused = layer.attach_daily_signal_factors(revised, "000001.SZ")
+    assert reused.attrs["signal_factor_cache_mode"] == "cache_hit"
+
+
+def test_signal_factor_state_rebuilds_after_structural_corruption(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    daily = _daily()
+    factor_root = tmp_path / "factors"
+    monkeypatch.setenv("DAILY_FACTOR_ROOT", str(factor_root))
+    layer.attach_daily_signal_factors(daily, "000001.SZ")
+    state_path = (
+        layer.signal_factor_symbol_dir(factor_root, "000001.SZ")
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.pop("close")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    actual = layer.attach_daily_signal_factors(daily, "000001.SZ")
+    expected = layer.attach_daily_signal_factors(
+        daily,
         "000001.SZ",
         persist_missing=False,
     )

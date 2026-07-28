@@ -715,6 +715,44 @@ def _load_signal_state(
         or state.get("factor_version") != SIGNAL_FACTOR_LAYER_VERSION
     ):
         return None
+    try:
+        last_date = pd.Timestamp(state["last_date"])
+        last_raw_close = float(state["last_raw_close"])
+        if pd.isna(last_date) or not np.isfinite(last_raw_close) or last_raw_close <= 0:
+            return None
+        for key, maximum in (
+            ("close", 120),
+            ("high", 9),
+            ("low", 9),
+            ("volume", 20),
+        ):
+            values = state[key]
+            if (
+                not isinstance(values, list)
+                or not values
+                or len(values) > maximum
+            ):
+                return None
+            numeric = np.asarray(values, dtype=float)
+            if not np.isfinite(numeric).all():
+                return None
+        for key in (
+            "daily_k",
+            "daily_d",
+            "z_k",
+            "z_d",
+            "z_white_first",
+            "z_white_second",
+        ):
+            ewm_state = state[key]
+            old_weight = float(ewm_state["old_weight"])
+            value = ewm_state.get("value")
+            if not np.isfinite(old_weight) or old_weight <= 0:
+                return None
+            if value is not None and not np.isfinite(float(value)):
+                return None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
     return state
 
 
@@ -740,12 +778,27 @@ def _write_signal_year_partition(
     factor_root: Path,
     symbol: str,
     year: int,
+    *,
+    replace_start: pd.Timestamp | None = None,
+    replace_end: pd.Timestamp | None = None,
 ) -> Path:
     directory = signal_factor_symbol_dir(factor_root, symbol)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{year}.parquet"
     existing = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+    if not existing.empty and replace_start is not None:
+        existing_dates = pd.to_datetime(
+            existing["date"],
+            errors="coerce",
+        )
+        end = replace_end if replace_end is not None else replace_start
+        existing = existing[
+            (existing_dates < replace_start)
+            | (existing_dates > end)
+        ].copy()
     combined = pd.concat([existing, frame], ignore_index=True, sort=False)
+    if combined.empty and not len(combined.columns):
+        return path
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
     combined = (
         combined.sort_values("date")
@@ -761,14 +814,29 @@ def _bootstrap_signal_factor_cache(
     prepared: pd.DataFrame,
     symbol: str,
     factor_root: Path,
+    *,
+    reconcile_end: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     factors = calculate_daily_signal_factors(prepared, symbol)
-    for year, group in factors.groupby(factors["date"].dt.year):
+    replace_start = pd.Timestamp(prepared["date"].min())
+    replace_end = max(
+        pd.Timestamp(prepared["date"].max()),
+        pd.Timestamp(reconcile_end)
+        if reconcile_end is not None and pd.notna(reconcile_end)
+        else pd.Timestamp(prepared["date"].max()),
+    )
+    for year in range(replace_start.year, replace_end.year + 1):
+        group = factors[factors["date"].dt.year == year]
+        path = signal_factor_symbol_dir(factor_root, symbol) / f"{year}.parquet"
+        if group.empty and not path.exists():
+            continue
         _write_signal_year_partition(
             group,
             factor_root,
             symbol,
             int(year),
+            replace_start=replace_start,
+            replace_end=replace_end,
         )
     _write_signal_state(
         _signal_state_from_prepared(prepared),
@@ -795,6 +863,12 @@ def _refresh_signal_factor_cache(
             "current_source_hash": _signal_source_hashes(prepared).to_numpy(),
         }
     )
+    state = _load_signal_state(factor_root, symbol)
+    state_date = (
+        pd.Timestamp(state["last_date"])
+        if state is not None and state.get("last_date")
+        else pd.NaT
+    )
     rebuild_mode = "bootstrap"
     if not cached.empty:
         required = {
@@ -816,17 +890,25 @@ def _refresh_signal_factor_cache(
             versions_match = cached["factor_version"].eq(
                 SIGNAL_FACTOR_LAYER_VERSION
             ).all()
-            if hashes_match and versions_match:
-                cached_dates = set(cached["date"])
+            cached_dates = set(cached["date"])
+            prepared_dates = set(prepared["date"])
+            cached_dates_still_exist = cached_dates.issubset(
+                prepared_dates
+            )
+            cache_state_matches = (
+                state is not None
+                and pd.notna(state_date)
+                and cached["date"].max() == state_date
+            )
+            if (
+                hashes_match
+                and versions_match
+                and cached_dates_still_exist
+                and cache_state_matches
+            ):
                 missing = prepared[~prepared["date"].isin(cached_dates)]
                 if missing.empty:
                     return cached, "cache_hit"
-                state = _load_signal_state(factor_root, symbol)
-                state_date = (
-                    pd.Timestamp(state["last_date"])
-                    if state is not None and state.get("last_date")
-                    else pd.NaT
-                )
                 missing_is_append = (
                     pd.notna(state_date)
                     and missing["date"].min() > state_date
@@ -871,7 +953,12 @@ def _refresh_signal_factor_cache(
         else:
             rebuild_mode = "invalidated_rebuild"
     return (
-        _bootstrap_signal_factor_cache(prepared, symbol, factor_root),
+        _bootstrap_signal_factor_cache(
+            prepared,
+            symbol,
+            factor_root,
+            reconcile_end=state_date,
+        ),
         rebuild_mode,
     )
 
