@@ -192,18 +192,28 @@ def build_continuous_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     if len(sorted_frame) < 2:
         return out
 
-    factor = pd.Series(1.0, index=sorted_frame.index, dtype=float)
-    close = pd.to_numeric(sorted_frame["close"], errors="coerce")
-    pre_close = pd.to_numeric(sorted_frame["pre_close"], errors="coerce")
-    for pos in range(len(sorted_frame) - 1, 0, -1):
-        idx = sorted_frame.index[pos]
-        prev_idx = sorted_frame.index[pos - 1]
-        prev_close = close.loc[prev_idx]
-        current_pre_close = pre_close.loc[idx]
-        ratio = current_pre_close / prev_close if pd.notna(current_pre_close) and pd.notna(prev_close) and prev_close else 1.0
-        if not np.isfinite(ratio) or ratio <= 0:
-            ratio = 1.0
-        factor.loc[prev_idx] = factor.loc[idx] * ratio
+    close = pd.to_numeric(
+        sorted_frame["close"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    pre_close = pd.to_numeric(
+        sorted_frame["pre_close"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ratios = pre_close[1:] / close[:-1]
+    ratios = np.where(
+        np.isfinite(ratios) & (ratios > 0),
+        ratios,
+        1.0,
+    )
+    factor_values = np.ones(len(sorted_frame), dtype=float)
+    factor_values[:-1] = np.cumprod(ratios[::-1])[::-1]
+    factor = pd.Series(
+        factor_values,
+        index=sorted_frame.index,
+        dtype=float,
+    )
 
     for col in ["open", "high", "low", "close"]:
         out[col] = pd.to_numeric(out[col], errors="coerce") * factor.reindex(out.index).fillna(1.0)

@@ -108,6 +108,132 @@ def _is_risk_name(name: pd.Series) -> pd.Series:
     return text.str.contains("ST", regex=False) | text.str.contains("*", regex=False) | text.str.contains("退", regex=False)
 
 
+def _anchor_window_metrics(
+    volume: np.ndarray,
+    volume_ma5: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    anchor_mask: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Calculate anchor-relative windows in one forward pass."""
+
+    size = len(volume)
+    anchor_positions = np.full(size, -1, dtype=np.int64)
+    days_since = np.full(size, np.nan, dtype=float)
+    shrink_consolidation = np.zeros(size, dtype=bool)
+    consolidation_range = np.full(size, np.nan, dtype=float)
+    pre_shrink = np.zeros(size, dtype=bool)
+    avg_pre_shrink = np.zeros(size, dtype=bool)
+    soft_shrink = np.zeros(size, dtype=bool)
+
+    last_anchor = -1
+    all_below_ma5 = True
+    all_soft_below_ma5 = True
+    prior_below_ma5 = True
+    running_high = np.nan
+    running_low = np.nan
+    prior_volume_sum = 0.0
+    prior_volume_count = 0
+    prior_ma5_sum = 0.0
+    prior_ma5_count = 0
+
+    for index in range(size):
+        if anchor_mask[index]:
+            last_anchor = index
+            anchor_positions[index] = index
+            days_since[index] = 0.0
+            all_below_ma5 = True
+            all_soft_below_ma5 = True
+            prior_below_ma5 = True
+            running_high = np.nan
+            running_low = np.nan
+            prior_volume_sum = 0.0
+            prior_volume_count = 0
+            prior_ma5_sum = 0.0
+            prior_ma5_count = 0
+            continue
+        if last_anchor < 0:
+            continue
+
+        anchor_positions[index] = last_anchor
+        days_since[index] = float(index - last_anchor)
+        current_volume = volume[index]
+        current_ma5 = volume_ma5[index]
+        below_ma5 = bool(current_volume < current_ma5)
+        below_soft_ma5 = bool(current_volume < current_ma5 * 1.15)
+        all_below_ma5 = all_below_ma5 and below_ma5
+        all_soft_below_ma5 = all_soft_below_ma5 and below_soft_ma5
+        running_high = (
+            high[index]
+            if pd.isna(running_high)
+            else np.fmax(running_high, high[index])
+        )
+        running_low = (
+            low[index]
+            if pd.isna(running_low)
+            else np.fmin(running_low, low[index])
+        )
+        consolidation_range[index] = (
+            running_high / running_low
+            if pd.notna(running_low) and running_low
+            else np.nan
+        )
+
+        if last_anchor >= 1:
+            below_pre_anchor = bool(
+                current_volume < volume[last_anchor - 1]
+            )
+            shrink_consolidation[index] = (
+                below_pre_anchor and all_below_ma5
+            )
+            soft_shrink[index] = (
+                below_pre_anchor and all_soft_below_ma5
+            )
+            if index == last_anchor + 1:
+                pre_window_below = below_ma5
+                pre_volume_mean = current_volume
+                pre_ma5_mean = current_ma5
+            else:
+                pre_window_below = prior_below_ma5
+                pre_volume_mean = (
+                    prior_volume_sum / prior_volume_count
+                    if prior_volume_count
+                    else np.nan
+                )
+                pre_ma5_mean = (
+                    prior_ma5_sum / prior_ma5_count
+                    if prior_ma5_count
+                    else np.nan
+                )
+            pre_shrink[index] = (
+                below_pre_anchor and pre_window_below
+            )
+            avg_pre_shrink[index] = bool(
+                below_pre_anchor
+                and pd.notna(pre_volume_mean)
+                and pd.notna(pre_ma5_mean)
+                and pre_volume_mean < pre_ma5_mean
+            )
+
+        prior_below_ma5 = prior_below_ma5 and below_ma5
+        if pd.notna(current_volume):
+            prior_volume_sum += float(current_volume)
+            prior_volume_count += 1
+        if pd.notna(current_ma5):
+            prior_ma5_sum += float(current_ma5)
+            prior_ma5_count += 1
+
+    return {
+        "anchor_positions": anchor_positions,
+        "days_since": days_since,
+        "shrink_consolidation": shrink_consolidation,
+        "consolidation_range": consolidation_range,
+        "pre_shrink": pre_shrink,
+        "avg_pre_shrink": avg_pre_shrink,
+        "soft_shrink": soft_shrink,
+    }
+
+
 def add_triple_volume_breakout_signals(
     df: pd.DataFrame,
     volume_multiple: float = 3.0,
@@ -135,31 +261,34 @@ def add_triple_volume_breakout_signals(
     volume_ma5 = volume.rolling(5).mean()
 
     triple_volume = volume.shift(1) >= volume.shift(2) * volume_multiple
-    triple_pos = np.where(triple_volume.fillna(False).to_numpy(), np.arange(len(out)), np.nan)
-    last_triple_pos = pd.Series(triple_pos, index=out.index).ffill()
-    pos = pd.Series(np.arange(len(out)), index=out.index)
-    days_since = pos - last_triple_pos
-    days_since[last_triple_pos.isna()] = np.nan
+    anchor_metrics = _anchor_window_metrics(
+        volume.to_numpy(dtype=float),
+        volume_ma5.to_numpy(dtype=float),
+        high.to_numpy(dtype=float),
+        low.to_numpy(dtype=float),
+        triple_volume.fillna(False).to_numpy(dtype=bool),
+    )
+    last_triple_pos = anchor_metrics["anchor_positions"]
+    days_since = pd.Series(
+        anchor_metrics["days_since"],
+        index=out.index,
+    )
 
     triple_price = pd.Series(np.nan, index=out.index, dtype=float)
-    valid_last = last_triple_pos.notna()
+    valid_last = last_triple_pos >= 0
     if valid_last.any():
-        triple_price.loc[valid_last] = close.iloc[last_triple_pos.loc[valid_last].astype(int)].to_numpy()
+        triple_price.loc[valid_last] = close.iloc[
+            last_triple_pos[valid_last]
+        ].to_numpy()
 
-    shrink_consolidation = pd.Series(False, index=out.index)
-    consolidation_range = pd.Series(np.nan, index=out.index, dtype=float)
-    for idx in out.index[valid_last]:
-        start = int(last_triple_pos.loc[idx]) + 1
-        end = int(idx)
-        if start > end:
-            continue
-        window = slice(start, end + 1)
-        below_volume_ma5 = (volume.iloc[window] < volume_ma5.iloc[window]).all()
-        below_anchor_pre_volume = volume.iloc[end] < volume.iloc[int(last_triple_pos.loc[idx]) - 1] if int(last_triple_pos.loc[idx]) >= 1 else False
-        shrink_consolidation.loc[idx] = bool(below_volume_ma5 and below_anchor_pre_volume)
-        window_high = high.iloc[window].max()
-        window_low = low.iloc[window].min()
-        consolidation_range.loc[idx] = window_high / window_low if window_low else np.nan
+    shrink_consolidation = pd.Series(
+        anchor_metrics["shrink_consolidation"],
+        index=out.index,
+    )
+    consolidation_range = pd.Series(
+        anchor_metrics["consolidation_range"],
+        index=out.index,
+    )
 
     right_side_bull = (ma5 > ma10) & (ma10 > ma20) & (ma20 > ma60) & (ma20 > ma20.shift(1))
     breakout = (close > triple_price) & (close > open_)
@@ -228,32 +357,25 @@ def add_triple_volume_research_signals(
         & (out["consolidation_range"] < 1.15)
     )
 
-    idx = pd.Series(np.arange(len(out)), index=out.index)
-    last_anchor = idx - out["days_since_triple_volume"]
-    pre_shrink = pd.Series(False, index=out.index)
-    avg_pre_shrink = pd.Series(False, index=out.index)
-    soft_shrink = pd.Series(False, index=out.index)
-    for i in out.index:
-        if pd.isna(last_anchor.loc[i]) or out.loc[i, "days_since_triple_volume"] <= 0:
-            continue
-        anchor = int(last_anchor.loc[i])
-        start = anchor + 1
-        end = int(i)
-        pre_end = max(start, end - 1)
-        if anchor < 1:
-            continue
-        current_below_pre_anchor = volume.iloc[end] < volume.iloc[anchor - 1]
-        pre_window = slice(start, pre_end + 1)
-        full_window = slice(start, end + 1)
-        pre_shrink.loc[i] = bool(
-            current_below_pre_anchor and (volume.iloc[pre_window] < volume_ma5.iloc[pre_window]).all()
-        )
-        avg_pre_shrink.loc[i] = bool(
-            current_below_pre_anchor and volume.iloc[pre_window].mean() < volume_ma5.iloc[pre_window].mean()
-        )
-        soft_shrink.loc[i] = bool(
-            current_below_pre_anchor and (volume.iloc[full_window] < volume_ma5.iloc[full_window] * 1.15).all()
-        )
+    anchor_metrics = _anchor_window_metrics(
+        volume.to_numpy(dtype=float),
+        volume_ma5.to_numpy(dtype=float),
+        price["high"].to_numpy(dtype=float),
+        price["low"].to_numpy(dtype=float),
+        out["triple_volume_anchor"].fillna(0).to_numpy(dtype=bool),
+    )
+    pre_shrink = pd.Series(
+        anchor_metrics["pre_shrink"],
+        index=out.index,
+    )
+    avg_pre_shrink = pd.Series(
+        anchor_metrics["avg_pre_shrink"],
+        index=out.index,
+    )
+    soft_shrink = pd.Series(
+        anchor_metrics["soft_shrink"],
+        index=out.index,
+    )
 
     out["signal_strict"] = out["signal_triple_volume_breakout"].astype(int)
     out["signal_pre_shrink_strict_bull"] = (common & strict_bull & pre_shrink).astype(int)

@@ -8,6 +8,82 @@ from pandas.testing import assert_frame_equal
 from quant.features import variable_library
 
 
+def _reference_continuous_ohlc(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    order = (
+        out.assign(
+            _order_date=pd.to_datetime(
+                out["date"],
+                errors="coerce",
+            )
+        )
+        .sort_values("_order_date")
+        .index
+    )
+    sorted_frame = out.loc[order].copy()
+    factor = pd.Series(1.0, index=sorted_frame.index, dtype=float)
+    close = pd.to_numeric(sorted_frame["close"], errors="coerce")
+    pre_close = pd.to_numeric(
+        sorted_frame["pre_close"],
+        errors="coerce",
+    )
+    for position in range(len(sorted_frame) - 1, 0, -1):
+        index = sorted_frame.index[position]
+        previous_index = sorted_frame.index[position - 1]
+        previous_close = close.loc[previous_index]
+        current_pre_close = pre_close.loc[index]
+        ratio = (
+            current_pre_close / previous_close
+            if pd.notna(current_pre_close)
+            and pd.notna(previous_close)
+            and previous_close
+            else 1.0
+        )
+        if not np.isfinite(ratio) or ratio <= 0:
+            ratio = 1.0
+        factor.loc[previous_index] = factor.loc[index] * ratio
+    for column in ("open", "high", "low", "close"):
+        out[column] = (
+            pd.to_numeric(out[column], errors="coerce")
+            * factor.reindex(out.index).fillna(1.0)
+        )
+    return out
+
+
+def test_vectorized_continuous_ohlc_matches_reference_with_repricing():
+    rng = np.random.default_rng(20260728)
+    size = 260
+    dates = pd.bdate_range("2025-01-02", periods=size)
+    close = rng.lognormal(2.5, 0.15, size)
+    pre_close = np.roll(close, 1)
+    pre_close[0] = close[0]
+    pre_close[80] = close[79] * 0.83
+    pre_close[170] = close[169] * 1.21
+    pre_close[210] = 0.0
+    frame = pd.DataFrame(
+        {
+            "date": dates,
+            "open": close * rng.uniform(0.98, 1.02, size),
+            "high": close * rng.uniform(1.0, 1.05, size),
+            "low": close * rng.uniform(0.95, 1.0, size),
+            "close": close,
+            "pre_close": pre_close,
+        },
+        index=rng.permutation(np.arange(1000, 1000 + size)),
+    ).sample(frac=1.0, random_state=20260728)
+
+    expected = _reference_continuous_ohlc(frame)
+    actual = variable_library.build_continuous_ohlc(frame)
+
+    assert_frame_equal(
+        actual,
+        expected,
+        check_exact=False,
+        rtol=1e-14,
+        atol=1e-14,
+    )
+
+
 def _write_daily_basic_history(root, periods: int = 90) -> list[pd.Timestamp]:
     dates = list(pd.bdate_range("2026-01-05", periods=periods))
     for index, trade_date in enumerate(dates):

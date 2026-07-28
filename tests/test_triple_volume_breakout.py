@@ -7,10 +7,117 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant.strategies.custom.triple_volume_breakout import (
+    _anchor_window_metrics,
     add_triple_volume_breakout_signals,
     add_triple_volume_strategy_pool_signals,
     load_triple_volume_variants,
 )
+
+
+def _reference_anchor_window_metrics(
+    volume: np.ndarray,
+    volume_ma5: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    anchor_mask: np.ndarray,
+) -> dict[str, np.ndarray]:
+    size = len(volume)
+    anchor_positions = np.full(size, -1, dtype=np.int64)
+    days_since = np.full(size, np.nan, dtype=float)
+    shrink_consolidation = np.zeros(size, dtype=bool)
+    consolidation_range = np.full(size, np.nan, dtype=float)
+    pre_shrink = np.zeros(size, dtype=bool)
+    avg_pre_shrink = np.zeros(size, dtype=bool)
+    soft_shrink = np.zeros(size, dtype=bool)
+    last_anchor = -1
+    for index in range(size):
+        if anchor_mask[index]:
+            last_anchor = index
+        if last_anchor < 0:
+            continue
+        anchor_positions[index] = last_anchor
+        days_since[index] = float(index - last_anchor)
+        start = last_anchor + 1
+        if start > index:
+            continue
+        full_slice = slice(start, index + 1)
+        below_pre_anchor = (
+            volume[index] < volume[last_anchor - 1]
+            if last_anchor >= 1
+            else False
+        )
+        shrink_consolidation[index] = bool(
+            below_pre_anchor
+            and (volume[full_slice] < volume_ma5[full_slice]).all()
+        )
+        window_high = pd.Series(high[full_slice]).max()
+        window_low = pd.Series(low[full_slice]).min()
+        consolidation_range[index] = (
+            window_high / window_low if window_low else np.nan
+        )
+        if last_anchor < 1:
+            continue
+        pre_end = max(start, index - 1)
+        pre_slice = slice(start, pre_end + 1)
+        pre_shrink[index] = bool(
+            below_pre_anchor
+            and (volume[pre_slice] < volume_ma5[pre_slice]).all()
+        )
+        avg_pre_shrink[index] = bool(
+            below_pre_anchor
+            and pd.Series(volume[pre_slice]).mean()
+            < pd.Series(volume_ma5[pre_slice]).mean()
+        )
+        soft_shrink[index] = bool(
+            below_pre_anchor
+            and (
+                volume[full_slice]
+                < volume_ma5[full_slice] * 1.15
+            ).all()
+        )
+    return {
+        "anchor_positions": anchor_positions,
+        "days_since": days_since,
+        "shrink_consolidation": shrink_consolidation,
+        "consolidation_range": consolidation_range,
+        "pre_shrink": pre_shrink,
+        "avg_pre_shrink": avg_pre_shrink,
+        "soft_shrink": soft_shrink,
+    }
+
+
+def test_anchor_window_linear_scan_matches_reference_windows():
+    rng = np.random.default_rng(20260728)
+    for size in (3, 5, 20, 160):
+        for _ in range(20):
+            volume = rng.lognormal(7.0, 0.5, size)
+            volume_ma5 = (
+                pd.Series(volume).rolling(5).mean().to_numpy()
+            )
+            close = rng.lognormal(2.3, 0.05, size)
+            high = close * rng.uniform(1.0, 1.05, size)
+            low = close * rng.uniform(0.95, 1.0, size)
+            anchor_mask = rng.random(size) < 0.15
+            expected = _reference_anchor_window_metrics(
+                volume,
+                volume_ma5,
+                high,
+                low,
+                anchor_mask,
+            )
+            actual = _anchor_window_metrics(
+                volume,
+                volume_ma5,
+                high,
+                low,
+                anchor_mask,
+            )
+            for key in expected:
+                np.testing.assert_allclose(
+                    actual[key],
+                    expected[key],
+                    equal_nan=True,
+                )
 
 
 def test_triple_volume_breakout_signal_detects_shrink_consolidation_breakout():
