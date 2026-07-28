@@ -252,6 +252,7 @@ _REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
 _REFRESH_STATUS: dict[str, Any] = {
     "status": "idle",
     "run_id": None,
+    "trade_date": None,
     "attempt": 0,
     "resumed_from": None,
     "started_at": None,
@@ -6456,6 +6457,9 @@ def _run_latest_refresh_job(
                 {
                     "status": "running",
                     "run_id": refresh_run_id,
+                    "trade_date": _source_expected_trade_date(
+                        (resume_status or {}).get("result")
+                    ),
                     "attempt": (
                         _REFRESH_STATUS.get("attempt")
                         if current_run_id == refresh_run_id
@@ -6600,6 +6604,13 @@ def _run_latest_refresh_job(
             expected_trade_date,
             format="%Y%m%d",
         ).date().isoformat()
+        with _REFRESH_LOCK:
+            if _owned_refresh_context_active_unlocked():
+                _REFRESH_STATUS["trade_date"] = expected_trade_date
+                _REFRESH_STATUS["updated_at"] = datetime.now().isoformat(
+                    timespec="seconds"
+                )
+                _persist_refresh_status_unlocked()
 
         # These workspaces only need the refreshed shared inputs. Start their
         # network-heavy work before the CPU-bound short-selector branch and
@@ -6847,18 +6858,6 @@ def _run_latest_refresh_job(
                 _persist_refresh_status_unlocked()
             return
 
-        _set_refresh_progress(
-            step_key="feature_cache",
-            message="正在依次增量构建 B1 特征缓存与全市场规则信号",
-            percent=35,
-            complete_previous=False,
-        )
-        _set_refresh_progress(
-            step_key="signal_cache",
-            message="正在依次增量构建 B1 特征缓存与全市场规则信号",
-            percent=35,
-            complete_previous=False,
-        )
         expected_incremental_date = pd.to_datetime(
             expected_trade_date,
             format="%Y%m%d",
@@ -6874,6 +6873,24 @@ def _run_latest_refresh_job(
             except Exception:
                 return False
 
+        def b1_gate_current() -> bool:
+            path = PROJECT_ROOT / "data/features/b1/b1_gate_manifest.json"
+            if not path.exists():
+                return False
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                processed = pd.to_datetime(
+                    payload.get("processed_through_date"),
+                    errors="coerce",
+                )
+                return (
+                    payload.get("status") == "success"
+                    and pd.notna(processed)
+                    and processed.normalize() == expected_incremental_date
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                return False
+
         feature_ready = (
             resume_inputs
             and (results.get("feature_cache") or {}).get("status") == "success"
@@ -6885,7 +6902,7 @@ def _run_latest_refresh_job(
                 PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
                 PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
             )
-        )
+        ) and (feature_ready or b1_gate_current())
         if feature_ready:
             results["feature_cache"]["checkpoint_reused"] = True
             _set_refresh_progress(
@@ -6911,42 +6928,64 @@ def _run_latest_refresh_job(
                 checkpoint_reused=True,
             )
 
-        # Each task creates its own CPU-bound process pool. A single outer
-        # worker prevents nested pools from contending for the same cores.
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            futures = {}
-            if not feature_ready:
-                futures[executor.submit(
-                    build_features,
-                    progress_callback=lambda percent, message: _set_refresh_progress(
-                        step_key="feature_cache",
-                        message=message,
-                        percent=percent,
-                        complete_previous=False,
-                    ),
-                )] = ("feature_cache", "B1 特征缓存刷新失败")
-            if not signal_ready:
-                futures[executor.submit(
-                    refresh_strategy_signal_cache,
-                    progress_callback=lambda percent, message: _set_refresh_progress(
-                        step_key="signal_cache",
-                        message=message,
-                        percent=max(46, min(68, percent)),
-                        complete_previous=False,
-                    ),
-                )] = ("signal_cache", "策略规则信号重建失败")
-            for future in as_completed(futures):
-                result_key, failure_message = futures[future]
-                results[result_key] = future.result()
-                if results[result_key].get("status") == "failed":
-                    raise RuntimeError(results[result_key].get("stderr_tail") or failure_message)
-                _set_refresh_progress(
-                    step_key=result_key,
-                    step_status="success",
-                    message=f"{failure_message.removesuffix('失败')}完成",
-                    percent=45 if result_key == "feature_cache" else 68,
+        # The signal pass owns the exact B1 gate for the new date. Run it first
+        # so feature refresh computes the expensive 159-column frame only for
+        # gate hits, while preserving a full-scan fallback for stale manifests.
+        if not signal_ready:
+            _set_refresh_progress(
+                step_key="signal_cache",
+                message="正在增量构建全市场规则信号与 B1 门控",
+                percent=46,
+                complete_previous=False,
+            )
+            results["signal_cache"] = refresh_strategy_signal_cache(
+                progress_callback=lambda percent, message: _set_refresh_progress(
+                    step_key="signal_cache",
+                    message=message,
+                    percent=max(46, min(68, percent)),
                     complete_previous=False,
+                ),
+            )
+            if results["signal_cache"].get("status") == "failed":
+                raise RuntimeError(
+                    results["signal_cache"].get("stderr_tail")
+                    or "策略规则信号重建失败"
                 )
+            _set_refresh_progress(
+                step_key="signal_cache",
+                step_status="success",
+                message="策略规则信号与 B1 门控构建完成",
+                percent=68,
+                complete_previous=False,
+            )
+
+        if not feature_ready:
+            _set_refresh_progress(
+                step_key="feature_cache",
+                message="正在按 B1 门控增量构建特征缓存",
+                percent=35,
+                complete_previous=False,
+            )
+            results["feature_cache"] = build_features(
+                progress_callback=lambda percent, message: _set_refresh_progress(
+                    step_key="feature_cache",
+                    message=message,
+                    percent=percent,
+                    complete_previous=False,
+                ),
+            )
+            if results["feature_cache"].get("status") == "failed":
+                raise RuntimeError(
+                    results["feature_cache"].get("stderr_tail")
+                    or "B1 特征缓存刷新失败"
+                )
+            _set_refresh_progress(
+                step_key="feature_cache",
+                step_status="success",
+                message="B1 特征缓存刷新完成",
+                percent=45,
+                complete_previous=False,
+            )
 
         # Generate independent outputs together after both upstream caches are
         # complete. Model and Chan scoring are capped at four workers each so
@@ -7014,6 +7053,7 @@ def _run_latest_refresh_job(
                     executor.submit(score_latest_models, workers=model_score_workers)
                 ] = ("model_score", "当日策略模型分计算失败")
 
+            completed_daily_outputs: set[str] = set()
             for future in as_completed(output_futures):
                 result_key, failure_message = output_futures[future]
                 payload = future.result()
@@ -7028,18 +7068,35 @@ def _run_latest_refresh_job(
                         percent=70,
                         complete_previous=False,
                     )
-
-        _set_refresh_progress(
-            step_key="daily_plan",
-            step_status="success",
-            message=(
-                "最新策略每日计划已生成；正式 B1 历史看板因模型兼容门禁保留上一有效版本"
-                if results["generate_dashboard"].get("status") == "skipped"
-                else "最新策略每日计划与 Dashboard 已生成"
-            ),
-            percent=72,
-            complete_previous=False,
-        )
+                elif result_key == "refresh_chan_model_scores":
+                    _set_refresh_progress(
+                        step_key="chan_model_strategy",
+                        step_status="success",
+                        message="缠论实时评分刷新完成",
+                        percent=72,
+                        complete_previous=False,
+                    )
+                elif result_key in {
+                    "generate_daily_plan",
+                    "generate_dashboard",
+                }:
+                    completed_daily_outputs.add(result_key)
+                    if completed_daily_outputs == {
+                        "generate_daily_plan",
+                        "generate_dashboard",
+                    }:
+                        _set_refresh_progress(
+                            step_key="daily_plan",
+                            step_status="success",
+                            message=(
+                                "最新策略每日计划已生成；正式 B1 历史看板因模型兼容门禁保留上一有效版本"
+                                if results["generate_dashboard"].get("status")
+                                == "skipped"
+                                else "最新策略每日计划与 Dashboard 已生成"
+                            ),
+                            percent=72,
+                            complete_previous=False,
+                        )
         _clear_selector_caches()
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
@@ -7281,6 +7338,9 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
             {
                 "status": "queued",
                 "run_id": run_id,
+                "trade_date": _source_expected_trade_date(
+                    (resume_status or {}).get("result")
+                ),
                 "attempt": _refresh_attempt_number(resume_status),
                 "resumed_from": _refresh_resume_source(resume_status),
                 "started_at": attempt_started_at,

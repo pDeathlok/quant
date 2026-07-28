@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -56,87 +58,175 @@ def read_daily_file(
     return df.sort_values("date").dropna(subset=["date"]).reset_index(drop=True)
 
 
+def _build_candidate_for_symbol(
+    task: tuple[Path, pd.DataFrame],
+    start_ts: pd.Timestamp,
+    min_rows: int,
+) -> tuple[pd.DataFrame | None, str | None]:
+    path, source_frame = task
+    try:
+        daily = read_daily_file(path, source_frame=source_frame)
+        if len(daily) < min_rows:
+            return None, None
+        signal_frame = add_chan_daily_signals(daily)
+        signals = signal_frame[
+            (signal_frame["date"] >= start_ts)
+            & (
+                (signal_frame["signal_chan_daily_long"] == 1)
+                | (signal_frame["chan_buy1_watch"] == 1)
+            )
+        ].copy()
+        if signals.empty:
+            return None, None
+        keep = [
+            "date",
+            "symbol",
+            "name",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "chan_buy1_watch",
+            "chan_buy2_confirm",
+            "chan_buy3_confirm",
+            "signal_chan_daily_long",
+            "signal_chan_daily_exit",
+            "chan_center_low",
+            "chan_center_high",
+            "chan_center_width",
+            "chan_stroke_amplitude",
+            "chan_score",
+            "chan_signal_name",
+            "chan_structure_note",
+        ]
+        return signals[[col for col in keep if col in signals.columns]], None
+    except Exception as exc:
+        return None, f"{path.name}: {exc}"
+
+
+def _build_candidate_batch(
+    tasks: list[tuple[Path, pd.DataFrame]],
+    start_date: str,
+    min_rows: int,
+) -> tuple[list[pd.DataFrame], list[str]]:
+    start_ts = pd.to_datetime(start_date)
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    for task in tasks:
+        frame, error = _build_candidate_for_symbol(task, start_ts, min_rows)
+        if frame is not None:
+            frames.append(frame)
+        if error is not None:
+            errors.append(error)
+    return frames, errors
+
+
 def build_candidates(
     daily_dir: Path,
     start_date: str,
     max_workers: int = 1,
     min_rows: int = 140,
+    executor_type: str = "threads",
+    batch_size: int = 16,
 ) -> pd.DataFrame:
+    started = time.monotonic()
+    if executor_type not in {"threads", "processes"}:
+        raise ValueError(f"unsupported executor_type: {executor_type}")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
     frames: list[pd.DataFrame] = []
     start_ts = pd.to_datetime(start_date)
     history_start = start_ts - pd.Timedelta(days=800)
+    read_started = time.monotonic()
     store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
     market = store.read_market_range(daily_dir.name, start_date=history_start.strftime("%Y%m%d"))
+    read_elapsed = time.monotonic() - read_started
     tasks = [
         (daily_dir / f"{symbol}.parquet", group.reset_index(drop=True))
         for symbol, group in market.groupby("ts_code", sort=False)
     ]
-
-    def process(task: tuple[Path, pd.DataFrame]) -> pd.DataFrame | None:
-        path, source_frame = task
-        try:
-            daily = read_daily_file(path, source_frame=source_frame)
-            if len(daily) < min_rows:
-                return None
-            signal_frame = add_chan_daily_signals(daily)
-            signals = signal_frame[
-                (signal_frame["date"] >= start_ts)
-                & (
-                    (signal_frame["signal_chan_daily_long"] == 1)
-                    | (signal_frame["chan_buy1_watch"] == 1)
-                )
-            ].copy()
-            if signals.empty:
-                return None
-            keep = [
-                "date",
-                "symbol",
-                "name",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "chan_buy1_watch",
-                "chan_buy2_confirm",
-                "chan_buy3_confirm",
-                "signal_chan_daily_long",
-                "signal_chan_daily_exit",
-                "chan_center_low",
-                "chan_center_high",
-                "chan_center_width",
-                "chan_stroke_amplitude",
-                "chan_score",
-                "chan_signal_name",
-                "chan_structure_note",
-            ]
-            return signals[[col for col in keep if col in signals.columns]]
-        except Exception as exc:
-            print(f"  skip {path.name}: {exc}")
-            return None
-
+    compute_started = time.monotonic()
+    errors: list[str] = []
     if max_workers <= 1:
         for n, task in enumerate(tasks, start=1):
-            result = process(task)
-            if result is not None:
-                frames.append(result)
+            frame, error = _build_candidate_for_symbol(task, start_ts, min_rows)
+            if frame is not None:
+                frames.append(frame)
+            if error is not None:
+                errors.append(error)
+                print(f"  skip {error}")
             if n % 500 == 0 or n == len(tasks):
                 print(f"  candidates: {n}/{len(tasks)} symbols")
+    elif executor_type == "processes":
+        batches = [
+            tasks[offset : offset + batch_size]
+            for offset in range(0, len(tasks), batch_size)
+        ]
+        processed = 0
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _build_candidate_batch,
+                    batch,
+                    str(start_date),
+                    min_rows,
+                ): len(batch)
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                batch_frames, batch_errors = future.result()
+                frames.extend(batch_frames)
+                errors.extend(batch_errors)
+                for error in batch_errors:
+                    print(f"  skip {error}")
+                processed += futures[future]
+                if processed // 500 != (processed - futures[future]) // 500 or processed == len(tasks):
+                    print(f"  candidates: {processed}/{len(tasks)} symbols")
     else:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process, task) for task in tasks]
+            futures = [
+                executor.submit(
+                    _build_candidate_for_symbol,
+                    task,
+                    start_ts,
+                    min_rows,
+                )
+                for task in tasks
+            ]
             for n, future in enumerate(as_completed(futures), start=1):
-                result = future.result()
-                if result is not None:
-                    frames.append(result)
+                frame, error = future.result()
+                if frame is not None:
+                    frames.append(frame)
+                if error is not None:
+                    errors.append(error)
+                    print(f"  skip {error}")
                 if n % 500 == 0 or n == len(tasks):
                     print(f"  candidates: {n}/{len(tasks)} symbols")
 
+    compute_elapsed = time.monotonic() - compute_started
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True).sort_values(["date", "symbol"]).reset_index(drop=True)
+        result = pd.DataFrame()
+    else:
+        result = (
+            pd.concat(frames, ignore_index=True)
+            .sort_values(["date", "symbol"])
+            .reset_index(drop=True)
+        )
+    result.attrs.update(
+        {
+            "executor": executor_type if max_workers > 1 else "inline",
+            "workers": int(max_workers),
+            "batch_size": int(batch_size) if executor_type == "processes" else 1,
+            "symbol_count": int(len(tasks)),
+            "error_count": int(len(errors)),
+            "error_samples": errors[:10],
+            "read_elapsed_seconds": round(read_elapsed, 3),
+            "compute_elapsed_seconds": round(compute_elapsed, 3),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    )
+    return result
 
 
 def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: int) -> pd.DataFrame:

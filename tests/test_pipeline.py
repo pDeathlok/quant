@@ -356,6 +356,8 @@ def test_chan_refresh_uses_explicit_worker_budget(monkeypatch, tmp_path) -> None
 
     command = captured["command"]
     assert command[command.index("--max-workers") + 1] == "3"
+    assert command[command.index("--executor") + 1] == "processes"
+    assert command[command.index("--batch-size") + 1] == "16"
     assert result["status"] == "success"
 
 
@@ -390,6 +392,12 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     command = captured["command"]
     kwargs = captured["kwargs"]
     assert command[command.index("--executor") + 1] == "processes"
+    assert command[command.index("--gate-cache") + 1] == (
+        "data/features/b1/b1_gate_candidates.parquet"
+    )
+    assert command[command.index("--gate-manifest") + 1] == (
+        "data/features/b1/b1_gate_manifest.json"
+    )
     assert "start_new_session" not in kwargs
     assert result["status"] == "success"
 

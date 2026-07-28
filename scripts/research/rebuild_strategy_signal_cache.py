@@ -25,12 +25,17 @@ import analyze_b1_family_rule_backtest as family_rules
 import analyze_z_skill_entry_exit_backtest as z_skills
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR
 from quant.data import MarketDataStore, MarketDataStoreConfig
-from quant.data.atomic_io import atomic_write_parquet
+from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
+from quant.data.source_merge import normalize_tushare_daily
+from quant.features.b1_gate import B1_GATE_METRIC_COLUMNS, calculate_b1_gate
 from quant.features.daily_factor_layer import (
     DEFAULT_FACTOR_ROOT,
     attach_daily_base_factors,
     attach_daily_signal_factors,
 )
+
+B1_GATE_CACHE = PROJECT_ROOT / "data/features/b1/b1_gate_candidates.parquet"
+B1_GATE_MANIFEST = PROJECT_ROOT / "data/features/b1/b1_gate_manifest.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +64,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_FACTOR_ROOT,
     )
+    parser.add_argument("--b1-gate-cache", type=Path, default=B1_GATE_CACHE)
+    parser.add_argument("--b1-gate-manifest", type=Path, default=B1_GATE_MANIFEST)
     return parser.parse_args()
 
 
@@ -109,6 +116,38 @@ def _summary(frame: pd.DataFrame, signal_columns: list[str]) -> dict[str, Any]:
     }
 
 
+def _build_b1_gate_rows(
+    symbol: str,
+    frame: pd.DataFrame,
+    rebuild_start: str,
+) -> pd.DataFrame:
+    start = pd.Timestamp(rebuild_start)
+    history_start = start - pd.Timedelta(days=450)
+    daily = normalize_tushare_daily(frame, symbol)
+    daily = (
+        daily[pd.to_datetime(daily["date"], errors="coerce") >= history_start]
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    if len(daily) < 130:
+        return pd.DataFrame(
+            columns=["symbol", "date", *B1_GATE_METRIC_COLUMNS]
+        )
+    name = str(daily["name"].iloc[0]) if "name" in daily.columns else ""
+    if "ST" in name.upper() or "退" in name:
+        return pd.DataFrame(
+            columns=["symbol", "date", *B1_GATE_METRIC_COLUMNS]
+        )
+    gate = calculate_b1_gate(daily)
+    rows = daily.loc[
+        gate["b1_gate"] & daily["date"].ge(start),
+        ["symbol", "date"],
+    ].copy()
+    for column in B1_GATE_METRIC_COLUMNS:
+        rows[column] = gate.loc[rows.index, column]
+    return rows.reset_index(drop=True)
+
+
 def _process_symbol(
     symbol: str,
     frame: pd.DataFrame,
@@ -119,6 +158,11 @@ def _process_symbol(
     """Compute shared factors once, then fan into both signal families."""
 
     try:
+        gate_rows = _build_b1_gate_rows(
+            symbol,
+            frame,
+            rebuild_start,
+        )
         normalized = family_rules.normalize_daily_frame(frame, symbol)
         if "name" in normalized.columns:
             names = normalized["name"].fillna("").astype(str)
@@ -126,13 +170,23 @@ def _process_symbol(
                 ~names.str.upper().str.contains("ST")
                 & ~names.str.contains("退")
             ].copy()
+        if len(normalized) < 130:
+            return {
+                "symbol": symbol,
+                "family": None,
+                "extended": None,
+                "b1_gate": gate_rows,
+                "errors": [],
+                "factor_cache_mode": "insufficient_history",
+            }
         if len(normalized) < 160:
             return {
                 "symbol": symbol,
                 "family": None,
                 "extended": None,
+                "b1_gate": gate_rows.reset_index(drop=True),
                 "errors": [],
-                "factor_cache_mode": "insufficient_history",
+                "factor_cache_mode": "insufficient_signal_history",
             }
         if factor_mode == "stateful":
             factored = attach_daily_signal_factors(
@@ -158,6 +212,7 @@ def _process_symbol(
             "symbol": symbol,
             "family": None,
             "extended": None,
+            "b1_gate": None,
             "errors": [f"shared_factors: {exc}"],
             "factor_cache_mode": "error",
         }
@@ -188,6 +243,7 @@ def _process_symbol(
         "symbol": symbol,
         "family": family,
         "extended": extended,
+        "b1_gate": gate_rows.reset_index(drop=True),
         "errors": errors,
         "factor_cache_mode": factor_cache_mode,
     }
@@ -281,6 +337,7 @@ def main() -> None:
     ]
     family_frames: list[pd.DataFrame] = []
     extended_frames: list[pd.DataFrame] = []
+    b1_gate_frames: list[pd.DataFrame] = []
     symbol_errors: list[dict[str, Any]] = []
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = [
@@ -302,6 +359,8 @@ def main() -> None:
                 family_frames.append(result["family"])
             if result["extended"] is not None and not result["extended"].empty:
                 extended_frames.append(result["extended"])
+            if result["b1_gate"] is not None and not result["b1_gate"].empty:
+                b1_gate_frames.append(result["b1_gate"])
             if result["errors"]:
                 symbol_errors.append(
                     {
@@ -337,8 +396,59 @@ def main() -> None:
         extended_frames,
         rebuild_from,
     )
+    b1_gate_cached = (
+        pd.read_parquet(args.b1_gate_cache)
+        if args.b1_gate_cache.exists()
+        else None
+    )
+    if b1_gate_cached is not None:
+        b1_gate_cached["date"] = pd.to_datetime(
+            b1_gate_cached["date"],
+            errors="coerce",
+        )
+    recent_b1_gate = (
+        pd.concat(b1_gate_frames, ignore_index=True, sort=False)
+        if b1_gate_frames
+        else pd.DataFrame(columns=["symbol", "date", *B1_GATE_METRIC_COLUMNS])
+    )
+    old_b1_gate = (
+        b1_gate_cached[b1_gate_cached["date"] < rebuild_from].copy()
+        if b1_gate_cached is not None
+        else pd.DataFrame()
+    )
+    b1_gate = pd.concat(
+        [old_b1_gate, recent_b1_gate],
+        ignore_index=True,
+        sort=False,
+    )
+    if not b1_gate.empty:
+        b1_gate["date"] = pd.to_datetime(b1_gate["date"], errors="coerce")
+        b1_gate = (
+            b1_gate.dropna(subset=["symbol", "date"])
+            .sort_values(["date", "symbol"])
+            .drop_duplicates(["symbol", "date"], keep="last")
+            .reset_index(drop=True)
+        )
     atomic_write_parquet(family, family_rules.SIGNAL_CACHE, index=False)
     atomic_write_parquet(extended, z_skills.SIGNAL_CACHE, index=False)
+    atomic_write_parquet(b1_gate, args.b1_gate_cache, index=False)
+    atomic_write_json(
+        {
+            "status": "success",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "incremental_start_date": rebuild_from.strftime("%Y-%m-%d"),
+            "processed_through_date": processed_through.strftime("%Y-%m-%d"),
+            "source_symbol_count": len(tasks),
+            "candidate_rows": int(len(recent_b1_gate)),
+            "candidate_symbols": int(
+                recent_b1_gate["symbol"].nunique()
+                if not recent_b1_gate.empty
+                else 0
+            ),
+            "factor_mode": args.factor_mode,
+        },
+        args.b1_gate_manifest,
+    )
 
     family_summary = _summary(family, sorted(family_columns))
     extended_summary = _summary(extended, sorted(extended_columns))
@@ -355,11 +465,20 @@ def main() -> None:
         "factor_mode": args.factor_mode,
         "factor_cache_modes": dict(sorted(factor_cache_modes.items())),
         "factor_root": str(args.factor_root),
+        "workers": max(1, args.workers),
         "elapsed_seconds": perf_counter() - started,
         "family": family_summary,
         "extended": extended_summary,
         "family_cache": str(family_rules.SIGNAL_CACHE),
         "extended_cache": str(z_skills.SIGNAL_CACHE),
+        "b1_gate_cache": str(args.b1_gate_cache),
+        "b1_gate_manifest": str(args.b1_gate_manifest),
+        "b1_gate_rows": int(len(recent_b1_gate)),
+        "b1_gate_symbols": int(
+            recent_b1_gate["symbol"].nunique()
+            if not recent_b1_gate.empty
+            else 0
+        ),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
 

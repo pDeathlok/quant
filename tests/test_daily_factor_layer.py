@@ -161,6 +161,44 @@ def test_signal_factor_state_appends_one_day_without_recomputing(
 
     assert actual.attrs["signal_factor_cache_mode"] == "incremental"
     _assert_signal_factors_equal(actual, expected)
+    latest_year = daily["date"].iloc[-1].year
+    symbol_dir = layer.signal_factor_symbol_dir(
+        tmp_path / "factors",
+        "000001.SZ",
+    )
+    assert (symbol_dir / f"{latest_year}.delta.parquet").exists()
+
+
+def test_signal_factor_rebuild_compacts_incremental_overlay(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    daily = _daily()
+    factor_root = tmp_path / "factors"
+    monkeypatch.setenv("DAILY_FACTOR_ROOT", str(factor_root))
+    layer.attach_daily_signal_factors(daily.iloc[:-1], "000001.SZ")
+    layer.attach_daily_signal_factors(daily, "000001.SZ")
+    latest_year = daily["date"].iloc[-1].year
+    symbol_dir = layer.signal_factor_symbol_dir(
+        factor_root,
+        "000001.SZ",
+    )
+    delta_path = symbol_dir / f"{latest_year}.delta.parquet"
+    assert delta_path.exists()
+
+    revised = daily.copy()
+    revised.loc[revised.index[-30], "volume"] *= 1.1
+    revised.loc[revised.index[-30], "vol"] *= 1.1
+    actual = layer.attach_daily_signal_factors(revised, "000001.SZ")
+    expected = layer.attach_daily_signal_factors(
+        revised,
+        "000001.SZ",
+        persist_missing=False,
+    )
+
+    assert actual.attrs["signal_factor_cache_mode"] == "invalidated_rebuild"
+    assert not delta_path.exists()
+    _assert_signal_factors_equal(actual, expected)
 
 
 def test_signal_factor_state_rescales_across_corporate_action(

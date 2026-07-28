@@ -379,13 +379,21 @@ def load_daily_signal_factors(
     if start_date is not None and end_date is not None:
         start_year = pd.Timestamp(start_date).year
         end_year = pd.Timestamp(end_date).year
-        paths = [
-            directory / f"{year}.parquet"
-            for year in range(start_year, end_year + 1)
-        ]
-        paths = [path for path in paths if path.exists()]
+        years = range(start_year, end_year + 1)
     else:
-        paths = sorted(directory.glob("*.parquet"))
+        years = sorted(
+            int(path.stem)
+            for path in directory.glob("[0-9][0-9][0-9][0-9].parquet")
+        )
+    paths = [
+        path
+        for year in years
+        for path in (
+            directory / f"{year}.parquet",
+            directory / f"{year}.delta.parquet",
+        )
+        if path.exists()
+    ]
     if not paths:
         return pd.DataFrame()
     out = pd.concat(
@@ -399,8 +407,8 @@ def load_daily_signal_factors(
     if end_date is not None:
         out = out[out["date"] <= pd.Timestamp(end_date)]
     return (
-        out.sort_values("date")
-        .drop_duplicates(["symbol", "date"], keep="last")
+        out.drop_duplicates(["symbol", "date"], keep="last")
+        .sort_values("date", kind="mergesort")
         .reset_index(drop=True)
     )
 
@@ -785,7 +793,22 @@ def _write_signal_year_partition(
     directory = signal_factor_symbol_dir(factor_root, symbol)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{year}.parquet"
-    existing = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+    delta_path = directory / f"{year}.delta.parquet"
+    existing_frames = [
+        pd.read_parquet(existing_path)
+        for existing_path in (path, delta_path)
+        if existing_path.exists()
+    ]
+    existing = (
+        pd.concat(existing_frames, ignore_index=True, sort=False)
+        if existing_frames
+        else pd.DataFrame()
+    )
+    if not existing.empty:
+        existing = existing.drop_duplicates(
+            ["symbol", "date"],
+            keep="last",
+        )
     if not existing.empty and replace_start is not None:
         existing_dates = pd.to_datetime(
             existing["date"],
@@ -804,6 +827,43 @@ def _write_signal_year_partition(
         combined.sort_values("date")
         .drop_duplicates(["symbol", "date"], keep="last")
     )
+    temp_path = path.with_suffix(f".{os.getpid()}.tmp.parquet")
+    combined.to_parquet(temp_path, index=False)
+    os.replace(temp_path, path)
+    if delta_path.exists():
+        delta_path.unlink()
+    return path
+
+
+def _write_signal_delta_partition(
+    frame: pd.DataFrame,
+    factor_root: Path,
+    symbol: str,
+    year: int,
+) -> Path:
+    directory = signal_factor_symbol_dir(factor_root, symbol)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{year}.delta.parquet"
+    existing = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+    combined = pd.concat([existing, frame], ignore_index=True, sort=False)
+    combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+    combined = (
+        combined.sort_values("date", kind="mergesort")
+        .drop_duplicates(["symbol", "date"], keep="last")
+        .reset_index(drop=True)
+    )
+    compact_rows = max(
+        2,
+        int(os.getenv("SIGNAL_FACTOR_DELTA_COMPACT_ROWS", "64")),
+    )
+    if len(combined) >= compact_rows:
+        _write_signal_year_partition(
+            combined,
+            factor_root,
+            symbol,
+            year,
+        )
+        return directory / f"{year}.parquet"
     temp_path = path.with_suffix(f".{os.getpid()}.tmp.parquet")
     combined.to_parquet(temp_path, index=False)
     os.replace(temp_path, path)
@@ -934,7 +994,7 @@ def _refresh_signal_factor_cache(
                     for year, group in incremental.groupby(
                         incremental["date"].dt.year
                     ):
-                        _write_signal_year_partition(
+                        _write_signal_delta_partition(
                             group,
                             factor_root,
                             symbol,

@@ -490,6 +490,10 @@ def build_features(progress_callback=None) -> dict:
         "--executor",
         os.getenv("ROUTINE_FEATURE_EXECUTOR", "processes"),
         "--no-adaptive-workers",
+        "--gate-cache",
+        "data/features/b1/b1_gate_candidates.parquet",
+        "--gate-manifest",
+        "data/features/b1/b1_gate_manifest.json",
     ]
     env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
     process = subprocess.Popen(
@@ -675,6 +679,10 @@ def refresh_chan_model_scores(progress_callback=None, workers: int | None = None
         "data/raw/daily_basic",
         "--max-workers",
         str(workers or int(os.getenv("ROUTINE_CHAN_WORKERS", "8"))),
+        "--executor",
+        os.getenv("ROUTINE_CHAN_EXECUTOR", "processes"),
+        "--batch-size",
+        os.getenv("ROUTINE_CHAN_BATCH_SIZE", "16"),
         "--skip-backfill-snapshots",
     ]
     candidate_latest = pd.NaT
@@ -712,6 +720,8 @@ def refresh_chan_model_scores(progress_callback=None, workers: int | None = None
         "processed_through": manifest.get("processed_through"),
         "manifest_path": str(manifest_path),
         "candidate_checkpoint_reused": "--rebuild-candidates" not in command,
+        "candidate_refresh": manifest.get("candidate_refresh"),
+        "script_elapsed_seconds": manifest.get("elapsed_seconds"),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 

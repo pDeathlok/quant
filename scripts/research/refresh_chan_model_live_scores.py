@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -224,6 +225,7 @@ def _write_strategy_outputs(scored: pd.DataFrame, output_dir: Path, top_n: int) 
 
 
 def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
+    started = time.monotonic()
     _load_env(PROJECT_ROOT / ".env")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.scored_path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,7 +233,14 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
     if args.rebuild_candidates:
         candidate_path = args.report_dir / "chan_daily_candidates.parquet"
         incremental_start = args.start if candidate_path.exists() else args.candidate_start_date
-        fresh_candidates = build_candidates(args.daily_dir, incremental_start, args.max_workers)
+        fresh_candidates = build_candidates(
+            args.daily_dir,
+            incremental_start,
+            args.max_workers,
+            executor_type=getattr(args, "executor", "threads"),
+            batch_size=getattr(args, "batch_size", 16),
+        )
+        candidate_metrics = dict(fresh_candidates.attrs)
         historical_candidates = pd.read_parquet(candidate_path) if candidate_path.exists() else pd.DataFrame()
         if not historical_candidates.empty:
             historical_candidates["date"] = pd.to_datetime(historical_candidates["date"], errors="coerce")
@@ -248,6 +257,16 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
         atomic_write_parquet(candidates, candidate_path, index=False)
         atomic_write_csv(candidates, candidate_path.with_suffix(".csv"), index=False)
     else:
+        candidate_metrics = {
+            "executor": "checkpoint",
+            "workers": 0,
+            "batch_size": 0,
+            "symbol_count": 0,
+            "error_count": 0,
+            "read_elapsed_seconds": 0.0,
+            "compute_elapsed_seconds": 0.0,
+            "elapsed_seconds": 0.0,
+        }
         candidates = pd.read_parquet(args.report_dir / "chan_daily_candidates.parquet")
 
     live = _build_recent_feature_dataset(
@@ -300,6 +319,8 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
         "combined_max_date": combined["date"].max().strftime("%Y-%m-%d") if not combined.empty else None,
         "strategy": strategy_meta,
         "snapshots": snapshot_results,
+        "candidate_refresh": candidate_metrics,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
     }
     manifest_path = args.scored_path.parent / DEFAULT_REFRESH_MANIFEST_PATH.name
     atomic_write_json(
@@ -310,6 +331,8 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
             "daily_basic_dir": str(args.daily_basic_dir),
             "live_rows": result["live_rows"],
             "combined_max_date": result["combined_max_date"],
+            "candidate_refresh": candidate_metrics,
+            "elapsed_seconds": result["elapsed_seconds"],
         },
         manifest_path,
     )
@@ -331,6 +354,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-start-date", default="2015-01-01")
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument("--executor", choices=["threads", "processes"], default="processes")
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--rebuild-candidates", action="store_true")
     parser.add_argument("--skip-backfill-snapshots", action="store_true")
     args = parser.parse_args()

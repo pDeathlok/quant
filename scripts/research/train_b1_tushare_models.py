@@ -38,11 +38,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 import build_training_data_parallel as btd
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.b1_gate import calculate_b1_gate
 from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
 from quant.features.variable_library import (
     PROJECT_FACTOR_COLUMNS,
-    build_continuous_ohlc,
-    calc_bbi as project_calc_bbi,
     merge_daily_basic_features,
 )
 from quant.ml.label_maker import create_b1_labels
@@ -109,16 +108,10 @@ def process_daily_frame(
         # fraction of symbols pass the gate, so reject the rest before doing
         # the expensive work.  The mask intentionally uses the same continuous
         # OHLC and shared KDJ definitions as the full path below.
-        price = build_continuous_ohlc(df)
-        pct_change = price["close"].pct_change() * 100
-        amplitude = (price["high"] - price["low"]) / price["low"].replace(0, np.nan) * 100
-        b1_signal = (
-            (pct_change >= -2)
-            & (pct_change <= 2)
-            & (amplitude < 7)
-            & (project_calc_bbi(price["close"]) > price["close"].rolling(60, min_periods=20).mean())
-            & (shared["kdj_d_j"] < 0)
-        )
+        b1_signal = calculate_b1_gate(
+            df,
+            shared_factors=shared,
+        )["b1_gate"]
         if not bool((b1_signal & (df["date"] >= start_ts)).any()):
             return None
 
@@ -163,11 +156,16 @@ def build_dataset(
     load_hard_limit: float = 1.20,
     max_symbol_error_rate: float | None = None,
     allow_empty: bool = False,
+    symbols: list[str] | None = None,
 ) -> pd.DataFrame:
     start_ts = pd.to_datetime(start_date)
     history_start = (start_ts - pd.Timedelta(days=450)).strftime("%Y%m%d")
     store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
-    market = store.read_market_range(daily_dir.name, start_date=history_start)
+    market = store.read_market_range(
+        daily_dir.name,
+        start_date=history_start,
+        symbols=symbols,
+    )
     if market.empty:
         raise RuntimeError(f"No canonical Tushare daily rows found for {history_start}+")
     source_dates = pd.to_datetime(
