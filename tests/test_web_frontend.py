@@ -17,6 +17,14 @@ def test_workspace_tabs_use_one_seven_item_contract() -> None:
     assert "grid-template-columns: repeat(7, minmax(0, 1fr));" in STYLES_CSS
 
 
+def test_watchlist_is_default_workspace_for_root_url() -> None:
+    assert 'const DEFAULT_WORKSPACE_PAGE = "similar";' in APP_JS
+    assert "activePage: workspacePageFromHash(window.location.hash)" in APP_JS
+    assert 'id="shortPage" class="main page-view"' in INDEX_HTML
+    assert 'id="similarPage" class="main page-view active"' in INDEX_HTML
+    assert "default-similar-v1" in INDEX_HTML
+
+
 def test_workspace_tabs_expose_accessible_keyboard_state() -> None:
     assert 'role="tab"' in APP_JS
     assert 'aria-selected="false"' in APP_JS

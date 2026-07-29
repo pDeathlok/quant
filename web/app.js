@@ -1,6 +1,18 @@
+const DEFAULT_WORKSPACE_PAGE = "similar";
+const WORKSPACE_PAGE_BY_HASH = {
+  "#similar": "similar",
+  "#chan": "chan",
+  "#long": "long",
+  "#byd": "byd",
+  "#cb-allotment": "cbAllotment",
+  "#cb": "cb",
+  "#short": "short",
+};
+const workspacePageFromHash = (hash) => WORKSPACE_PAGE_BY_HASH[hash] || DEFAULT_WORKSPACE_PAGE;
+
 const state = {
   payload: null,
-  activePage: window.location.hash === "#similar" ? "similar" : window.location.hash === "#chan" ? "chan" : window.location.hash === "#long" ? "long" : window.location.hash === "#byd" ? "byd" : window.location.hash === "#cb-allotment" ? "cbAllotment" : window.location.hash === "#cb" ? "cb" : "short",
+  activePage: workspacePageFromHash(window.location.hash),
   selectedStrategies: new Set(),
   selectedSymbol: null,
   query: "",
@@ -405,7 +417,7 @@ const fmtRange = (range) => {
   const high = fmtPrice(range.high);
   return low === high ? low : `${low}-${high}`;
 };
-const hashPage = () => window.location.hash === "#similar" ? "similar" : window.location.hash === "#chan" ? "chan" : window.location.hash === "#long" ? "long" : window.location.hash === "#byd" ? "byd" : window.location.hash === "#cb-allotment" ? "cbAllotment" : window.location.hash === "#cb" ? "cb" : "short";
+const hashPage = () => workspacePageFromHash(window.location.hash);
 const formatBuyPlanText = (text) => {
   if (!text) return "";
   let normalized = String(text)
