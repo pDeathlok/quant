@@ -37,6 +37,8 @@ from train_chan_daily_models import (
     read_daily_basic_features,
 )
 from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
+from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.source_merge import normalize_ts_code as normalize_canonical_ts_code
 from quant.features.market_sentiment import (
     build_limit_proxy_features,
     normalize_ts_code,
@@ -91,7 +93,7 @@ def _load_models(model_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 def _resolve_daily_path(daily_dir: Path, symbol: str) -> Path | None:
-    value = str(symbol)
+    value = normalize_canonical_ts_code(str(symbol).strip().upper())
     direct = daily_dir / f"{value}.parquet"
     if direct.exists():
         return direct
@@ -102,10 +104,13 @@ def _resolve_daily_path(daily_dir: Path, symbol: str) -> Path | None:
     matches = sorted(daily_dir.glob(f"{digits}.*.parquet"))
     if matches:
         return matches[0]
-    suffix = "SH" if digits.startswith(("6", "9")) else "BJ" if digits.startswith(("4", "8")) else "SZ"
-    canonical = daily_dir / f"{digits}.{suffix}.parquet"
-    partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
-    return canonical if partition_root.exists() else None
+    canonical = daily_dir / f"{normalize_canonical_ts_code(digits)}.parquet"
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    return (
+        canonical
+        if store.latest_trade_date(daily_dir.name, canonical.stem) is not None
+        else None
+    )
 
 
 def _build_recent_feature_dataset(

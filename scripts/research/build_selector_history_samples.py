@@ -25,6 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from quant.features.variable_library import build_continuous_ohlc
+from quant.data import read_partitioned_symbol_file
 from quant.routine.paths import DAILY_DIR
 from quant.webapp.services import (
     EXTENDED_STRATEGIES,
@@ -186,21 +187,11 @@ def replay_date(
     return rows
 
 
-def _daily_file(daily_dir: Path, symbol: str) -> Path | None:
-    for candidate in [
-        daily_dir / f"{symbol}.parquet",
-        daily_dir / f"{symbol.replace('.SH', '').replace('.SZ', '').replace('.BJ', '')}.parquet",
-    ]:
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def _forward_labels_for_symbol(daily_dir: Path, symbol: str, dates: pd.Series) -> pd.DataFrame:
-    path = _daily_file(daily_dir, symbol)
-    if path is None:
+    path = daily_dir / f"{symbol}.parquet"
+    daily = read_partitioned_symbol_file(path)
+    if daily.empty:
         return pd.DataFrame({"symbol": symbol, "date": dates})
-    daily = pd.read_parquet(path)
     if "trade_date" in daily.columns:
         daily["date"] = pd.to_datetime(daily["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
     else:

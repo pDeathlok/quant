@@ -29,6 +29,11 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from quant.data.source_merge import normalize_ts_code
+
 RAW_DIR = PROJECT_ROOT / "data/raw"
 AUDIT_ROOT = RAW_DIR / "source_audit"
 OUTPUT_PATH = RAW_DIR / "analyst_forecasts.parquet"
@@ -90,9 +95,7 @@ def load_symbol_names() -> dict[str, str]:
 
 
 def to_ts_code(code: str) -> str:
-    code = str(code).zfill(6)
-    suffix = "SH" if code.startswith(("5", "6", "9")) else "SZ"
-    return f"{code}.{suffix}"
+    return normalize_ts_code(str(code).zfill(6))
 
 
 def parse_forecast_year(column: str) -> int | None:

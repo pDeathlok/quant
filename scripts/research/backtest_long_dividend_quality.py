@@ -341,7 +341,7 @@ def load_daily_monthly_features(
     returns: list[pd.DataFrame] = []
     stock_meta = stock_basic.set_index("ts_code") if not stock_basic.empty else pd.DataFrame()
 
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
     market = store.read_market_range(
         DAILY_DIR.name,
         start_date=history_start.strftime("%Y%m%d"),

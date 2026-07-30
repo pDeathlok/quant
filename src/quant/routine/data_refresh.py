@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -56,6 +57,8 @@ BATCH_NO_TRADE_STATUS = "no_trade_in_batch"
 TUSHARE_DAILY_ROW_LIMIT = 6000
 DEFAULT_BATCH_MAX_TRADE_DATES = 30
 DEFAULT_BATCH_MIN_COVERAGE_RATE = 0.995
+MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+DEFAULT_MARKET_DATA_READY_TIME = "16:00"
 
 
 class MarketBatchCoverageError(RuntimeError):
@@ -197,6 +200,39 @@ def _parse_trade_date(value: str | pd.Timestamp) -> pd.Timestamp | None:
 
 def _format_trade_date(value: pd.Timestamp) -> str:
     return value.strftime("%Y%m%d")
+
+
+def _market_data_ready_time() -> tuple[int, int]:
+    raw = os.getenv("ROUTINE_MARKET_DATA_READY_TIME", DEFAULT_MARKET_DATA_READY_TIME)
+    try:
+        parsed = datetime.strptime(raw, "%H:%M")
+    except ValueError as exc:
+        raise ValueError(
+            "ROUTINE_MARKET_DATA_READY_TIME must use HH:MM format"
+        ) from exc
+    return parsed.hour, parsed.minute
+
+
+def _completed_market_end_date(
+    requested_end_date: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, bool]:
+    current = now or datetime.now(MARKET_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=MARKET_TIMEZONE)
+    else:
+        current = current.astimezone(MARKET_TIMEZONE)
+    requested = _parse_trade_date(requested_end_date)
+    if requested is None:
+        raise ValueError(f"invalid end_date: {requested_end_date}")
+    hour, minute = _market_data_ready_time()
+    ready_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    today = pd.Timestamp(current.date())
+    if requested >= today and current < ready_at:
+        completed_end = today - pd.Timedelta(days=1)
+        return _format_trade_date(completed_end), True
+    return _format_trade_date(requested), False
 
 
 def _symbol_refresh_start(
@@ -763,8 +799,12 @@ def refresh_daily_data(
     final_retry_workers: int = 4,
     final_retry_sleep: float = 0.8,
 ) -> dict:
-    if end_date is None:
-        end_date = datetime.now().strftime("%Y%m%d")
+    market_now = datetime.now(MARKET_TIMEZONE)
+    requested_end_date = end_date or market_now.strftime("%Y%m%d")
+    end_date, end_date_adjusted = _completed_market_end_date(
+        requested_end_date,
+        now=market_now,
+    )
 
     cache_dir = PROJECT_ROOT / "data/cache/source_merge"
     tushare = TushareDataFetcher(cache_dir=cache_dir / "tushare")
@@ -882,7 +922,13 @@ def refresh_daily_data(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_policy": "tushare_only_daily",
         "start_date": start_date,
+        "requested_end_date": requested_end_date,
         "end_date": end_date,
+        "end_date_adjusted_before_market_ready": end_date_adjusted,
+        "market_data_ready_time": os.getenv(
+            "ROUTINE_MARKET_DATA_READY_TIME",
+            DEFAULT_MARKET_DATA_READY_TIME,
+        ),
         "expected_trade_date": expected_trade_date,
         "dataset_trade_date": dataset_trade_date,
         "freshness_error": freshness_error,

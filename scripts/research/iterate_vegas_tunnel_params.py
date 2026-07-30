@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 from backtest_vegas_tunnel import add_future_prices, build_exit_rules, evaluate, read_daily_file
+from quant.data import list_partitioned_symbol_paths
 from quant.strategies.custom.vegas_tunnel import add_vegas_tunnel_signals
 
 
@@ -118,7 +119,7 @@ def build_param_candidates(
     start_date: str,
     max_workers: int,
 ) -> pd.DataFrame:
-    files = sorted(daily_dir.glob("*.parquet"))
+    files = list_partitioned_symbol_paths(daily_dir)
     params_list = list(params_grid)
     start_ts = pd.to_datetime(start_date)
     frames: list[pd.DataFrame] = []

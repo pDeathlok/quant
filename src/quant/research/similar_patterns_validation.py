@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.research.similar_patterns import (
     SimilarPatternConfig,
     apply_probability_calibration,
@@ -57,13 +58,45 @@ def build_industry_regime(
         return pd.DataFrame(columns=["date", "industry_regime"])
     symbols = basic.loc[basic["industry"].fillna("").astype(str).eq(industry), "ts_code"].astype(str).tolist()
     returns: list[pd.Series] = []
-    for symbol in symbols:
-        path = daily_dir / f"{symbol}.parquet"
-        if not path.exists():
-            continue
-        daily = load_daily_file(path)
-        series = daily.set_index("date")["close"].pct_change().rename(symbol)
-        returns.append(series)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    market = store.read_market_range(
+        daily_dir.name,
+        symbols=symbols,
+        columns=["ts_code", "trade_date", "close"],
+    )
+    if not market.empty:
+        if "trade_date" in market.columns:
+            trade_dates = pd.to_datetime(
+                market["trade_date"].astype(str),
+                format="%Y%m%d",
+                errors="coerce",
+            )
+            if "date" in market.columns:
+                market["date"] = pd.to_datetime(market["date"], errors="coerce").fillna(trade_dates)
+            else:
+                market["date"] = trade_dates
+        else:
+            market["date"] = pd.to_datetime(market["date"], errors="coerce")
+        market["close"] = pd.to_numeric(market["close"], errors="coerce")
+        market = market.dropna(subset=["ts_code", "date", "close"])
+        for symbol, daily in market.groupby("ts_code", sort=False):
+            series = (
+                daily.sort_values("date")
+                .drop_duplicates("date", keep="last")
+                .set_index("date")["close"]
+                .pct_change()
+                .rename(str(symbol))
+            )
+            returns.append(series)
+    else:
+        # Preserve compatibility with repositories that still only have the
+        # pre-migration one-file-per-symbol layout.
+        for symbol in symbols:
+            path = daily_dir / f"{symbol}.parquet"
+            if not path.exists():
+                continue
+            daily = load_daily_file(path)
+            returns.append(daily.set_index("date")["close"].pct_change().rename(symbol))
     if not returns:
         return pd.DataFrame(columns=["date", "industry_regime"])
     industry_return = pd.concat(returns, axis=1).mean(axis=1, skipna=True).fillna(0.0)

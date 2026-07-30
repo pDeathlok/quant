@@ -524,11 +524,7 @@ def read_partitioned_symbol_file(
 
     symbol_path = Path(path)
     store = MarketDataStore(
-        MarketDataStoreConfig(
-            backend="parquet",
-            root=symbol_path.parent.parent,
-            mirror_parquet=True,
-        )
+        MarketDataStoreConfig.from_env(root=symbol_path.parent.parent)
     )
     if start_date is None and end_date is None:
         return store.read_frame(symbol_path.parent.name, symbol_path.stem)
@@ -546,9 +542,7 @@ def list_partitioned_symbol_paths(daily_dir: Path | str) -> list[Path]:
     """Return synthetic per-symbol paths for code that processes one time series per task."""
 
     directory = Path(daily_dir)
-    store = MarketDataStore(
-        MarketDataStoreConfig(backend="parquet", root=directory.parent, mirror_parquet=True)
-    )
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=directory.parent))
     symbols = store.list_symbols(directory.name)
     if symbols:
         return [directory / f"{symbol}.parquet" for symbol in symbols]

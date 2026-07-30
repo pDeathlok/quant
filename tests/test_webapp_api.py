@@ -386,6 +386,104 @@ def test_global_refresh_starts_independent_workspaces_before_feature_build(
     assert status["result"]["byd_daily_plan"]["status"] == "success"
 
 
+def test_allotment_quality_accepts_negative_j_values() -> None:
+    payload = {
+        "records": [
+            {
+                "stock_price_date": "2026-07-23",
+                "kdj_daily_j": -6.58,
+                "kdj_weekly_j": -9.08,
+                "kdj_monthly_j": -3.21,
+            }
+        ],
+        "data_sources": {
+            "stock_daily": {"requested": 1, "matched": 1, "error": None},
+            "daily_basic": {"matched": 1, "error": None},
+        },
+    }
+
+    quality = services._convertible_bond_allotment_quality(
+        payload,
+        expected_trade_date="20260723",
+    )
+
+    assert quality["status"] == "success"
+    assert quality["metrics"]["kdj_weekly_j"]["count"] == 1
+    assert quality["metrics"]["kdj_monthly_j"]["count"] == 1
+
+
+def test_allotment_quality_gate_rejects_stale_or_incomplete_payload(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    payload = {
+        "generated_at": "2026-07-23T18:00:00",
+        "asof": "2026-07-23",
+        "records": [
+            {
+                "stock_price_date": "2026-07-22",
+                "kdj_daily_j": 12.0,
+                "kdj_weekly_j": None,
+                "kdj_monthly_j": None,
+            }
+        ],
+        "data_sources": {
+            "stock_daily": {"requested": 1, "matched": 1, "error": None},
+            "daily_basic": {"matched": 1, "error": None},
+        },
+    }
+    writes = []
+    monkeypatch.setattr(
+        services,
+        "CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH",
+        tmp_path / "allotments.json",
+    )
+    monkeypatch.setattr(
+        services,
+        "build_convertible_bond_allotment_payload",
+        lambda **kwargs: payload,
+    )
+    monkeypatch.setattr(
+        services,
+        "_write_workspace_snapshot",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="配债股数据质量门禁失败") as exc_info:
+        services.get_convertible_bond_allotments(
+            refresh=True,
+            expected_trade_date="2026-07-23",
+            validate_quality=True,
+        )
+
+    assert "行情日期新鲜度不足" in str(exc_info.value)
+    assert "周线 J 完整率不足" in str(exc_info.value)
+    assert "月线 J 完整率不足" in str(exc_info.value)
+    assert payload["quality"]["status"] == "failed"
+    assert writes
+
+
+def test_allotment_scope_refreshes_daily_basic_inputs(monkeypatch) -> None:
+    from quant.routine import pipeline
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    daily_basic_calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "refresh_daily_basic_data",
+        lambda **kwargs: daily_basic_calls.append(kwargs)
+        or {"status": "success", "latest_trade_date": "20260723"},
+    )
+
+    services._run_latest_refresh_job(
+        "cbAllotment",
+        run_id="allotment-daily-basic-refresh",
+    )
+
+    assert status["status"] == "success"
+    assert len(daily_basic_calls) == 1
+
+
 def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -> None:
     rendezvous = threading.Barrier(4, timeout=3)
     active = 0
@@ -1671,7 +1769,8 @@ def test_similar_pattern_weekly_library_becomes_due_on_friday_after_close(
     )
 
     decision = services._similar_pattern_vector_cache_refresh_decision(
-        now=datetime(2026, 7, 24, 15, 1, 0)
+        now=datetime(2026, 7, 24, 15, 1, 0),
+        source_trade_date="2026-07-24",
     )
 
     assert decision["due"] is True
@@ -1969,6 +2068,34 @@ def test_strategy_add_appends_source_note_without_overwriting_or_duplication(mon
     assert note.count("7.17 触发 B1 策略") == 1
 
 
+def test_watchlist_add_returns_without_calculating_scores(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"symbols":["002594.SZ"]}', encoding="utf-8")
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(
+            [
+                {"ts_code": "002594.SZ", "name": "比亚迪", "industry": "汽车整车"},
+                {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行"},
+            ]
+        ),
+    )
+
+    def fail_if_scores_run(symbols):
+        raise AssertionError(f"add should not calculate scores synchronously: {symbols}")
+
+    monkeypatch.setattr(services, "_watchlist_buy_hold_scores", fail_if_scores_run)
+
+    payload = services.add_similar_pattern_watch_symbol("000001.SZ")
+
+    assert [item["symbol"] for item in payload["stocks"]] == ["002594.SZ", "000001.SZ"]
+    assert payload["stocks"][1]["name"] == "平安银行"
+    assert "opportunity_score" not in payload["stocks"][1]
+
+
 def test_watchlist_api_forwards_default_source_note(monkeypatch) -> None:
     captured = {}
 
@@ -1985,6 +2112,21 @@ def test_watchlist_api_forwards_default_source_note(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert captured == {"symbol": "002594.SZ", "note": "7.15 配债股"}
+
+
+def test_watchlist_api_can_return_lightweight_profiles(monkeypatch) -> None:
+    captured = {}
+
+    def fake_get(*, include_scores=True):
+        captured["include_scores"] = include_scores
+        return {"stocks": []}
+
+    monkeypatch.setattr(webapp_api, "get_similar_pattern_watchlist", fake_get)
+
+    response = client.get("/api/similar-patterns/watchlist?include_scores=false")
+
+    assert response.status_code == 200
+    assert captured == {"include_scores": False}
 
 
 def test_watchlist_note_rejects_stock_outside_watchlist(monkeypatch, tmp_path) -> None:
@@ -2287,7 +2429,14 @@ def test_convertible_bond_plan_bootstraps_from_legacy_snapshot(monkeypatch, tmp_
 
 def test_allotment_tab_serves_stale_daily_cache_without_blocking_refresh(monkeypatch, tmp_path) -> None:
     calls = []
-    stale = {"generated_at": "2026-06-28T22:52:04", "records": []}
+    stale = {
+        "generated_at": "2026-06-28T22:52:04",
+        "records": [],
+        "data_sources": {
+            "stock_daily": {"requested": 0, "matched": 0, "error": None},
+            "daily_basic": {"matched": 0, "error": None},
+        },
+    }
 
     monkeypatch.setattr(services, "CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH", tmp_path / "allotments.json")
     monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: stale)
@@ -2304,6 +2453,7 @@ def test_allotment_tab_serves_stale_daily_cache_without_blocking_refresh(monkeyp
     assert calls == []
     assert payload["records"] == []
     assert payload["cache"]["stale"] is True
+    assert payload["quality"]["status"] == "success"
 
 
 def test_similar_pattern_tab_serves_stale_cache_without_blocking_refresh(monkeypatch) -> None:

@@ -141,10 +141,10 @@ def main() -> None:
     manifest: list[dict[str, str]] = []
     for symbol in args.targets:
         path = args.daily_dir / f"{symbol}.parquet"
-        if not path.exists():
-            print(f"missing target daily file: {path}", flush=True)
-            continue
         daily = load_daily_file(path)
+        if daily.empty:
+            print(f"missing target daily data: {symbol}", flush=True)
+            continue
         result = analyze_target(symbol, daily, library, config, basic, target_date=args.target_date)
         paths = write_result(result, args.output_dir)
         manifest.append(

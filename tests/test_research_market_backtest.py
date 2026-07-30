@@ -15,7 +15,7 @@ if str(RESEARCH_DIR) not in sys.path:
 import analyze_b1_entry_exit_grid as entry_exit  # noqa: E402
 from analyze_b1_entry_exit_grid import add_future_prices  # noqa: E402
 from analyze_b1_formal_combos import COMBOS, combo_mask  # noqa: E402
-from refresh_chan_model_live_scores import _build_recent_feature_dataset  # noqa: E402
+from refresh_chan_model_live_scores import _build_recent_feature_dataset, _resolve_daily_path  # noqa: E402
 from quant.data import MarketDataStore, MarketDataStoreConfig  # noqa: E402
 
 
@@ -30,6 +30,32 @@ class _UnifiedModel:
     def predict_proba(self, frame: pd.DataFrame) -> np.ndarray:
         positive = np.full(len(frame), self.probability)
         return np.column_stack([1 - positive, positive])
+
+
+def test_chan_live_score_resolver_preserves_beijing_exchange_suffix(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    daily_dir = raw_root / "daily"
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(raw_root))
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    MarketDataStore(
+        MarketDataStoreConfig(backend="parquet", root=raw_root)
+    ).write_market_batch(
+        pd.DataFrame(
+            {
+                "ts_code": ["920826.BJ"],
+                "trade_date": ["20260729"],
+                "close": [10.0],
+            }
+        )
+    )
+
+    resolved = _resolve_daily_path(daily_dir, "920826.BJ")
+
+    assert resolved == daily_dir / "920826.BJ.parquet"
 
 
 def test_formal_prediction_adapter_supports_unified_models(monkeypatch) -> None:

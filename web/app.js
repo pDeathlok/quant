@@ -45,6 +45,7 @@ const state = {
   similarError: "",
   similarSelectedSymbol: null,
   similarRefreshPromise: null,
+  similarRefreshQueued: false,
   similarPendingRemovals: new Set(),
   loading: false,
 };
@@ -84,6 +85,7 @@ const REFRESH_BUTTON_LABELS = {
   chanRefreshLatestButton: "更新本页",
   cbRefreshLatestButton: "更新本页",
   cbAllotmentRefreshLatestButton: "更新本页",
+  cbAllotmentRefreshButton: "更新行情与配债",
   bydRefreshLatestButton: "更新本页",
   similarRefreshLatestButton: "更新本页",
 };
@@ -363,6 +365,11 @@ const fmtPct = (value, digits = 2) => {
 const fmtRate = (value, digits = 1) => {
   if (value == null || Number.isNaN(Number(value))) return "-";
   return `${(Number(value) * 100).toFixed(digits)}%`;
+};
+const fmtNumber = (value, digits = 2) => {
+  if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : "-";
 };
 const fmtPrice = (value) => {
   if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
@@ -745,14 +752,43 @@ function mergeSimilarPayloadWithWatchlist(payload, watchlist) {
   };
 }
 
+function mergeWatchlistProfiles(currentWatchlist, incomingWatchlist) {
+  const currentBySymbol = new Map(
+    (Array.isArray(currentWatchlist) ? currentWatchlist : []).map((item) => [item.symbol, item]),
+  );
+  return (Array.isArray(incomingWatchlist) ? incomingWatchlist : []).map((item) => ({
+    ...(currentBySymbol.get(item.symbol) || {}),
+    ...item,
+  }));
+}
+
+function enrichWatchlistProfiles(currentWatchlist, enrichedWatchlist) {
+  const enrichedBySymbol = new Map(
+    (Array.isArray(enrichedWatchlist) ? enrichedWatchlist : []).map((item) => [item.symbol, item]),
+  );
+  const scoreFields = [
+    "opportunity_score",
+    "holding_score",
+    "buy_score",
+    "hold_score",
+    "score_date",
+    "score_target",
+  ];
+  return (Array.isArray(currentWatchlist) ? currentWatchlist : []).map((item) => {
+    const enriched = enrichedBySymbol.get(item.symbol);
+    if (!enriched) return item;
+    const current = { ...item };
+    scoreFields.forEach((field) => delete current[field]);
+    return { ...current, ...enriched };
+  });
+}
+
 function syncSimilarLoadingControls() {
   const refreshButton = document.querySelector("#similarRefreshButton");
-  const addButton = document.querySelector('#similarAddForm button[type="submit"]');
   if (refreshButton) {
     refreshButton.disabled = state.similarLoading;
     refreshButton.textContent = state.similarLoading ? "刷新中" : "刷新分析";
   }
-  if (addButton) addButton.disabled = state.similarLoading;
 }
 
 async function loadSimilarPatternsOnce(options = {}) {
@@ -760,18 +796,26 @@ async function loadSimilarPatternsOnce(options = {}) {
   state.similarError = "";
   renderSimilarPatternsPage();
   try {
-    const watchlistPayload = await fetchJson("/similar-patterns/watchlist");
+    const watchlistPayload = await fetchJson("/similar-patterns/watchlist?include_scores=false");
+    const currentWatchlist = state.similarPayload?.watchlist || [];
+    const latestPersistedWatchlist = mergeWatchlistProfiles(
+      currentWatchlist,
+      watchlistPayload.stocks || [],
+    );
     state.similarPayload = mergeSimilarPayloadWithWatchlist({
       ...(state.similarPayload || {}),
       generated_at: state.similarPayload?.generated_at || watchlistPayload.updated_at,
-    }, watchlistPayload.stocks || []);
+    }, latestPersistedWatchlist);
     renderSimilarPatternsPage();
     const path = options.refresh ? "/similar-patterns/analysis?refresh=true" : "/similar-patterns/analysis";
     const requestOptions = options.refresh
       ? { ...workspaceRequestOptions(options), timeoutMs: SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS }
       : workspaceRequestOptions(options);
     const analysisPayload = await fetchJson(path, requestOptions);
-    const latestWatchlist = state.similarPayload?.watchlist || watchlistPayload.stocks || analysisPayload.watchlist || [];
+    const latestWatchlist = enrichWatchlistProfiles(
+      state.similarPayload?.watchlist || latestPersistedWatchlist,
+      analysisPayload.watchlist || [],
+    );
     state.similarPayload = mergeSimilarPayloadWithWatchlist(analysisPayload, latestWatchlist);
     const results = state.similarPayload.results || [];
     if (!state.similarSelectedSymbol && results.length) {
@@ -791,8 +835,18 @@ async function loadSimilarPatternsOnce(options = {}) {
 }
 
 function loadSimilarPatterns(options = {}) {
-  if (state.similarRefreshPromise) return state.similarRefreshPromise;
-  const request = loadSimilarPatternsOnce(options);
+  if (state.similarRefreshPromise) {
+    if (options.refresh) state.similarRefreshQueued = true;
+    return state.similarRefreshPromise;
+  }
+  const request = (async () => {
+    let nextOptions = options;
+    do {
+      state.similarRefreshQueued = false;
+      await loadSimilarPatternsOnce(nextOptions);
+      nextOptions = { refresh: true };
+    } while (state.similarRefreshQueued);
+  })();
   const sharedRequest = request.finally(() => {
     if (state.similarRefreshPromise === sharedRequest) state.similarRefreshPromise = null;
   });
@@ -806,7 +860,12 @@ async function addSimilarWatchSymbol(symbol, options = {}) {
     body: JSON.stringify({ symbol, note: options.note || "" }),
   });
   applySimilarWatchlistPayload(payload);
-  if (options.refresh !== false) await loadSimilarPatterns({ refresh: true });
+  if (options.refresh !== false) {
+    loadSimilarPatterns({ refresh: true }).catch((error) => {
+      showWatchlistToast(error.message || "已加入自选池，但后台计算失败", "error");
+    });
+  }
+  return payload;
 }
 
 async function removeSimilarWatchSymbol(symbol) {
@@ -841,7 +900,11 @@ function applySimilarWatchlistPayload(payload) {
     ...(state.similarPayload || {}),
     generated_at: state.similarPayload?.generated_at || payload.updated_at,
   };
-  state.similarPayload = mergeSimilarPayloadWithWatchlist(currentPayload, payload.stocks || []);
+  const latestWatchlist = mergeWatchlistProfiles(
+    state.similarPayload?.watchlist || [],
+    payload.stocks || [],
+  );
+  state.similarPayload = mergeSimilarPayloadWithWatchlist(currentPayload, latestWatchlist);
   const symbols = new Set(state.similarPayload.watchlist.map((item) => item.symbol));
   if (state.similarSelectedSymbol && !symbols.has(state.similarSelectedSymbol)) {
     state.similarSelectedSymbol = null;
@@ -1076,7 +1139,7 @@ function xueqiuStockUrl(symbol) {
   if (!match) return "";
   const code = match[1];
   const market = match[2]
-    || (/^[69]/.test(code) ? "SH" : /^[48]/.test(code) ? "BJ" : "SZ");
+    || (/^(?:920|[48])/.test(code) ? "BJ" : /^[69]/.test(code) ? "SH" : "SZ");
   return `https://xueqiu.com/S/${market}${code}`;
 }
 
@@ -1483,7 +1546,6 @@ async function loadConvertibleBondAllotments(options = {}) {
   query.set("limit", "120");
   query.set("include_listed_days", "180");
   query.set("stage_scope", "pipeline");
-  if (options.refresh) query.set("refresh", "true");
   try {
     state.cbAllotmentPayload = await fetchJson(
       `/convertible-bonds/allotments?${query.toString()}`,
@@ -2499,6 +2561,21 @@ function allotmentStatusClass(stage) {
   return "listed";
 }
 
+function allotmentStockCell(item) {
+  const stockCode = item.stock_code || "";
+  const stockName = item.stock_name || "";
+  const xueqiuUrl = xueqiuStockUrl(stockCode);
+  if (!xueqiuUrl) {
+    return `<strong>${escapeHtml(stockCode || "--")}</strong><em>${escapeHtml(stockName || "--")}</em>`;
+  }
+  return `
+    <a class="allotment-xueqiu-link" data-allotment-xueqiu href="${escapeHtml(xueqiuUrl)}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(stockName || stockCode)}">
+      <strong>${escapeHtml(stockCode)}</strong>
+      <em>${escapeHtml(stockName || "--")} · 雪球 ↗</em>
+    </a>
+  `;
+}
+
 const allotmentSortConfig = {
   rights_value_pct: { type: "number", defaultDirection: "desc" },
   kdj_daily_j: { type: "number", defaultDirection: "desc" },
@@ -2675,6 +2752,11 @@ function renderConvertibleBondAllotments() {
   const basicRows = source.basic?.rows ?? 0;
   const issueRows = source.issue?.rows ?? 0;
   const issueAvailable = Boolean(source.issue?.available);
+  const quality = payload.quality || {};
+  const qualityMetrics = quality.metrics || {};
+  const stockDailyQuality = qualityMetrics.stock_daily_match || {};
+  const weeklyJQuality = qualityMetrics.kdj_weekly_j || {};
+  const monthlyJQuality = qualityMetrics.kdj_monthly_j || {};
   const allRecords = payload.records || [];
   const statusOptions = allotmentStatusOptions(allRecords);
   renderAllotmentStatusFilters(statusOptions);
@@ -2682,32 +2764,25 @@ function renderConvertibleBondAllotments() {
   summary.innerHTML = `
     <span>数据状态</span>
     <strong>${filteredRecords.length} / ${allRecords.length} 条前置阶段</strong>
-    <em>六阶段队列 ${source.pipeline?.rows ?? 0} 行 · 发行明细 ${source.cninfo_issue?.rows ?? 0} 行 · cb_issue ${issueAvailable ? `${issueRows} 行` : "未可用"}</em>
-    <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">刷新配债数据</button>
+    <em>行情 ${stockDailyQuality.count ?? source.stock_daily?.matched ?? 0}/${stockDailyQuality.total ?? source.stock_daily?.requested ?? 0} · 周/月 J ${weeklyJQuality.count ?? "-"}/${weeklyJQuality.total ?? "-"}、${monthlyJQuality.count ?? "-"}/${monthlyJQuality.total ?? "-"} · 六阶段队列 ${source.pipeline?.rows ?? 0} 行 · 发行明细 ${source.cninfo_issue?.rows ?? 0} 行 · cb_issue ${issueAvailable ? `${issueRows} 行` : "未可用"}</em>
+    <button id="cbAllotmentRefreshButton" class="secondary-button" type="button" data-refresh-scope="cbAllotment">更新行情与配债</button>
   `;
-  document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", async () => {
-    const button = document.querySelector("#cbAllotmentRefreshButton");
-    button.disabled = true;
-    button.textContent = "刷新中";
-    try {
-      await loadConvertibleBondAllotments({ refresh: true });
-    } catch (error) {
-      showError(error);
-    }
+  document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", () => {
+    startLatestDataRefresh("cbAllotment");
   });
   const records = sortedAllotmentRecords(filteredRecords);
   if (!records.length) {
-    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">当前状态下暂无配债股；可切换状态或点击刷新配债数据</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">当前状态下暂无配债股；可切换状态或点击更新行情与配债</td></tr>`;
     return;
   }
   rows.innerHTML = records.map((item) => `
     <tr data-watchlist-symbol="${item.stock_code || ""}" data-watchlist-name="${item.stock_name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(item.stock_price_date || item.announce_date || payload.asof, `配债股${item.status ? ` · ${item.status}` : ""}`))}" tabindex="0">
       <td><span class="allotment-status ${allotmentStatusClass(item.stage)}">${item.status || "-"}</span></td>
-      <td><strong>${item.stock_code || "--"}</strong><em>${item.stock_name || "--"}</em></td>
+      <td>${allotmentStockCell(item)}</td>
       <td><strong>${fmtPrice(item.stock_price)}</strong><em>${item.stock_price_date || "--"}</em></td>
-      <td>${fmtPrice(item.kdj_daily_j)}</td>
-      <td>${fmtPrice(item.kdj_weekly_j)}</td>
-      <td>${fmtPrice(item.kdj_monthly_j)}</td>
+      <td>${fmtNumber(item.kdj_daily_j)}</td>
+      <td>${fmtNumber(item.kdj_weekly_j)}</td>
+      <td>${fmtNumber(item.kdj_monthly_j)}</td>
       <td>${fmtPct(item.rights_value_pct)}</td>
       <td>${item.shares_for_one_lot || item.shares_for_10_bonds || "--"}</td>
       <td>${item.announce_date || "--"}</td>
@@ -3241,20 +3316,6 @@ document.querySelector("#cbRefreshButton")?.addEventListener("click", async () =
   }
 });
 
-document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", async () => {
-  const button = document.querySelector("#cbAllotmentRefreshButton");
-  button.disabled = true;
-  button.textContent = "刷新中";
-  try {
-    await loadConvertibleBondAllotments({ refresh: true });
-  } catch (error) {
-    showError(error);
-  } finally {
-    button.disabled = false;
-    button.textContent = "刷新配债数据";
-  }
-});
-
 document.querySelectorAll(".long-variant-button").forEach((button) => {
   button.addEventListener("click", () => {
     state.longVariant = button.dataset.longVariant || "tea";
@@ -3386,8 +3447,8 @@ document.querySelector("[data-watchlist-context-add]")?.addEventListener("click"
   const button = document.querySelector("[data-watchlist-context-add]");
   button.disabled = true;
   try {
-    await addSimilarWatchSymbol(target.symbol, { refresh: false, note: target.note });
-    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}`);
+    await addSimilarWatchSymbol(target.symbol, { note: target.note });
+    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}，数据后台计算中`);
   } catch (error) {
     showWatchlistToast(error.message || "加入自选池失败", "error");
   } finally {
@@ -3741,6 +3802,7 @@ document.querySelector("#similarAddForm")?.addEventListener("submit", async (eve
   try {
     await addSimilarWatchSymbol(symbol);
     if (input) input.value = "";
+    showWatchlistToast(`${symbol} 已加入自选池，数据后台计算中`);
   } catch (error) {
     showError(error);
   } finally {

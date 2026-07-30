@@ -14,6 +14,12 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+import sys
+
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from quant.data import read_partitioned_symbol_file
+
 DEFAULT_INPUT_DIR = PROJECT_ROOT / "data/research/june_2026_selector_review"
 DEFAULT_DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports/selector_review"
@@ -29,26 +35,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def daily_file(daily_dir: Path, symbol: str) -> Path | None:
-    plain = symbol.replace(".SH", "").replace(".SZ", "").replace(".BJ", "")
-    for candidate in (daily_dir / f"{symbol}.parquet", daily_dir / f"{plain}.parquet"):
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def add_t7_labels(stock: pd.DataFrame, daily_dir: Path) -> pd.DataFrame:
     frames = []
     for symbol, part in stock.groupby("symbol", sort=False):
-        path = daily_file(daily_dir, str(symbol))
-        if path is None:
+        path = daily_dir / f"{symbol}.parquet"
+        daily = read_partitioned_symbol_file(path)
+        if daily.empty:
             frame = part[["date", "symbol"]].copy()
             frame["future_return_t7_pct"] = np.nan
             frame["future_max_high_t7_pct"] = np.nan
             frame["future_max_drawdown_t7_pct"] = np.nan
             frames.append(frame)
             continue
-        daily = pd.read_parquet(path)
         if "trade_date" in daily.columns:
             daily["date"] = pd.to_datetime(daily["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
         else:

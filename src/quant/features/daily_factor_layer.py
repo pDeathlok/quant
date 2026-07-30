@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import normalize_tushare_daily
 from quant.data.factors.technical import KDJ
 from quant.features.variable_library import (
@@ -1136,34 +1137,42 @@ def refresh_symbol_factor_cache(
     daily_path: Path,
     factor_root: Path,
     incremental_start_date: str | pd.Timestamp,
+    source_frame: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
-    daily = pd.read_parquet(daily_path)
+    daily = source_frame.copy() if source_frame is not None else pd.read_parquet(daily_path)
+    symbol = daily_path.stem
+    for column in ("ts_code", "symbol"):
+        if column in daily.columns:
+            values = daily[column].dropna().astype(str)
+            if not values.empty:
+                symbol = values.iloc[0]
+                break
     start = pd.Timestamp(incremental_start_date)
-    prepared = _prepare_daily(daily, daily_path.stem)
+    prepared = _prepare_daily(daily, symbol)
     target_dates = prepared.loc[prepared["date"] >= start, "date"]
     cached = load_daily_base_factors(
-        daily_path.stem,
+        symbol,
         factor_root=factor_root,
         start_date=start,
         end_date=prepared["date"].max(),
     )
     if _cache_covers(cached, target_dates):
         return {
-            "symbol": daily_path.stem,
+            "symbol": symbol,
             "rows": int(len(target_dates)),
             "date_max": target_dates.max().strftime("%Y-%m-%d") if not target_dates.empty else None,
             "paths": [],
             "cache_hit": True,
             "elapsed_seconds": perf_counter() - started,
         }
-    factors = calculate_daily_base_factors(prepared, daily_path.stem)
+    factors = calculate_daily_base_factors(prepared, symbol)
     recent = factors[factors["date"] >= start].copy()
     paths: list[str] = []
     for year, group in recent.groupby(recent["date"].dt.year):
-        paths.append(str(_write_year_partition(group, factor_root, daily_path.stem, int(year))))
+        paths.append(str(_write_year_partition(group, factor_root, symbol, int(year))))
     return {
-        "symbol": daily_path.stem,
+        "symbol": symbol,
         "rows": int(len(recent)),
         "date_max": recent["date"].max().strftime("%Y-%m-%d") if not recent.empty else None,
         "paths": paths,
@@ -1182,19 +1191,41 @@ def refresh_daily_factor_layer(
 ) -> dict[str, Any]:
     """Idempotently refresh the shared layer and write a freshness manifest."""
 
-    suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
-    files = [path for path in sorted(Path(daily_dir).glob("*.parquet")) if path.name.endswith(suffixes)]
-    if limit:
-        files = files[:limit]
-    if not files:
-        raise RuntimeError(f"No standard daily files found in {daily_dir}")
+    daily_dir = Path(daily_dir)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    market = store.read_market_range(daily_dir.name)
+    tasks: list[tuple[Path, pd.DataFrame | None]]
+    if not market.empty and "ts_code" in market.columns:
+        grouped = [
+            (daily_dir / f"{symbol}.parquet", group.reset_index(drop=True))
+            for symbol, group in market.groupby("ts_code", sort=True)
+        ]
+        tasks = grouped[:limit] if limit else grouped
+    else:
+        suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
+        files = [
+            path
+            for path in sorted(daily_dir.glob("*.parquet"))
+            if path.name.endswith(suffixes)
+        ]
+        if limit:
+            files = files[:limit]
+        tasks = [(path, None) for path in files]
+    if not tasks:
+        raise RuntimeError(f"No standard daily data found in {daily_dir}")
     executor_cls = ProcessPoolExecutor if executor_type == "processes" else ThreadPoolExecutor
     results: list[dict[str, Any]] = []
     started = perf_counter()
     with executor_cls(max_workers=max(1, workers)) as executor:
         futures = [
-            executor.submit(refresh_symbol_factor_cache, path, Path(factor_root), incremental_start_date)
-            for path in files
+            executor.submit(
+                refresh_symbol_factor_cache,
+                path,
+                Path(factor_root),
+                incremental_start_date,
+                source_frame,
+            )
+            for path, source_frame in tasks
         ]
         for n, future in enumerate(as_completed(futures), start=1):
             results.append(future.result())

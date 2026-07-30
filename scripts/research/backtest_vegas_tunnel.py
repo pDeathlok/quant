@@ -23,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from quant.features.variable_library import build_continuous_ohlc
+from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
 from quant.strategies.custom.vegas_tunnel import add_vegas_tunnel_signals
 
 
@@ -42,7 +43,7 @@ class ExitRule:
 
 
 def read_daily_file(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    df = read_partitioned_symbol_file(path)
     if "trade_date" in df.columns:
         df["date"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
     else:
@@ -55,7 +56,7 @@ def read_daily_file(path: Path) -> pd.DataFrame:
 
 
 def build_candidates(daily_dir: Path, start_date: str, max_workers: int = 1) -> pd.DataFrame:
-    files = sorted(daily_dir.glob("*.parquet"))
+    files = list_partitioned_symbol_paths(daily_dir)
     frames: list[pd.DataFrame] = []
     start_ts = pd.to_datetime(start_date)
 
@@ -126,11 +127,13 @@ def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: 
     frames = []
     for symbol in candidates["symbol"].dropna().unique():
         path = daily_dir / f"{symbol}.parquet"
-        if not path.exists():
-            path = daily_dir / f"{str(symbol).replace('.SH', '').replace('.SZ', '').replace('.BJ', '')}.parquet"
-        if not path.exists():
+        try:
+            daily = read_daily_file(path)
+        except Exception:
             continue
-        daily = build_continuous_ohlc(read_daily_file(path))
+        if daily.empty:
+            continue
+        daily = build_continuous_ohlc(daily)
         daily["ma10"] = daily["close"].rolling(10).mean()
         daily["ema24_px"] = daily["close"].ewm(span=24, adjust=False, min_periods=24).mean()
         daily["ema144_px"] = daily["close"].ewm(span=144, adjust=False, min_periods=144).mean()

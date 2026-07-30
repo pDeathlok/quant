@@ -5,6 +5,7 @@ import json
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.features import daily_factor_layer as layer
 
 
@@ -100,6 +101,35 @@ def test_incremental_refresh_replaces_same_dates_without_duplicates(tmp_path) ->
     stored = layer.load_daily_base_factors("000001.SZ", factor_root, start_date=start)
     assert len(stored) == 5
     assert not stored.duplicated(["symbol", "date"]).any()
+
+
+def test_daily_factor_refresh_reads_partitioned_market_store(monkeypatch, tmp_path) -> None:
+    raw_root = tmp_path / "raw"
+    factor_root = tmp_path / "factor-cache"
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(raw_root))
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    daily = _daily()
+    MarketDataStore(
+        MarketDataStoreConfig(backend="parquet", root=raw_root)
+    ).write_market_batch(daily)
+    start = daily["date"].iloc[-5]
+
+    result = layer.refresh_daily_factor_layer(
+        raw_root / "daily",
+        factor_root=factor_root,
+        incremental_start_date=start,
+        workers=1,
+        executor_type="threads",
+    )
+
+    assert result["symbols"] == 1
+    assert result["rows"] == 5
+    assert layer.load_daily_base_factors(
+        "000001.SZ",
+        factor_root,
+        start_date=start,
+    ).shape[0] == 5
 
 
 def _assert_signal_factors_equal(

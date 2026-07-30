@@ -20,7 +20,7 @@ import pandas as pd
 
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
-from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
 from quant.data.atomic_io import atomic_write_parquet
 from quant.features.daily_factor_layer import attach_daily_base_factors
 from quant.features.variable_library import build_continuous_ohlc
@@ -230,7 +230,7 @@ def build_exit_rules() -> list[ExitRule]:
 
 
 def normalize_daily(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    df = read_partitioned_symbol_file(path)
     if "trade_date" in df.columns:
         df["date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce")
     else:
@@ -554,7 +554,7 @@ def build_signal_candidates(
 
     rebuild_from = incremental_start or pd.Timestamp("2020-01-01")
     history_start = rebuild_from - pd.Timedelta(days=600)
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DEFAULT_DAILY_DIR.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DEFAULT_DAILY_DIR.parent))
     market = store.read_market_range(DEFAULT_DAILY_DIR.name, start_date=history_start.strftime("%Y%m%d"))
     if market.empty:
         raise RuntimeError(f"No canonical daily rows found for {history_start:%Y-%m-%d}+")

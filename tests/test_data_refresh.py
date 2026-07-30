@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -26,6 +27,27 @@ def test_adjusted_incremental_refresh_restarts_from_first_stored_date():
 
     assert data_refresh._symbol_refresh_start(existing, "20240104", adjust="qfq") == "20240102"
     assert data_refresh._symbol_refresh_start(existing, "20240104", adjust=None) == "20240104"
+
+
+def test_completed_market_end_date_uses_previous_day_before_data_ready(monkeypatch):
+    monkeypatch.delenv("ROUTINE_MARKET_DATA_READY_TIME", raising=False)
+
+    before_close, adjusted = data_refresh._completed_market_end_date(
+        "20260730",
+        now=datetime(2026, 7, 30, 9, 38),
+    )
+    after_ready, after_ready_adjusted = data_refresh._completed_market_end_date(
+        "20260730",
+        now=datetime(2026, 7, 30, 16, 1),
+    )
+    historical, historical_adjusted = data_refresh._completed_market_end_date(
+        "20260729",
+        now=datetime(2026, 7, 30, 9, 38),
+    )
+
+    assert (before_close, adjusted) == ("20260729", True)
+    assert (after_ready, after_ready_adjusted) == ("20260730", False)
+    assert (historical, historical_adjusted) == ("20260729", False)
 
 
 def test_refresh_one_symbol_retries_then_succeeds(monkeypatch, tmp_path):

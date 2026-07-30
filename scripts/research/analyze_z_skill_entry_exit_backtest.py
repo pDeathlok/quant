@@ -27,7 +27,7 @@ import pandas as pd
 
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
-from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
 from quant.data.atomic_io import atomic_link_or_copy, atomic_write_parquet
 from quant.features.daily_factor_layer import Z_CONSUMER_ALIASES, attach_z_skill_base_factors
 from quant.features.variable_library import build_continuous_ohlc
@@ -117,7 +117,7 @@ def _normalize_daily(
     *,
     factors_attached: bool = False,
 ) -> pd.DataFrame:
-    df = source_frame.copy() if source_frame is not None else pd.read_parquet(path)
+    df = source_frame.copy() if source_frame is not None else read_partitioned_symbol_file(path)
     if df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -435,7 +435,7 @@ def build_signal_candidates(
         )
 
     history_start = start_ts - pd.Timedelta(days=450)
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     market = store.read_market_range(daily_dir.name, start_date=history_start.strftime("%Y%m%d"))
     if market.empty:
         raise RuntimeError(f"No canonical daily rows found for {history_start:%Y-%m-%d}+")

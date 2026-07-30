@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
 from quant.features.daily_factor_layer import attach_z_skill_base_factors
 from quant.features.variable_library import build_continuous_ohlc
 
@@ -93,7 +93,7 @@ def _normalize_daily(
     source_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     target = pd.to_datetime(signal_date) if signal_date else pd.Timestamp.today().normalize()
-    df = source_frame.copy() if source_frame is not None else (pd.read_parquet(path) if path.exists() else pd.DataFrame())
+    df = source_frame.copy() if source_frame is not None else read_partitioned_symbol_file(path)
     if df.empty:
         return df
     out = df.copy()
@@ -655,7 +655,7 @@ def build_z_skill_daily_signals(
 ) -> dict[str, dict[str, Any]]:
     """Scan raw daily files and return latest extended pattern hits by symbol."""
     target = pd.to_datetime(signal_date) if signal_date else pd.Timestamp.today().normalize()
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=Path(daily_dir).parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=Path(daily_dir).parent))
     market = store.read_market_range(
         Path(daily_dir).name,
         start_date=(target - pd.Timedelta(days=600)).strftime("%Y%m%d"),

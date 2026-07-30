@@ -69,7 +69,7 @@ def main() -> None:
     candidate_symbols: list[str] | None = None
     gate_source_symbol_count: int | None = None
     source_store = MarketDataStore(
-        MarketDataStoreConfig(backend="parquet", root=args.daily_dir.parent)
+        MarketDataStoreConfig.from_env(root=args.daily_dir.parent)
     )
     source_recent = source_store.read_market_range(
         args.daily_dir.name,

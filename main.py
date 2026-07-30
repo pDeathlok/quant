@@ -26,6 +26,7 @@ from quant import (  # noqa: E402
     TemplateStrategy,
 )
 from quant.data.source_merge import normalize_ts_code  # noqa: E402
+from quant.data import MarketDataStore, MarketDataStoreConfig  # noqa: E402
 
 
 STRATEGIES = {
@@ -63,14 +64,31 @@ def _resolve_data_path(symbol: str, explicit_path: str | None) -> Path:
 
 
 def _load_backtest_data(path: Path, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    frame = pd.read_parquet(path).copy()
+    return _prepare_backtest_data(
+        pd.read_parquet(path),
+        symbol,
+        start_date,
+        end_date,
+        source=str(path),
+    )
+
+
+def _prepare_backtest_data(
+    source_frame: pd.DataFrame,
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    source: str,
+) -> pd.DataFrame:
+    frame = source_frame.copy()
     if "date" in frame.columns:
         dates = pd.to_datetime(frame["date"], errors="coerce")
     elif "trade_date" in frame.columns:
         dates = pd.to_datetime(frame["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
         frame["date"] = dates
     else:
-        raise ValueError(f"行情文件缺少 date/trade_date 列: {path}")
+        raise ValueError(f"行情数据缺少 date/trade_date 列: {source}")
     frame["date"] = dates
     if "symbol" not in frame.columns:
         frame["symbol"] = normalize_ts_code(symbol)
@@ -78,8 +96,47 @@ def _load_backtest_data(path: Path, symbol: str, start_date: str, end_date: str)
     end = pd.to_datetime(end_date, format="%Y%m%d")
     selected = frame.loc[dates.between(start, end)].sort_values("date").reset_index(drop=True)
     if selected.empty:
-        raise ValueError(f"{path} 在 {start_date}-{end_date} 没有行情数据")
+        raise ValueError(f"{source} 在 {start_date}-{end_date} 没有行情数据")
     return selected
+
+
+def _load_symbol_backtest_data(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    explicit_path: str | None = None,
+) -> tuple[pd.DataFrame, str]:
+    if explicit_path:
+        path = _resolve_data_path(symbol, explicit_path)
+        return _load_backtest_data(path, symbol, start_date, end_date), str(path)
+
+    ts_code = normalize_ts_code(symbol)
+    store = MarketDataStore(
+        MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data/raw")
+    )
+    market = store.read_market_range(
+        "daily",
+        start_date=start_date,
+        end_date=end_date,
+        symbols=[ts_code],
+    )
+    if not market.empty:
+        source = f"canonical:daily/{ts_code}"
+        return (
+            _prepare_backtest_data(
+                market,
+                ts_code,
+                start_date,
+                end_date,
+                source=source,
+            ),
+            source,
+        )
+
+    # Compatibility fallback for checkouts that have not migrated their local
+    # one-file-per-symbol history yet.
+    path = _resolve_data_path(symbol, None)
+    return _load_backtest_data(path, symbol, start_date, end_date), str(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -99,13 +156,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    data_path = _resolve_data_path(args.symbol, args.data)
-    data = _load_backtest_data(data_path, args.symbol, args.start_date, args.end_date)
+    data, data_source = _load_symbol_backtest_data(
+        args.symbol,
+        args.start_date,
+        args.end_date,
+        args.data,
+    )
     strategy = STRATEGIES[args.strategy]()
     engine = BacktestEngine(data=data, strategy=strategy)
 
     print(f"策略: {strategy.name}")
-    print(f"行情: {data_path}")
+    print(f"行情: {data_source}")
     print(f"股票: {args.symbol}")
     print(f"时间范围: {args.start_date} ~ {args.end_date}")
     engine.run(report_filename=args.output)

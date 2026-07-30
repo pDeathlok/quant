@@ -40,6 +40,7 @@ from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exi
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from analyze_z_skill_entry_exit_backtest import OpenFilter, apply_open_filter, build_open_filters
 from quant.data.source_merge import normalize_tushare_daily
+from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
 from quant.data.atomic_io import atomic_link_or_copy
 from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc
@@ -265,7 +266,7 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
     try:
         if signal_rows.empty:
             return None
-        daily = pd.read_parquet(path)
+        daily = read_partitioned_symbol_file(path)
         daily = normalize_tushare_daily(daily, path.stem)
         daily = daily.sort_values("date").reset_index(drop=True)
         history_start = pd.Timestamp(start_date) - pd.Timedelta(days=450)
@@ -333,8 +334,11 @@ def build_model_dataset(
 
     signal_df = _load_signal_cache(signals, start_date)
     by_symbol = {symbol: group[["symbol", "date", *signals]].copy() for symbol, group in signal_df.groupby("symbol")}
-    suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
-    files = [path for path in sorted(daily_dir.glob("*.parquet")) if path.name.endswith(suffixes) and path.stem in by_symbol]
+    files = [
+        path
+        for path in list_partitioned_symbol_paths(daily_dir)
+        if path.stem in by_symbol
+    ]
     frames: list[pd.DataFrame] = []
     started = perf_counter()
     executor_cls = ProcessPoolExecutor if executor_type == "processes" else ThreadPoolExecutor

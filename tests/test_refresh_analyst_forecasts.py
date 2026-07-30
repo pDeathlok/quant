@@ -16,6 +16,12 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+def test_to_ts_code_uses_beijing_exchange_prefixes() -> None:
+    assert MODULE.to_ts_code("920826") == "920826.BJ"
+    assert MODULE.to_ts_code("430047") == "430047.BJ"
+    assert MODULE.to_ts_code("600000") == "600000.SH"
+
+
 def _configure_paths(monkeypatch, tmp_path) -> Path:
     output = tmp_path / "analyst_forecasts.parquet"
     monkeypatch.setattr(MODULE, "OUTPUT_PATH", output)

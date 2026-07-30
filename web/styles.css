@@ -659,6 +659,31 @@ h3 {
   display: block;
 }
 
+.allotment-xueqiu-link {
+  color: inherit;
+  display: block;
+  text-decoration: none;
+}
+
+.allotment-xueqiu-link em {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  text-underline-offset: 2px;
+}
+
+.allotment-xueqiu-link:hover strong,
+.allotment-xueqiu-link:hover em,
+.allotment-xueqiu-link:focus-visible strong,
+.allotment-xueqiu-link:focus-visible em {
+  color: var(--accent);
+}
+
+.allotment-xueqiu-link:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  outline-offset: 2px;
+}
+
 .allotment-table strong {
   line-height: 1.35;
 }

@@ -8,18 +8,11 @@ import numpy as np
 import pandas as pd
 
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.source_merge import normalize_ts_code as _normalize_ts_code
 
 def normalize_ts_code(symbol: str) -> str:
-    text = str(symbol)
-    if "." in text:
-        return text
-    if text.startswith(("6", "9")):
-        return f"{text}.SH"
-    if text.startswith(("0", "2", "3")):
-        return f"{text}.SZ"
-    if text.startswith(("4", "8")):
-        return f"{text}.BJ"
-    return text
+    """Compatibility export for the project's canonical symbol normalizer."""
+    return _normalize_ts_code(symbol)
 
 
 def build_limit_proxy_features(daily_dir: Path, start: str | pd.Timestamp | None = None) -> pd.DataFrame:
@@ -29,7 +22,7 @@ def build_limit_proxy_features(daily_dir: Path, start: str | pd.Timestamp | None
     fallback that approximates broad sentiment with daily return thresholds.
     """
     start_ts = pd.to_datetime(start) if start is not None else None
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     read_start = (start_ts - pd.Timedelta(days=10)).strftime("%Y%m%d") if start_ts is not None else None
     all_daily = store.read_market_range(
         daily_dir.name,

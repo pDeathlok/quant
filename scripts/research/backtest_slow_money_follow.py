@@ -26,6 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from quant.data.tushare_fetcher import TushareDataFetcher
+from quant.data import MarketDataStore, MarketDataStoreConfig
 
 
 DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
@@ -129,17 +130,21 @@ def date_text(value: pd.Timestamp) -> str:
 
 
 def available_trade_dates(daily_dir: Path, start: pd.Timestamp, end: pd.Timestamp) -> list[str]:
-    seen: set[str] = set()
-    for path in daily_dir.glob("*.parquet"):
-        try:
-            df = pd.read_parquet(path, columns=["trade_date"])
-        except Exception:
-            continue
-        dates = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-        mask = (dates >= start) & (dates <= end)
-        if mask.any():
-            seen.update(dates[mask].dt.strftime("%Y%m%d").dropna().tolist())
-    return sorted(seen)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    frame = store.read_market_range(
+        daily_dir.name,
+        start_date=date_text(start),
+        end_date=date_text(end),
+        columns=["trade_date"],
+    )
+    if frame.empty or "trade_date" not in frame.columns:
+        return []
+    dates = pd.to_datetime(
+        frame["trade_date"].astype(str),
+        format="%Y%m%d",
+        errors="coerce",
+    )
+    return sorted(dates.dropna().dt.strftime("%Y%m%d").unique().tolist())
 
 
 def refresh_tushare_data(args: argparse.Namespace, dates: list[str]) -> dict[str, int | str]:
@@ -175,28 +180,21 @@ def refresh_tushare_data(args: argparse.Namespace, dates: list[str]) -> dict[str
 
 
 def load_daily_window(daily_dir: Path, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    frames = []
     columns = ["ts_code", "trade_date", "open", "high", "low", "close", "pct_chg", "vol", "amount", "turnover", "volume", "name"]
-    for idx, path in enumerate(sorted(daily_dir.glob("*.parquet")), start=1):
-        try:
-            df = pd.read_parquet(path, columns=columns)
-        except Exception:
-            df = pd.read_parquet(path)
-            df = df[[col for col in columns if col in df.columns]]
-        if df.empty or "trade_date" not in df.columns:
-            continue
-        df["date"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-        df = df[(df["date"] >= start) & (df["date"] <= end)].copy()
-        if df.empty:
-            continue
-        if "ts_code" not in df.columns:
-            df["ts_code"] = path.stem
-        frames.append(df)
-        if idx % 1000 == 0:
-            print(f"  loaded daily files: {idx}", flush=True)
-    if not frames:
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    out = store.read_market_range(
+        daily_dir.name,
+        start_date=date_text(start),
+        end_date=date_text(end),
+    )
+    if out.empty or "trade_date" not in out.columns:
         return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
+    out = out[[column for column in columns if column in out.columns]].copy()
+    out["date"] = pd.to_datetime(
+        out["trade_date"].astype(str),
+        format="%Y%m%d",
+        errors="coerce",
+    )
     if "amount" not in out.columns:
         out["amount"] = np.nan
     if "turnover" in out.columns:

@@ -11,10 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from quant.research.similar_patterns_validation import (
     apply_expanding_calibration,
     apply_global_expanding_calibration,
+    build_industry_regime,
     build_market_regime,
     filter_cases_mature_at_signal,
     summarize_walk_forward_records,
 )
+from quant.data import MarketDataStore, MarketDataStoreConfig
 
 
 def test_build_market_regime_uses_only_trailing_prices() -> None:
@@ -27,6 +29,40 @@ def test_build_market_regime_uses_only_trailing_prices() -> None:
     assert regime.iloc[40]["market_regime"] == "risk_on"
     assert regime.iloc[-1]["market_regime"] == "risk_off"
     assert list(regime.columns) == ["date", "market_regime", "market_ret_20d", "market_vol_20d"]
+
+
+def test_build_industry_regime_reads_partitioned_market_store(monkeypatch, tmp_path) -> None:
+    raw_root = tmp_path / "raw"
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(raw_root))
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    dates = pd.bdate_range("2025-01-02", periods=45)
+    rows = []
+    for symbol, offset in [("000001.SZ", 0.0), ("920826.BJ", 1.0)]:
+        close = np.linspace(10.0 + offset, 15.0 + offset, len(dates))
+        rows.append(
+            pd.DataFrame(
+                {
+                    "ts_code": symbol,
+                    "trade_date": dates.strftime("%Y%m%d"),
+                    "close": close,
+                }
+            )
+        )
+    MarketDataStore(
+        MarketDataStoreConfig(backend="parquet", root=raw_root)
+    ).write_market_batch(pd.concat(rows, ignore_index=True))
+    basic = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "920826.BJ"],
+            "industry": ["软件服务", "软件服务"],
+        }
+    )
+
+    regime = build_industry_regime(raw_root / "daily", basic, "软件服务")
+
+    assert len(regime) == len(dates)
+    assert regime.iloc[-1]["industry_regime"] == "risk_on"
 
 
 def test_filter_cases_mature_at_signal_uses_horizon_specific_cutoff() -> None:

@@ -72,7 +72,7 @@ def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
     path = Path(path_str)
     start_ts = pd.to_datetime(start_date)
     history_start = start_ts - pd.Timedelta(days=450)
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=path.parent.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=path.parent.parent))
     df = store.read_market_range(path.parent.name, start_date=history_start.strftime("%Y%m%d"), symbols=[path.stem])
     return process_daily_frame((path.stem, df, start_date))
 
@@ -160,7 +160,7 @@ def build_dataset(
 ) -> pd.DataFrame:
     start_ts = pd.to_datetime(start_date)
     history_start = (start_ts - pd.Timedelta(days=450)).strftime("%Y%m%d")
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     market = store.read_market_range(
         daily_dir.name,
         start_date=history_start,

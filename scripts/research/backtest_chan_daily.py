@@ -139,7 +139,7 @@ def build_candidates(
     start_ts = pd.to_datetime(start_date)
     history_start = start_ts - pd.Timedelta(days=800)
     read_started = time.monotonic()
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     market = store.read_market_range(daily_dir.name, start_date=history_start.strftime("%Y%m%d"))
     read_elapsed = time.monotonic() - read_started
     tasks = [
@@ -233,11 +233,9 @@ def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: 
     frames = []
     for symbol in candidates["symbol"].dropna().astype(str).unique():
         path = daily_dir / f"{symbol}.parquet"
-        if not path.exists():
-            path = daily_dir / f"{symbol.replace('.SH', '').replace('.SZ', '').replace('.BJ', '')}.parquet"
-        if not path.exists():
-            continue
         daily = read_daily_file(path)
+        if daily.empty:
+            continue
         daily["ma5"] = daily["close"].rolling(5).mean()
         daily["ma10"] = daily["close"].rolling(10).mean()
         daily["ma20"] = daily["close"].rolling(20).mean()

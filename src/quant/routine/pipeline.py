@@ -817,11 +817,16 @@ def refresh_daily_web_workspaces(max_workers: int | None = None) -> dict[str, di
         }
 
     def refresh_allotments() -> dict:
-        allotments = get_convertible_bond_allotments(refresh=True)
+        allotments = get_convertible_bond_allotments(
+            refresh=True,
+            expected_trade_date=signal_date,
+            validate_quality=True,
+        )
         return {
             "status": "success",
             "generated_at": allotments.get("generated_at"),
             "records": len(allotments.get("records") or []),
+            "quality": allotments.get("quality"),
         }
 
     def refresh_byd() -> dict:

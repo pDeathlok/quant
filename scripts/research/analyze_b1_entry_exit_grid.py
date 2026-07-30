@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 import build_training_data_parallel as btd
-from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
 from quant.features.variable_library import (
     EXTRA_FEATURE_COLUMNS,
     build_continuous_ohlc,
@@ -111,7 +111,7 @@ def process_strict_b1_no_volume_file(args: tuple[str, str, dict[str, dict]]) -> 
     path_str, start_date, meta_by_ts_code = args
     path = Path(path_str)
     try:
-        df = pd.read_parquet(path)
+        df = read_partitioned_symbol_file(path)
         return process_strict_b1_no_volume_frame((path.stem, df, start_date, meta_by_ts_code))
     except Exception as exc:
         print(f"  skip {path.name}: {exc}")
@@ -183,7 +183,7 @@ def build_strict_b1_no_volume_candidates(
     """Derive formal candidates from the single unified B1 feature cache."""
     start_ts = pd.to_datetime(start_date)
 
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     market_latest = store.latest_dataset_trade_date(daily_dir.name)
     if DEFAULT_FEATURE_CACHE.exists():
         features = pd.read_parquet(DEFAULT_FEATURE_CACHE)
@@ -497,22 +497,18 @@ def build_exit_rules() -> list[ExitRule]:
 
 
 def read_daily_file(daily_dir: Path, symbol: str) -> pd.DataFrame | None:
-    candidates = [
-        daily_dir / f"{symbol}.parquet",
-        daily_dir / f"{symbol.replace('.SH', '').replace('.SZ', '').replace('.BJ', '')}.parquet",
-    ]
-    for path in candidates:
-        if path.exists():
-            df = pd.read_parquet(path)
-            if "trade_date" in df.columns:
-                df["date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
-            else:
-                df["date"] = pd.to_datetime(df["date"])
-            if "vol" in df.columns and "volume" not in df.columns:
-                df = df.rename(columns={"vol": "volume"})
-            df["symbol"] = symbol
-            return df.sort_values("date").reset_index(drop=True)
-    return None
+    path = daily_dir / f"{symbol}.parquet"
+    df = read_partitioned_symbol_file(path)
+    if df.empty:
+        return None
+    if "trade_date" in df.columns:
+        df["date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
+    else:
+        df["date"] = pd.to_datetime(df["date"])
+    if "vol" in df.columns and "volume" not in df.columns:
+        df = df.rename(columns={"vol": "volume"})
+    df["symbol"] = symbol
+    return df.sort_values("date").reset_index(drop=True)
 
 
 def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: int) -> pd.DataFrame:
@@ -525,7 +521,7 @@ def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: 
     symbols = prepared["symbol"].dropna().unique().tolist()
     start_date = prepared["date"].min().strftime("%Y%m%d")
     end_date = (prepared["date"].max() + pd.Timedelta(days=max_hold_days * 3 + 10)).strftime("%Y%m%d")
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=daily_dir.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     market = store.read_market_range(
         daily_dir.name,
         start_date=start_date,

@@ -27,6 +27,7 @@ from analyze_b1_xgb_entry_exit_grid import (
     predict_xgb_models,
 )
 from quant.strategies.custom.b1_family import add_b1_family_signals
+from quant.data import read_partitioned_symbol_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -59,9 +60,9 @@ def build_combos() -> list[ResearchCombo]:
 
 def read_daily_with_signals(symbol: str) -> pd.DataFrame | None:
     path = DEFAULT_DAILY_DIR / f"{symbol}.parquet"
-    if not path.exists():
+    df = read_partitioned_symbol_file(path)
+    if df.empty:
         return None
-    df = pd.read_parquet(path)
     if "date" not in df.columns and "trade_date" in df.columns:
         df["date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
     else:

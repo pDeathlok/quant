@@ -14,7 +14,12 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
+from quant.data import (
+    MarketDataStore,
+    MarketDataStoreConfig,
+    list_partitioned_symbol_paths,
+    read_partitioned_symbol_file,
+)
 
 
 @dataclass(frozen=True)
@@ -168,11 +173,16 @@ def vector_cache_path(cache_dir: Path, symbol: str, config: SimilarPatternConfig
 
 
 def partitioned_daily_source_fingerprint(daily_dir: Path) -> str | None:
-    """Return one stable fingerprint for the cross-sectional parquet partitions."""
+    """Return a stable fingerprint for the configured canonical daily source."""
     partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
     partition_paths = sorted(partition_root.glob("year_month=*/data.parquet"))
     if not partition_paths:
-        return None
+        store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+        latest = store.latest_dataset_trade_date(daily_dir.name)
+        if latest is None:
+            return None
+        symbols = store.list_symbols(daily_dir.name)
+        return f"canonical:{latest.strftime('%Y%m%d')}:{len(symbols)}"
     digest = hashlib.sha1()
     for path in partition_paths:
         source_stat = path.stat()

@@ -62,21 +62,33 @@ def test_watchlist_stocks_have_persistent_note_editor() -> None:
     assert 'id="similarNoteInput"' in INDEX_HTML
     assert "/note`, {" in APP_JS
     assert 'method: "PUT"' in APP_JS
-    assert 'await fetchJson("/similar-patterns/watchlist")' in APP_JS
+    assert 'await fetchJson("/similar-patterns/watchlist?include_scores=false")' in APP_JS
     assert "分析加载失败，笔记仍可编辑" in APP_JS
     assert ".similar-note-dialog" in STYLES_CSS
 
 
 def test_watchlist_mutations_keep_previous_analysis_during_background_refresh() -> None:
     assert "similarRefreshPromise: null" in APP_JS
+    assert "similarRefreshQueued: false" in APP_JS
     assert "similarPendingRemovals: new Set()" in APP_JS
     assert "function mergeSimilarPayloadWithWatchlist" in APP_JS
+    assert "function mergeWatchlistProfiles(currentWatchlist, incomingWatchlist)" in APP_JS
+    assert "function enrichWatchlistProfiles(currentWatchlist, enrichedWatchlist)" in APP_JS
     assert "正在后台刷新，当前显示上次结果" in APP_JS
-    assert "if (state.similarRefreshPromise) return state.similarRefreshPromise;" in APP_JS
+    assert "if (options.refresh) state.similarRefreshQueued = true;" in APP_JS
+    assert "while (state.similarRefreshQueued);" in APP_JS
     assert "if (state.similarPendingRemovals.has(symbol)) return;" in APP_JS
     assert "const SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS = 45 * 60 * 1000;" in APP_JS
     assert "timeoutMs: SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS" in APP_JS
     assert "state.similarPayload = null;" not in APP_JS
+
+
+def test_watchlist_add_returns_before_background_analysis_finishes() -> None:
+    assert 'await fetchJson("/similar-patterns/watchlist?include_scores=false")' in APP_JS
+    assert "loadSimilarPatterns({ refresh: true }).catch((error) => {" in APP_JS
+    assert "if (options.refresh !== false) await loadSimilarPatterns" not in APP_JS
+    assert "数据后台计算中" in APP_JS
+    assert "if (addButton) addButton.disabled = state.similarLoading;" not in APP_JS
 
 
 def test_strategy_watchlist_add_includes_default_source_note() -> None:
@@ -88,6 +100,44 @@ def test_strategy_watchlist_add_includes_default_source_note() -> None:
     assert 'note: target.note' in APP_JS
     assert "触发 ${(item.matched_families || []).join(\" / \")} 策略" in APP_JS
     assert "配债股${item.status ?" in APP_JS
+
+
+def test_allotment_kdj_values_use_signed_number_formatter() -> None:
+    assert "const fmtNumber = (value, digits = 2) => {" in APP_JS
+    assert "return Number.isFinite(numeric) ? numeric.toFixed(digits) : \"-\";" in APP_JS
+    assert "${fmtNumber(item.kdj_daily_j)}" in APP_JS
+    assert "${fmtNumber(item.kdj_weekly_j)}" in APP_JS
+    assert "${fmtNumber(item.kdj_monthly_j)}" in APP_JS
+    assert "${fmtPrice(item.kdj_weekly_j)}" not in APP_JS
+    assert "${fmtPrice(item.kdj_monthly_j)}" not in APP_JS
+
+
+def test_allotment_refresh_updates_market_inputs_and_exposes_quality() -> None:
+    assert 'cbAllotmentRefreshButton: "更新行情与配债"' in APP_JS
+    assert 'startLatestDataRefresh("cbAllotment");' in APP_JS
+    assert "loadConvertibleBondAllotments({ refresh: true })" not in APP_JS
+    assert "qualityMetrics.stock_daily_match" in APP_JS
+    assert "qualityMetrics.kdj_weekly_j" in APP_JS
+    assert "qualityMetrics.kdj_monthly_j" in APP_JS
+    assert "20260730-allotment-refresh-quality-v1" in INDEX_HTML
+
+
+def test_allotment_stocks_link_to_xueqiu_in_a_new_tab() -> None:
+    assert "function allotmentStockCell(item)" in APP_JS
+    assert "xueqiuStockUrl(stockCode)" in APP_JS
+    assert 'class="allotment-xueqiu-link"' in APP_JS
+    assert "data-allotment-xueqiu" in APP_JS
+    assert 'target="_blank"' in APP_JS
+    assert 'rel="noopener noreferrer"' in APP_JS
+    assert "雪球 ↗" in APP_JS
+    assert ".allotment-xueqiu-link" in STYLES_CSS
+    assert "20260730-allotment-xueqiu-v1" in INDEX_HTML
+
+
+def test_xueqiu_market_prefix_handles_beijing_920_codes_first() -> None:
+    assert '/^(?:920|[48])/.test(code) ? "BJ"' in APP_JS
+    assert 'https://xueqiu.com/S/${market}${code}' in APP_JS
+    assert "20260730-xueqiu-bj920-v2" in INDEX_HTML
 
 
 def test_watchlist_note_is_visible_on_stock_hover_and_keyboard_focus() -> None:

@@ -24,6 +24,7 @@ from quant.features.market_sentiment import (
     normalize_ts_code,
     read_top_list_features,
 )
+from quant.data import read_partitioned_symbol_file
 
 
 DEFAULT_DAILY_DIR = PROJECT_ROOT / "data/stocks_daily"
@@ -86,7 +87,7 @@ BASE_FEATURES = [
 
 
 def read_daily_file(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    df = read_partitioned_symbol_file(path)
     if "trade_date" in df.columns:
         trade_dates = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
         if "date" not in df.columns:
@@ -172,8 +173,6 @@ def build_feature_dataset(
     frames: list[pd.DataFrame] = []
     for symbol, group in signal.groupby("symbol"):
         path = daily_dir / f"{symbol}.parquet"
-        if not path.exists():
-            continue
         daily = add_stock_features(read_daily_file(path))
         keep = [
             "symbol",

@@ -12,7 +12,8 @@ from typing import Any
 
 import pandas as pd
 
-from quant.data import read_partitioned_symbol_file
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
+from quant.data.source_merge import normalize_ts_code
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.features.variable_library import calculate_project_extra_features
 from quant.routine.convertible_bond_grid_plan import CB_BASIC_PATH, CB_DATA_DIR
@@ -192,23 +193,38 @@ def _stock_code_candidates(stock_code: Any) -> list[str]:
     code = raw.split(".")[0]
     candidates = [raw]
     if "." not in raw and len(code) == 6:
-        if code.startswith(("6", "9")):
-            candidates.append(f"{code}.SH")
-        elif code.startswith(("0", "2", "3")):
-            candidates.append(f"{code}.SZ")
-        elif code.startswith(("4", "8")):
-            candidates.append(f"{code}.BJ")
+        candidates.append(normalize_ts_code(code))
     candidates.append(code)
     return list(dict.fromkeys(candidates))
 
 
-def _load_stock_daily(stock_code: Any, daily_dir: Path | None = None) -> pd.DataFrame:
-    daily_dir = daily_dir or STOCK_DAILY_DIR
+def _legacy_stock_daily_path(stock_code: Any, daily_dir: Path) -> Path | None:
     for candidate in _stock_code_candidates(stock_code):
         path = daily_dir / f"{candidate}.parquet"
         if path.exists():
-            return read_partitioned_symbol_file(path)
-    return pd.DataFrame()
+            return path
+    return None
+
+
+def _load_stock_daily(
+    stock_code: Any,
+    daily_dir: Path | None = None,
+    canonical_daily: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    daily_dir = daily_dir or STOCK_DAILY_DIR
+    candidates = _stock_code_candidates(stock_code)
+    legacy_path = _legacy_stock_daily_path(stock_code, daily_dir)
+    if legacy_path is not None:
+        return read_partitioned_symbol_file(legacy_path)
+    if canonical_daily is not None:
+        if canonical_daily.empty or "ts_code" not in canonical_daily.columns:
+            return pd.DataFrame()
+        symbol_rows = canonical_daily[
+            canonical_daily["ts_code"].astype(str).isin(candidates)
+        ]
+        return symbol_rows.reset_index(drop=True)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    return store.read_market_range(daily_dir.name, symbols=candidates)
 
 
 def _prepare_stock_daily(frame: pd.DataFrame) -> pd.DataFrame:
@@ -230,11 +246,7 @@ def _prepare_stock_daily(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _stock_market_snapshot(stock_code: Any, daily_dir: Path | None = None) -> dict[str, Any]:
-    daily_dir = daily_dir or STOCK_DAILY_DIR
-    daily = _prepare_stock_daily(_load_stock_daily(stock_code, daily_dir=daily_dir))
-    if daily.empty:
-        return {}
+def _market_snapshot_from_daily(daily: pd.DataFrame) -> dict[str, Any]:
     try:
         features = calculate_project_extra_features(daily)
     except Exception:
@@ -255,6 +267,33 @@ def _stock_market_snapshot(stock_code: Any, daily_dir: Path | None = None) -> di
 
 def _attach_stock_market_snapshots(records: list[dict[str, Any]], daily_dir: Path | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     daily_dir = daily_dir or STOCK_DAILY_DIR
+    stock_codes = {
+        stock_code
+        for item in records
+        if (stock_code := _clean_text(item.get("stock_code"))) is not None
+    }
+    canonical_codes = {
+        stock_code
+        for stock_code in stock_codes
+        if _legacy_stock_daily_path(stock_code, daily_dir) is None
+    }
+    canonical_daily = pd.DataFrame()
+    storage_backend = "legacy"
+    storage_error = None
+    if canonical_codes:
+        candidates = sorted(
+            {
+                candidate
+                for stock_code in canonical_codes
+                for candidate in _stock_code_candidates(stock_code)
+            }
+        )
+        store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+        storage_backend = store.config.backend
+        try:
+            canonical_daily = store.read_market_range(daily_dir.name, symbols=candidates)
+        except Exception as exc:
+            storage_error = str(exc)
     cache: dict[str, dict[str, Any]] = {}
     hits = 0
     for item in records:
@@ -262,14 +301,25 @@ def _attach_stock_market_snapshots(records: list[dict[str, Any]], daily_dir: Pat
         if not stock_code:
             continue
         if stock_code not in cache:
-            cache[stock_code] = _stock_market_snapshot(stock_code, daily_dir=daily_dir)
+            daily = _load_stock_daily(
+                stock_code,
+                daily_dir=daily_dir,
+                canonical_daily=canonical_daily,
+            )
+            prepared = _prepare_stock_daily(daily)
+            if prepared.empty:
+                cache[stock_code] = {}
+            else:
+                cache[stock_code] = _market_snapshot_from_daily(prepared)
         snapshot = cache[stock_code]
         if snapshot:
             hits += 1
             item.update(snapshot)
     return records, {
         "source": str(daily_dir),
-        "requested": len({str(item.get("stock_code")) for item in records if item.get("stock_code")}),
+        "storage_backend": storage_backend,
+        "error": storage_error,
+        "requested": len(stock_codes),
         "matched": hits,
     }
 

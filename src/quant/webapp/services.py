@@ -28,6 +28,7 @@ import pandas as pd
 import yaml
 
 from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
+from quant.data.source_merge import normalize_ts_code
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_daily_plan, write_daily_plan
@@ -433,7 +434,7 @@ def _similar_pattern_vector_cache_refreshed_this_window(
 
 def _similar_pattern_source_date_is_current(source_trade_date: str | None, current: datetime) -> bool:
     if not source_trade_date:
-        return True
+        return False
     parsed = pd.to_datetime(source_trade_date, errors="coerce")
     return pd.notna(parsed) and parsed.date() == current.date()
 
@@ -441,7 +442,7 @@ def _similar_pattern_source_date_is_current(source_trade_date: str | None, curre
 def _latest_similar_pattern_target_date(symbols: list[str]) -> str | None:
     """Read only watchlist files; target vectors themselves are still built live later."""
     latest: pd.Timestamp | None = None
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
     for symbol in symbols:
         try:
             candidate = store.latest_trade_date(DAILY_DIR.name, symbol)
@@ -2934,10 +2935,8 @@ def _normalize_watch_symbol(raw_symbol: str) -> str:
     if not symbol:
         raise ValueError("股票代码不能为空")
     symbol = symbol.replace("_", ".")
-    if "." not in symbol and len(symbol) == 6 and symbol.isdigit():
-        suffix = "SH" if symbol.startswith(("6", "9")) else "SZ"
-        symbol = f"{symbol}.{suffix}"
-    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+    symbol = normalize_ts_code(symbol)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
     if store.latest_trade_date(DAILY_DIR.name, symbol) is None:
         raise ValueError(f"本地日线数据不存在: {symbol}")
     return symbol
@@ -3172,9 +3171,13 @@ def _write_similar_pattern_watchlist_state(state: dict[str, Any]) -> None:
     SIMILAR_PATTERN_WATCHLIST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> list[dict[str, Any]]:
+def _similar_pattern_watchlist_profiles(
+    basic: pd.DataFrame | None = None,
+    *,
+    include_scores: bool = True,
+) -> list[dict[str, Any]]:
     state = _read_similar_pattern_watchlist_state()
-    scores = _watchlist_buy_hold_scores(tuple(state["symbols"]))
+    scores = _watchlist_buy_hold_scores(tuple(state["symbols"])) if include_scores else {}
     profiles = []
     for symbol in state["symbols"]:
         profile = _stock_profile_from_basic(symbol, basic)
@@ -3194,11 +3197,14 @@ def _similar_pattern_watchlist_profiles(basic: pd.DataFrame | None = None) -> li
     return profiles
 
 
-def get_similar_pattern_watchlist() -> dict[str, Any]:
+def get_similar_pattern_watchlist(*, include_scores: bool = True) -> dict[str, Any]:
     basic = _stock_basic_for_similar_patterns()
     return {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
-        "stocks": _similar_pattern_watchlist_profiles(basic),
+        "stocks": _similar_pattern_watchlist_profiles(
+            basic,
+            include_scores=include_scores,
+        ),
     }
 
 
@@ -3220,7 +3226,7 @@ def add_similar_pattern_watch_symbol(symbol: str, note: str = "") -> dict[str, A
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
     _write_similar_pattern_watchlist_state(state)
-    return get_similar_pattern_watchlist()
+    return get_similar_pattern_watchlist(include_scores=False)
 
 
 def remove_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
@@ -4391,11 +4397,123 @@ def get_convertible_bond_grid_plan(
     return payload
 
 
+def _convertible_bond_allotment_min_coverage() -> float:
+    try:
+        configured = float(os.getenv("ROUTINE_ALLOTMENT_MIN_COVERAGE", "0.90"))
+    except (TypeError, ValueError):
+        configured = 0.90
+    return min(1.0, max(0.0, configured))
+
+
+def _convertible_bond_allotment_quality(
+    payload: dict[str, Any],
+    *,
+    expected_trade_date: str | None = None,
+) -> dict[str, Any]:
+    records = [item for item in payload.get("records") or [] if isinstance(item, dict)]
+    data_sources = payload.get("data_sources") or {}
+    stock_daily = data_sources.get("stock_daily")
+    daily_basic = data_sources.get("daily_basic")
+    minimum_coverage = _convertible_bond_allotment_min_coverage()
+
+    def numeric_present(value: Any) -> bool:
+        try:
+            return value is not None and bool(np.isfinite(float(value)))
+        except (TypeError, ValueError):
+            return False
+
+    def normalized_date(value: Any) -> str | None:
+        parsed = pd.to_datetime(value, errors="coerce")
+        return None if pd.isna(parsed) else parsed.date().isoformat()
+
+    def metric(count: int, total: int) -> dict[str, Any]:
+        ratio = 1.0 if total <= 0 else count / total
+        return {
+            "count": int(count),
+            "total": int(total),
+            "ratio": round(float(ratio), 6),
+            "passed": bool(ratio >= minimum_coverage),
+        }
+
+    if not isinstance(stock_daily, dict) or not isinstance(daily_basic, dict):
+        return {
+            "status": "failed",
+            "expected_trade_date": normalized_date(expected_trade_date),
+            "minimum_coverage": minimum_coverage,
+            "metrics": {},
+            "issues": ["缺少 stock_daily 或 daily_basic 数据源元信息"],
+        }
+
+    requested = max(0, int(stock_daily.get("requested") or 0))
+    matched = max(0, int(stock_daily.get("matched") or 0))
+    expected_date = normalized_date(expected_trade_date)
+    if expected_date is None:
+        price_dates = [
+            value
+            for item in records
+            if (value := normalized_date(item.get("stock_price_date"))) is not None
+        ]
+        expected_date = max(price_dates, default=None)
+
+    current_prices = sum(
+        normalized_date(item.get("stock_price_date")) == expected_date
+        for item in records
+        if expected_date is not None
+    )
+    daily_basic_matched = max(0, int(daily_basic.get("matched") or 0))
+    metrics = {
+        "stock_daily_match": metric(matched, requested),
+        "stock_price_freshness": metric(current_prices, matched),
+        "daily_basic_match": metric(daily_basic_matched, requested),
+        "kdj_daily_j": metric(
+            sum(numeric_present(item.get("kdj_daily_j")) for item in records),
+            matched,
+        ),
+        "kdj_weekly_j": metric(
+            sum(numeric_present(item.get("kdj_weekly_j")) for item in records),
+            matched,
+        ),
+        "kdj_monthly_j": metric(
+            sum(numeric_present(item.get("kdj_monthly_j")) for item in records),
+            matched,
+        ),
+    }
+    labels = {
+        "stock_daily_match": "行情匹配率",
+        "stock_price_freshness": "行情日期新鲜度",
+        "daily_basic_match": "daily_basic 匹配率",
+        "kdj_daily_j": "日线 J 完整率",
+        "kdj_weekly_j": "周线 J 完整率",
+        "kdj_monthly_j": "月线 J 完整率",
+    }
+    issues = [
+        (
+            f"{labels[key]}不足: {value['count']}/{value['total']} "
+            f"({value['ratio']:.1%} < {minimum_coverage:.1%})"
+        )
+        for key, value in metrics.items()
+        if not value["passed"]
+    ]
+    if stock_daily.get("error"):
+        issues.append(f"stock_daily 读取异常: {stock_daily['error']}")
+    if daily_basic.get("error"):
+        issues.append(f"daily_basic 读取异常: {daily_basic['error']}")
+    return {
+        "status": "success" if not issues else "failed",
+        "expected_trade_date": expected_date,
+        "minimum_coverage": minimum_coverage,
+        "metrics": metrics,
+        "issues": issues,
+    }
+
+
 def get_convertible_bond_allotments(
     limit: int = 80,
     include_listed_days: int = 90,
     refresh: bool = False,
     stage_scope: str = "pipeline",
+    expected_trade_date: str | None = None,
+    validate_quality: bool = False,
 ) -> dict[str, Any]:
     params = {
         "limit": int(limit),
@@ -4417,6 +4535,11 @@ def get_convertible_bond_allotments(
                 "hit": True,
                 "stale": not _is_daily_payload_current(cached),
             })
+            cached_quality = cached.get("quality") or {}
+            cached["quality"] = _convertible_bond_allotment_quality(
+                cached,
+                expected_trade_date=cached_quality.get("expected_trade_date"),
+            )
             return cached
     daily_refresh_required = refresh
     payload = build_convertible_bond_allotment_payload(
@@ -4424,6 +4547,10 @@ def get_convertible_bond_allotments(
         include_listed_days=include_listed_days,
         refresh=daily_refresh_required,
         stage_scope=stage_scope,
+    )
+    payload["quality"] = _convertible_bond_allotment_quality(
+        payload,
+        expected_trade_date=expected_trade_date,
     )
     _write_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH, payload)
     _write_workspace_snapshot(
@@ -4433,6 +4560,9 @@ def get_convertible_bond_allotments(
         params=params,
         write_sql=refresh,
     )
+    if validate_quality and payload["quality"]["status"] != "success":
+        details = "；".join(payload["quality"].get("issues") or ["未知质量问题"])
+        raise RuntimeError(f"配债股数据质量门禁失败: {details}")
     return payload
 
 
@@ -5553,7 +5683,7 @@ def _selector_watchlist_feature_row(symbol: str, signal_date: str) -> dict[str, 
     if candidate is not None:
         return dict(candidate)
     try:
-        store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+        store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
         daily = store.read_frame(DAILY_DIR.name, symbol).copy()
     except Exception:
         return {}
@@ -5702,7 +5832,7 @@ def _watchlist_buy_hold_scores(symbols: tuple[str, ...]) -> dict[str, dict[str, 
     missing_symbols = [symbol for symbol in symbols if symbol not in feature_rows]
     if missing_symbols:
         try:
-            store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=DAILY_DIR.parent))
+            store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
             start_date = (pd.Timestamp(score_date) - pd.Timedelta(days=130)).strftime("%Y-%m-%d")
             daily = store.read_market_range(
                 DAILY_DIR.name,
@@ -6601,7 +6731,18 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
         ),
         ("long_stock_pool", lambda: _refresh_long_stock_pool_variants(long_variants, signal_date), "长线策略股票池生成失败"),
         ("convertible_bond_plan", lambda: get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date)), "可转债策略计划刷新失败"),
-        ("convertible_bond_allotment", lambda: get_convertible_bond_allotments(80, 90, True, "pipeline"), "配债股数据刷新失败"),
+        (
+            "convertible_bond_allotment",
+            lambda: get_convertible_bond_allotments(
+                80,
+                90,
+                True,
+                "pipeline",
+                expected_trade_date=signal_date,
+                validate_quality=True,
+            ),
+            "配债股数据刷新失败",
+        ),
         ("byd_daily_plan", lambda: get_byd_daily_strategy(refresh=True), "BYD 做T日线计划刷新失败"),
         ("similar_patterns", lambda: _run_similar_pattern_analysis_isolated(), "相似走势决策台刷新失败"),
     ]
@@ -6657,6 +6798,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                         "status": "success",
                         "asof": payload.get("asof"),
                         "records": len(payload.get("records") or []),
+                        "quality": payload.get("quality"),
                     }
                 elif step_key == "similar_patterns":
                     results[step_key] = {
@@ -6857,7 +6999,7 @@ def _run_latest_refresh_job(
             if results["refresh_data"].get("status") == "failed":
                 raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
-            if refresh_scope in {"all", "short", "chan", "long"}:
+            if refresh_scope in {"all", "short", "chan", "long", "cbAllotment"}:
                 results["refresh_daily_basic"] = refresh_daily_basic_data(
                     dry_run=False,
                     progress_callback=lambda percent, message: _set_refresh_progress(
@@ -6929,7 +7071,14 @@ def _run_latest_refresh_job(
                 ),
                 (
                     "convertible_bond_allotment",
-                    lambda: get_convertible_bond_allotments(80, 90, True, "pipeline"),
+                    lambda: get_convertible_bond_allotments(
+                        80,
+                        90,
+                        True,
+                        "pipeline",
+                        expected_trade_date=early_signal_date,
+                        validate_quality=True,
+                    ),
                     "配债股数据刷新失败",
                     "配债股数据已提前刷新完成",
                 ),
@@ -6976,6 +7125,7 @@ def _run_latest_refresh_job(
                             "status": "success",
                             "asof": payload.get("asof"),
                             "records": len(payload.get("records") or []),
+                            "quality": payload.get("quality"),
                         }
                     else:
                         planned_t = payload.get("planned_t") or {}
@@ -7092,11 +7242,19 @@ def _run_latest_refresh_job(
                 )
             elif refresh_scope == "cbAllotment":
                 _set_refresh_progress(step_key="convertible_bond_allotment", message="正在刷新配债股数据", percent=92)
-                payload = get_convertible_bond_allotments(80, 90, True, "pipeline")
+                payload = get_convertible_bond_allotments(
+                    80,
+                    90,
+                    True,
+                    "pipeline",
+                    expected_trade_date=signal_date,
+                    validate_quality=True,
+                )
                 results["convertible_bond_allotment"] = {
                     "status": "success",
                     "asof": payload.get("asof"),
                     "records": len(payload.get("records") or []),
+                    "quality": payload.get("quality"),
                 }
                 _set_refresh_progress(
                     step_key="convertible_bond_allotment",

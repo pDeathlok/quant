@@ -314,7 +314,7 @@ def main() -> None:
     ).normalize()
     history_start = rebuild_from - pd.Timedelta(days=600)
     store = MarketDataStore(
-        MarketDataStoreConfig(backend="parquet", root=args.daily_dir.parent)
+        MarketDataStoreConfig.from_env(root=args.daily_dir.parent)
     )
     market = store.read_market_range(
         args.daily_dir.name,

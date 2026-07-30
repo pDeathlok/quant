@@ -333,9 +333,9 @@ def selector_refresh_latest_status() -> dict[str, Any]:
 
 
 @router.get("/similar-patterns/watchlist")
-def similar_pattern_watchlist() -> dict[str, Any]:
+def similar_pattern_watchlist(include_scores: bool = True) -> dict[str, Any]:
     try:
-        return get_similar_pattern_watchlist()
+        return get_similar_pattern_watchlist(include_scores=include_scores)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"相似走势自选池读取失败: {exc}") from exc
 
