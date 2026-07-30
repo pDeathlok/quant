@@ -199,6 +199,49 @@ def test_return_model_scores_use_fixed_historical_reference(monkeypatch) -> None
     assert rows[0]["buy_score_source"] == "historical_return_model"
 
 
+def test_watchlist_buy_hold_scores_accepts_numpy_matched_groups(monkeypatch) -> None:
+    observed_groups = []
+    monkeypatch.setattr(
+        services,
+        "_latest_similar_pattern_target_date",
+        lambda symbols: "2026-07-21",
+    )
+    monkeypatch.setattr(
+        services,
+        "_selector_model_score_date",
+        lambda market_date: "2026-07-21",
+    )
+    monkeypatch.setattr(
+        services,
+        "_selector_model_feature_rows",
+        lambda signal_date: {
+            "000001.SZ": {
+                "matched_groups": np.array(["B1", "B2"]),
+                "best_profit_factor": 1.5,
+                "best_avg_return_pct": 2.0,
+            },
+        },
+    )
+
+    def apply_scores(rows, feature_rows):
+        observed_groups.extend(row["matched_groups"] for row in rows)
+        for row in rows:
+            row.update(
+                opportunity_score=70.0,
+                holding_score=60.0,
+                score_target="historical_return_model_score",
+                buy_score_source="historical_return_model",
+                hold_score_source="historical_return_model",
+            )
+
+    monkeypatch.setattr(services, "_apply_historical_score_normalization", apply_scores)
+
+    result = services._watchlist_buy_hold_scores(("000001.SZ",))
+
+    assert observed_groups == [["B1", "B2"]]
+    assert result["000001.SZ"]["opportunity_score"] == 70.0
+
+
 def test_family_signal_cache_does_not_fall_back_to_prior_trade_date(
     monkeypatch,
     tmp_path: Path,
@@ -919,6 +962,127 @@ def test_long_stock_pool_variants_run_in_parallel_and_keep_order(monkeypatch) ->
     assert ("max_workers", 3) in observed
     assert [item["variant"] for item in result] == ["tea", "tea_safe", "v44"]
     assert [item["signal_date"] for item in result] == ["2026-07-20"] * 3
+
+
+def test_long_research_module_waits_for_concurrent_import(monkeypatch) -> None:
+    module_name = "quant_long_dividend_quality_research"
+    import_started = threading.Event()
+    allow_import_to_finish = threading.Event()
+    second_returned = threading.Event()
+    import_calls = []
+
+    class FakeLoader:
+        def exec_module(self, module) -> None:
+            import_calls.append(module)
+            import_started.set()
+            assert allow_import_to_finish.wait(timeout=2)
+            module.load_stock_basic = lambda: pd.DataFrame()
+
+    class FakeSpec:
+        loader = FakeLoader()
+
+    class FakeModule:
+        pass
+
+    monkeypatch.delitem(services.sys.modules, module_name, raising=False)
+    monkeypatch.setattr(
+        services.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: FakeSpec(),
+    )
+    monkeypatch.setattr(
+        services.importlib.util,
+        "module_from_spec",
+        lambda spec: FakeModule(),
+    )
+    services._long_research_module.cache_clear()
+
+    def load_second():
+        module = services._long_research_module()
+        second_returned.set()
+        return module
+
+    try:
+        with services.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(services._long_research_module)
+            assert import_started.wait(timeout=2)
+            second = executor.submit(load_second)
+            returned_before_import_finished = second_returned.wait(timeout=0.1)
+            allow_import_to_finish.set()
+            first_module = first.result(timeout=2)
+            second_module = second.result(timeout=2)
+    finally:
+        allow_import_to_finish.set()
+        services._long_research_module.cache_clear()
+
+    assert not returned_before_import_finished
+    assert first_module is second_module
+    assert len(import_calls) == 1
+    assert first_module._quant_services_import_complete is True
+
+
+def test_tea_master_research_module_discards_partial_import(monkeypatch) -> None:
+    module_name = "quant_tea_master_long_research"
+    imported_modules = []
+
+    class FakeLoader:
+        def exec_module(self, module) -> None:
+            imported_modules.append(module)
+            module.CONFIGS = []
+            if len(imported_modules) == 1:
+                raise RuntimeError("incomplete import")
+
+    class FakeSpec:
+        loader = FakeLoader()
+
+    class FakeModule:
+        pass
+
+    monkeypatch.delitem(services.sys.modules, module_name, raising=False)
+    monkeypatch.setattr(
+        services.importlib.util,
+        "spec_from_file_location",
+        lambda *args, **kwargs: FakeSpec(),
+    )
+    monkeypatch.setattr(
+        services.importlib.util,
+        "module_from_spec",
+        lambda spec: FakeModule(),
+    )
+    services._tea_master_research_module.cache_clear()
+
+    try:
+        with pytest.raises(RuntimeError, match="incomplete import"):
+            services._tea_master_research_module()
+        recovered = services._tea_master_research_module()
+    finally:
+        services._tea_master_research_module.cache_clear()
+
+    assert len(imported_modules) == 2
+    assert recovered is imported_modules[1]
+    assert recovered._quant_services_import_complete is True
+
+
+def test_long_stock_pool_worker_does_not_redirect_process_stdout(monkeypatch) -> None:
+    original_stdout = services.sys.stdout
+    observed_stdout = []
+    payload = {"signal_date": "2026-07-30", "stocks": []}
+
+    def build(variant, signal_date):
+        observed_stdout.append(services.sys.stdout)
+        return payload
+
+    monkeypatch.setattr(services, "_build_tea_master_stock_pool_cached", build)
+    monkeypatch.setattr(services, "_write_long_stock_pool_snapshot", lambda *args, **kwargs: None)
+
+    result = services._refresh_long_stock_pool_variant("tea", "2026-07-30")
+
+    assert observed_stdout == [original_stdout]
+    assert result == {
+        "variant": "tea",
+        "signal_date": "2026-07-30",
+        "stocks": 0,
+    }
 
 
 def test_live_long_base_skips_persistent_backtest_cache_and_reuses_memory(monkeypatch) -> None:

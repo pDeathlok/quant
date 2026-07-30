@@ -15,7 +15,6 @@ import sys
 import threading
 import traceback
 import uuid
-from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -106,6 +105,7 @@ MODEL_SIGNAL_LABELS = {
     "YUEYUE": "跃跃欲试",
     "VIOLENCE_K": "暴力K",
 }
+_LONG_RESEARCH_MODULE_LOCK = threading.Lock()
 _TEA_MASTER_MODULE_LOCK = threading.Lock()
 _LONG_LIVE_DATA_LOCK = threading.Lock()
 STRATEGY_GROUPS = [
@@ -1093,15 +1093,25 @@ def _normalize_byd_daily_frame(daily: pd.DataFrame) -> pd.DataFrame:
 def _long_research_module():
     path = PROJECT_ROOT / "scripts/research/backtest_long_dividend_quality.py"
     module_name = "quant_long_dividend_quality_research"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"无法加载长线策略研究脚本: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    with _LONG_RESEARCH_MODULE_LOCK:
+        module = sys.modules.get(module_name)
+        if module is not None and getattr(module, "_quant_services_import_complete", False):
+            return module
+        if module is not None:
+            sys.modules.pop(module_name, None)
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"无法加载长线策略研究脚本: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            raise
+        module._quant_services_import_complete = True
+        return module
 
 
 @lru_cache(maxsize=1)
@@ -1110,7 +1120,7 @@ def _tea_master_research_module():
     module_name = "quant_tea_master_long_research"
     with _TEA_MASTER_MODULE_LOCK:
         module = sys.modules.get(module_name)
-        if module is not None and hasattr(module, "CONFIGS"):
+        if module is not None and getattr(module, "_quant_services_import_complete", False):
             return module
         if module is not None:
             sys.modules.pop(module_name, None)
@@ -1122,7 +1132,13 @@ def _tea_master_research_module():
             raise RuntimeError(f"无法加载茶大长线策略脚本: {path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            raise
+        module._quant_services_import_complete = True
         return module
 
 
@@ -5561,6 +5577,23 @@ def _historical_percentile_scores(
     return np.clip(50.0 + 100.0 / np.pi * np.arctan(z_score / width), 0.0, 100.0)
 
 
+def _matched_group_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        items = value.tolist()
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        try:
+            if bool(pd.isna(value)):
+                return []
+        except (TypeError, ValueError):
+            pass
+        items = [value]
+    return [str(item) for item in items if item is not None and str(item)]
+
+
 def _apply_return_model_scores(
     rows: list[dict[str, Any]],
     feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
@@ -5584,7 +5617,7 @@ def _apply_return_model_scores(
             )
             if source is None:
                 continue
-            groups = {str(group) for group in row.get("matched_groups") or []}
+            groups = set(_matched_group_values(row.get("matched_groups")))
             values = dict(source)
             values["matched_count"] = len(groups)
             values["best_profit_factor"] = row.get("best_profit_factor")
@@ -5701,7 +5734,9 @@ def _watchlist_buy_hold_scores(symbols: tuple[str, ...]) -> dict[str, dict[str, 
         {
             "symbol": symbol,
             "date": score_date,
-            "matched_groups": feature_rows[symbol].get("matched_groups") or [],
+            "matched_groups": _matched_group_values(
+                feature_rows[symbol].get("matched_groups"),
+            ),
             "best_profit_factor": feature_rows[symbol].get("best_profit_factor"),
             "best_avg_return_pct": feature_rows[symbol].get("best_avg_return_pct"),
         }
@@ -5869,7 +5904,9 @@ def _primary_family(row: dict[str, Any]) -> str:
     signals = row.get("signals") or []
     if signals:
         return _signal_group_key(signals[0])
-    families = row.get("matched_groups") or row.get("matched_families") or []
+    families = _matched_group_values(row.get("matched_groups"))
+    if not families:
+        families = _matched_group_values(row.get("matched_families"))
     return str(families[0]) if families else ""
 
 
@@ -6490,12 +6527,10 @@ def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> d
         (key for key, value in LONG_VARIANTS.items() if value == variant),
         variant,
     )
-    with open(os.devnull, "w", encoding="utf-8") as sink:
-        with redirect_stdout(sink), redirect_stderr(sink):
-            if variant_key in TEA_LONG_VARIANTS:
-                payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
-            else:
-                payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
+    if variant_key in TEA_LONG_VARIANTS:
+        payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
+    else:
+        payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
     _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
     return {
         "variant": variant_key,

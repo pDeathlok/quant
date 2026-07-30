@@ -13,5 +13,12 @@ if str(SRC_DIR) not in sys.path:
 from quant.routine.web_refresh_runner import main
 
 
+def daily_refresh_args(argv: list[str]) -> list[str]:
+    restart_flags = {"--restart-service", "--no-restart-service"}
+    if any(arg in restart_flags for arg in argv):
+        return list(argv)
+    return ["--restart-service", *argv]
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(daily_refresh_args(sys.argv[1:])))
