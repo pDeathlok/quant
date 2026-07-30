@@ -20,6 +20,7 @@ from quant.data import (
     list_partitioned_symbol_paths,
     read_partitioned_symbol_file,
 )
+from quant.data.factors.technical import KDJ
 
 
 @dataclass(frozen=True)
@@ -474,6 +475,7 @@ def latest_snapshot(daily: pd.DataFrame, idx: int) -> dict[str, float | str | No
     hist = daily.iloc[: idx + 1].copy()
     close = hist["close"]
     volume = hist["volume"].replace(0, np.nan)
+    kdj_daily_j = KDJ().compute(hist)["J"].iloc[-1]
     ma20 = close.rolling(20).mean().iloc[-1]
     ma60 = close.rolling(60).mean().iloc[-1]
     high60 = close.rolling(60).max().iloc[-1]
@@ -490,6 +492,7 @@ def latest_snapshot(daily: pd.DataFrame, idx: int) -> dict[str, float | str | No
         "dist_ma20": _round((row["close"] / ma20 - 1) * 100 if ma20 else np.nan),
         "dist_ma60": _round((row["close"] / ma60 - 1) * 100 if ma60 else np.nan),
         "vol_ratio20": _round(row["volume"] / vol20 if vol20 else np.nan),
+        "kdj_daily_j": _round(kdj_daily_j),
     }
 
 

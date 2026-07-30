@@ -1,3 +1,16 @@
+import { createApiClient } from "./core/api-client.js";
+import {
+  escapeHtml,
+  fmtMoney,
+  fmtNumber,
+  fmtPct,
+  fmtPrice,
+  fmtRange,
+  fmtRate,
+  fmtWeight,
+  sortT1ScenarioRows,
+} from "./core/formatters.js";
+
 const DEFAULT_WORKSPACE_PAGE = "similar";
 const WORKSPACE_PAGE_BY_HASH = {
   "#similar": "similar",
@@ -45,19 +58,22 @@ const state = {
   similarError: "",
   similarSelectedSymbol: null,
   similarRefreshPromise: null,
-  similarRefreshQueued: false,
   similarPendingRemovals: new Set(),
+  similarOrderSaving: false,
+  selectorRequestId: 0,
+  directRefreshPromises: new Map(),
   loading: false,
 };
 
 const API_BASE = "/api";
-const SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS = 45 * 60 * 1000;
+const fetchJson = createApiClient(API_BASE);
 const WATCHLIST_ALERT_INDICATORS = {
   ret_20d: { label: "20日涨跌幅", unit: "%", source: "snapshot" },
   drawdown_60d: { label: "60日回撤", unit: "%", source: "snapshot" },
   vol_ratio20: { label: "20日量比", unit: "倍", source: "snapshot" },
   dist_ma20: { label: "距20日均线", unit: "%", source: "snapshot" },
   dist_ma60: { label: "距60日均线", unit: "%", source: "snapshot" },
+  kdj_daily_j: { label: "日线J", unit: "", source: "snapshot" },
   opportunity_score: { label: "买入评分", unit: "分", source: "watchlist" },
   holding_score: { label: "持有评分", unit: "分", source: "watchlist" },
 };
@@ -87,6 +103,7 @@ const REFRESH_BUTTON_LABELS = {
   cbAllotmentRefreshLatestButton: "更新本页",
   cbAllotmentRefreshButton: "更新行情与配债",
   bydRefreshLatestButton: "更新本页",
+  similarRefreshButton: "刷新分析",
   similarRefreshLatestButton: "更新本页",
 };
 
@@ -102,6 +119,7 @@ const WORKSPACE_TABS = [
 let focusWorkspaceTabAfterRender = false;
 let workspaceTabDragKey = "";
 let suppressWorkspaceTabClick = false;
+let selectorFilterReloadTimer = null;
 
 function normalizeWorkspaceTabOrder(value) {
   const knownKeys = WORKSPACE_TABS.map((tab) => tab.key);
@@ -358,72 +376,6 @@ const longStrategies = [
   },
 ];
 
-const fmtPct = (value, digits = 2) => {
-  if (value == null || Number.isNaN(Number(value))) return "-";
-  return `${Number(value).toFixed(digits)}%`;
-};
-const fmtRate = (value, digits = 1) => {
-  if (value == null || Number.isNaN(Number(value))) return "-";
-  return `${(Number(value) * 100).toFixed(digits)}%`;
-};
-const fmtNumber = (value, digits = 2) => {
-  if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric.toFixed(digits) : "-";
-};
-const fmtPrice = (value) => {
-  if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
-  const numeric = Number(value);
-  return Number.isFinite(numeric) && numeric > 0 ? numeric.toFixed(2) : "-";
-};
-const t1ReturnBucketOrder = (bucket) => {
-  const text = String(bucket || "");
-  const knownOrder = {
-    "大跌<=-3%": 0,
-    "小跌-3~-1%": 1,
-    "震荡-1~1%": 2,
-    "小涨1~3%": 3,
-    "大涨>=3%": 4,
-  };
-  if (Object.prototype.hasOwnProperty.call(knownOrder, text)) return knownOrder[text];
-  const numbers = text.match(/-?\d+(?:\.\d+)?/g)?.map(Number).filter(Number.isFinite) || [];
-  if (!numbers.length) return Number.POSITIVE_INFINITY;
-  return Math.min(...numbers);
-};
-const t1VolumeBucketOrder = (bucket) => {
-  const text = String(bucket || "");
-  const knownOrder = {
-    "缩量<0.8": 0,
-    "平量0.8~1.3": 1,
-    "放量1.3~2": 2,
-    "巨量>2": 3,
-  };
-  if (Object.prototype.hasOwnProperty.call(knownOrder, text)) return knownOrder[text];
-  return text;
-};
-const sortT1ScenarioRows = (rows) => [...(rows || [])].sort((a, b) => {
-  const returnDiff = t1ReturnBucketOrder(a.t1_return_bucket) - t1ReturnBucketOrder(b.t1_return_bucket);
-  if (returnDiff !== 0) return returnDiff;
-  const volumeA = t1VolumeBucketOrder(a.t1_volume_bucket);
-  const volumeB = t1VolumeBucketOrder(b.t1_volume_bucket);
-  if (typeof volumeA === "number" && typeof volumeB === "number") return volumeA - volumeB;
-  return String(volumeA).localeCompare(String(volumeB), "zh-Hans-CN");
-});
-const fmtWeight = (value) => {
-  if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
-  return `${(Number(value) * 100).toFixed(1)}%`;
-};
-const fmtMoney = (value) => {
-  if (value == null || Number.isNaN(Number(value))) return "-";
-  return Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 0 });
-};
-const fmtRange = (range) => {
-  if (!range) return "-";
-  if (range.label) return range.label;
-  const low = fmtPrice(range.low);
-  const high = fmtPrice(range.high);
-  return low === high ? low : `${low}-${high}`;
-};
 const hashPage = () => workspacePageFromHash(window.location.hash);
 const formatBuyPlanText = (text) => {
   if (!text) return "";
@@ -620,50 +572,6 @@ function analystCoverageText(item) {
   };
 }
 
-async function fetchJson(path, options = {}) {
-  const { timeoutMs = 0, ...fetchOptions } = options;
-  const controller = timeoutMs > 0 && !fetchOptions.signal ? new AbortController() : null;
-  const timeoutId = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
-  let response;
-  try {
-    response = await fetch(`${API_BASE}${path}`, {
-      cache: "no-store",
-      ...fetchOptions,
-      ...(controller ? { signal: controller.signal } : {}),
-      headers: {
-        ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}),
-        ...(fetchOptions.headers || {}),
-      },
-    });
-  } catch (error) {
-    if (controller?.signal.aborted) {
-      throw new Error(`${path} 加载超时，请稍后重试`);
-    }
-    throw error;
-  } finally {
-    if (timeoutId !== null) window.clearTimeout(timeoutId);
-  }
-  if (!response.ok) {
-    let detail = "";
-    try {
-      detail = (await response.json()).detail || "";
-    } catch {
-      detail = "";
-    }
-    throw new Error(`${path} 加载失败: ${response.status}${detail ? ` · ${detail}` : ""}`);
-  }
-  return response.json();
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
 function selectedStrategyParam() {
   return Array.from(state.selectedStrategies).join(",");
 }
@@ -690,7 +598,23 @@ function setRefreshMessage(message) {
 }
 
 function workspaceRequestOptions(options = {}) {
-  return { timeoutMs: options.refresh ? 120000 : 15000 };
+  // Aborting a long refresh only detaches the browser; the server keeps
+  // calculating and a retry can start duplicate work. Keep refresh requests
+  // attached to the single-flight promise until the server responds.
+  return { timeoutMs: options.refresh ? 0 : 15000 };
+}
+
+function runDirectWorkspaceRefresh(key, operation) {
+  const active = state.directRefreshPromises.get(key);
+  if (active) return active;
+  const request = Promise.resolve().then(operation);
+  const sharedRequest = request.finally(() => {
+    if (state.directRefreshPromises.get(key) === sharedRequest) {
+      state.directRefreshPromises.delete(key);
+    }
+  });
+  state.directRefreshPromises.set(key, sharedRequest);
+  return sharedRequest;
 }
 
 function renderShortPage() {
@@ -704,6 +628,7 @@ function renderShortPage() {
 }
 
 async function loadSelector(options = {}) {
+  const requestId = ++state.selectorRequestId;
   state.loading = true;
   renderShortPage();
   if (options.latest && state.calendar?.latest_signal_date) {
@@ -720,7 +645,9 @@ async function loadSelector(options = {}) {
   const suffix = query.toString();
   const path = suffix ? `/selector/stocks?${suffix}` : "/selector/stocks";
   try {
-    state.payload = await fetchJson(path, workspaceRequestOptions(options));
+    const payload = await fetchJson(path, workspaceRequestOptions(options));
+    if (requestId !== state.selectorRequestId) return;
+    state.payload = payload;
     state.signalDate = requestedSignalDate || state.payload.signal_date || state.signalDate;
     const dateInput = document.querySelector("#signalDateInput");
     if (dateInput) {
@@ -733,9 +660,11 @@ async function loadSelector(options = {}) {
       state.selectedSymbol = state.payload.stocks[0]?.symbol || null;
     }
   } catch (error) {
+    if (requestId !== state.selectorRequestId) return;
     showError(error);
     throw error;
   } finally {
+    if (requestId !== state.selectorRequestId) return;
     state.loading = false;
     renderShortPage();
   }
@@ -786,12 +715,17 @@ function enrichWatchlistProfiles(currentWatchlist, enrichedWatchlist) {
 function syncSimilarLoadingControls() {
   const refreshButton = document.querySelector("#similarRefreshButton");
   if (refreshButton) {
-    refreshButton.disabled = state.similarLoading;
-    refreshButton.textContent = state.similarLoading ? "刷新中" : "刷新分析";
+    const refreshRunning = ["running", "queued"].includes(state.latestRefreshStatus?.status);
+    refreshButton.disabled = state.similarLoading || refreshRunning;
+    refreshButton.textContent = state.similarLoading
+      ? "加载中"
+      : refreshRunning
+        ? "分析中"
+        : "刷新分析";
   }
 }
 
-async function loadSimilarPatternsOnce(options = {}) {
+async function loadSimilarPatternsOnce() {
   state.similarLoading = true;
   state.similarError = "";
   renderSimilarPatternsPage();
@@ -807,11 +741,10 @@ async function loadSimilarPatternsOnce(options = {}) {
       generated_at: state.similarPayload?.generated_at || watchlistPayload.updated_at,
     }, latestPersistedWatchlist);
     renderSimilarPatternsPage();
-    const path = options.refresh ? "/similar-patterns/analysis?refresh=true" : "/similar-patterns/analysis";
-    const requestOptions = options.refresh
-      ? { ...workspaceRequestOptions(options), timeoutMs: SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS }
-      : workspaceRequestOptions(options);
-    const analysisPayload = await fetchJson(path, requestOptions);
+    const analysisPayload = await fetchJson(
+      "/similar-patterns/analysis",
+      workspaceRequestOptions(),
+    );
     const latestWatchlist = enrichWatchlistProfiles(
       state.similarPayload?.watchlist || latestPersistedWatchlist,
       analysisPayload.watchlist || [],
@@ -834,19 +767,11 @@ async function loadSimilarPatternsOnce(options = {}) {
   }
 }
 
-function loadSimilarPatterns(options = {}) {
+function loadSimilarPatterns() {
   if (state.similarRefreshPromise) {
-    if (options.refresh) state.similarRefreshQueued = true;
     return state.similarRefreshPromise;
   }
-  const request = (async () => {
-    let nextOptions = options;
-    do {
-      state.similarRefreshQueued = false;
-      await loadSimilarPatternsOnce(nextOptions);
-      nextOptions = { refresh: true };
-    } while (state.similarRefreshQueued);
-  })();
+  const request = loadSimilarPatternsOnce();
   const sharedRequest = request.finally(() => {
     if (state.similarRefreshPromise === sharedRequest) state.similarRefreshPromise = null;
   });
@@ -859,24 +784,21 @@ async function addSimilarWatchSymbol(symbol, options = {}) {
     method: "POST",
     body: JSON.stringify({ symbol, note: options.note || "" }),
   });
-  applySimilarWatchlistPayload(payload);
-  if (options.refresh !== false) {
-    loadSimilarPatterns({ refresh: true }).catch((error) => {
-      showWatchlistToast(error.message || "已加入自选池，但后台计算失败", "error");
-    });
-  }
+  applySimilarWatchlistPayload(payload, { analysisChanged: true });
   return payload;
 }
 
 async function removeSimilarWatchSymbol(symbol) {
   if (state.similarPendingRemovals.has(symbol)) return;
+  const current = similarWatchItem(symbol);
+  const displayName = current?.name || symbol;
   state.similarPendingRemovals.add(symbol);
   renderSimilarPatternsPage();
   try {
     const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" });
     if (state.similarSelectedSymbol === symbol) state.similarSelectedSymbol = null;
-    applySimilarWatchlistPayload(payload);
-    await loadSimilarPatterns({ refresh: true });
+    applySimilarWatchlistPayload(payload, { analysisChanged: true });
+    showWatchlistToast(`${displayName} 已从自选池删除`);
   } finally {
     state.similarPendingRemovals.delete(symbol);
     renderSimilarPatternsPage();
@@ -895,10 +817,17 @@ async function saveSimilarWatchNote(symbol, content) {
   return saved;
 }
 
-function applySimilarWatchlistPayload(payload) {
+function applySimilarWatchlistPayload(payload, options = {}) {
   const currentPayload = {
     ...(state.similarPayload || {}),
     generated_at: state.similarPayload?.generated_at || payload.updated_at,
+    cache: options.analysisChanged
+      ? {
+        ...(state.similarPayload?.cache || {}),
+        stale: true,
+        watchlist_changed: true,
+      }
+      : state.similarPayload?.cache,
   };
   const latestWatchlist = mergeWatchlistProfiles(
     state.similarPayload?.watchlist || [],
@@ -1223,6 +1152,10 @@ function renderSimilarPatternsPage() {
       ? results.length
         ? `自选 ${watch.length} 只 · 正在后台刷新，当前显示上次结果`
         : `自选 ${watch.length} 只 · 正在加载分析，笔记可先编辑`
+      : payload.cache?.missing
+        ? `自选 ${watch.length} 只 · 尚未生成分析，点击“刷新分析”开始后台计算`
+        : payload.cache?.watchlist_changed
+          ? `自选 ${watch.length} 只 · 自选池已变化，点击“刷新分析”更新结果`
       : `更新于 ${payload.generated_at || "-"} · 全池统一策略 · T+1 观望区 ${payload.config?.signal_bearish_max ?? 45}%～${payload.config?.signal_bullish_min ?? 55}% · 自选 ${watch.length} 只`;
   if (watchCount) watchCount.textContent = `${watch.length} 只股票`;
   if (signalSummary) {
@@ -1272,7 +1205,7 @@ function renderSimilarPatternsPage() {
         data-watchlist-pinned="${item.pinned ? "true" : "false"}"
         draggable="true"
         tabindex="0"
-        title="按住拖动排序；右键可置顶或设置提醒"
+        title="按住拖动排序；右键可置顶、设置提醒或删除"
       >
         <td class="similar-stock-cell">
           <strong>${item.name || item.symbol}${item.pinned ? `<span class="watchlist-pin-badge">置顶</span>` : ""}${watchlistAlertBell(item, alertState)}</strong>
@@ -1320,7 +1253,7 @@ function renderSimilarPatternsPage() {
           ` : `<span class="xueqiu-stock-unavailable">—</span>`}
         </td>
         <td class="similar-row-actions">
-          <button type="button" data-similar-remove="${item.symbol}" ${state.similarLoading || removePending ? "disabled" : ""}>
+          <button type="button" data-similar-remove="${item.symbol}" ${removePending ? "disabled" : ""}>
             ${removePending ? "删除中" : "删除"}
           </button>
         </td>
@@ -2037,14 +1970,21 @@ function renderStrategyFilters() {
     `;
   }).join("");
   wrap.querySelectorAll("button").forEach((button) => {
-    button.addEventListener("click", async () => {
+    button.addEventListener("click", () => {
       const key = button.dataset.strategy;
       if (state.selectedStrategies.has(key)) {
         state.selectedStrategies.delete(key);
       } else {
         state.selectedStrategies.add(key);
       }
-      await loadSelector().catch(showError);
+      renderStrategyFilters();
+      if (selectorFilterReloadTimer !== null) {
+        window.clearTimeout(selectorFilterReloadTimer);
+      }
+      selectorFilterReloadTimer = window.setTimeout(() => {
+        selectorFilterReloadTimer = null;
+        loadSelector().catch(showError);
+      }, 150);
     });
   });
 }
@@ -2979,6 +2919,10 @@ document.querySelector("#searchInput").addEventListener("input", (event) => {
 });
 
 document.querySelector("#clearFilters").addEventListener("click", async () => {
+  if (selectorFilterReloadTimer !== null) {
+    window.clearTimeout(selectorFilterReloadTimer);
+    selectorFilterReloadTimer = null;
+  }
   state.selectedStrategies.clear();
   state.query = "";
   document.querySelector("#searchInput").value = "";
@@ -3017,6 +2961,7 @@ document.addEventListener("click", (event) => {
 
 document.querySelector("#reloadButton").addEventListener("click", async () => {
   const button = document.querySelector("#reloadButton");
+  const refreshPage = state.activePage;
   button.disabled = true;
   button.textContent = "刷新中";
   const latestRefreshRunning = state.latestRefreshStatus?.status === "running" || state.latestRefreshStatus?.status === "queued";
@@ -3024,13 +2969,15 @@ document.querySelector("#reloadButton").addEventListener("click", async () => {
     if (!latestRefreshRunning) {
       setRefreshMessage("正在重算当前日期股票池，并写入快照缓存...");
     }
-    if (state.activePage === "long") {
-      await loadLongStockPool({ refresh: true });
-    } else if (state.activePage === "chan") {
-      await loadChanModelStrategy({ refresh: true });
-    } else {
-      await loadSelector({ refresh: true });
-    }
+    await runDirectWorkspaceRefresh(refreshPage, async () => {
+      if (refreshPage === "long") {
+        await loadLongStockPool({ refresh: true });
+      } else if (refreshPage === "chan") {
+        await loadChanModelStrategy({ refresh: true });
+      } else {
+        await loadSelector({ refresh: true });
+      }
+    });
     if (!latestRefreshRunning) {
       setRefreshMessage("当前日期股票池已重算完成");
     } else {
@@ -3090,6 +3037,7 @@ async function reloadAfterRefresh(status) {
   const shouldReloadCb = scope === "all" || scope === "cb";
   const shouldReloadAllotment = scope === "all" || scope === "cbAllotment";
   const shouldReloadByd = scope === "all" || scope === "byd";
+  const shouldReloadSimilar = scope === "all" || scope === "similar";
 
   if (shouldReloadShort) {
     state.signalDate = "";
@@ -3112,6 +3060,8 @@ async function reloadAfterRefresh(status) {
     await loadConvertibleBondAllotments();
   } else if (state.activePage === "byd" && shouldReloadByd) {
     await loadBydMinuteStrategy();
+  } else if (state.activePage === "similar" && shouldReloadSimilar) {
+    await loadSimilarPatterns();
   } else if (state.activePage === "short" && shouldReloadShort) {
     await loadSelector();
   }
@@ -3293,7 +3243,7 @@ document.querySelector("#chanRefreshButton")?.addEventListener("click", async ()
   button.disabled = true;
   button.textContent = "刷新中";
   try {
-    await loadChanModelStrategy({ refresh: true });
+    await runDirectWorkspaceRefresh("chan", () => loadChanModelStrategy({ refresh: true }));
   } catch (error) {
     showError(error);
   } finally {
@@ -3307,7 +3257,7 @@ document.querySelector("#cbRefreshButton")?.addEventListener("click", async () =
   button.disabled = true;
   button.textContent = "刷新中";
   try {
-    await loadConvertibleBondPlan({ refresh: true });
+    await runDirectWorkspaceRefresh("cb", () => loadConvertibleBondPlan({ refresh: true }));
   } catch (error) {
     showError(error);
   } finally {
@@ -3332,7 +3282,7 @@ document.querySelector("#longPoolRefresh").addEventListener("click", async () =>
   button.disabled = true;
   button.textContent = "刷新中";
   try {
-    await loadLongStockPool({ refresh: true });
+    await runDirectWorkspaceRefresh("long", () => loadLongStockPool({ refresh: true }));
   } catch (error) {
     showError(error);
   } finally {
@@ -3347,7 +3297,7 @@ document.querySelector("#bydRefreshButton")?.addEventListener("click", async () 
   button.disabled = true;
   button.textContent = "刷新中";
   try {
-    await loadBydMinuteStrategy({ refresh: true });
+    await runDirectWorkspaceRefresh("byd", () => loadBydMinuteStrategy({ refresh: true }));
   } catch (error) {
     showError(error);
   } finally {
@@ -3407,12 +3357,14 @@ function openWatchlistContextMenu(target, clientX, clientY) {
   const addButton = menu.querySelector("[data-watchlist-context-add]");
   const pinButton = menu.querySelector("[data-watchlist-context-pin]");
   const alertButton = menu.querySelector("[data-watchlist-context-alert]");
+  const deleteButton = menu.querySelector("[data-watchlist-context-delete]");
   if (addButton) addButton.hidden = watchlistContextTarget.inWatchlist;
   if (pinButton) {
     pinButton.hidden = !watchlistContextTarget.inWatchlist;
     pinButton.textContent = watchlistContextTarget.pinned ? "取消置顶" : "置顶";
   }
   if (alertButton) alertButton.hidden = !watchlistContextTarget.inWatchlist;
+  if (deleteButton) deleteButton.hidden = !watchlistContextTarget.inWatchlist;
   menu.hidden = false;
   const width = menu.offsetWidth || 150;
   const height = menu.offsetHeight || 44;
@@ -3448,7 +3400,7 @@ document.querySelector("[data-watchlist-context-add]")?.addEventListener("click"
   button.disabled = true;
   try {
     await addSimilarWatchSymbol(target.symbol, { note: target.note });
-    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}，数据后台计算中`);
+    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}，可点击“刷新分析”更新结果`);
   } catch (error) {
     showWatchlistToast(error.message || "加入自选池失败", "error");
   } finally {
@@ -3469,6 +3421,23 @@ document.querySelector("[data-watchlist-context-pin]")?.addEventListener("click"
     showWatchlistToast(error.message || "置顶状态保存失败", "error");
   } finally {
     button.disabled = false;
+    hideWatchlistContextMenu();
+  }
+});
+
+document.querySelector("[data-watchlist-context-delete]")?.addEventListener("click", async () => {
+  const target = watchlistContextTarget;
+  if (!target?.inWatchlist) return;
+  const button = document.querySelector("[data-watchlist-context-delete]");
+  button.disabled = true;
+  button.textContent = "删除中";
+  try {
+    await removeSimilarWatchSymbol(target.symbol);
+  } catch (error) {
+    showWatchlistToast(error.message || "删除自选失败", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "删除自选";
     hideWatchlistContextMenu();
   }
 });
@@ -3802,19 +3771,11 @@ document.querySelector("#similarAddForm")?.addEventListener("submit", async (eve
   try {
     await addSimilarWatchSymbol(symbol);
     if (input) input.value = "";
-    showWatchlistToast(`${symbol} 已加入自选池，数据后台计算中`);
+    showWatchlistToast(`${symbol} 已加入自选池，可点击“刷新分析”更新结果`);
   } catch (error) {
     showError(error);
   } finally {
     if (button) button.disabled = false;
-  }
-});
-
-document.querySelector("#similarRefreshButton")?.addEventListener("click", async () => {
-  try {
-    await loadSimilarPatterns({ refresh: true });
-  } catch (error) {
-    showError(error);
   }
 });
 
@@ -3905,6 +3866,10 @@ function clearSimilarWatchDropTargets() {
 }
 
 function reorderSimilarWatchRows(sourceSymbol, targetSymbol, placeAfter = false) {
+  if (state.similarOrderSaving) {
+    showWatchlistToast("自选池顺序正在保存，请稍候");
+    return false;
+  }
   const watch = state.similarPayload?.watchlist || [];
   const source = watch.find((item) => item.symbol === sourceSymbol);
   const target = watch.find((item) => item.symbol === targetSymbol);
@@ -3917,9 +3882,13 @@ function reorderSimilarWatchRows(sourceSymbol, targetSymbol, placeAfter = false)
   const targetIndex = order.indexOf(targetSymbol);
   order.splice(targetIndex + (placeAfter ? 1 : 0), 0, sourceSymbol);
   suppressSimilarWatchRowClick = true;
+  state.similarOrderSaving = true;
   saveSimilarWatchOrder(order)
     .then(() => showWatchlistToast("自选池顺序已保存"))
-    .catch((error) => showWatchlistToast(error.message || "自选池排序保存失败", "error"));
+    .catch((error) => showWatchlistToast(error.message || "自选池排序保存失败", "error"))
+    .finally(() => {
+      state.similarOrderSaving = false;
+    });
   window.setTimeout(() => { suppressSimilarWatchRowClick = false; }, 300);
   return true;
 }

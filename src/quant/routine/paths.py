@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+from quant.core.paths import PROJECT_ROOT
 
 
 def load_project_env() -> None:

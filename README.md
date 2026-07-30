@@ -12,6 +12,8 @@ Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、
 - 在一个 FastAPI + 静态前端工作台中查看 7 类策略结果。
 - 按日期保存选股器和工作区快照，支持历史复盘。
 - 每日流水线采用有依赖的并行编排，单个非核心工作区失败不会阻断其他工作区。
+- 以模块化单体方式维护应用用例、存储适配和 HTTP 交付边界，避免工作区继续堆叠在 Web 服务层。
+- JS/CSS 静态资源支持 gzip、模块预加载和显式缓存策略，桌面端与 390px 移动端均纳入真实浏览器验收。
 
 ## 前置条件
 
@@ -112,18 +114,23 @@ PYTHONPATH=src python main.py backtest --strategy momentum --symbol 600000 \
 
 # 测试与静态检查
 PYTHONPATH=src pytest -q
+PYTHONPATH=src python -m compileall -q src tests scripts
 ruff check src tests
 ```
 
 ## 项目结构
 
 ```text
+src/quant/core/            项目路径与无副作用公共基础类型
+src/quant/application/     API、CLI、调度共用的应用用例与刷新契约
+src/quant/infrastructure/  文件与 SQL 快照等外部存储适配器
 src/quant/data/            数据源、标准化和统一存储
 src/quant/features/        项目级变量与特征
 src/quant/strategies/      可复用策略实现
 src/quant/routine/         每日任务和产物编排
 src/quant/webapp/          FastAPI 路由与工作区服务
 web/                       单页工作台前端
+web/core/                  前端 API 客户端与格式化基础模块
 scripts/research/          研究、训练、回测和校准脚本
 configs/strategies/        已确认的生产策略配置
 docs/strategies/           策略依据、口径和迭代记录
@@ -131,6 +138,10 @@ tests/                     单元、集成和 API 测试
 ```
 
 `data/`、`models/`、`reports/` 和 `web/data/` 是本地运行产物，不提交到 Git。
+
+应用依赖方向为 `interfaces -> application -> domain/data`，文件和 SQL 等技术细节由
+`infrastructure` 适配。BYD、可转债和配债股已形成可独立测试的垂直工作区，Web 服务保留兼容
+函数作为组合入口。详细边界和后续迁移规则见[系统架构与数据流](docs/architecture.md)。
 
 ## 文档
 

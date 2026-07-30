@@ -142,6 +142,45 @@ def test_convertible_bond_allotment_uses_pipeline_announcements(monkeypatch, tmp
     assert "审核" in record["announcement_title"]
 
 
+def test_convertible_bond_allotment_excludes_targeted_convertible_bond_pipeline(monkeypatch, tmp_path):
+    import quant.routine.convertible_bond_allotment as module
+
+    basic_path = tmp_path / "missing_basic.parquet"
+    issue_path = tmp_path / "missing_issue.parquet"
+    pipeline_path = tmp_path / "pipeline.parquet"
+    cninfo_issue_path = tmp_path / "missing_cninfo_issue.parquet"
+    pd.DataFrame(
+        [
+            {
+                "stock_code": "600048",
+                "stock_name": "保利发展",
+                "announcement_title": "保利发展控股集团股份有限公司关于2025年度向特定对象发行可转换公司债券申请获得中国证券监督管理委员会同意注册批复的公告",
+                "announce_date": "2026-05-20",
+                "stage": "registered",
+                "status": "同意注册",
+            },
+            {
+                "stock_code": "300001",
+                "stock_name": "公开发行股份",
+                "announcement_title": "公开发行股份关于向不特定对象发行可转换公司债券申请获得中国证券监督管理委员会同意注册批复的公告",
+                "announce_date": "2026-05-20",
+                "stage": "registered",
+                "status": "同意注册",
+            },
+        ]
+    ).to_parquet(pipeline_path, index=False)
+    monkeypatch.setattr(module, "CB_BASIC_PATH", basic_path)
+    monkeypatch.setattr(module, "CB_ISSUE_PATH", issue_path)
+    monkeypatch.setattr(module, "CB_PIPELINE_PATH", pipeline_path)
+    monkeypatch.setattr(module, "CB_CNINFO_ISSUE_PATH", cninfo_issue_path)
+
+    payload = module.build_convertible_bond_allotment_payload(today=date(2026, 6, 18))
+
+    stock_codes = {record["stock_code"] for record in payload["records"]}
+    assert "600048" not in stock_codes
+    assert "300001" in stock_codes
+
+
 def test_convertible_bond_allotment_filters_expired_record_date(monkeypatch, tmp_path):
     import quant.routine.convertible_bond_allotment as module
 

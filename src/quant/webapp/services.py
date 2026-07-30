@@ -27,10 +27,32 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from quant.application.refresh_contracts import (
+    REFRESH_SCOPE_LABELS,
+    REFRESH_STEP_DEFINITIONS,
+    build_progress_steps as _progress_steps,
+    normalize_refresh_scope as _normalize_refresh_scope,
+)
+from quant.application.workspaces.byd import (
+    BydWorkspaceDependencies,
+    build_byd_daily_strategy,
+)
+from quant.application.workspaces.convertible_bonds import (
+    ConvertibleBondAllotmentDependencies,
+    ConvertibleBondGridDependencies,
+    build_convertible_bond_allotment_workspace,
+    build_convertible_bond_grid_workspace,
+    evaluate_convertible_bond_allotment_quality,
+)
 from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
 from quant.data.source_merge import normalize_ts_code
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
+from quant.infrastructure.workspace_snapshots import (
+    WorkspaceSnapshotRepository,
+    canonical_snapshot_date,
+    workspace_params_key,
+)
 from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_daily_plan, write_daily_plan
 from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.convertible_bond_allotment import build_convertible_bond_allotment_payload
@@ -51,8 +73,6 @@ from quant.research.similar_patterns import (
     vector_cache_key,
 )
 from quant.research.similar_patterns_validation import build_industry_regime, load_market_regime
-from quant.research.byd_daily_t_plan import build_daily_t_plan
-from quant.strategies.custom.byd_minute_t import BydHolding, build_minute_payload, load_daily_qfq
 from quant.strategies.custom.b1_family import add_b1_family_signals
 from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
 from quant.strategies.custom.z_skill_patterns import (
@@ -275,66 +295,6 @@ REFRESH_CHILD_PROCESS_MARKERS = (
     "scripts/research/refresh_b1_feature_cache.py",
     "scripts/research/rebuild_strategy_signal_cache.py",
 )
-REFRESH_SCOPE_LABELS = {
-    "all": "全部工作区",
-    "short": "短线策略",
-    "chan": "缠论策略",
-    "long": "长线策略",
-    "cb": "可转债策略",
-    "cbAllotment": "配债股",
-    "byd": "BYD 做T",
-    "similar": "自选池",
-}
-REFRESH_SCOPE_STEPS = {
-    "all": [
-        "refresh_data",
-        "feature_cache",
-        "daily_plan",
-        "signal_cache",
-        "model_score",
-        "selector_core",
-        "selector_extended",
-        "chan_model_strategy",
-        "long_stock_pool",
-        "convertible_bond_plan",
-        "convertible_bond_allotment",
-        "byd_daily_plan",
-        "similar_patterns",
-        "snapshot",
-    ],
-    "short": [
-        "refresh_data",
-        "feature_cache",
-        "daily_plan",
-        "signal_cache",
-        "model_score",
-        "selector_core",
-        "selector_extended",
-        "snapshot",
-    ],
-    "chan": ["refresh_data", "chan_model_strategy"],
-    "long": ["refresh_data", "long_stock_pool"],
-    "cb": ["refresh_data", "convertible_bond_plan"],
-    "cbAllotment": ["refresh_data", "convertible_bond_allotment"],
-    "byd": ["refresh_data", "byd_daily_plan"],
-    "similar": ["refresh_data", "similar_patterns"],
-}
-REFRESH_STEP_DEFINITIONS = {
-    "refresh_data": {"label": "拉取 Tushare 最新日线数据", "percent": 10},
-    "feature_cache": {"label": "增量构建 B1 特征缓存", "percent": 35},
-    "daily_plan": {"label": "生成最新策略每日计划", "percent": 45},
-    "signal_cache": {"label": "重建全市场策略规则信号", "percent": 56},
-    "model_score": {"label": "计算当日策略模型分", "percent": 70},
-    "selector_core": {"label": "计算短线核心股票池", "percent": 78},
-    "selector_extended": {"label": "计算短线全策略股票池", "percent": 88},
-    "chan_model_strategy": {"label": "生成缠论模型策略候选", "percent": 90},
-    "long_stock_pool": {"label": "计算长线策略股票池", "percent": 92},
-    "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
-    "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
-    "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
-    "similar_patterns": {"label": "刷新自选池相似走势", "percent": 97},
-    "snapshot": {"label": "写入策略股票池快照", "percent": 98},
-}
 SIMILAR_PATTERN_STATE_DIR = PROJECT_ROOT / "data/research/similar_patterns"
 SIMILAR_PATTERN_WATCHLIST_PATH = SIMILAR_PATTERN_STATE_DIR / "watchlist.json"
 SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analysis.json"
@@ -352,6 +312,7 @@ WATCHLIST_ALERT_INDICATORS = {
     "vol_ratio20",
     "dist_ma20",
     "dist_ma60",
+    "kdj_daily_j",
     "opportunity_score",
     "holding_score",
 }
@@ -944,149 +905,16 @@ def get_byd_daily_strategy(
     cost: float = 110.6061,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Return BYD's fixed, pre-market daily T plan."""
-    params = {
-        "plan_version": 3,
-        "shares": int(shares),
-        "cost": round(float(cost), 6),
-    }
-    if not refresh:
-        cached = _read_workspace_snapshot("byd_daily_plan", params=params, allow_sql=False)
-        if cached is not None:
-            return cached
-    daily = _load_byd_daily_frame()
-    holding = BydHolding(shares=max(int(shares), 0), cost=float(cost), full_shares=10000)
-    payload = build_minute_payload(
-        daily=daily,
-        minutes=pd.DataFrame(),
-        holding=holding,
-        data_status="盘前固定日线计划",
-    )
-    daily_plan = build_daily_t_plan(
-        daily=daily,
-        intraday=_load_byd_intraday_validation_frame(),
-        shares=holding.shares,
-        full_shares=holding.full_shares,
-    )
-    positive = daily_plan["positive"]
-    if positive["execution_enabled"]:
-        primary_action = {
-            "action": "BUY_LIMIT",
-            "title": f"正T挂买单：{positive['shares']}股 × {positive['buy_price']:.2f}",
-            "detail": f"{positive['entry_rule']} {positive['exit_rule']}",
-            "shares_delta": positive["shares"],
-        }
-    else:
-        primary_action = {
-            "action": "WAIT",
-            "title": "今日不挂正T买单",
-            "detail": (
-                "历史规则本身已通过验证，但下一交易日质量分未过闸门；"
-                "不为增加次数而追价。反T仍暂停。"
-            ),
-            "shares_delta": 0,
-        }
-    payload.update(
-        {
-            "daily_t_plan": daily_plan,
-            "planned_t": daily_plan,
-            "validation": daily_plan["validation"],
-            "primary_action": primary_action,
-            "stage": {
-                "key": (
-                    "OVERWEIGHT"
-                    if holding.shares > holding.full_shares
-                    else "UNDERWEIGHT"
-                    if holding.shares < 8000
-                    else "BALANCED"
-                ),
-                "label": (
-                    f"高于满仓 {holding.shares - holding.full_shares} 股"
-                    if holding.shares > holding.full_shares
-                    else f"低于合理仓 {8000 - holding.shares} 股"
-                    if holding.shares < 8000
-                    else "合理仓位"
-                ),
-                "goal_shares": holding.full_shares,
-                "mode": daily_plan["inventory"]["note"],
-            },
-            "alerts": [],
-            "playbook": [
-                positive["entry_rule"],
-                positive["exit_rule"],
-                positive["no_fill_rule"],
-                daily_plan["reverse"]["reason"],
-                daily_plan["inventory"]["note"],
-            ],
-        }
-    )
-    for obsolete_key in [
-        "today_t",
-        "recent_minutes",
-        "intraday_dynamic",
-        "indicators",
-        "validated_positive_t",
-        "intraday_levels",
-    ]:
-        payload.pop(obsolete_key, None)
-    snapshot_date = daily_plan["signal_date"]
-    _write_workspace_snapshot(
-        "byd_daily_plan",
-        snapshot_date,
-        payload,
-        params=params,
-        write_sql=refresh,
-    )
-    return payload
+    """Compatibility facade for the application-layer BYD workspace."""
 
-
-@lru_cache(maxsize=1)
-def _load_byd_intraday_validation_frame() -> pd.DataFrame:
-    """Load the longest local 5-minute history for offline validation only."""
-    paths = list((PROJECT_ROOT / "data/cache").glob("baostock_002594_5min_*_qfq.parquet"))
-    if not paths:
-        raise FileNotFoundError("缺少比亚迪历史5分钟验证数据")
-    path = max(paths, key=lambda item: item.stat().st_size)
-    return pd.read_parquet(path)
-
-
-def _load_byd_daily_frame() -> pd.DataFrame:
-    """Prefer the refreshed daily store so one-click updates advance BYD plans."""
-    try:
-        store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
-        daily = store.read_frame(DAILY_DIR.name, "002594.SZ")
-        normalized = _normalize_byd_daily_frame(daily)
-        if not normalized.empty:
-            return normalized
-    except Exception:
-        pass
-    return load_daily_qfq(PROJECT_ROOT / "data/cache")
-
-
-def _normalize_byd_daily_frame(daily: pd.DataFrame) -> pd.DataFrame:
-    if daily is None or daily.empty:
-        return pd.DataFrame()
-    out = daily.copy()
-    parsed_date = pd.Series(pd.NaT, index=out.index)
-    if "date" in out.columns:
-        parsed_date = pd.to_datetime(out["date"], errors="coerce")
-    if "trade_date" in out.columns:
-        trade_date = pd.to_datetime(out["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-        parsed_date = parsed_date.fillna(trade_date)
-    out["date"] = parsed_date
-    if "vol" in out.columns and "volume" not in out.columns:
-        out["volume"] = out["vol"]
-    for col in ["open", "high", "low", "close", "volume", "amount"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-    required = ["date", "open", "high", "low", "close"]
-    if any(col not in out.columns for col in required):
-        return pd.DataFrame()
-    return (
-        out.dropna(subset=required)
-        .sort_values("date")
-        .drop_duplicates("date", keep="last")
-        .reset_index(drop=True)
+    return build_byd_daily_strategy(
+        shares=shares,
+        cost=cost,
+        refresh=refresh,
+        dependencies=BydWorkspaceDependencies(
+            read_snapshot=_read_workspace_snapshot,
+            write_snapshot=_write_workspace_snapshot,
+        ),
     )
 
 
@@ -1486,40 +1314,30 @@ def _write_long_stock_pool_snapshot(
 
 
 def _workspace_params_key(params: dict[str, Any] | None = None) -> str:
-    params = params or {}
-    raw = json.dumps(params, ensure_ascii=True, sort_keys=True, default=str)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return workspace_params_key(params)
 
 
 def _canonical_workspace_snapshot_date(value: Any) -> str:
-    text_value = str(value or "latest").strip()
-    if text_value == "latest":
-        return text_value
-    compact = text_value.replace("-", "")
-    if len(compact) == 8 and compact.isdigit():
-        return f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
-    return text_value
+    return canonical_snapshot_date(value)
+
+
+def _workspace_snapshot_repository() -> WorkspaceSnapshotRepository:
+    return WorkspaceSnapshotRepository(
+        directory=WEB_WORKSPACE_SNAPSHOT_DIR,
+        table_name=WEB_WORKSPACE_SNAPSHOT_TABLE,
+        schema_version=WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
+        store_factory=lambda: MarketDataStore(
+            MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data")
+        ),
+    )
 
 
 def _workspace_snapshot_key(workspace: str, snapshot_date: str, params_key: str) -> str:
-    snapshot_date = _canonical_workspace_snapshot_date(snapshot_date)
-    raw = json.dumps(
-        {
-            "schema_version": WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
-            "workspace": workspace,
-            "snapshot_date": snapshot_date,
-            "params_key": params_key,
-        },
-        ensure_ascii=True,
-        sort_keys=True,
-    )
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return _workspace_snapshot_repository().snapshot_key(workspace, snapshot_date, params_key)
 
 
 def _workspace_snapshot_file_path(workspace: str, params_key: str, snapshot_date: str) -> Path:
-    safe_workspace = "".join(char for char in workspace if char.isalnum() or char in {"_", "-"})
-    date_key = _canonical_workspace_snapshot_date(snapshot_date)
-    return WEB_WORKSPACE_SNAPSHOT_DIR / safe_workspace / params_key / f"{date_key}.json"
+    return _workspace_snapshot_repository().file_path(workspace, params_key, snapshot_date)
 
 
 def _read_filesystem_workspace_snapshot(
@@ -1527,55 +1345,11 @@ def _read_filesystem_workspace_snapshot(
     snapshot_date: str | None,
     params_key: str,
 ) -> dict[str, Any] | None:
-    directory = _workspace_snapshot_file_path(workspace, params_key, "latest").parent
-    requested = _canonical_workspace_snapshot_date(snapshot_date) if snapshot_date else None
-    candidates: list[Path] = []
-    if requested:
-        exact = _workspace_snapshot_file_path(workspace, params_key, requested)
-        if exact.exists():
-            candidates.append(exact)
-        candidates.extend(
-            sorted(
-                (
-                    path
-                    for path in directory.glob("*.json")
-                    if path != exact and path.stem != "latest" and path.stem <= requested
-                ),
-                key=lambda path: path.stem,
-                reverse=True,
-            )
-        )
-    elif directory.exists():
-        candidates = sorted(
-            (path for path in directory.glob("*.json") if path.stem != "latest"),
-            key=lambda path: path.stem,
-            reverse=True,
-        )
-    latest_path = directory / "latest.json"
-    if latest_path.exists() and latest_path not in candidates:
-        candidates.append(latest_path)
-    for path in candidates:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        cached_date = _canonical_workspace_snapshot_date(
-            payload.get("trade_date") or payload.get("signal_date") or path.stem
-        )
-        if requested and cached_date != "latest" and cached_date > requested:
-            continue
-        payload["cache"] = {
-            "hit": True,
-            "backend": "filesystem",
-            "workspace": workspace,
-            "snapshot_date": cached_date,
-            "requested_date": requested,
-            "stale": bool(requested and cached_date != requested),
-        }
-        return payload
-    return None
+    return _workspace_snapshot_repository().read_filesystem(
+        workspace,
+        snapshot_date,
+        params_key,
+    )
 
 
 def _read_workspace_snapshot(
@@ -1584,57 +1358,12 @@ def _read_workspace_snapshot(
     params: dict[str, Any] | None = None,
     allow_sql: bool = True,
 ) -> dict[str, Any] | None:
-    params_key = _workspace_params_key(params)
-    filesystem_payload = _read_filesystem_workspace_snapshot(workspace, snapshot_date, params_key)
-    if filesystem_payload is not None:
-        return filesystem_payload
-    if not allow_sql:
-        return None
-    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    if not store.config.sql_url:
-        return None
-    requested = _canonical_workspace_snapshot_date(snapshot_date) if snapshot_date else None
-    try:
-        from sqlalchemy import text
-
-        with store._engine().begin() as conn:
-            rows = conn.execute(
-                text(
-                    f"""
-                    SELECT snapshot_key, snapshot_date, payload_json
-                    FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
-                    WHERE workspace = :workspace
-                      AND params_key = :params_key
-                    ORDER BY updated_at DESC
-                    LIMIT 64
-                    """
-                ),
-                {"workspace": workspace, "params_key": params_key},
-            ).mappings().all()
-        eligible = []
-        for row in rows:
-            row_date = _canonical_workspace_snapshot_date(row.get("snapshot_date"))
-            if requested and row_date != "latest" and row_date > requested:
-                continue
-            eligible.append((row_date, row))
-        eligible.sort(key=lambda item: item[0] if item[0] != "latest" else "", reverse=True)
-        for row_date, row in eligible:
-            if not row.get("payload_json"):
-                continue
-            payload = json.loads(row["payload_json"])
-            payload["cache"] = {
-                "hit": True,
-                "backend": "mysql",
-                "workspace": workspace,
-                "snapshot_key": str(row.get("snapshot_key") or ""),
-                "snapshot_date": row_date,
-                "requested_date": requested,
-                "stale": bool(requested and row_date != requested),
-            }
-            return payload
-        return None
-    except Exception:
-        return None
+    return _workspace_snapshot_repository().read(
+        workspace,
+        snapshot_date=snapshot_date,
+        params=params,
+        allow_sql=allow_sql,
+    )
 
 
 def _write_workspace_snapshot(
@@ -1644,71 +1373,13 @@ def _write_workspace_snapshot(
     params: dict[str, Any] | None = None,
     write_sql: bool = True,
 ) -> None:
-    snapshot_date = _canonical_workspace_snapshot_date(snapshot_date)
-    params = params or {}
-    params_key = _workspace_params_key(params)
-    snapshot_key = _workspace_snapshot_key(workspace, snapshot_date, params_key)
-    payload_to_store = dict(payload)
-    payload_to_store["cache"] = {
-        "hit": False,
-        "backend": "generated",
-        "workspace": workspace,
-        "snapshot_key": snapshot_key,
-        "snapshot_date": snapshot_date,
-    }
-    payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
-    _write_filesystem_workspace_snapshot(workspace, params_key, snapshot_date, payload_json)
-    if not write_sql:
-        return
-    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    if not store.config.sql_url:
-        return
-    try:
-        from sqlalchemy import text
-
-        with store._engine().begin() as conn:
-            conn.execute(
-                text(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {WEB_WORKSPACE_SNAPSHOT_TABLE} (
-                        snapshot_key VARCHAR(64) PRIMARY KEY,
-                        workspace VARCHAR(64) NOT NULL,
-                        snapshot_date VARCHAR(32) NOT NULL,
-                        params_key VARCHAR(64) NOT NULL,
-                        params_json TEXT NOT NULL,
-                        generated_at VARCHAR(32) NOT NULL,
-                        payload_json LONGTEXT NOT NULL,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                        KEY idx_workspace_latest (workspace, params_key, snapshot_date)
-                    )
-                    """
-                )
-            )
-            conn.execute(
-                text(
-                    f"""
-                    INSERT INTO {WEB_WORKSPACE_SNAPSHOT_TABLE}
-                        (snapshot_key, workspace, snapshot_date, params_key, params_json, generated_at, payload_json)
-                    VALUES
-                        (:snapshot_key, :workspace, :snapshot_date, :params_key, :params_json, :generated_at, :payload_json)
-                    ON DUPLICATE KEY UPDATE
-                        generated_at = VALUES(generated_at),
-                        params_json = VALUES(params_json),
-                        payload_json = VALUES(payload_json)
-                    """
-                ),
-                {
-                    "snapshot_key": snapshot_key,
-                    "workspace": workspace,
-                    "snapshot_date": snapshot_date,
-                    "params_key": params_key,
-                    "params_json": json.dumps(params, ensure_ascii=False, sort_keys=True, default=str),
-                    "generated_at": str(payload.get("generated_at") or datetime.now().isoformat(timespec="seconds")),
-                    "payload_json": payload_json,
-                },
-            )
-    except Exception:
-        return
+    _workspace_snapshot_repository().write(
+        workspace,
+        snapshot_date,
+        payload,
+        params=params,
+        write_sql=write_sql,
+    )
 
 
 def _write_filesystem_workspace_snapshot(
@@ -1717,18 +1388,12 @@ def _write_filesystem_workspace_snapshot(
     snapshot_date: str,
     payload_json: str,
 ) -> None:
-    snapshot_path = _workspace_snapshot_file_path(workspace, params_key, snapshot_date)
-    latest_path = _workspace_snapshot_file_path(workspace, params_key, "latest")
-    try:
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = snapshot_path.with_suffix(".json.tmp")
-        temporary_path.write_text(payload_json, encoding="utf-8")
-        temporary_path.replace(snapshot_path)
-        latest_temporary_path = latest_path.with_suffix(".json.tmp")
-        latest_temporary_path.write_text(payload_json, encoding="utf-8")
-        latest_temporary_path.replace(latest_path)
-    except Exception:
-        return
+    _workspace_snapshot_repository().write_filesystem(
+        workspace,
+        params_key,
+        snapshot_date,
+        payload_json,
+    )
 
 
 @lru_cache(maxsize=4)
@@ -1750,28 +1415,7 @@ def _chan_model_strategy_dates() -> set[str]:
 
 
 def _workspace_snapshot_dates(workspace: str, params: dict[str, Any] | None = None) -> set[str]:
-    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    if not store.config.sql_url:
-        return set()
-    params_key = _workspace_params_key(params)
-    try:
-        from sqlalchemy import text
-
-        with store._engine().begin() as conn:
-            rows = conn.execute(
-                text(
-                    f"""
-                    SELECT snapshot_date
-                    FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
-                    WHERE workspace = :workspace
-                      AND params_key = :params_key
-                    """
-                ),
-                {"workspace": workspace, "params_key": params_key},
-            ).scalars().all()
-        return {str(item) for item in rows if item}
-    except Exception:
-        return set()
+    return _workspace_snapshot_repository().dates(workspace, params=params)
 
 
 def _long_entry_tranche(row: pd.Series, target_weight: float, regime: str) -> tuple[float, str]:
@@ -2930,18 +2574,25 @@ def _frame_records(frame: pd.DataFrame | None, limit: int | None = None) -> list
     return [_json_ready(record) for record in out.replace([np.inf, -np.inf], np.nan).to_dict("records")]
 
 
-def _normalize_watch_symbol(raw_symbol: str) -> str:
+def _canonical_watch_symbol(raw_symbol: str) -> str:
     symbol = str(raw_symbol or "").strip().upper()
     if not symbol:
-        raise ValueError("股票代码不能为空")
+        return ""
     symbol = symbol.replace("_", ".")
-    symbol = normalize_ts_code(symbol)
+    return normalize_ts_code(symbol)
+
+
+def _normalize_watch_symbol(raw_symbol: str) -> str:
+    symbol = _canonical_watch_symbol(raw_symbol)
+    if not symbol:
+        raise ValueError("股票代码不能为空")
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
     if store.latest_trade_date(DAILY_DIR.name, symbol) is None:
         raise ValueError(f"本地日线数据不存在: {symbol}")
     return symbol
 
 
+@lru_cache(maxsize=1)
 def _stock_basic_for_similar_patterns() -> pd.DataFrame:
     return load_stock_basic(PROJECT_ROOT / "data/raw/stock_basic.parquet")
 
@@ -3101,9 +2752,8 @@ def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
     raw_symbols = payload.get("symbols", payload) if isinstance(payload, dict) else payload
     symbols: list[str] = []
     for item in raw_symbols if isinstance(raw_symbols, list) else []:
-        try:
-            symbol = _normalize_watch_symbol(str(item))
-        except ValueError:
+        symbol = _canonical_watch_symbol(str(item))
+        if not re.fullmatch(r"\d{6}\.(?:SH|SZ|BJ)", symbol):
             continue
         if symbol not in symbols:
             symbols.append(symbol)
@@ -3112,7 +2762,7 @@ def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
     notes: dict[str, dict[str, str]] = {}
     if isinstance(raw_notes, dict):
         for raw_symbol, raw_note in raw_notes.items():
-            symbol = str(raw_symbol or "").strip().upper().replace("_", ".")
+            symbol = _canonical_watch_symbol(str(raw_symbol))
             if symbol not in symbols:
                 continue
             if isinstance(raw_note, dict):
@@ -3126,7 +2776,11 @@ def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
     symbols = symbols or list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
     raw_pinned = payload.get("pinned", []) if isinstance(payload, dict) else []
     pinned_values = raw_pinned if isinstance(raw_pinned, list) else []
-    pinned = [symbol for symbol in symbols if symbol in {str(item).strip().upper().replace("_", ".") for item in pinned_values}]
+    pinned = [
+        symbol
+        for symbol in symbols
+        if symbol in {_canonical_watch_symbol(str(item)) for item in pinned_values}
+    ]
     raw_alerts = payload.get("alerts", {}) if isinstance(payload, dict) else {}
     alerts = {}
     if isinstance(raw_alerts, dict):
@@ -3230,19 +2884,21 @@ def add_similar_pattern_watch_symbol(symbol: str, note: str = "") -> dict[str, A
 
 
 def remove_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
-    normalized = _normalize_watch_symbol(symbol)
     state = _read_similar_pattern_watchlist_state()
+    normalized = _canonical_watch_symbol(symbol)
+    if normalized not in state["symbols"]:
+        raise ValueError(f"股票不在自选池中: {normalized}")
     state["symbols"] = [item for item in state["symbols"] if item != normalized]
     state["pinned"] = [item for item in state["pinned"] if item != normalized]
     state["notes"].pop(normalized, None)
     state["alerts"].pop(normalized, None)
     _write_similar_pattern_watchlist_state(state)
-    return get_similar_pattern_watchlist()
+    return get_similar_pattern_watchlist(include_scores=False)
 
 
 def reorder_similar_pattern_watchlist(symbols: list[str]) -> dict[str, Any]:
     state = _read_similar_pattern_watchlist_state()
-    normalized = [_normalize_watch_symbol(symbol) for symbol in symbols]
+    normalized = [_canonical_watch_symbol(symbol) for symbol in symbols]
     if len(normalized) != len(set(normalized)):
         raise ValueError("自选池排序不能包含重复股票")
     if set(normalized) != set(state["symbols"]):
@@ -3252,11 +2908,11 @@ def reorder_similar_pattern_watchlist(symbols: list[str]) -> dict[str, Any]:
         symbol for symbol in normalized if symbol not in pinned_set
     ]
     _write_similar_pattern_watchlist_state(state)
-    return get_similar_pattern_watchlist()
+    return get_similar_pattern_watchlist(include_scores=False)
 
 
 def set_similar_pattern_watch_pin(symbol: str, pinned: bool) -> dict[str, Any]:
-    normalized = _normalize_watch_symbol(symbol)
+    normalized = _canonical_watch_symbol(symbol)
     state = _read_similar_pattern_watchlist_state()
     if normalized not in state["symbols"]:
         raise ValueError(f"股票不在自选池中: {normalized}")
@@ -3269,11 +2925,11 @@ def set_similar_pattern_watch_pin(symbol: str, pinned: bool) -> dict[str, Any]:
         state["pinned"] = current_pinned
         state["symbols"] = [*symbols[: len(current_pinned)], normalized, *symbols[len(current_pinned) :]]
     _write_similar_pattern_watchlist_state(state)
-    return get_similar_pattern_watchlist()
+    return get_similar_pattern_watchlist(include_scores=False)
 
 
 def save_similar_pattern_watch_note(symbol: str, content: str) -> dict[str, Any]:
-    normalized = _normalize_watch_symbol(symbol)
+    normalized = _canonical_watch_symbol(symbol)
     state = _read_similar_pattern_watchlist_state()
     if normalized not in state["symbols"]:
         raise ValueError(f"股票不在自选池中: {normalized}")
@@ -3288,11 +2944,11 @@ def save_similar_pattern_watch_note(symbol: str, content: str) -> dict[str, Any]
     else:
         state["notes"].pop(normalized, None)
     _write_similar_pattern_watchlist_state(state)
-    return get_similar_pattern_watchlist()
+    return get_similar_pattern_watchlist(include_scores=False)
 
 
 def save_similar_pattern_watch_alerts(symbol: str, config: dict[str, Any]) -> dict[str, Any]:
-    normalized = _normalize_watch_symbol(symbol)
+    normalized = _canonical_watch_symbol(symbol)
     state = _read_similar_pattern_watchlist_state()
     if normalized not in state["symbols"]:
         raise ValueError(f"股票不在自选池中: {normalized}")
@@ -3303,7 +2959,7 @@ def save_similar_pattern_watch_alerts(symbol: str, config: dict[str, Any]) -> di
     else:
         state["alerts"].pop(normalized, None)
     _write_similar_pattern_watchlist_state(state)
-    return get_similar_pattern_watchlist()
+    return get_similar_pattern_watchlist(include_scores=False)
 
 
 def _read_similar_pattern_validation() -> dict[str, Any]:
@@ -3474,10 +3130,7 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
     hits: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in targets}
 
     def append_hit(symbol: str, key: str, label: str, detail: str, signal_date: Any = None) -> None:
-        try:
-            normalized = _normalize_watch_symbol(symbol)
-        except ValueError:
-            return
+        normalized = _canonical_watch_symbol(symbol)
         if normalized not in targets:
             return
         candidate = {
@@ -3490,7 +3143,18 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
             hits[normalized].append(candidate)
 
     try:
-        short_payload = get_stock_selector_payload(include_extended=True, use_cache=True)
+        latest_signal_date = _latest_candidate_signal_date()
+        short_payload = _read_selector_snapshot(
+            latest_signal_date,
+            None,
+            True,
+        )
+        if short_payload is None:
+            short_payload = get_stock_selector_payload(
+                signal_date=latest_signal_date,
+                include_extended=True,
+                use_cache=True,
+            )
         for item in short_payload.get("stocks") or []:
             families = " / ".join(str(value) for value in (item.get("matched_families") or [])[:4])
             append_hit(
@@ -3831,6 +3495,11 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
         ]
         watchlist_symbols = _read_similar_pattern_watchlist_symbols()
         if cached is not None:
+            cached_watchlist = {
+                str(item.get("symbol") or "").upper(): item
+                for item in cached.get("watchlist") or []
+                if item.get("symbol")
+            }
             result_by_symbol = {
                 str(item.get("target", {}).get("symbol") or "").upper(): item
                 for item in cached.get("results", [])
@@ -3842,9 +3511,29 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
                 if symbol in result_by_symbol
             ]
             cached = _attach_watchlist_strategy_hits(cached)
-            cached["watchlist"] = _similar_pattern_watchlist_profiles(
-                _stock_basic_for_similar_patterns()
+            persisted_profiles = _similar_pattern_watchlist_profiles(
+                _stock_basic_for_similar_patterns(),
+                include_scores=False,
             )
+            score_fields = (
+                "opportunity_score",
+                "holding_score",
+                "buy_score",
+                "hold_score",
+                "score_date",
+                "score_target",
+            )
+            cached["watchlist"] = [
+                {
+                    **profile,
+                    **{
+                        field: cached_watchlist[profile["symbol"]][field]
+                        for field in score_fields
+                        if field in cached_watchlist.get(profile["symbol"], {})
+                    },
+                }
+                for profile in persisted_profiles
+            ]
             cached.setdefault("config", {}).update(_similarity_score_config())
             cached["cache"] = {
                 **(cached.get("cache") or {}),
@@ -3854,6 +3543,21 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
                 "watchlist_changed": cached_symbols != watchlist_symbols,
             }
             return cached
+        watchlist = get_similar_pattern_watchlist(include_scores=False)
+        return {
+            "generated_at": watchlist.get("updated_at"),
+            "watchlist": watchlist.get("stocks") or [],
+            "results": [],
+            "config": _similarity_score_config(),
+            "global_policy": {},
+            "cache": {
+                "hit": False,
+                "backend": "none",
+                "stale": True,
+                "missing": True,
+                "watchlist_changed": True,
+            },
+        }
     return refresh_similar_pattern_analysis()
 
 
@@ -3922,7 +3626,11 @@ def _selector_snapshot_path(snapshot_key: str) -> Path:
     return SELECTOR_SNAPSHOT_DIR / f"{snapshot_key}.json"
 
 
-def _selector_snapshot_dates(strategies: list[str] | None, include_extended: bool) -> list[str]:
+@lru_cache(maxsize=32)
+def _selector_snapshot_dates_cached(
+    strategies: tuple[str, ...],
+    include_extended: bool,
+) -> tuple[str, ...]:
     _, _, strategy_key = _selector_snapshot_key(None, strategies, include_extended)
     dates: set[str] = set()
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
@@ -3968,7 +3676,12 @@ def _selector_snapshot_dates(strategies: list[str] | None, include_extended: boo
             parsed = pd.to_datetime(date_key, errors="coerce")
             if pd.notna(parsed) and parsed.weekday() < 5:
                 dates.add(parsed.strftime("%Y-%m-%d"))
-    return sorted(dates)
+    return tuple(sorted(dates))
+
+
+def _selector_snapshot_dates(strategies: list[str] | None, include_extended: bool) -> list[str]:
+    normalized = tuple(sorted({str(item).upper() for item in strategies or [] if item}))
+    return list(_selector_snapshot_dates_cached(normalized, include_extended))
 
 
 def _latest_selector_snapshot_date(strategies: list[str] | None, include_extended: bool) -> str | None:
@@ -3993,6 +3706,7 @@ def _resolve_selector_signal_date(
     return previous[-1] if previous else signal_date
 
 
+@lru_cache(maxsize=1)
 def _latest_candidate_signal_date() -> str | None:
     """Latest date available from strategy candidate/model caches."""
 
@@ -4098,6 +3812,7 @@ def _write_selector_snapshot(
     temporary_path = snapshot_path.with_suffix(".json.tmp")
     temporary_path.write_text(payload_json, encoding="utf-8")
     temporary_path.replace(snapshot_path)
+    _selector_snapshot_dates_cached.cache_clear()
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
         try:
@@ -4348,53 +4063,37 @@ def get_convertible_bond_grid_plan(
     limit: int = 18,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    params = {"limit": int(limit)}
-    if not refresh:
-        cached = _read_workspace_snapshot(
-            "convertible_bond_grid_plan",
-            snapshot_date=trade_date,
-            params=params,
-            allow_sql=False,
-        )
-        if cached is not None:
-            return cached
+    def read_legacy_snapshot() -> dict[str, Any] | None:
         try:
-            legacy = json.loads(CONVERTIBLE_BOND_GRID_PLAN_PATH.read_text(encoding="utf-8"))
+            payload = json.loads(
+                CONVERTIBLE_BOND_GRID_PLAN_PATH.read_text(encoding="utf-8")
+            )
         except Exception:
-            legacy = None
-        if isinstance(legacy, dict) and legacy.get("trade_date"):
-            cached_date = _canonical_workspace_snapshot_date(legacy.get("trade_date"))
-            requested_date = _canonical_workspace_snapshot_date(trade_date) if trade_date else None
-            if not requested_date or cached_date <= requested_date:
-                legacy["cache"] = {
-                    "hit": True,
-                    "backend": "legacy_filesystem",
-                    "workspace": "convertible_bond_grid_plan",
-                    "snapshot_date": cached_date,
-                    "requested_date": requested_date,
-                    "stale": bool(requested_date and cached_date != requested_date),
-                }
-                _write_filesystem_workspace_snapshot(
-                    "convertible_bond_grid_plan",
-                    _workspace_params_key(params),
-                    cached_date,
-                    json.dumps(legacy, ensure_ascii=False, default=str),
-                )
-                return legacy
-    refresh_result = None
-    if refresh and trade_date:
-        refresh_result = refresh_convertible_bond_daily(trade_date=trade_date)
-    payload = build_convertible_bond_grid_plan(trade_date=trade_date, limit=limit)
-    if refresh_result is not None:
-        payload["data_refresh"] = refresh_result
-    _write_workspace_snapshot(
-        "convertible_bond_grid_plan",
-        payload.get("trade_date") or trade_date,
-        payload,
-        params=params,
-        write_sql=refresh,
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    params = {"limit": int(limit)}
+    dependencies = ConvertibleBondGridDependencies(
+        read_snapshot=_read_workspace_snapshot,
+        read_legacy_snapshot=read_legacy_snapshot,
+        promote_legacy_snapshot=lambda snapshot_date, payload: (
+            _write_filesystem_workspace_snapshot(
+                "convertible_bond_grid_plan",
+                _workspace_params_key(params),
+                snapshot_date,
+                json.dumps(payload, ensure_ascii=False, default=str),
+            )
+        ),
+        write_snapshot=_write_workspace_snapshot,
+        refresh_daily=refresh_convertible_bond_daily,
+        build_plan=build_convertible_bond_grid_plan,
     )
-    return payload
+    return build_convertible_bond_grid_workspace(
+        trade_date=trade_date,
+        limit=limit,
+        refresh=refresh,
+        dependencies=dependencies,
+    )
 
 
 def _convertible_bond_allotment_min_coverage() -> float:
@@ -4410,101 +4109,11 @@ def _convertible_bond_allotment_quality(
     *,
     expected_trade_date: str | None = None,
 ) -> dict[str, Any]:
-    records = [item for item in payload.get("records") or [] if isinstance(item, dict)]
-    data_sources = payload.get("data_sources") or {}
-    stock_daily = data_sources.get("stock_daily")
-    daily_basic = data_sources.get("daily_basic")
-    minimum_coverage = _convertible_bond_allotment_min_coverage()
-
-    def numeric_present(value: Any) -> bool:
-        try:
-            return value is not None and bool(np.isfinite(float(value)))
-        except (TypeError, ValueError):
-            return False
-
-    def normalized_date(value: Any) -> str | None:
-        parsed = pd.to_datetime(value, errors="coerce")
-        return None if pd.isna(parsed) else parsed.date().isoformat()
-
-    def metric(count: int, total: int) -> dict[str, Any]:
-        ratio = 1.0 if total <= 0 else count / total
-        return {
-            "count": int(count),
-            "total": int(total),
-            "ratio": round(float(ratio), 6),
-            "passed": bool(ratio >= minimum_coverage),
-        }
-
-    if not isinstance(stock_daily, dict) or not isinstance(daily_basic, dict):
-        return {
-            "status": "failed",
-            "expected_trade_date": normalized_date(expected_trade_date),
-            "minimum_coverage": minimum_coverage,
-            "metrics": {},
-            "issues": ["缺少 stock_daily 或 daily_basic 数据源元信息"],
-        }
-
-    requested = max(0, int(stock_daily.get("requested") or 0))
-    matched = max(0, int(stock_daily.get("matched") or 0))
-    expected_date = normalized_date(expected_trade_date)
-    if expected_date is None:
-        price_dates = [
-            value
-            for item in records
-            if (value := normalized_date(item.get("stock_price_date"))) is not None
-        ]
-        expected_date = max(price_dates, default=None)
-
-    current_prices = sum(
-        normalized_date(item.get("stock_price_date")) == expected_date
-        for item in records
-        if expected_date is not None
+    return evaluate_convertible_bond_allotment_quality(
+        payload,
+        expected_trade_date=expected_trade_date,
+        minimum_coverage=_convertible_bond_allotment_min_coverage(),
     )
-    daily_basic_matched = max(0, int(daily_basic.get("matched") or 0))
-    metrics = {
-        "stock_daily_match": metric(matched, requested),
-        "stock_price_freshness": metric(current_prices, matched),
-        "daily_basic_match": metric(daily_basic_matched, requested),
-        "kdj_daily_j": metric(
-            sum(numeric_present(item.get("kdj_daily_j")) for item in records),
-            matched,
-        ),
-        "kdj_weekly_j": metric(
-            sum(numeric_present(item.get("kdj_weekly_j")) for item in records),
-            matched,
-        ),
-        "kdj_monthly_j": metric(
-            sum(numeric_present(item.get("kdj_monthly_j")) for item in records),
-            matched,
-        ),
-    }
-    labels = {
-        "stock_daily_match": "行情匹配率",
-        "stock_price_freshness": "行情日期新鲜度",
-        "daily_basic_match": "daily_basic 匹配率",
-        "kdj_daily_j": "日线 J 完整率",
-        "kdj_weekly_j": "周线 J 完整率",
-        "kdj_monthly_j": "月线 J 完整率",
-    }
-    issues = [
-        (
-            f"{labels[key]}不足: {value['count']}/{value['total']} "
-            f"({value['ratio']:.1%} < {minimum_coverage:.1%})"
-        )
-        for key, value in metrics.items()
-        if not value["passed"]
-    ]
-    if stock_daily.get("error"):
-        issues.append(f"stock_daily 读取异常: {stock_daily['error']}")
-    if daily_basic.get("error"):
-        issues.append(f"daily_basic 读取异常: {daily_basic['error']}")
-    return {
-        "status": "success" if not issues else "failed",
-        "expected_trade_date": expected_date,
-        "minimum_coverage": minimum_coverage,
-        "metrics": metrics,
-        "issues": issues,
-    }
 
 
 def get_convertible_bond_allotments(
@@ -4515,55 +4124,29 @@ def get_convertible_bond_allotments(
     expected_trade_date: str | None = None,
     validate_quality: bool = False,
 ) -> dict[str, Any]:
-    params = {
-        "limit": int(limit),
-        "include_listed_days": int(include_listed_days),
-        "stage_scope": str(stage_scope),
-    }
-    cached = None
-    if not refresh:
-        cached = _read_workspace_snapshot(
-            "convertible_bond_allotments",
-            params=params,
-            allow_sql=False,
-        )
-        if cached is None:
-            cached = _read_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH)
-        if cached is not None:
-            cached.setdefault("cache", {})
-            cached["cache"].update({
-                "hit": True,
-                "stale": not _is_daily_payload_current(cached),
-            })
-            cached_quality = cached.get("quality") or {}
-            cached["quality"] = _convertible_bond_allotment_quality(
-                cached,
-                expected_trade_date=cached_quality.get("expected_trade_date"),
-            )
-            return cached
-    daily_refresh_required = refresh
-    payload = build_convertible_bond_allotment_payload(
+    dependencies = ConvertibleBondAllotmentDependencies(
+        read_snapshot=_read_workspace_snapshot,
+        read_daily_cache=lambda: _read_daily_payload_cache(
+            CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH
+        ),
+        write_daily_cache=lambda payload: _write_daily_payload_cache(
+            CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH,
+            payload,
+        ),
+        write_snapshot=_write_workspace_snapshot,
+        build_payload=build_convertible_bond_allotment_payload,
+        is_daily_current=_is_daily_payload_current,
+    )
+    return build_convertible_bond_allotment_workspace(
         limit=limit,
         include_listed_days=include_listed_days,
-        refresh=daily_refresh_required,
+        refresh=refresh,
         stage_scope=stage_scope,
-    )
-    payload["quality"] = _convertible_bond_allotment_quality(
-        payload,
         expected_trade_date=expected_trade_date,
+        validate_quality=validate_quality,
+        dependencies=dependencies,
+        minimum_coverage=_convertible_bond_allotment_min_coverage(),
     )
-    _write_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH, payload)
-    _write_workspace_snapshot(
-        "convertible_bond_allotments",
-        payload.get("asof") or payload.get("trade_date") or payload.get("generated_at"),
-        payload,
-        params=params,
-        write_sql=refresh,
-    )
-    if validate_quality and payload["quality"]["status"] != "success":
-        details = "；".join(payload["quality"].get("issues") or ["未知质量问题"])
-        raise RuntimeError(f"配债股数据质量门禁失败: {details}")
-    return payload
 
 
 def refresh_dashboard() -> dict[str, Any]:
@@ -6500,6 +6083,9 @@ def _clear_selector_caches() -> None:
         _selector_buy_hold_models,
         _selector_model_feature_rows,
         _selector_model_score_date,
+        _selector_snapshot_dates_cached,
+        _latest_candidate_signal_date,
+        _stock_basic_for_similar_patterns,
         _stock_basic_map,
         _long_research_module,
         _tea_master_research_module,
@@ -6513,39 +6099,6 @@ def _clear_selector_caches() -> None:
         "quant_tea_master_long_research",
     ):
         sys.modules.pop(module_name, None)
-
-
-def _normalize_refresh_scope(scope: str | None = None) -> str:
-    if not scope:
-        return "all"
-    value = str(scope).strip()
-    aliases = {
-        "cb-allotment": "cbAllotment",
-        "allotment": "cbAllotment",
-        "convertible_bond": "cb",
-        "convertible-bond": "cb",
-    }
-    normalized = aliases.get(value, value)
-    if normalized not in REFRESH_SCOPE_STEPS:
-        raise ValueError(f"未知刷新范围: {scope}")
-    return normalized
-
-
-def _progress_steps(scope: str | None = None) -> list[dict[str, Any]]:
-    normalized = _normalize_refresh_scope(scope)
-    return [
-        {
-            "key": key,
-            "label": REFRESH_STEP_DEFINITIONS[key]["label"],
-            "status": "pending",
-            "percent": REFRESH_STEP_DEFINITIONS[key]["percent"],
-            "started_at": None,
-            "finished_at": None,
-            "elapsed_seconds": None,
-            "checkpoint_reused": False,
-        }
-        for key in REFRESH_SCOPE_STEPS[normalized]
-    ]
 
 
 def _mark_refresh_step_started(step: dict[str, Any], now: datetime) -> None:
@@ -6920,7 +6473,13 @@ def _run_latest_refresh_job(
                         else f"{refresh_label}刷新任务已启动"
                     ),
                     "percent": 90 if resume_tail else 35 if resume_inputs else 1,
-                    "current_step": "similar_patterns" if resume_tail else "feature_cache" if resume_inputs else "refresh_data",
+                    "current_step": (
+                        "similar_patterns"
+                        if refresh_scope == "similar" or resume_tail
+                        else "feature_cache"
+                        if resume_inputs
+                        else "refresh_data"
+                    ),
                     "steps": attempt_steps,
                     "scope": refresh_scope,
                     "scope_label": refresh_label,
@@ -6941,6 +6500,33 @@ def _run_latest_refresh_job(
                     if step.get("key") in reused_keys:
                         _mark_refresh_step_checkpoint_reused(step, now)
             _persist_refresh_status_unlocked()
+        if refresh_scope == "similar":
+            _set_refresh_progress(
+                step_key="similar_patterns",
+                message="正在后台刷新相似走势决策台",
+                percent=10,
+            )
+            payload = _run_similar_pattern_analysis_isolated()
+            results = {
+                "similar_patterns": {
+                    "status": "success",
+                    "generated_at": payload.get("generated_at"),
+                    "targets": len(payload.get("results") or []),
+                }
+            }
+            _set_refresh_progress(
+                status="success",
+                step_key="similar_patterns",
+                step_status="success",
+                message="自选池相似走势刷新完成",
+                percent=100,
+                result=results,
+            )
+            with _REFRESH_LOCK:
+                for step in _REFRESH_STATUS["steps"]:
+                    step["status"] = "success"
+                _persist_refresh_status_unlocked()
+            return
         cache_cleanup = run_cache_cleanup(PROJECT_ROOT)
         results: dict[str, Any] = (
             dict((resume_status or {}).get("result") or {}) if resume_inputs else {}
@@ -7285,22 +6871,6 @@ def _run_latest_refresh_job(
                     percent=98,
                     complete_previous=False,
                 )
-            elif refresh_scope == "similar":
-                _set_refresh_progress(step_key="similar_patterns", message="正在刷新相似走势决策台", percent=92)
-                payload = _run_similar_pattern_analysis_isolated()
-                results["similar_patterns"] = {
-                    "status": "success",
-                    "generated_at": payload.get("generated_at"),
-                    "targets": len(payload.get("results") or []),
-                }
-                _set_refresh_progress(
-                    step_key="similar_patterns",
-                    step_status="success",
-                    message="相似走势决策台刷新完成",
-                    percent=98,
-                    complete_previous=False,
-                )
-
             _set_refresh_progress(
                 status="success",
                 step_key=_REFRESH_STATUS.get("current_step"),

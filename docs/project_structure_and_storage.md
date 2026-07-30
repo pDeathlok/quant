@@ -6,15 +6,34 @@
 
 ```text
 src/quant/data/          数据源、字段标准化、统一存储
+src/quant/core/          仓库路径、公共类型和无副作用基础设施
+src/quant/application/   API、CLI、调度共同消费的应用用例
+src/quant/infrastructure/ 文件系统、SQL 等外部存储适配器
 src/quant/features/      项目变量库
 src/quant/strategies/    可复用策略规则
 src/quant/routine/       例行任务编排
 src/quant/webapp/        FastAPI 后端
 web/                     前端选股器
+web/core/                前端 API 客户端与无状态格式化模块
 scripts/research/        研究、训练、回测脚本
 configs/strategies/      已确认策略配置
 docs/                    项目与策略文档
 ```
+
+依赖约束：
+
+```text
+interfaces(webapp/cli) -> application -> data/features/strategies
+routine                -> application -> data/features/strategies
+scripts/research       -> application/data/features/strategies
+webapp                 -> infrastructure -> MySQL/filesystem
+```
+
+`application` 不反向依赖 `webapp` 或 `routine`；`routine` 不依赖 `webapp`。项目路径统一从 `quant.core.paths` 派生，构造配置对象不会自动创建目录，运行入口需要写产物时再显式创建。
+
+通用工作区快照位于 `src/quant/infrastructure/workspace_snapshots.py`。该仓储统一处理参数哈希、日期标准化、最近历史快照选择、原子文件写入及 MySQL 回退；Web 服务保留兼容函数，但不再内联存储实现。
+
+工作区业务用例位于 `src/quant/application/workspaces/`。新增或迁移工作区时，应把纯业务流程和质量判断放在此目录，把行情、快照和缓存访问声明为依赖；`webapp.services` 只负责组合依赖和兼容 API。当前 BYD、可转债网格与配债股已完成该迁移。
 
 本地运行产物不进入 Git：
 

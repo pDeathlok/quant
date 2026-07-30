@@ -72,6 +72,17 @@ def _clean_text(value: Any) -> str | None:
 
 def _is_pipeline_issuance_title(title: Any) -> bool:
     text = _clean_text(title) or ""
+    non_public_issue = [
+        "向特定对象发行可转债",
+        "向特定对象发行可转换公司债券",
+        "定向发行可转债",
+        "定向发行可转换公司债券",
+        "定向可转债",
+        "发行股份及可转换公司债券购买资产",
+        "发行股份、可转换公司债券购买资产",
+    ]
+    if any(key in text for key in non_public_issue):
+        return False
     include = [
         "向不特定对象发行可转债",
         "向不特定对象发行可转换公司债券",
@@ -1131,7 +1142,10 @@ def _pipeline_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
         return []
     records: list[dict[str, Any]] = []
     for _, row in frame.iterrows():
-        inferred_stage, inferred_status = _stage_from_title(row.get("announcement_title"))
+        announcement_title = row.get("announcement_title")
+        if not _is_pipeline_issuance_title(announcement_title):
+            continue
+        inferred_stage, inferred_status = _stage_from_title(announcement_title)
         stage = _normalize_pipeline_stage(inferred_stage or row.get("stage"))
         status = PIPELINE_STAGE_STATUS.get(stage or "", inferred_status or _clean_text(row.get("status")))
         if stage not in PIPELINE_STAGES:
@@ -1158,7 +1172,7 @@ def _pipeline_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
                 "remain_size": None,
                 "allot_ratio": _number(row.get("allot_ratio")),
                 "rating": _clean_text(row.get("rating")),
-                "announcement_title": _clean_text(row.get("announcement_title")),
+                "announcement_title": _clean_text(announcement_title),
                 "announcement_url": _clean_text(row.get("announcement_url")),
                 "allotment_note": _clean_text(row.get("allotment_note")) or _pipeline_note(stage),
                 "risk_note": _clean_text(row.get("risk_note")) or "前置阶段；重点跟踪下一份受理/上市委/注册/发行公告",

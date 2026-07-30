@@ -215,6 +215,10 @@ h3 {
   min-width: 0;
 }
 
+.main > * {
+  min-width: 0;
+}
+
 .main.page-view {
   display: none;
 }
@@ -2834,13 +2838,13 @@ th {
 .watchlist-alert-dialog {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.24);
+  border-radius: 16px;
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.22);
   color: var(--ink);
   margin: auto;
   max-height: calc(100vh - 40px);
   padding: 0;
-  width: min(1080px, calc(100vw - 32px));
+  width: min(1120px, calc(100vw - 40px));
 }
 
 .watchlist-alert-dialog::backdrop {
@@ -2850,10 +2854,10 @@ th {
 
 .watchlist-alert-dialog form {
   display: grid;
-  gap: 16px;
+  gap: 18px;
   max-height: calc(100vh - 42px);
   overflow: auto;
-  padding: 22px;
+  padding: 24px;
 }
 
 .watchlist-alert-dialog-head,
@@ -2875,18 +2879,40 @@ th {
   margin: 0;
 }
 
+.watchlist-alert-dialog-head h3 {
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.watchlist-alert-dialog-head .eyebrow {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin-bottom: 3px;
+  text-transform: uppercase;
+}
+
+.watchlist-alert-dialog-head .subline {
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 5px;
+}
+
 .watchlist-alert-options {
   background: var(--accent-soft);
   border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
-  padding: 12px 14px;
+  border-radius: 10px;
+  min-height: 62px;
+  padding: 12px 16px;
 }
 
 .watchlist-alert-options label > span,
 .watchlist-alert-condition label > span,
 .watchlist-alert-reminder-note > span {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
+  line-height: 1.25;
 }
 
 .watchlist-alert-enabled {
@@ -2903,7 +2929,11 @@ th {
 .watchlist-alert-options > button {
   background: #fff;
   border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  border-radius: 8px;
   color: var(--accent);
+  font-size: 13px;
+  min-height: 38px;
+  padding-inline: 14px;
 }
 
 .watchlist-alert-reminders {
@@ -2913,9 +2943,10 @@ th {
 
 .watchlist-alert-reminder {
   border: 1px solid var(--line);
+  border-radius: 12px;
   display: grid;
-  gap: 12px;
-  padding: 14px;
+  gap: 14px;
+  padding: 16px;
 }
 
 .watchlist-alert-empty,
@@ -2927,19 +2958,37 @@ th {
 }
 
 .watchlist-alert-reminder-head > div {
+  align-items: baseline;
   justify-content: flex-start;
 }
 
+.watchlist-alert-reminder-head h4 {
+  font-size: 16px;
+  line-height: 1.3;
+}
+
 .watchlist-alert-reminder-head span {
+  background: #f1f5f9;
+  border-radius: 999px;
   color: var(--muted);
   font-size: 11px;
+  padding: 3px 7px;
 }
 
 .watchlist-alert-reminder-head > button {
   background: transparent;
   border-color: transparent;
+  border-radius: 7px;
   color: var(--warn);
+  font-size: 12px;
   min-height: 32px;
+  padding: 5px 8px;
+}
+
+.watchlist-alert-reminder-head > button:hover,
+.watchlist-alert-reminder-head > button:focus-visible {
+  background: color-mix(in srgb, var(--warn) 9%, transparent);
+  outline: none;
 }
 
 .watchlist-alert-empty {
@@ -2961,36 +3010,45 @@ th {
 
 .watchlist-alert-reminder-note {
   display: grid;
-  gap: 5px;
+  gap: 7px;
 }
 
 .watchlist-alert-reminder-note input {
   background: #fff;
   border: 1px solid var(--line-strong);
+  border-radius: 8px;
   color: var(--ink);
   font: inherit;
-  min-height: 40px;
-  padding: 8px 10px;
+  font-size: 14px;
+  min-height: 42px;
+  padding: 9px 11px;
   width: 100%;
 }
 
 .watchlist-alert-conditions {
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .watchlist-alert-condition {
-  align-items: end;
+  align-items: start;
   background: #f8fafc;
   border: 1px solid var(--line);
+  border-radius: 10px;
   display: grid;
-  gap: 8px;
-  grid-template-columns: 86px minmax(110px, 0.8fr) minmax(150px, 1.2fr) minmax(110px, 0.75fr) minmax(130px, 0.8fr) auto;
-  padding: 10px;
+  gap: 10px;
+  grid-template-columns:
+    84px
+    minmax(140px, 0.9fr)
+    minmax(180px, 1.15fr)
+    minmax(112px, 0.72fr)
+    minmax(132px, 0.82fr)
+    88px;
+  padding: 12px;
 }
 
-.watchlist-alert-condition:has(.watchlist-alert-indicator-select[hidden]) {
-  grid-template-columns: 86px minmax(130px, 0.9fr) minmax(120px, 0.75fr) minmax(140px, 0.9fr) auto;
+.watchlist-alert-condition:has(.watchlist-alert-indicator-select[hidden]) .watchlist-alert-condition-type {
+  grid-column: span 2;
 }
 
 .watchlist-alert-indicator-select[hidden] {
@@ -2999,13 +3057,15 @@ th {
 
 .watchlist-alert-condition > label {
   display: grid;
-  gap: 5px;
+  gap: 7px;
   min-width: 0;
 }
 
 .watchlist-alert-condition-type small {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 10px;
+  line-height: 1.35;
+  min-height: 14px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3013,37 +3073,44 @@ th {
 
 .watchlist-alert-join-first {
   align-items: center;
-  align-self: stretch;
   color: var(--accent);
   display: flex;
   font-size: 12px;
   font-weight: 800;
+  min-height: 42px;
+  padding-left: 2px;
+  padding-top: 22px;
 }
 
 .watchlist-alert-condition input,
 .watchlist-alert-condition select {
   background: #fff;
   border: 1px solid var(--line-strong);
+  border-radius: 8px;
   color: var(--ink);
   font: inherit;
-  min-height: 38px;
+  font-size: 14px;
+  min-height: 42px;
   min-width: 0;
-  padding: 7px 9px;
+  padding: 8px 10px;
   width: 100%;
 }
 
 .watchlist-alert-condition-actions {
-  gap: 5px;
+  gap: 6px;
+  justify-content: flex-end;
+  padding-top: 22px;
 }
 
 .watchlist-alert-condition-actions button {
   background: #fff;
   border-color: var(--line-strong);
+  border-radius: 8px;
   color: var(--accent);
-  font-size: 18px;
-  min-height: 38px;
-  min-width: 38px;
-  padding: 4px 8px;
+  font-size: 19px;
+  min-height: 42px;
+  min-width: 40px;
+  padding: 4px 7px;
 }
 
 .watchlist-alert-condition-actions button[data-alert-condition-remove] {
@@ -3054,16 +3121,54 @@ th {
   flex: 0 0 auto;
 }
 
+.watchlist-alert-dialog-actions button {
+  border-radius: 8px;
+  font-size: 13px;
+  min-height: 38px;
+  padding-inline: 14px;
+}
+
 @media (max-width: 920px) {
-  .watchlist-alert-dialog form { padding: 16px; }
+  .watchlist-alert-dialog {
+    width: min(760px, calc(100vw - 28px));
+  }
+
+  .watchlist-alert-dialog form {
+    padding: 18px;
+  }
+
   .watchlist-alert-condition,
   .watchlist-alert-condition:has(.watchlist-alert-indicator-select[hidden]) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .watchlist-alert-condition-actions { justify-content: flex-end; }
+
+  .watchlist-alert-condition:has(.watchlist-alert-indicator-select[hidden]) .watchlist-alert-condition-type {
+    grid-column: auto;
+  }
+
+  .watchlist-alert-join-first {
+    grid-column: 1 / -1;
+    min-height: auto;
+    padding-top: 0;
+  }
+
+  .watchlist-alert-condition-actions {
+    padding-top: 22px;
+  }
 }
 
 @media (max-width: 620px) {
+  .watchlist-alert-dialog {
+    max-height: calc(100vh - 20px);
+    width: calc(100vw - 20px);
+  }
+
+  .watchlist-alert-dialog form {
+    gap: 14px;
+    max-height: calc(100vh - 22px);
+    padding: 16px;
+  }
+
   .watchlist-alert-options,
   .watchlist-alert-dialog-actions {
     align-items: stretch;
@@ -3075,6 +3180,12 @@ th {
   .watchlist-alert-condition:has(.watchlist-alert-indicator-select[hidden]) {
     grid-template-columns: 1fr;
   }
+
+  .watchlist-alert-condition-actions,
+  .watchlist-alert-join-first {
+    padding-top: 0;
+  }
+
   .watchlist-alert-dialog-actions > div { justify-content: flex-end; }
 }
 
@@ -3311,6 +3422,18 @@ th {
 .watchlist-context-menu button:focus-visible {
   background: var(--accent-soft);
   outline: none;
+}
+
+.watchlist-context-menu .watchlist-context-danger {
+  border-top: 1px solid var(--line);
+  color: var(--warn);
+  margin-top: 4px;
+  padding-top: 9px;
+}
+
+.watchlist-context-menu .watchlist-context-danger:hover,
+.watchlist-context-menu .watchlist-context-danger:focus-visible {
+  background: color-mix(in srgb, var(--warn) 9%, #fff);
 }
 
 .watchlist-toast {
@@ -4356,8 +4479,7 @@ tbody tr.selected-row:hover td {
 .byd-trade-toast,
 .watchlist-context-menu,
 .watchlist-toast,
-.similar-note-dialog,
-.watchlist-alert-dialog {
+.similar-note-dialog {
   border-radius: 2px;
 }
 
@@ -4510,6 +4632,41 @@ tbody tr.selected-row:hover td {
 @media (max-width: 680px) {
   .long-hero-panel h3 {
     font-size: 20px;
+  }
+
+  .chan-toolbar .toolbar-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .chan-toolbar #chanDateSlot {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
+
+  .chan-toolbar #chanDateSlot .date-control {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .chan-toolbar .toolbar-actions > button {
+    margin-top: 0;
+    min-height: 44px;
+    white-space: nowrap;
+    width: 100%;
+  }
+
+  .chan-performance {
+    grid-template-columns: 1fr;
+  }
+
+  .chan-performance-title {
+    grid-column: auto;
+  }
+
+  .chan-performance-item {
+    border-left: 0;
+    padding-left: 0;
   }
 }
 

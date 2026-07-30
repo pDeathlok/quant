@@ -164,7 +164,7 @@ python scripts/research/analyze_b1_entry_exit_grid.py --candidate-mode strict_no
 入口：
 
 ```bash
-python scripts/research/analyze_b1_formal_combos.py
+PYTHONPATH=src python -m quant.research.b1_formal_combos
 ```
 
 输出：
@@ -218,7 +218,7 @@ http://127.0.0.1:8092
 ### 阶段 2：生产化重构
 
 - [ ] 把 `analyze_b1_entry_exit_grid.py` 中的候选池构建、模型预测、卖出模拟迁入 `src/quant/routine/b1_engine.py`。
-- [ ] 把 `analyze_b1_formal_combos.py` 改成只调用 `src/quant/routine/b1_engine.py`。
+- [x] 把 `analyze_b1_formal_combos.py` 改成只调用包内 `quant.research.b1_formal_combos`；共享退出模拟位于 `quant.research.b1_backtest`。
 - [ ] 每次例行运行落盘到 `data/routine/YYYYMMDD_HHMMSS/`，包含 `signals.csv`、`summary.csv`、`manifest.json`。
 - [ ] 前端改为读取最新 `data/routine/latest.json`，而不是固定读取 20260606 的回测文件。
 - [ ] 清理旧脚本、旧模型、旧报告前，先确认对应策略已经写入 `docs/strategies/`。
@@ -241,7 +241,7 @@ http://127.0.0.1:8092
 ```bash
 PYTHONPATH=src python -m quant.routine.cli dashboard
 python -m py_compile src/quant/routine/*.py
-python scripts/research/analyze_b1_formal_combos.py
+PYTHONPATH=src python -m quant.research.b1_formal_combos
 ```
 
 ## 清理原则

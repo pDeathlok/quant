@@ -27,10 +27,16 @@ import build_training_data_parallel as btd
 from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
 from quant.features.variable_library import (
     EXTRA_FEATURE_COLUMNS,
-    build_continuous_ohlc,
     calc_bbi as project_calc_bbi,
     calculate_project_extra_features,
     merge_daily_basic_features,
+)
+from quant.research.b1_backtest import (
+    ExitRule,
+    add_future_prices,
+    max_drawdown_from_daily_returns,
+    simulate_exit,
+    summarize_returns,
 )
 
 
@@ -78,17 +84,6 @@ class EntryRule:
     min_up8: float | None = None
     min_up10: float | None = None
     max_down3: float | None = None
-
-
-@dataclass(frozen=True)
-class ExitRule:
-    name: str
-    kind: str
-    hold_days: int
-    take_profit: float | None = None
-    stop_loss: float | None = None
-    trail_drawdown: float | None = None
-    stop_trigger: str = "intraday"
 
 
 def load_candidates(path: Path, start_date: str) -> pd.DataFrame:
@@ -509,209 +504,6 @@ def read_daily_file(daily_dir: Path, symbol: str) -> pd.DataFrame | None:
         df = df.rename(columns={"vol": "volume"})
     df["symbol"] = symbol
     return df.sort_values("date").reset_index(drop=True)
-
-
-def add_future_prices(candidates: pd.DataFrame, daily_dir: Path, max_hold_days: int) -> pd.DataFrame:
-    if candidates.empty:
-        return candidates.copy()
-    prepared = candidates.copy()
-    prepared["date"] = pd.to_datetime(prepared["date"])
-    prepared["symbol"] = prepared["symbol"].astype(str)
-    prepared["_candidate_order"] = np.arange(len(prepared))
-    symbols = prepared["symbol"].dropna().unique().tolist()
-    start_date = prepared["date"].min().strftime("%Y%m%d")
-    end_date = (prepared["date"].max() + pd.Timedelta(days=max_hold_days * 3 + 10)).strftime("%Y%m%d")
-    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
-    market = store.read_market_range(
-        daily_dir.name,
-        start_date=start_date,
-        end_date=end_date,
-        symbols=symbols,
-        columns=["ts_code", "trade_date", "open", "high", "low", "close", "pre_close"],
-    )
-    if market.empty:
-        raise RuntimeError(f"No canonical daily rows found under {daily_dir.parent}")
-    market["ts_code"] = market["ts_code"].astype(str)
-    market_by_symbol = {symbol: frame for symbol, frame in market.groupby("ts_code", sort=False)}
-    candidate_by_symbol = {
-        symbol: frame for symbol, frame in prepared.groupby("symbol", sort=False)
-    }
-    frames = []
-    future_cols = ["entry_open", "date_t1", "open_t1", "high_t1", "low_t1", "close_t1"]
-    for day in range(2, max_hold_days + 2):
-        future_cols.append(f"date_t{day}")
-        future_cols.extend([f"open_t{day}", f"high_t{day}", f"low_t{day}", f"close_t{day}"])
-
-    for n, symbol in enumerate(symbols, start=1):
-        raw_daily = market_by_symbol.get(symbol)
-        if raw_daily is None or raw_daily.empty:
-            continue
-        daily = raw_daily.copy()
-        daily["date"] = pd.to_datetime(
-            daily["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
-        )
-        daily["symbol"] = symbol
-        if "vol" in daily.columns and "volume" not in daily.columns:
-            daily = daily.rename(columns={"vol": "volume"})
-        daily = daily.sort_values("date").reset_index(drop=True)
-        daily = build_continuous_ohlc(daily)
-        keep_cols = ["symbol", "date", "open", "high", "low", "close"]
-        daily = daily[keep_cols].copy()
-        future = daily[["symbol", "date"]].copy()
-        future["_adjusted_signal_close"] = daily["close"]
-        future["entry_open"] = daily["open"].shift(-1)
-        future["date_t1"] = daily["date"].shift(-1)
-        future["open_t1"] = daily["open"].shift(-1)
-        future["high_t1"] = daily["high"].shift(-1)
-        future["low_t1"] = daily["low"].shift(-1)
-        future["close_t1"] = daily["close"].shift(-1)
-        for day in range(2, max_hold_days + 2):
-            future[f"date_t{day}"] = daily["date"].shift(-day)
-            future[f"open_t{day}"] = daily["open"].shift(-day)
-            future[f"high_t{day}"] = daily["high"].shift(-day)
-            future[f"low_t{day}"] = daily["low"].shift(-day)
-            future[f"close_t{day}"] = daily["close"].shift(-day)
-        enriched = candidate_by_symbol[symbol].merge(future, on=["symbol", "date"], how="left")
-        frames.append(enriched)
-        if n % 500 == 0:
-            print(f"  future prices: {n}/{len(symbols)} symbols")
-
-    if not frames:
-        raise RuntimeError(f"No candidate symbols matched canonical daily data under {daily_dir.parent}")
-
-    merged = pd.concat(frames, ignore_index=True).sort_values("_candidate_order")
-    if "_adjusted_signal_close" in merged.columns:
-        merged["close"] = merged["_adjusted_signal_close"].combine_first(merged.get("close"))
-        merged = merged.drop(columns=["_adjusted_signal_close"])
-    return merged.drop(columns=["_candidate_order"]).dropna(subset=["entry_open"]).copy()
-
-
-def simulate_exit(df: pd.DataFrame, rule: ExitRule) -> pd.DataFrame:
-    if rule.stop_trigger not in {"intraday", "close"}:
-        raise ValueError(f"Unsupported stop_trigger: {rule.stop_trigger}")
-
-    entry = df["entry_open"].to_numpy(dtype=float)
-    n = len(df)
-    ret = np.full(n, np.nan)
-    exit_day = np.full(n, -1, dtype=int)
-    exit_date = np.full(n, np.datetime64("NaT"), dtype="datetime64[ns]")
-    exit_type = np.full(n, "unknown", dtype=object)
-    active = np.zeros(n, dtype=bool)
-    peak = np.zeros(n, dtype=float)
-    open_mask = ~np.isnan(entry)
-
-    for day in range(2, rule.hold_days + 2):
-        unresolved = open_mask & np.isnan(ret)
-        if not unresolved.any():
-            break
-
-        open_ = df[f"open_t{day}"].to_numpy(dtype=float)
-        high = df[f"high_t{day}"].to_numpy(dtype=float)
-        low = df[f"low_t{day}"].to_numpy(dtype=float)
-        close = df[f"close_t{day}"].to_numpy(dtype=float)
-        date_t = pd.to_datetime(df[f"date_t{day}"]).to_numpy(dtype="datetime64[ns]")
-        valid_day = unresolved & ~np.isnan(open_) & ~np.isnan(high) & ~np.isnan(low) & ~np.isnan(close)
-        if not valid_day.any():
-            continue
-
-        if rule.kind == "expiry" and rule.stop_loss is None:
-            if day == rule.hold_days + 1:
-                ret[valid_day] = close[valid_day] / entry[valid_day] - 1
-                exit_day[valid_day] = day
-                exit_date[valid_day] = date_t[valid_day]
-                exit_type[valid_day] = "expiry"
-            continue
-
-        stop_price = entry * (1 - (rule.stop_loss or 0))
-        if rule.stop_trigger == "close":
-            stop_hit = valid_day & (close <= stop_price)
-        else:
-            stop_hit = valid_day & (low <= stop_price)
-        if stop_hit.any():
-            if rule.stop_trigger == "close":
-                ret[stop_hit] = close[stop_hit] / entry[stop_hit] - 1
-            else:
-                gap_stop = stop_hit & (open_ <= stop_price)
-                normal_stop = stop_hit & ~gap_stop
-                ret[gap_stop] = open_[gap_stop] / entry[gap_stop] - 1
-                ret[normal_stop] = stop_price[normal_stop] / entry[normal_stop] - 1
-            exit_day[stop_hit] = day
-            exit_date[stop_hit] = date_t[stop_hit]
-            exit_type[stop_hit] = "stop_loss"
-
-        still = valid_day & np.isnan(ret)
-        if not still.any():
-            continue
-
-        if rule.kind == "fixed":
-            tp_hit = still & (high >= entry * (1 + (rule.take_profit or 0)))
-            if tp_hit.any():
-                ret[tp_hit] = rule.take_profit or 0
-                exit_day[tp_hit] = day
-                exit_date[tp_hit] = date_t[tp_hit]
-                exit_type[tp_hit] = "take_profit"
-
-        elif rule.kind == "trailing":
-            peak[still] = np.maximum(peak[still], high[still])
-            target_hit = still & (peak >= entry * (1 + (rule.take_profit or 0)))
-            active |= target_hit
-            trailing_price = peak * (1 - (rule.trail_drawdown or 0))
-            trail_hit = still & active & (low <= trailing_price)
-            if trail_hit.any():
-                gap_trail = trail_hit & (open_ <= trailing_price)
-                normal_trail = trail_hit & ~gap_trail
-                ret[gap_trail] = open_[gap_trail] / entry[gap_trail] - 1
-                ret[normal_trail] = trailing_price[normal_trail] / entry[normal_trail] - 1
-                exit_day[trail_hit] = day
-                exit_date[trail_hit] = date_t[trail_hit]
-                exit_type[trail_hit] = "trailing_stop"
-
-        expiry = valid_day & np.isnan(ret) & (day == rule.hold_days + 1)
-        if expiry.any():
-            ret[expiry] = close[expiry] / entry[expiry] - 1
-            exit_day[expiry] = day
-            exit_date[expiry] = date_t[expiry]
-            exit_type[expiry] = "expiry"
-
-    result = df[["date", "symbol"]].copy()
-    result["return_pct"] = ret * 100
-    result["exit_day"] = exit_day
-    result["exit_date"] = exit_date
-    result["exit_type"] = exit_type
-    return result.dropna(subset=["return_pct"])
-
-
-def max_drawdown_from_daily_returns(daily_returns_pct: pd.Series) -> float:
-    equity = (1 + daily_returns_pct / 100).cumprod()
-    peak = equity.cummax()
-    dd = equity / peak - 1
-    return float(dd.min() * 100)
-
-
-def summarize_returns(trades: pd.DataFrame) -> dict:
-    r = trades["return_pct"].dropna()
-    if r.empty:
-        return {}
-    daily = trades.groupby("date")["return_pct"].mean().sort_index()
-    wins = r[r > 0].sum()
-    losses = -r[r < 0].sum()
-    return {
-        "trades": int(len(r)),
-        "days": int(daily.shape[0]),
-        "avg_return_pct": float(r.mean()),
-        "median_return_pct": float(r.median()),
-        "win_rate": float((r > 0).mean()),
-        "p10_return_pct": float(r.quantile(0.10)),
-        "p90_return_pct": float(r.quantile(0.90)),
-        "daily_avg_pct": float(daily.mean()),
-        "daily_sharpe": float(np.sqrt(244) * daily.mean() / daily.std()) if daily.std() else np.nan,
-        "max_drawdown_pct": max_drawdown_from_daily_returns(daily),
-        "profit_factor": float(wins / losses) if losses > 0 else np.nan,
-        "stop_rate": float((trades["exit_type"] == "stop_loss").mean()),
-        "take_profit_rate": float((trades["exit_type"] == "take_profit").mean()),
-        "trailing_stop_rate": float((trades["exit_type"] == "trailing_stop").mean()),
-        "expiry_rate": float((trades["exit_type"] == "expiry").mean()),
-    }
 
 
 def evaluate_grid(df: pd.DataFrame, entry_rules: Iterable[EntryRule], exit_rules: Iterable[ExitRule]) -> pd.DataFrame:

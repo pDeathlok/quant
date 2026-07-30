@@ -74,6 +74,7 @@ class SimilarPatternWatchAlertConditionRequest(BaseModel):
             "vol_ratio20",
             "dist_ma20",
             "dist_ma60",
+            "kdj_daily_j",
             "opportunity_score",
             "holding_score",
         ]

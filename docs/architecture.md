@@ -24,8 +24,54 @@ flowchart LR
 | 特征 | `src/quant/features/` | 市场情绪、项目变量和特征合并 |
 | 策略 | `src/quant/strategies/` | 可复用的选股、交易和可转债规则 |
 | 例行任务 | `src/quant/routine/` | 增量刷新、模型评分、工作区编排和 manifest |
-| 应用 | `src/quant/webapp/`、`web/` | API、缓存、刷新状态和页面交互 |
+| 应用 | `src/quant/application/`、`src/quant/webapp/`、`web/` | 应用用例、API、刷新状态和页面交互 |
+| 基础设施 | `src/quant/infrastructure/` | 工作区快照文件/SQL 仓储等外部存储适配 |
 | 研究 | `scripts/research/` | 训练、回测、参数迭代和审计，不直接作为 Web 服务入口 |
+
+## 模块化单体边界
+
+项目保持单进程可部署的模块化单体，不为七个工作区拆分独立微服务。新增代码遵循以下依赖方向：
+
+```mermaid
+flowchart LR
+    API[FastAPI / CLI] --> APP[application 应用用例]
+    ROUTINE[每日调度] --> APP
+    RESEARCH[研究脚本] --> APP
+    APP --> DOMAIN[策略与因子领域模块]
+    APP --> PORT[数据与快照契约]
+    API --> INFRA[基础设施适配器]
+    INFRA --> STORE[MySQL / 文件快照]
+```
+
+- `src/quant/core/` 保存仓库路径和跨模块基础类型，不依赖应用、例行任务或 Web。
+- `src/quant/application/` 保存 API、CLI 和调度共同调用的用例与契约，不导入 `quant.webapp` 或 `quant.routine`。
+- `src/quant/infrastructure/` 封装文件系统和 SQL 等技术细节，通过工厂函数接收运行环境依赖。
+- `src/quant/routine/` 只负责生产步骤和调度兼容入口，不导入 FastAPI/Web 服务。
+- `src/quant/webapp/` 负责 HTTP 参数、错误映射、后台任务入口和静态页面挂载。
+- `scripts/research/` 允许调用 `src/quant`，但 `src/quant` 不允许把研究脚本作为普通 Python 模块导入。
+- 仍需兼容的研究命令必须集中在明确的任务适配层，逐批把计算实现迁入 `src/quant`，脚本最终只保留参数解析和结果打印。
+
+架构边界由 `tests/test_architecture_boundaries.py` 使用 AST 扫描验证。
+
+### 工作区垂直切片
+
+`application/workspaces` 以“一个工作区一个用例模块”的方式逐步接管原先集中在
+`webapp.services` 的计算流程：
+
+- `byd.py` 负责 BYD 日线计划、行情标准化和快照回退。
+- `convertible_bonds.py` 负责可转债网格计划、配债股质量评估和日缓存回退。
+- 外部读取、写入、刷新和构建器均通过不可变依赖对象注入，应用层可以脱离 FastAPI 与真实存储测试。
+- `webapp.services` 继续保留原公开函数和 monkeypatch 点，只负责构造依赖、兼容旧快照和映射 HTTP 调用。
+
+后续迁移其他工作区时沿用同一模式，不在 `application` 内读取环境变量、实例化数据库连接或导入 Web 层。
+
+### 前端模块与静态交付
+
+- `web/core/api-client.js` 统一超时、取消、错误详情和 `no-store` API 请求。
+- `web/core/formatters.js` 统一数值、百分比、金额、区间和 HTML 转义。
+- `app.js` 保留页面编排与工作区交互，新增通用能力优先进入 `web/core/`。
+- HTML 使用 `no-cache`，JS/CSS 使用 `Cache-Control: public, max-age=3600`；资源 URL 通过版本参数失效。
+- FastAPI 对大于 1 KiB 的响应启用 gzip，并预加载两个前端 core 模块。
 
 ## 每日流水线
 
@@ -101,6 +147,7 @@ flowchart TD
 
 - 短线选股器快照按日期、策略组合和扩展标记区分。
 - Web 工作区快照按工作区、日期和参数哈希区分，SQL 表为 `web_workspace_snapshots`。
+- 工作区快照的日期回退、原子文件发布和 SQL 回退统一由 `WorkspaceSnapshotRepository` 处理；Web 层只组装路径和存储工厂。
 - 配债股最新日缓存位于 `data/routine/convertible_bond_allotments_latest.json`。
 - 相似走势自选池、分析和向量缓存位于 `data/research/similar_patterns/`。
 - 后台刷新状态位于 `data/routine/latest_refresh_status.json`，服务重启后仍可读取最后状态。

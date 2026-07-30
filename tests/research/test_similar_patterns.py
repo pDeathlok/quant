@@ -19,6 +19,7 @@ from quant.research.similar_patterns import (
     candidate_end_indices,
     classify_forecast_signal,
     fit_probability_calibration,
+    latest_snapshot,
     load_stock_vector_cache,
     optimize_similar_cases,
     select_best_positions_from_contiguous_matches,
@@ -27,6 +28,7 @@ from quant.research.similar_patterns import (
     summarize_status_probs,
 )
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.factors.technical import KDJ
 
 
 def test_normalize_daily_frame_accepts_tushare_schema() -> None:
@@ -70,6 +72,25 @@ def test_normalize_daily_frame_removes_ex_right_price_jump() -> None:
     assert np.isclose(daily["close"].pct_change().iloc[1], 0.01)
     assert np.isclose(daily["close"].pct_change().iloc[2], 0.0)
     assert np.isclose(daily.iloc[-1]["close"], 33.67)
+
+
+def test_latest_snapshot_includes_daily_kdj_j() -> None:
+    close = pd.Series([10.0, 10.4, 10.2, 10.8, 11.1, 10.9, 11.4, 11.7, 11.5, 12.0, 12.3])
+    daily = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2026-01-05", periods=len(close)),
+            "open": close * 0.99,
+            "high": close * 1.02,
+            "low": close * 0.98,
+            "close": close,
+            "volume": np.linspace(1_000, 2_000, len(close)),
+        }
+    )
+
+    snapshot = latest_snapshot(daily, len(daily) - 1)
+
+    expected = KDJ().compute(daily)["J"].iloc[-1]
+    assert snapshot["kdj_daily_j"] == round(float(expected), 2)
 
 
 def test_threshold_analysis_loads_target_from_partitioned_daily_store(tmp_path: Path) -> None:

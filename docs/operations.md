@@ -26,6 +26,33 @@ curl --fail http://127.0.0.1:8088/api/health
 {"status":"ok","service":"quant-webapp"}
 ```
 
+## 前端静态交付验证
+
+HTML 每次重新验证，JS/CSS 缓存一小时并通过版本参数更新。服务对大于 1 KiB 的响应启用 gzip。
+部署或重启后使用真实 GET 请求检查响应头：
+
+```bash
+curl --compressed -D - -o /dev/null http://127.0.0.1:8088/app.js
+curl --compressed -D - -o /dev/null http://127.0.0.1:8088/styles.css
+```
+
+两项响应都应包含：
+
+```text
+content-encoding: gzip
+cache-control: public, max-age=3600
+vary: Accept-Encoding
+```
+
+如需比较传输量，分别请求 identity 与 gzip；不要用 `HEAD` 判断 gzip，因为无响应体时中间件可以不压缩：
+
+```bash
+curl -H 'Accept-Encoding: identity' -o /dev/null \
+  -w 'bytes=%{size_download} time=%{time_total}\n' http://127.0.0.1:8088/app.js
+curl --compressed -o /dev/null \
+  -w 'bytes=%{size_download} time=%{time_total}\n' http://127.0.0.1:8088/app.js
+```
+
 ## Web 服务常驻运行（macOS）
 
 不要用普通终端后台进程长期托管 Web 服务；会话退出、开发工具回收子进程或机器重启后，进程不会自动恢复。项目提供 `launchd` 用户服务，登录后自动启动，退出时自动拉起：
@@ -97,8 +124,10 @@ PYTHONPATH=src:scripts/research python scripts/research/train_b1_tushare_models.
 ```bash
 B1_FORMAL_MODEL_DIR=models/research/b1_candidate \
 B1_FORMAL_OUTPUT_DIR=reports/b1/candidate \
-PYTHONPATH=src:scripts/research python scripts/research/analyze_b1_formal_combos.py
+PYTHONPATH=src python -m quant.research.b1_formal_combos
 ```
+
+兼容脚本 `scripts/research/analyze_b1_formal_combos.py` 只转发到上述包内任务；生产编排不再执行研究脚本路径。
 
 ## 调度说明
 

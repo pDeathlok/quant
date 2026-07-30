@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, Optional
 from pathlib import Path
+from typing import Any
+
 import yaml
+
+from quant.core.paths import PROJECT_ROOT, ProjectPaths
 
 
 @dataclass
 class Settings:
-    project_root: Path = Path(__file__).parent.parent
+    project_root: Path = field(default_factory=lambda: PROJECT_ROOT)
     data_dir: Path = field(init=False)
     cache_dir: Path = field(init=False)
     log_dir: Path = field(init=False)
@@ -17,19 +22,22 @@ class Settings:
     default_slippage: float = 0.0
     default_initial_cash: float = 1000000.0
 
-    broker_config: Dict = field(default_factory=dict)
-    strategy_config: Dict = field(default_factory=dict)
-    risk_limits: Dict = field(default_factory=dict)
+    broker_config: dict[str, Any] = field(default_factory=dict)
+    strategy_config: dict[str, Any] = field(default_factory=dict)
+    risk_limits: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self):
-        self.data_dir = self.project_root / "data"
-        self.cache_dir = self.data_dir / "cache"
-        self.log_dir = self.project_root / "logs"
-        self.reports_dir = self.project_root / "backtest" / "reports"
+    def __post_init__(self) -> None:
+        paths = ProjectPaths.from_root(self.project_root)
+        self.project_root = paths.root
+        self.data_dir = paths.data
+        self.cache_dir = paths.cache
+        self.log_dir = paths.logs
+        self.reports_dir = paths.reports
 
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.reports_dir.mkdir(parents=True, exist_ok=True)
+    def ensure_runtime_directories(self) -> tuple[Path, Path, Path, Path]:
+        """Create runtime roots only when an entry point explicitly requests it."""
+
+        return ProjectPaths.from_root(self.project_root).ensure_runtime_directories()
 
     @classmethod
     def from_yaml(cls, config_path: str) -> "Settings":
@@ -46,7 +54,7 @@ class Settings:
         return settings
 
 
-_settings: Optional[Settings] = None
+_settings: Settings | None = None
 
 
 def get_settings() -> Settings:

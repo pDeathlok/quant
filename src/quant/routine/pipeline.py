@@ -13,6 +13,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant.application.workspace_refresh import (
+    WorkspaceRefreshOperations,
+    refresh_daily_workspaces,
+)
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.dashboard import write_dashboard_json
@@ -727,7 +731,11 @@ def refresh_chan_model_scores(progress_callback=None, workers: int | None = None
 
 
 def run_selected_strategies() -> dict:
-    command = [sys.executable, "scripts/research/analyze_b1_formal_combos.py"]
+    command = [
+        sys.executable,
+        "-m",
+        "quant.research.b1_formal_combos",
+    ]
     result = subprocess.run(command, cwd=PROJECT_ROOT, check=False, capture_output=True, text=True)
     return {
         "status": "success" if result.returncode == 0 else "failed",
@@ -766,106 +774,13 @@ def generate_daily_plan() -> dict:
     return {"status": "success", "output": str(output)}
 
 
-def refresh_daily_web_workspaces(max_workers: int | None = None) -> dict[str, dict]:
-    """Refresh every non-short-line web workspace with bounded concurrency.
+def refresh_daily_web_workspaces(
+    operations: WorkspaceRefreshOperations,
+    max_workers: int | None = None,
+) -> dict[str, dict]:
+    """Compatibility wrapper around the application-layer workspace coordinator."""
 
-    The short-line workspace is produced by the core daily pipeline. These six
-    downstream workspaces only read the refreshed shared datasets and write
-    separate snapshots, so they can safely run in parallel.
-    """
-
-    from quant.webapp.services import (
-        _latest_candidate_signal_date,
-        get_byd_daily_strategy,
-        get_convertible_bond_allotments,
-        get_convertible_bond_grid_plan,
-        get_chan_model_strategy_plan,
-        get_long_stock_pool,
-        refresh_similar_pattern_analysis,
-    )
-
-    signal_date = _latest_candidate_signal_date()
-    trade_date = str(signal_date).replace("-", "") if signal_date else None
-
-    def refresh_chan() -> dict:
-        payload = get_chan_model_strategy_plan(top_n=20, refresh=True, signal_date=signal_date)
-        return {
-            "status": "success",
-            "signal_date": payload.get("signal_date"),
-            "candidates": len(payload.get("candidates") or []),
-        }
-
-    def refresh_long() -> dict:
-        variants = []
-        for variant in ("tea", "tea_safe", "v44"):
-            payload = get_long_stock_pool(variant=variant, signal_date=signal_date, refresh=True)
-            variants.append(
-                {
-                    "variant": variant,
-                    "signal_date": payload.get("signal_date"),
-                    "stocks": len(payload.get("stocks") or []),
-                }
-            )
-        return {"status": "success", "variants": variants}
-
-    def refresh_convertible_bonds() -> dict:
-        payload = get_convertible_bond_grid_plan(trade_date=trade_date, limit=18, refresh=bool(trade_date))
-        return {
-            "status": "success",
-            "trade_date": payload.get("trade_date") or signal_date,
-            "candidates": len(payload.get("candidates") or payload.get("items") or []),
-        }
-
-    def refresh_allotments() -> dict:
-        allotments = get_convertible_bond_allotments(
-            refresh=True,
-            expected_trade_date=signal_date,
-            validate_quality=True,
-        )
-        return {
-            "status": "success",
-            "generated_at": allotments.get("generated_at"),
-            "records": len(allotments.get("records") or []),
-            "quality": allotments.get("quality"),
-        }
-
-    def refresh_byd() -> dict:
-        payload = get_byd_daily_strategy(refresh=True)
-        planned_t = payload.get("planned_t") or {}
-        return {
-            "status": "success",
-            "signal_date": planned_t.get("signal_date"),
-            "alerts": len(payload.get("alerts") or []),
-        }
-
-    def refresh_similar() -> dict:
-        similar = refresh_similar_pattern_analysis()
-        return {
-            "status": "success",
-            "generated_at": similar.get("generated_at"),
-            "targets": len(similar.get("results") or []),
-        }
-
-    jobs = {
-        "chan_model_strategy": refresh_chan,
-        "long_stock_pool": refresh_long,
-        "convertible_bond_plan": refresh_convertible_bonds,
-        "convertible_bond_allotments": refresh_allotments,
-        "byd_daily_plan": refresh_byd,
-        "similar_patterns": refresh_similar,
-    }
-    worker_count = max_workers or int(os.getenv("ROUTINE_WEB_WORKSPACE_WORKERS", "6"))
-    worker_count = max(1, min(worker_count, len(jobs)))
-    results: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {executor.submit(job): name for name, job in jobs.items()}
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                results[name] = future.result()
-            except Exception as exc:
-                results[name] = {"status": "failed", "error": str(exc)}
-    return results
+    return refresh_daily_workspaces(operations, max_workers=max_workers)
 
 
 def write_run_manifest(results: dict, strategies: list[StrategyConfig]) -> Path:
@@ -883,7 +798,12 @@ def write_run_manifest(results: dict, strategies: list[StrategyConfig]) -> Path:
     return path
 
 
-def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> dict:
+def run_daily_pipeline(
+    skip_data: bool = True,
+    skip_backtest: bool = False,
+    *,
+    workspace_operations: WorkspaceRefreshOperations | None = None,
+) -> dict:
     """Run the routine B1 workflow.
 
     The routine keeps only selected production strategies from
@@ -952,14 +872,26 @@ def run_daily_pipeline(skip_data: bool = True, skip_backtest: bool = False) -> d
                     step_name,
                     allow_skipped=step_name == "generate_dashboard" and skip_backtest,
                 )
-        results["refresh_daily_web_workspaces"] = refresh_daily_web_workspaces()
-        failed_workspaces = [
-            name
-            for name, payload in results["refresh_daily_web_workspaces"].items()
-            if isinstance(payload, dict) and payload.get("status") != "success"
-        ]
-        if failed_workspaces:
-            raise RuntimeError(f"downstream workspaces incomplete: {', '.join(failed_workspaces)}")
+        if workspace_operations is None:
+            results["refresh_daily_web_workspaces"] = {
+                "status": "skipped",
+                "reason": (
+                    "workspace operations were not provided; canonical production "
+                    "refresh runs through web-refresh"
+                ),
+            }
+        else:
+            workspace_results = refresh_daily_web_workspaces(workspace_operations)
+            results["refresh_daily_web_workspaces"] = workspace_results
+            failed_workspaces = [
+                name
+                for name, payload in workspace_results.items()
+                if payload.get("status") != "success"
+            ]
+            if failed_workspaces:
+                raise RuntimeError(
+                    f"downstream workspaces incomplete: {', '.join(failed_workspaces)}"
+                )
     except Exception as exc:
         pipeline_status = "failed"
         pipeline_error = str(exc)

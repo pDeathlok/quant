@@ -912,6 +912,40 @@ def test_global_refresh_includes_daily_similar_pattern_step() -> None:
     assert "similar_patterns" in step_keys
 
 
+def test_similar_refresh_scope_runs_only_the_isolated_analysis(monkeypatch) -> None:
+    status = {
+        "status": "queued",
+        "run_id": "similar-run",
+        "attempt": 1,
+        "started_at": "2026-07-30T20:00:00",
+        "steps": services._progress_steps("similar"),
+        "scope": "similar",
+    }
+    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+    monkeypatch.setattr(services, "_write_terminal_refresh_manifest_unlocked", lambda: None)
+    monkeypatch.setattr(
+        services,
+        "run_cache_cleanup",
+        lambda *args, **kwargs: pytest.fail("单独刷新自选分析不应清理全站缓存"),
+    )
+    monkeypatch.setattr(
+        services,
+        "_run_similar_pattern_analysis_isolated",
+        lambda: {
+            "generated_at": "2026-07-30T20:01:00",
+            "results": [{"target": {"symbol": "002594.SZ"}}],
+        },
+    )
+
+    services._run_latest_refresh_job("similar", run_id="similar-run")
+
+    assert [step["key"] for step in status["steps"]] == ["similar_patterns"]
+    assert status["status"] == "success"
+    assert status["percent"] == 100
+    assert status["result"]["similar_patterns"]["targets"] == 1
+
+
 def test_refresh_progress_ignores_stale_run_context(monkeypatch) -> None:
     status = {
         "status": "running",
@@ -1943,8 +1977,14 @@ def test_similar_pattern_payload_includes_optimized_decision_and_validation() ->
 def test_watchlist_strategy_hits_merge_only_strategy_workspaces(monkeypatch) -> None:
     monkeypatch.setattr(
         services,
-        "get_stock_selector_payload",
-        lambda **kwargs: {
+        "_normalize_watch_symbol",
+        lambda symbol: pytest.fail(f"策略命中合并不应读取行情文件: {symbol}"),
+    )
+    monkeypatch.setattr(services, "_latest_candidate_signal_date", lambda: "2026-07-15")
+    monkeypatch.setattr(
+        services,
+        "_read_selector_snapshot",
+        lambda *args, **kwargs: {
             "signal_date": "2026-07-15",
             "stocks": [{"symbol": "002594.SZ", "matched_families": ["B1", "强K"], "matched_count": 2}],
         },
@@ -2000,14 +2040,18 @@ def test_attach_watchlist_strategy_hits_adds_badges_to_each_result(monkeypatch) 
     assert enriched["results"][1]["strategy_hit_count"] == 0
 
 
-def test_watchlist_notes_are_saved_and_returned_with_stock_profiles(monkeypatch, tmp_path) -> None:
+def test_watchlist_notes_are_saved_without_recalculating_scores(monkeypatch, tmp_path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(
         '{"symbols":["002594.SZ"],"notes":{}}',
         encoding="utf-8",
     )
     monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
-    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_normalize_watch_symbol",
+        lambda symbol: pytest.fail(f"笔记保存不应读取行情文件: {symbol}"),
+    )
     monkeypatch.setattr(
         services,
         "_stock_basic_for_similar_patterns",
@@ -2018,15 +2062,7 @@ def test_watchlist_notes_are_saved_and_returned_with_stock_profiles(monkeypatch,
     monkeypatch.setattr(
         services,
         "_watchlist_buy_hold_scores",
-        lambda symbols: {
-            "002594.SZ": {
-                "opportunity_score": 73.2,
-                "holding_score": 61.8,
-                "buy_score": 73.2,
-                "hold_score": 61.8,
-                "score_date": "2026-07-21",
-            }
-        },
+        lambda symbols: pytest.fail(f"笔记保存不应重新计算评分: {symbols}"),
     )
 
     payload = services.save_similar_pattern_watch_note(
@@ -2038,9 +2074,8 @@ def test_watchlist_notes_are_saved_and_returned_with_stock_profiles(monkeypatch,
     persisted = watchlist_path.read_text(encoding="utf-8")
     assert stock["note"] == "操作计划：回踩 20 日线后分批关注"
     assert stock["note_updated_at"]
-    assert stock["opportunity_score"] == 73.2
-    assert stock["holding_score"] == 61.8
-    assert stock["score_date"] == "2026-07-21"
+    assert "opportunity_score" not in stock
+    assert "holding_score" not in stock
     assert "回踩 20 日线" in persisted
 
 
@@ -2096,6 +2131,49 @@ def test_watchlist_add_returns_without_calculating_scores(monkeypatch, tmp_path)
     assert "opportunity_score" not in payload["stocks"][1]
 
 
+def test_watchlist_remove_returns_without_market_or_score_recalculation(monkeypatch, tmp_path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        json.dumps(
+            {
+                "symbols": ["002594.SZ", "000001.SZ"],
+                "pinned": ["002594.SZ"],
+                "notes": {"002594.SZ": {"content": "观察", "updated_at": "2026-07-30T10:00:00"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(
+            [
+                {"ts_code": "002594.SZ", "name": "比亚迪", "industry": "汽车整车"},
+                {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行"},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        services,
+        "_normalize_watch_symbol",
+        lambda symbol: pytest.fail("删除现有自选股不应重新校验行情"),
+    )
+    monkeypatch.setattr(
+        services,
+        "_watchlist_buy_hold_scores",
+        lambda symbols: pytest.fail("删除响应不应重新计算评分"),
+    )
+
+    payload = services.remove_similar_pattern_watch_symbol("002594.SZ")
+
+    persisted = json.loads(watchlist_path.read_text(encoding="utf-8"))
+    assert [item["symbol"] for item in payload["stocks"]] == ["000001.SZ"]
+    assert persisted["symbols"] == ["000001.SZ"]
+    assert persisted["pinned"] == []
+    assert persisted["notes"] == {}
+
+
 def test_watchlist_api_forwards_default_source_note(monkeypatch) -> None:
     captured = {}
 
@@ -2146,7 +2224,11 @@ def test_watchlist_independent_reminders_with_notes_are_persisted(monkeypatch, t
         encoding="utf-8",
     )
     monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
-    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_normalize_watch_symbol",
+        lambda symbol: pytest.fail(f"提醒保存不应读取行情文件: {symbol}"),
+    )
     monkeypatch.setattr(
         services,
         "_stock_basic_for_similar_patterns",
@@ -2154,7 +2236,11 @@ def test_watchlist_independent_reminders_with_notes_are_persisted(monkeypatch, t
             [{"ts_code": "002594.SZ", "name": "比亚迪", "industry": "汽车整车"}]
         ),
     )
-    monkeypatch.setattr(services, "_watchlist_buy_hold_scores", lambda symbols: {})
+    monkeypatch.setattr(
+        services,
+        "_watchlist_buy_hold_scores",
+        lambda symbols: pytest.fail(f"提醒保存不应重新计算评分: {symbols}"),
+    )
 
     payload = services.save_similar_pattern_watch_alerts(
         "002594.SZ",
@@ -2190,9 +2276,9 @@ def test_watchlist_independent_reminders_with_notes_are_persisted(monkeypatch, t
                             "id": "drawdown",
                             "conjunction": "and",
                             "kind": "indicator",
-                            "indicator": "drawdown_60d",
+                            "indicator": "kdj_daily_j",
                             "operator": "lt",
-                            "value": -8,
+                            "value": -10,
                         },
                         {
                             "id": "buy-score",
@@ -2218,6 +2304,7 @@ def test_watchlist_independent_reminders_with_notes_are_persisted(monkeypatch, t
     assert payload["stocks"][0]["alert_count"] == 2
     assert payload["stocks"][0]["alert_condition_count"] == 4
     assert persisted["alerts"]["002594.SZ"]["reminders"][0]["conditions"][1]["indicator"] == "vol_ratio20"
+    assert persisted["alerts"]["002594.SZ"]["reminders"][1]["conditions"][0]["indicator"] == "kdj_daily_j"
 
 
 def test_watchlist_alert_api_accepts_reminder_notes_and_condition_logic(monkeypatch) -> None:
@@ -2248,9 +2335,9 @@ def test_watchlist_alert_api_accepts_reminder_notes_and_condition_logic(monkeypa
                             "id": "i1",
                             "conjunction": "or",
                             "kind": "indicator",
-                            "indicator": "ret_20d",
+                            "indicator": "kdj_daily_j",
                             "operator": "lt",
-                            "value": -5,
+                            "value": -10,
                         },
                     ],
                 }
@@ -2280,7 +2367,7 @@ def test_watchlist_alert_api_accepts_reminder_notes_and_condition_logic(monkeypa
     assert captured["symbol"] == "002594.SZ"
     assert captured["config"]["reminders"][0]["note"] == "价格或涨幅满足"
     assert captured["config"]["reminders"][0]["conditions"][1]["conjunction"] == "or"
-    assert captured["config"]["reminders"][0]["conditions"][1]["indicator"] == "ret_20d"
+    assert captured["config"]["reminders"][0]["conditions"][1]["indicator"] == "kdj_daily_j"
     assert invalid.status_code == 422
 
 
@@ -2316,7 +2403,16 @@ def test_watchlist_order_and_pins_are_persisted(monkeypatch, tmp_path) -> None:
         encoding="utf-8",
     )
     monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
-    monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
+    monkeypatch.setattr(
+        services,
+        "_normalize_watch_symbol",
+        lambda symbol: pytest.fail(f"置顶或排序不应读取行情文件: {symbol}"),
+    )
+    monkeypatch.setattr(
+        services,
+        "_watchlist_buy_hold_scores",
+        lambda symbols: pytest.fail(f"置顶或排序不应重新计算评分: {symbols}"),
+    )
     monkeypatch.setattr(
         services,
         "_stock_basic_for_similar_patterns",
@@ -2477,12 +2573,48 @@ def test_similar_pattern_tab_serves_stale_cache_without_blocking_refresh(monkeyp
     assert payload["cache"]["stale"] is True
 
 
+def test_similar_pattern_tab_without_cache_returns_immediately(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_read_similar_pattern_analysis_cache", lambda: None)
+    monkeypatch.setattr(
+        services,
+        "_read_similar_pattern_watchlist_symbols",
+        lambda: ["002594.SZ"],
+    )
+    monkeypatch.setattr(
+        services,
+        "get_similar_pattern_watchlist",
+        lambda *, include_scores=True: {
+            "updated_at": "2026-07-30T20:00:00",
+            "stocks": [{"symbol": "002594.SZ", "name": "比亚迪"}],
+        },
+    )
+    monkeypatch.setattr(
+        services,
+        "refresh_similar_pattern_analysis",
+        lambda: pytest.fail("打开自选池不应同步生成完整分析"),
+    )
+
+    payload = services.get_similar_pattern_analysis()
+
+    assert payload["results"] == []
+    assert payload["watchlist"][0]["symbol"] == "002594.SZ"
+    assert payload["cache"]["missing"] is True
+
+
 def test_similar_pattern_cache_filters_results_removed_from_watchlist(monkeypatch) -> None:
     monkeypatch.setattr(
         services,
         "_read_similar_pattern_analysis_cache",
         lambda: {
             "generated_at": "2026-07-28T13:21:53",
+            "watchlist": [
+                {
+                    "symbol": "002594.SZ",
+                    "opportunity_score": 73.2,
+                    "holding_score": 61.8,
+                    "score_date": "2026-07-28",
+                }
+            ],
             "results": [
                 {"target": {"symbol": "002594.SZ"}},
                 {"target": {"symbol": "000792.SZ"}},
@@ -2497,7 +2629,7 @@ def test_similar_pattern_cache_filters_results_removed_from_watchlist(monkeypatc
     monkeypatch.setattr(
         services,
         "_similar_pattern_watchlist_profiles",
-        lambda basic=None: [{"symbol": "002594.SZ"}],
+        lambda basic=None, include_scores=True: [{"symbol": "002594.SZ"}],
     )
     monkeypatch.setattr(
         services,
@@ -2513,6 +2645,8 @@ def test_similar_pattern_cache_filters_results_removed_from_watchlist(monkeypatc
     payload = services.get_similar_pattern_analysis()
 
     assert [item["target"]["symbol"] for item in payload["results"]] == ["002594.SZ"]
+    assert payload["watchlist"][0]["opportunity_score"] == 73.2
+    assert payload["watchlist"][0]["holding_score"] == 61.8
     assert payload["cache"]["watchlist_changed"] is True
 
 

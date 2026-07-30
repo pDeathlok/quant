@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v3-20260730-allotment-xueqiu-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1" />
+    <link rel="modulepreload" href="/core/api-client.js" />
+    <link rel="modulepreload" href="/core/formatters.js" />
   </head>
   <body>
     <div class="app selector-app">
@@ -768,7 +770,7 @@
               <input id="similarSymbolInput" type="text" placeholder="002594 或 002594.SZ" />
             </label>
             <button type="submit">加入自选</button>
-            <button id="similarRefreshButton" type="button">刷新分析</button>
+            <button id="similarRefreshButton" type="button" data-refresh-scope="similar">刷新分析</button>
           </form>
           <div class="refresh-status"></div>
           <div class="progress-steps"></div>
@@ -879,6 +881,7 @@
       <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
       <button type="button" role="menuitem" data-watchlist-context-pin hidden>置顶</button>
       <button type="button" role="menuitem" data-watchlist-context-alert hidden>设置提醒</button>
+      <button type="button" role="menuitem" class="watchlist-context-danger" data-watchlist-context-delete hidden>删除自选</button>
     </div>
     <div id="watchlistToast" class="watchlist-toast" role="status" aria-live="polite"></div>
     <div id="similarNoteTooltip" class="similar-note-tooltip" role="tooltip" hidden>
@@ -934,6 +937,6 @@
         </div>
       </form>
     </dialog>
-    <script src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v3-default-similar-v1-20260729-watchlist-async-add-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1"></script>
   </body>
 </html>

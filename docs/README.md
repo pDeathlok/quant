@@ -15,6 +15,7 @@
 - [A 股分析 Skill 集成](a_share_skill_integration.md)：复用正式行情、保存不可变个股底稿，以及财报/事件后的认知迭代。
 - [数据存储审查](data_storage_review_20260617.md)：存储问题与阶段性审查结论。
 - [项目重构计划](project_restructure_plan.md)：从研究脚本向例行生产结构迁移的历史计划。
+- [模块化单体实施记录](plans/2026-07-30-modular-monolith-refactor.md)：应用/基础设施边界、工作区迁移、前端性能和完整验收记录。
 
 ## 因子与变量
 

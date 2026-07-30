@@ -7,7 +7,6 @@ import pandas as pd
 import pytest
 
 from quant.routine import pipeline
-from quant.webapp import services
 
 
 def test_refresh_daily_basic_reports_partial_failure(monkeypatch) -> None:
@@ -525,87 +524,28 @@ def test_model_scoring_uses_batched_processes_and_exposes_manifest(
     assert result["script_elapsed_seconds"] == 76.8
 
 
-def test_daily_web_workspaces_refreshes_every_non_short_tab_in_parallel(monkeypatch) -> None:
-    calls: list[str] = []
-    calls_lock = threading.Lock()
-    barrier = threading.Barrier(6)
+def test_run_selected_strategies_uses_packaged_module(monkeypatch) -> None:
+    captured: list[str] = []
 
-    def record(name: str) -> None:
-        with calls_lock:
-            calls.append(name)
-        barrier.wait(timeout=2)
+    class Result:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
 
-    monkeypatch.setattr(services, "_latest_candidate_signal_date", lambda: "2026-07-13")
-    monkeypatch.setattr(
-        services,
-        "get_chan_model_strategy_plan",
-        lambda **kwargs: record("chan") or {"signal_date": kwargs["signal_date"], "candidates": []},
-    )
+    def fake_run(command, **kwargs):
+        captured.extend(command)
+        return Result()
 
-    def get_long_stock_pool(**kwargs):
-        if kwargs["variant"] == "tea":
-            record("long")
-        return {"signal_date": kwargs["signal_date"], "stocks": []}
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
 
-    monkeypatch.setattr(services, "get_long_stock_pool", get_long_stock_pool)
-    monkeypatch.setattr(
-        services,
-        "get_convertible_bond_grid_plan",
-        lambda **kwargs: record("convertible_bond") or {"trade_date": kwargs["trade_date"], "candidates": []},
-    )
+    result = pipeline.run_selected_strategies()
 
-    monkeypatch.setattr(
-        services,
-        "get_convertible_bond_allotments",
-        lambda **kwargs: record("allotment")
-        or {"generated_at": "2026-07-13T08:30:00", "records": []},
-    )
-    monkeypatch.setattr(
-        services,
-        "get_byd_daily_strategy",
-        lambda **kwargs: record("byd") or {"planned_t": {"signal_date": "2026-07-13"}, "alerts": []},
-    )
-    monkeypatch.setattr(
-        services,
-        "refresh_similar_pattern_analysis",
-        lambda: record("similar")
-        or {"generated_at": "2026-07-13T08:31:00", "results": []},
-    )
-
-    result = pipeline.refresh_daily_web_workspaces()
-
-    assert set(calls) == {"chan", "long", "convertible_bond", "allotment", "byd", "similar"}
-    assert set(result) == {
-        "chan_model_strategy",
-        "long_stock_pool",
-        "convertible_bond_plan",
-        "convertible_bond_allotments",
-        "byd_daily_plan",
-        "similar_patterns",
-    }
-    assert all(item["status"] == "success" for item in result.values())
-    assert result["convertible_bond_allotments"]["status"] == "success"
-    assert result["similar_patterns"]["status"] == "success"
-
-
-def test_daily_web_workspaces_isolates_individual_failure(monkeypatch) -> None:
-    monkeypatch.setattr(services, "_latest_candidate_signal_date", lambda: "2026-07-13")
-    monkeypatch.setattr(
-        services,
-        "get_chan_model_strategy_plan",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("chan failed")),
-    )
-    monkeypatch.setattr(services, "get_long_stock_pool", lambda **kwargs: {"stocks": []})
-    monkeypatch.setattr(services, "get_convertible_bond_grid_plan", lambda **kwargs: {"candidates": []})
-    monkeypatch.setattr(services, "get_convertible_bond_allotments", lambda **kwargs: {"records": []})
-    monkeypatch.setattr(services, "get_byd_daily_strategy", lambda **kwargs: {"planned_t": {}, "alerts": []})
-    monkeypatch.setattr(services, "refresh_similar_pattern_analysis", lambda: {"results": []})
-
-    result = pipeline.refresh_daily_web_workspaces(max_workers=1)
-
-    assert result["chan_model_strategy"] == {"status": "failed", "error": "chan failed"}
-    assert result["long_stock_pool"]["status"] == "success"
-    assert result["similar_patterns"]["status"] == "success"
+    assert captured == [
+        pipeline.sys.executable,
+        "-m",
+        "quant.research.b1_formal_combos",
+    ]
+    assert result["status"] == "success"
 
 
 def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, tmp_path) -> None:
@@ -651,7 +591,6 @@ def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, 
     monkeypatch.setattr(pipeline, "refresh_chan_model_scores", lambda: {"status": "success"})
     monkeypatch.setattr(pipeline, "generate_daily_plan", parallel_step)
     monkeypatch.setattr(pipeline, "generate_dashboard", lambda **kwargs: parallel_step())
-    monkeypatch.setattr(pipeline, "refresh_daily_web_workspaces", lambda: {"status": "success"})
     monkeypatch.setattr(pipeline, "write_run_manifest", lambda results, strategies: tmp_path / "manifest.json")
 
     result = pipeline.run_daily_pipeline(skip_data=False, skip_backtest=True)
@@ -661,6 +600,7 @@ def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, 
     assert result["steps"]["cache_cleanup"]["status"] == "success"
     assert result["steps"]["build_features"]["status"] == "success"
     assert result["steps"]["generate_dashboard"]["status"] == "success"
+    assert result["steps"]["refresh_daily_web_workspaces"]["status"] == "skipped"
 
 
 def test_daily_pipeline_stops_before_features_when_source_refresh_is_incomplete(monkeypatch, tmp_path) -> None:
