@@ -12,7 +12,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from quant.features.variable_library import build_continuous_ohlc, calculate_project_extra_features
+from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.variable_library import build_continuous_ohlc
 
 
 @dataclass(frozen=True)
@@ -46,10 +47,17 @@ def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
         "s1_distribution",
     }
     if not needed <= set(out.columns):
-        extra = calculate_project_extra_features(out)
-        for col in extra.columns:
-            if col not in out.columns:
-                out[col] = extra[col]
+        symbol = ""
+        for column in ("ts_code", "symbol"):
+            if column in out.columns and out[column].notna().any():
+                symbol = str(out.loc[out[column].notna(), column].iloc[-1])
+                break
+        out = attach_daily_base_factors(
+            out,
+            symbol=symbol,
+            compute_if_missing=True,
+            persist_missing=False,
+        )
     return out
 
 

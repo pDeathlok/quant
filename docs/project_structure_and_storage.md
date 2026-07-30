@@ -89,6 +89,13 @@ src/quant/strategies/custom/z_skill_patterns.py        # 扩展策略规则模�
 
 因此当前迁移策略是 MySQL 主存储 + parquet 镜像兼容。后续每次改造一个研究脚本，就把它从目录读取迁移到 `MarketDataStore.read_frame()` 或批量 SQL 查询。
 
+这里的 Parquet 镜像与 `data/cache/source_merge/tushare/` 请求缓存用途不同：
+
+- `data/raw/daily/`、`data/raw/daily_basic/` 是正式行情镜像，供生产特征和研究脚本读取。
+- `data/cache/source_merge/tushare/` 只是按请求参数保存的可重建副本，用于减少短时间内重复请求。
+- 请求缓存保留 7 天即可；删除旧请求缓存不会删除 MySQL 或 `data/raw/` 中的正式数据。
+- 对 `daily_basic` 额外要求对应 `data/raw/daily_basic/YYYYMMDD.parquet` 存在且非空，才允许清理其旧请求缓存。
+
 ## 策略选股器复盘范围
 
 前端复盘日期暂从 `2026-06-01` 开始。原因：

@@ -12,10 +12,14 @@ research supplement:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import json
 import os
+import random
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime
 from datetime import timedelta
@@ -25,9 +29,17 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from quant.data.source_merge import normalize_ts_code
+
 RAW_DIR = PROJECT_ROOT / "data/raw"
 AUDIT_ROOT = RAW_DIR / "source_audit"
 OUTPUT_PATH = RAW_DIR / "analyst_forecasts.parquet"
+OUTPUT_LOCK_PATH = RAW_DIR / "analyst_forecasts.lock"
+REQUIRED_OUTPUT_COLUMNS = {"source", "ts_code", "report_date"}
+DEFAULT_LOCK_STALE_SECONDS = 2 * 60 * 60
 
 
 def load_symbols(limit: int | None = None) -> list[str]:
@@ -83,9 +95,7 @@ def load_symbol_names() -> dict[str, str]:
 
 
 def to_ts_code(code: str) -> str:
-    code = str(code).zfill(6)
-    suffix = "SH" if code.startswith(("5", "6", "9")) else "SZ"
-    return f"{code}.{suffix}"
+    return normalize_ts_code(str(code).zfill(6))
 
 
 def parse_forecast_year(column: str) -> int | None:
@@ -117,29 +127,179 @@ def parse_number(value) -> float | None:
         return None
 
 
+@contextmanager
+def output_lock():
+    """Serialize cross-process merges into the shared analyst dataset."""
+
+    OUTPUT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        stale_lock = _stale_lock_metadata(OUTPUT_LOCK_PATH)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                    "command": " ".join(sys.argv),
+                    "stale_lock_replaced": stale_lock,
+                },
+                ensure_ascii=False,
+            )
+        )
+        lock_file.flush()
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            lock_file.truncate()
+            lock_file.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "finished_at": datetime.now().isoformat(timespec="seconds"),
+                        "command": " ".join(sys.argv),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            lock_file.flush()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stale_lock_metadata(lock_path: Path) -> dict | None:
+    if not lock_path.exists():
+        return None
+    stale_after = max(60, int(os.getenv("ANALYST_FORECAST_LOCK_STALE_SECONDS", str(DEFAULT_LOCK_STALE_SECONDS))))
+    try:
+        stat = lock_path.stat()
+    except OSError:
+        return None
+    age_seconds = max(0.0, time.time() - stat.st_mtime)
+    if age_seconds < stale_after:
+        return None
+    raw = lock_path.read_text(encoding="utf-8").strip()
+    metadata: dict = {}
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                metadata = loaded
+        except json.JSONDecodeError:
+            metadata = {"raw": raw[:200]}
+    pid = metadata.get("pid")
+    running = _pid_is_running(int(pid)) if str(pid or "").isdigit() else False
+    if running:
+        return None
+    return {
+        "path": str(lock_path),
+        "age_seconds": round(age_seconds, 3),
+        "metadata": metadata,
+        "reason": "stale lock file without a running owner",
+    }
+
+
+def _validate_new_frame(frame: pd.DataFrame) -> None:
+    if frame.empty:
+        return
+    missing = REQUIRED_OUTPUT_COLUMNS - set(frame.columns)
+    if missing:
+        raise ValueError(f"analyst frame missing required columns: {sorted(missing)}")
+    if frame[list(REQUIRED_OUTPUT_COLUMNS)].isna().any().any():
+        raise ValueError("analyst frame contains null source, ts_code, or report_date")
+    if pd.to_datetime(frame["report_date"], errors="coerce").isna().any():
+        raise ValueError("analyst frame contains invalid report_date")
+
+
+def _atomic_write_parquet(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f".{os.getpid()}.{time.time_ns()}.tmp.parquet")
+    try:
+        frame.to_parquet(temp_path, index=False)
+        # Read the temporary file before replacement so a truncated or invalid
+        # write can never destroy the last-known-good dataset.
+        pd.read_parquet(temp_path, columns=["source", "ts_code", "report_date"])
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f".{os.getpid()}.{time.time_ns()}.tmp.csv")
+    try:
+        frame.to_csv(temp_path, index=False)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def append_and_dedupe(new_frame: pd.DataFrame) -> pd.DataFrame:
-    if OUTPUT_PATH.exists():
-        old_frame = pd.read_parquet(OUTPUT_PATH)
-        combined = pd.concat([old_frame, new_frame], ignore_index=True)
-    else:
-        combined = new_frame
-    if combined.empty:
+    _validate_new_frame(new_frame)
+    with output_lock():
+        if OUTPUT_PATH.exists():
+            old_frame = pd.read_parquet(OUTPUT_PATH)
+            combined = pd.concat([old_frame, new_frame], ignore_index=True)
+        else:
+            combined = new_frame.copy()
+        if combined.empty:
+            return combined
+        dedupe_columns = [
+            column
+            for column in ["source", "ts_code", "report_date", "org_name", "author_name", "forecast_year"]
+            if column in combined.columns
+        ]
+        combined = combined.drop_duplicates(dedupe_columns, keep="last")
+        sort_columns = [column for column in ["ts_code", "report_date", "forecast_year", "source"] if column in combined]
+        combined = combined.sort_values(sort_columns).reset_index(drop=True)
+        _atomic_write_parquet(combined, OUTPUT_PATH)
         return combined
-    combined = combined.drop_duplicates(
-        ["source", "ts_code", "report_date", "org_name", "author_name", "forecast_year"],
-        keep="last",
-    )
-    combined = combined.sort_values(["ts_code", "report_date", "forecast_year", "source"])
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(OUTPUT_PATH, index=False)
-    return combined
 
 
-def refresh_akshare_em_snapshot() -> dict:
+def retry_delay(base_seconds: float, attempt: int) -> float:
+    base = min(30.0, max(0.1, base_seconds) * (2 ** max(0, attempt - 1)))
+    return base + random.uniform(0.0, min(1.0, base * 0.25))
+
+
+def is_eastmoney_empty_research_response_error(exc: Exception) -> bool:
+    """AkShare raises KeyError('infoCode') when Eastmoney omits the report payload."""
+
+    return isinstance(exc, KeyError) and str(exc).strip("\"'") == "infoCode"
+
+
+def refresh_akshare_em_snapshot(sleep_seconds: float = 0.5, retries: int = 3) -> dict:
     import akshare as ak
 
     snapshot_date = pd.Timestamp(datetime.now().date())
-    frame = ak.stock_profit_forecast_em(symbol="")
+    frame = pd.DataFrame()
+    last_error: Exception | None = None
+    attempts = 0
+    for attempts in range(1, max(0, retries) + 2):
+        try:
+            frame = ak.stock_profit_forecast_em(symbol="")
+            if frame is None or frame.empty:
+                raise RuntimeError("AkShare Eastmoney consensus returned no rows")
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempts > retries:
+                raise RuntimeError(f"AkShare consensus failed after {attempts} attempts: {exc}") from exc
+            time.sleep(retry_delay(sleep_seconds, attempts))
+    if frame.empty:
+        raise RuntimeError(f"AkShare consensus returned no usable rows: {last_error}")
     rows: list[dict] = []
     for _, item in frame.iterrows():
         ts_code = to_ts_code(item["代码"])
@@ -182,6 +342,7 @@ def refresh_akshare_em_snapshot() -> dict:
         "total_rows": int(len(combined)),
         "total_symbols": int(combined["ts_code"].nunique()) if not combined.empty else 0,
         "output_path": str(OUTPUT_PATH),
+        "attempts": attempts,
     }
 
 
@@ -245,7 +406,16 @@ def normalize_eastmoney_research(symbol: str, frame: pd.DataFrame) -> pd.DataFra
     )
 
 
-def refresh_akshare_em_research(limit: int | None, sleep_seconds: float, retries: int) -> dict:
+def refresh_akshare_em_research(
+    limit: int | None,
+    sleep_seconds: float,
+    retries: int,
+    *,
+    symbols: list[str] | None = None,
+    refresh_existing: bool = False,
+    circuit_breaker_failures: int = 6,
+    checkpoint_every: int = 10,
+) -> dict:
     import akshare as ak
 
     existing_symbols: set[str] = set()
@@ -255,55 +425,101 @@ def refresh_akshare_em_research(limit: int | None, sleep_seconds: float, retries
             existing.loc[existing["source"] == "akshare_em_research", "ts_code"].dropna().astype(str)
         )
 
-    symbols = [symbol for symbol in load_symbols(limit=None) if symbol not in existing_symbols]
+    requested_symbols = sorted(set(symbols)) if symbols else load_symbols(limit=None)
+    symbols = requested_symbols if refresh_existing else [symbol for symbol in requested_symbols if symbol not in existing_symbols]
     if limit is not None:
         symbols = symbols[:limit]
 
-    fetched: list[pd.DataFrame] = []
+    pending_frames: list[pd.DataFrame] = []
     audits: list[dict] = []
+    new_rows = 0
+    consecutive_failures = 0
+    circuit_open = False
+    combined = pd.read_parquet(OUTPUT_PATH) if OUTPUT_PATH.exists() else pd.DataFrame()
     for index, symbol in enumerate(symbols, start=1):
+        if circuit_open:
+            audits.append(
+                {
+                    "ts_code": symbol,
+                    "status": "deferred",
+                    "rows": 0,
+                    "attempts": 0,
+                    "error": f"circuit open after {consecutive_failures} consecutive failures",
+                }
+            )
+            continue
         status = "failed"
         rows = 0
         error = None
+        attempts = 0
         for attempt in range(1, retries + 2):
+            attempts = attempt
             try:
                 raw = ak.stock_research_report_em(symbol=normalize_a_code(symbol))
                 normalized = normalize_eastmoney_research(symbol, raw)
                 rows = len(normalized)
                 if not normalized.empty:
-                    fetched.append(normalized)
+                    pending_frames.append(normalized)
+                    new_rows += rows
                 status = "success"
                 break
             except Exception as exc:
                 error = str(exc)
+                if is_eastmoney_empty_research_response_error(exc):
+                    status = "no_data"
+                    break
                 if attempt > retries:
                     break
-                time.sleep(min(30.0, sleep_seconds * (2 ** attempt)))
-        audits.append({"ts_code": symbol, "status": status, "rows": rows, "error": error})
+                time.sleep(retry_delay(sleep_seconds, attempt))
+        if status == "success":
+            consecutive_failures = 0
+        elif status == "no_data":
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            circuit_open = circuit_breaker_failures > 0 and consecutive_failures >= circuit_breaker_failures
+        audits.append(
+            {"ts_code": symbol, "status": status, "rows": rows, "attempts": attempts, "error": error}
+        )
+        if pending_frames and (index % max(1, checkpoint_every) == 0 or index == len(symbols)):
+            combined = append_and_dedupe(pd.concat(pending_frames, ignore_index=True))
+            pending_frames.clear()
         if index % 50 == 0 or index == len(symbols):
             ok = sum(1 for item in audits if item["status"] == "success")
             failed = sum(1 for item in audits if item["status"] == "failed")
-            print(f"akshare_em_research progress: {index}/{len(symbols)} success={ok} failed={failed}", flush=True)
-        time.sleep(sleep_seconds)
+            deferred = sum(1 for item in audits if item["status"] == "deferred")
+            no_data = sum(1 for item in audits if item["status"] == "no_data")
+            print(
+                f"akshare_em_research progress: {index}/{len(symbols)} "
+                f"success={ok} failed={failed} deferred={deferred} no_data={no_data}",
+                flush=True,
+            )
+        if not circuit_open:
+            time.sleep(max(0.1, sleep_seconds))
 
-    new_frame = pd.concat(fetched, ignore_index=True) if fetched else pd.DataFrame()
-    combined = append_and_dedupe(new_frame) if not new_frame.empty else (
-        pd.read_parquet(OUTPUT_PATH) if OUTPUT_PATH.exists() else pd.DataFrame()
-    )
-    audit_dir = AUDIT_ROOT / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_akshare_em_research"
+    if pending_frames:
+        combined = append_and_dedupe(pd.concat(pending_frames, ignore_index=True))
+    audit_dir = AUDIT_ROOT / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_akshare_em_research"
     audit_dir.mkdir(parents=True, exist_ok=True)
     audit_path = audit_dir / "akshare_em_research_audit.csv"
-    pd.DataFrame(audits).to_csv(audit_path, index=False)
+    _atomic_write_csv(pd.DataFrame(audits), audit_path)
     return {
         "source": "akshare_em_research",
         "symbols_requested": len(symbols),
         "success": sum(1 for item in audits if item["status"] == "success"),
         "failed": sum(1 for item in audits if item["status"] == "failed"),
-        "new_rows": int(len(new_frame)),
+        "deferred": sum(1 for item in audits if item["status"] == "deferred"),
+        "no_data": sum(1 for item in audits if item["status"] == "no_data"),
+        "failed_symbols": [item["ts_code"] for item in audits if item["status"] == "failed"],
+        "deferred_symbols": [item["ts_code"] for item in audits if item["status"] == "deferred"],
+        "no_data_symbols": [item["ts_code"] for item in audits if item["status"] == "no_data"],
+        "new_rows": int(new_rows),
         "total_rows": int(len(combined)),
         "total_symbols": int(combined["ts_code"].nunique()) if not combined.empty else 0,
         "output_path": str(OUTPUT_PATH),
         "audit_path": str(audit_path),
+        "circuit_open": circuit_open,
+        "checkpoint_every": max(1, checkpoint_every),
     }
 
 
@@ -647,6 +863,14 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--concurrency", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--circuit-breaker-failures", type=int, default=6)
+    parser.add_argument("--checkpoint-every", type=int, default=10)
+    parser.add_argument("--symbols", default=None, help="Comma-separated ts_codes to refresh.")
+    parser.add_argument(
+        "--refresh-existing",
+        action="store_true",
+        help="Fetch requested symbols even when historical research rows already exist.",
+    )
     parser.add_argument(
         "--retry-failed-from",
         default=None,
@@ -665,9 +889,18 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.source == "akshare_em_snapshot":
-        result = refresh_akshare_em_snapshot()
+        result = refresh_akshare_em_snapshot(args.sleep, args.retries)
     elif args.source == "akshare_em_research":
-        result = refresh_akshare_em_research(args.limit, args.sleep, args.retries)
+        requested_symbols = [item.strip() for item in (args.symbols or "").split(",") if item.strip()]
+        result = refresh_akshare_em_research(
+            args.limit,
+            args.sleep,
+            args.retries,
+            symbols=requested_symbols or None,
+            refresh_existing=args.refresh_existing,
+            circuit_breaker_failures=args.circuit_breaker_failures,
+            checkpoint_every=args.checkpoint_every,
+        )
     elif args.source == "akshare_cninfo_rating":
         result = refresh_akshare_cninfo_rating(args.start, args.end, args.sleep, args.retries, args.limit_days)
     else:
@@ -683,6 +916,10 @@ def main() -> None:
             args.include_no_data,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.source == "akshare_em_research" and (
+        int(result.get("failed") or 0) > 0 or int(result.get("deferred") or 0) > 0
+    ):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

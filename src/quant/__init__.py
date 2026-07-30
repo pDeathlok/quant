@@ -4,12 +4,16 @@ Quant 量化系统
 一个用于量化交易策略开发和回测的框架
 """
 
-__version__ = "1.0.0"
+__version__ = "0.1.0"
 __author__ = "Quant Team"
 
-# 导出核心模块
-from .strategies import *
-from .backtest import BacktestEngine, GridSearchOptimizer
+# 导出核心模块。策略和回测依赖 akquant，日常刷新入口不需要它们。
+try:
+    from .strategies import *
+    from .backtest import BacktestEngine, GridSearchOptimizer
+except ModuleNotFoundError as exc:
+    if exc.name != "akquant":
+        raise
 from .data import DataStorage, TushareDataFetcher, MarketDataStore, MarketDataStoreConfig
 from .analysis import PerformanceAnalyzer, AttributionAnalyzer
 from .ml import (

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260617-cb-overlay-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v3-20260730-allotment-xueqiu-v1" />
   </head>
   <body>
     <div class="app selector-app">
@@ -19,7 +19,13 @@
         </div>
         <div class="sidebar-brief">
             <span>工作区</span>
-          <p>顶部 Tab 切换短线、长线、可转债、配债股与 BYD 做T。左侧区域跟随当前工作区显示对应策略选择。</p>
+          <p>顶部 Tab 切换短线、缠论、长线、可转债、配债股、BYD 做T 与自选池。左侧区域跟随当前工作区显示对应策略选择。</p>
+        </div>
+        <div class="global-refresh-card">
+          <span>全局更新</span>
+          <button id="refreshAllButton" type="button">更新全部</button>
+          <div class="refresh-status compact"></div>
+          <div class="progress-steps compact"></div>
         </div>
         <div id="strategyFilterSection" class="side-section">
           <span>策略筛选</span>
@@ -51,7 +57,7 @@
         </div>
       </aside>
 
-      <main id="shortPage" class="main page-view active">
+      <main id="shortPage" class="main page-view">
         <nav class="workspace-tabs" aria-label="策略工作区">
           <button class="page-tab active" type="button" data-page="short">
             <strong>短线策略</strong>
@@ -71,7 +77,11 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -105,7 +115,7 @@
             </div>
             <input id="searchInput" type="search" placeholder="搜索股票 / 策略" />
             <button id="reloadButton" type="button">刷新当前日期</button>
-            <button id="refreshLatestButton" type="button">一键更新数据</button>
+            <button id="refreshLatestButton" type="button" data-refresh-scope="short">更新本页</button>
           </div>
           <div id="refreshStatus" class="refresh-status"></div>
           <div id="progressSteps" class="progress-steps"></div>
@@ -158,6 +168,103 @@
         </section>
       </main>
 
+      <main id="chanPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="chan">
+            <strong>缠论策略</strong>
+            <span>三买模型 / T+1 计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>盘前计划 / 正T优先</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
+          </button>
+        </nav>
+
+        <section class="toolbar chan-toolbar">
+          <div>
+            <p class="eyebrow">Chan Model Strategy</p>
+            <h2>缠论模型策略</h2>
+            <p id="chanPlanMeta" class="subline">等待加载</p>
+          </div>
+          <div class="toolbar-actions">
+            <div id="chanDateSlot"></div>
+            <button id="chanRefreshButton" type="button">刷新计划</button>
+            <button id="chanRefreshLatestButton" type="button" data-refresh-scope="chan">更新本页</button>
+          </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
+        </section>
+
+        <section id="chanMetrics" class="chan-performance"></section>
+
+        <section class="split chan-split">
+          <div class="panel">
+            <div class="panel-head">
+              <h3>模型候选</h3>
+              <span id="chanCandidateCount">等待加载</span>
+            </div>
+            <div class="table-wrap tall">
+              <table class="chan-table">
+                <thead>
+                  <tr>
+                    <th>股票</th>
+                    <th>规则</th>
+                    <th>排名分</th>
+                    <th>模型分</th>
+                    <th>缠论分</th>
+                    <th>T+1跳空</th>
+                    <th>仓位</th>
+                  </tr>
+                </thead>
+                <tbody id="chanRows">
+                  <tr><td colspan="7" class="empty-cell">切到缠论策略后加载候选</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel detail-panel">
+            <div class="panel-head">
+              <div>
+                <h3 id="chanDetailTitle">选择候选</h3>
+                <span id="chanDetailMeta"></span>
+              </div>
+            </div>
+            <div id="chanDetail" class="chan-detail">
+              <div class="empty-state">选择一只股票查看缠论结构、模型分和执行计划</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>执行备注</h3>
+            <span>主策略优先，扩容策略补充</span>
+          </div>
+          <ul id="chanNotes" class="notes"></ul>
+        </section>
+      </main>
+
       <main id="longPage" class="main page-view">
         <nav class="workspace-tabs" aria-label="策略工作区">
           <button class="page-tab" type="button" data-page="short">
@@ -178,7 +285,11 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -190,7 +301,7 @@
           </div>
           <div class="long-toolbar-actions">
             <div id="longDateSlot" class="long-date-slot"></div>
-            <button id="longRefreshLatestButton" type="button">一键更新数据</button>
+            <button id="longRefreshLatestButton" type="button" data-refresh-scope="long">更新本页</button>
             <div class="long-summary">
               <span id="longSummaryLabel">主推荐</span>
               <strong id="longSummaryName">茶大长线趋势网格</strong>
@@ -235,15 +346,15 @@
             <table class="long-pool-table">
               <thead>
                 <tr>
-                  <th>状态</th>
+                  <th>推荐程度</th>
                   <th>股票</th>
                   <th>行业</th>
-                  <th>动作</th>
-                  <th>仓位计划</th>
+                  <th>价格状态</th>
+                  <th>策略计划</th>
                   <th>评分</th>
-                  <th>价格计划</th>
+                  <th>关键价格</th>
                   <th>预测覆盖</th>
-                  <th>原因</th>
+                  <th>入选 / 观察原因</th>
                 </tr>
               </thead>
               <tbody id="longStockRows">
@@ -304,7 +415,11 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -316,7 +431,10 @@
           </div>
           <div class="toolbar-actions">
             <div id="cbDateSlot"></div>
+            <button id="cbRefreshLatestButton" type="button" data-refresh-scope="cb">更新本页</button>
           </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
         </section>
 
         <section id="cbMetrics" class="metrics-grid cb-metrics"></section>
@@ -383,7 +501,11 @@
           </button>
           <button class="page-tab" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -397,8 +519,13 @@
             <span>数据状态</span>
             <strong>等待加载</strong>
             <em>切到配债股页签后读取后端数据</em>
-            <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">刷新配债数据</button>
+            <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">更新行情与配债</button>
           </div>
+          <div class="toolbar-actions">
+            <button id="cbAllotmentRefreshLatestButton" type="button" data-refresh-scope="cbAllotment">更新本页</button>
+          </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
         </section>
 
         <section class="panel allotment-table-panel">
@@ -506,7 +633,11 @@
           </button>
           <button class="page-tab active" type="button" data-page="byd">
             <strong>BYD 做T</strong>
-            <span>日线计划 / 降仓路线</span>
+            <span>盘前计划 / 正T优先</span>
+          </button>
+          <button class="page-tab" type="button" data-page="similar">
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
           </button>
         </nav>
 
@@ -514,42 +645,41 @@
           <div>
             <p class="eyebrow">BYD Inventory Desk</p>
             <h2>比亚迪日线做T计划</h2>
-            <p id="bydSubline" class="subline">10500 股 · 成本 110.6061 · 等待日线计划</p>
+            <p id="bydSubline" class="subline">10000 股 · 成本 110.6061 · 等待历史验证计划</p>
           </div>
           <div class="byd-toolbar-actions">
             <label>
               <span>持仓股数</span>
-              <input id="bydSharesInput" type="number" min="0" step="100" value="10500" />
+              <input id="bydSharesInput" type="number" min="0" step="100" value="10000" />
             </label>
             <label>
               <span>成本价</span>
               <input id="bydCostInput" type="number" min="0" step="0.0001" value="110.6061" />
             </label>
-            <label>
-              <span>今日已卖</span>
-              <input id="bydSoldTodaySharesInput" type="number" min="0" step="100" value="0" />
-            </label>
-            <label>
-              <span>今日卖价</span>
-              <input id="bydSoldTodayPriceInput" type="number" min="0" step="0.01" value="" />
-            </label>
-            <label>
-              <span>待买回股数</span>
-              <input id="bydOpenTInput" type="number" min="0" step="100" value="0" />
-            </label>
-            <label>
-              <span>待买回卖价</span>
-              <input id="bydOpenTPriceInput" type="number" min="0" step="0.01" value="" />
-            </label>
             <button id="bydRefreshButton" type="button">刷新日线计划</button>
+            <button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页</button>
+            <span id="bydHoldingSaveStatus" class="byd-save-status" role="status" aria-live="polite">持仓修改后自动保存</span>
           </div>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
+        </section>
+
+        <section class="panel byd-validation-panel">
+          <div class="panel-head">
+            <div>
+              <h3>横盘期历史验证</h3>
+              <span id="bydValidationStatus">等待加载</span>
+            </div>
+          </div>
+          <p id="bydValidationDecision" class="subline">只使用2022年后的横盘期选择参数；历史分钟线只负责验证成交先后，盘中计划不刷新。</p>
+          <div id="bydValidationMetrics" class="byd-validation-metrics"></div>
         </section>
 
         <section class="panel byd-range-panel">
           <div class="panel-head">
             <div>
-              <h3>核心做T区间</h3>
-              <span>前复权日线 + ATR + 箱体分位</span>
+              <h3>正T / 反T 分开计划</h3>
+              <span>正T优先 · 反T未通过则暂停</span>
             </div>
           </div>
           <div id="bydIntradayZones" class="byd-dynamic-zones"></div>
@@ -574,8 +704,8 @@
 
         <section class="panel byd-ladder-panel">
           <div class="panel-head">
-            <h3>辅助价位</h3>
-            <span>风控线 / 兜底线 / 箱体边界</span>
+            <h3>固定计划价位</h3>
+            <span>正T买卖 / 尾盘退出 / 反T观察</span>
           </div>
           <div id="bydPriceLadder" class="byd-ladder"></div>
         </section>
@@ -591,14 +721,219 @@
           <div class="panel">
             <div class="panel-head">
               <h3>执行路线</h3>
-              <span>先反T，后正T</span>
+              <span>先验证，再交易</span>
             </div>
             <ol id="bydPlaybook" class="byd-playbook"></ol>
           </div>
         </section>
       </main>
+
+      <main id="similarPage" class="main page-view active">
+        <nav class="workspace-tabs" aria-label="策略工作区">
+          <button class="page-tab" type="button" data-page="short">
+            <strong>短线策略</strong>
+            <span>每日选股 / 交易计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="long">
+            <strong>长线策略</strong>
+            <span>组合候选 / 仓位择时</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cb">
+            <strong>可转债策略</strong>
+            <span>低位候选 / 分批计划</span>
+          </button>
+          <button class="page-tab" type="button" data-page="cbAllotment">
+            <strong>配债股</strong>
+            <span>发行流程 / 关键日期</span>
+          </button>
+          <button class="page-tab" type="button" data-page="byd">
+            <strong>BYD 做T</strong>
+            <span>盘前计划 / 正T优先</span>
+          </button>
+          <button class="page-tab active" type="button" data-page="similar">
+            <strong>自选池</strong>
+            <span>相似走势 / 策略联动</span>
+          </button>
+        </nav>
+
+        <section class="toolbar similar-toolbar">
+          <div>
+            <p class="eyebrow">Watchlist Intelligence</p>
+            <h2>自选池</h2>
+            <p id="similarMeta" class="subline">等待加载自选池</p>
+          </div>
+          <form id="similarAddForm" class="similar-add-form">
+            <label>
+              <span>加入股票</span>
+              <input id="similarSymbolInput" type="text" placeholder="002594 或 002594.SZ" />
+            </label>
+            <button type="submit">加入自选</button>
+            <button id="similarRefreshButton" type="button">刷新分析</button>
+          </form>
+          <div class="refresh-status"></div>
+          <div class="progress-steps"></div>
+        </section>
+
+        <section id="similarSignalSummary" class="similar-signal-summary" aria-label="自选池策略信号总览"></section>
+
+        <section class="panel similar-watch-panel">
+          <div class="panel-head">
+            <div>
+              <h3>自选股票</h3>
+              <span id="similarWatchCount">-</span>
+            </div>
+            <span>点击股票查看下方决策详情</span>
+          </div>
+          <div class="table-wrap similar-watch-table-wrap">
+            <table class="similar-watch-table">
+              <thead>
+                <tr>
+                  <th>股票</th>
+                  <th>策略共振</th>
+                  <th>买入分</th>
+                  <th>持有分</th>
+                  <th>当前走势</th>
+                  <th>T+1 结论</th>
+                  <th>中期预期</th>
+                  <th>笔记 / 操作计划</th>
+                  <th>雪球</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="similarWatchlist">
+                <tr><td colspan="10" class="empty-cell">切到自选池后加载</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="similarSelectedOverview" class="similar-card-grid"></section>
+
+        <section class="split similar-split">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3 id="similarDetailTitle">选择股票</h3>
+                <span id="similarDetailMeta">查看 T+1 量价情景</span>
+              </div>
+            </div>
+            <div class="table-wrap similar-scenario-wrap">
+              <table class="similar-scenario-table">
+                <thead>
+                  <tr>
+                    <th>T+1涨跌</th>
+                    <th>量比</th>
+                    <th>样本</th>
+                    <th>3日上冲</th>
+                    <th>3日下破</th>
+                    <th>1月中位</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="similarScenarioRows">
+                  <tr><td colspan="7" class="empty-cell">切到相似走势页后加载</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>卖出/持有模型</h3>
+                <span id="similarModelMeta">3日止盈止损概率</span>
+              </div>
+            </div>
+            <div id="similarSellModel" class="similar-model-list"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Top 相似阶段</h3>
+            <span>综合相似度、行业与市场匹配和时间衰减；按预测权重降序，采用全局统一尺度</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>排名</th>
+                  <th>股票</th>
+                  <th>行业</th>
+                  <th>日期</th>
+                  <th>相似分</th>
+                  <th>次日</th>
+                  <th>1月</th>
+                  <th>3月</th>
+                </tr>
+              </thead>
+              <tbody id="similarTopRows">
+                <tr><td colspan="8" class="empty-cell">暂无数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
     </div>
     <div id="bydTradeToast" class="byd-trade-toast" role="status" aria-live="polite" aria-atomic="true"></div>
-    <script src="./app.js?v=20260617-buy-hold-score-v15"></script>
+    <div id="watchlistContextMenu" class="watchlist-context-menu" role="menu" hidden>
+      <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
+      <button type="button" role="menuitem" data-watchlist-context-pin hidden>置顶</button>
+      <button type="button" role="menuitem" data-watchlist-context-alert hidden>设置提醒</button>
+    </div>
+    <div id="watchlistToast" class="watchlist-toast" role="status" aria-live="polite"></div>
+    <div id="similarNoteTooltip" class="similar-note-tooltip" role="tooltip" hidden>
+      <strong></strong>
+      <p></p>
+    </div>
+    <dialog id="similarNoteDialog" class="similar-note-dialog" aria-labelledby="similarNoteTitle">
+      <form id="similarNoteForm" method="dialog">
+        <div class="similar-note-dialog-head">
+          <div>
+            <h3 id="similarNoteTitle">自选股笔记</h3>
+            <p id="similarNoteMeta" class="subline"></p>
+          </div>
+          <button id="similarNoteCancel" class="similar-note-close" type="button" aria-label="关闭笔记编辑器">×</button>
+        </div>
+        <label class="similar-note-field" for="similarNoteInput">
+          <span>笔记内容</span>
+          <textarea id="similarNoteInput" maxlength="20000" rows="12" placeholder="例如：&#10;操作计划：回踩 20 日线且缩量时分批关注&#10;关注价位：……&#10;止损条件：……&#10;复盘记录：……"></textarea>
+        </label>
+        <div class="similar-note-dialog-actions">
+          <span>内容会随自选股持久保存；清空后保存可删除笔记。</span>
+          <div>
+            <button type="button" data-dialog-secondary id="similarNoteCancelBottom">取消</button>
+            <button id="similarNoteSave" type="submit">保存笔记</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="watchlistAlertDialog" class="watchlist-alert-dialog" aria-labelledby="watchlistAlertTitle">
+      <form id="watchlistAlertForm" method="dialog">
+        <div class="watchlist-alert-dialog-head">
+          <div>
+            <p class="eyebrow">Watchlist Alert</p>
+            <h3 id="watchlistAlertTitle">设置提醒</h3>
+            <p id="watchlistAlertMeta" class="subline"></p>
+          </div>
+          <button id="watchlistAlertClose" class="similar-note-close" type="button" aria-label="关闭提醒设置">×</button>
+        </div>
+        <div class="watchlist-alert-options">
+          <label class="watchlist-alert-enabled">
+            <input id="watchlistAlertEnabled" type="checkbox" checked />
+            <span>启用提醒</span>
+          </label>
+          <button type="button" data-watchlist-alert-add-reminder>＋ 添加提醒</button>
+        </div>
+        <div id="watchlistAlertReminders" class="watchlist-alert-reminders"></div>
+        <div class="watchlist-alert-dialog-actions">
+          <span>每只股票最多 20 个提醒，每个提醒最多 20 条条件；从第二行开始选择 AND/OR。</span>
+          <div>
+            <button type="button" data-dialog-secondary id="watchlistAlertCancel">取消</button>
+            <button id="watchlistAlertSave" type="submit">保存提醒</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+    <script src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v3-default-similar-v1-20260729-watchlist-async-add-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2"></script>
   </body>
 </html>

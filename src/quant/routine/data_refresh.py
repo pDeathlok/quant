@@ -9,20 +9,23 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from quant.data.atomic_io import atomic_write_csv, atomic_write_json
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import (
     DailyRefreshAudit,
     audits_to_frame,
     build_tushare_daily_audit,
-    normalize_tushare_daily,
     normalize_ts_code,
+    normalize_tushare_market_daily,
+    normalize_tushare_daily,
 )
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT
-
 
 AUDIT_ROOT = PROJECT_ROOT / "data/raw/source_audit"
 
@@ -50,6 +53,60 @@ NON_RETRYABLE_ERROR_KEYWORDS = (
 )
 
 SUSPENDED_STATUS = "no_trade_suspended"
+BATCH_NO_TRADE_STATUS = "no_trade_in_batch"
+TUSHARE_DAILY_ROW_LIMIT = 6000
+DEFAULT_BATCH_MAX_TRADE_DATES = 30
+DEFAULT_BATCH_MIN_COVERAGE_RATE = 0.995
+MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+DEFAULT_MARKET_DATA_READY_TIME = "16:00"
+
+
+class MarketBatchCoverageError(RuntimeError):
+    """Raised before publication when a market-wide response is materially incomplete."""
+
+
+def _validate_market_batch_coverage(
+    market: pd.DataFrame,
+    target_symbols: set[str],
+    trade_dates: list[str],
+    minimum_rate: float,
+) -> dict[str, Any]:
+    if not 0 < minimum_rate <= 1:
+        raise ValueError(f"market batch minimum coverage must be in (0, 1], got {minimum_rate}")
+    expected = len(target_symbols)
+    if expected == 0:
+        raise MarketBatchCoverageError("market batch has no expected symbols")
+
+    date_values = market["trade_date"].astype(str)
+    details: dict[str, dict[str, int | float]] = {}
+    failures: list[str] = []
+    for trade_date in trade_dates:
+        actual_symbols = set(
+            market.loc[date_values == trade_date, "ts_code"].dropna().astype(str)
+        ) & target_symbols
+        actual = len(actual_symbols)
+        coverage_rate = actual / expected
+        missing = expected - actual
+        details[trade_date] = {
+            "symbols": actual,
+            "missing_symbols": missing,
+            "coverage_rate": round(coverage_rate, 6),
+        }
+        if coverage_rate < minimum_rate:
+            failures.append(
+                f"{trade_date}: {actual}/{expected} ({coverage_rate:.2%}), missing={missing}"
+            )
+
+    if failures:
+        raise MarketBatchCoverageError(
+            "Tushare daily market coverage below "
+            f"{minimum_rate:.2%}: {'; '.join(failures)}"
+        )
+    return {
+        "minimum_rate": minimum_rate,
+        "expected_symbols": expected,
+        "trade_dates": details,
+    }
 
 
 class RequestLimiter:
@@ -145,8 +202,50 @@ def _format_trade_date(value: pd.Timestamp) -> str:
     return value.strftime("%Y%m%d")
 
 
-def _symbol_refresh_start(existing: pd.DataFrame, requested_start: str) -> str:
-    """Use the earlier of requested_start and the symbol's own next missing day."""
+def _market_data_ready_time() -> tuple[int, int]:
+    raw = os.getenv("ROUTINE_MARKET_DATA_READY_TIME", DEFAULT_MARKET_DATA_READY_TIME)
+    try:
+        parsed = datetime.strptime(raw, "%H:%M")
+    except ValueError as exc:
+        raise ValueError(
+            "ROUTINE_MARKET_DATA_READY_TIME must use HH:MM format"
+        ) from exc
+    return parsed.hour, parsed.minute
+
+
+def _completed_market_end_date(
+    requested_end_date: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, bool]:
+    current = now or datetime.now(MARKET_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=MARKET_TIMEZONE)
+    else:
+        current = current.astimezone(MARKET_TIMEZONE)
+    requested = _parse_trade_date(requested_end_date)
+    if requested is None:
+        raise ValueError(f"invalid end_date: {requested_end_date}")
+    hour, minute = _market_data_ready_time()
+    ready_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    today = pd.Timestamp(current.date())
+    if requested >= today and current < ready_at:
+        completed_end = today - pd.Timedelta(days=1)
+        return _format_trade_date(completed_end), True
+    return _format_trade_date(requested), False
+
+
+def _symbol_refresh_start(
+    existing: pd.DataFrame,
+    requested_start: str,
+    adjust: str | None = None,
+) -> str:
+    """Resolve a safe start date for one symbol.
+
+    Adjusted prices are anchored to the request window. Re-fetch the complete
+    stored history before merging so old and new rows share one adjustment base.
+    Raw prices can continue from the symbol's next missing day.
+    """
 
     requested = _parse_trade_date(requested_start)
     if requested is None or existing.empty:
@@ -160,6 +259,9 @@ def _symbol_refresh_start(existing: pd.DataFrame, requested_start: str) -> str:
     latest = dates.max()
     if pd.isna(latest):
         return requested_start
+    if adjust in {"qfq", "hfq"}:
+        earliest = dates.min()
+        return requested_start if pd.isna(earliest) else _format_trade_date(earliest)
     next_missing = latest + pd.Timedelta(days=1)
     return _format_trade_date(min(requested, next_missing))
 
@@ -175,6 +277,52 @@ def _latest_existing_trade_date(existing: pd.DataFrame) -> pd.Timestamp | None:
         return None
     latest = dates.max()
     return None if pd.isna(latest) else latest
+
+
+def _latest_incoming_trade_date(frame: pd.DataFrame) -> pd.Timestamp | None:
+    if frame.empty:
+        return None
+    if "trade_date" in frame.columns:
+        dates = pd.to_datetime(
+            frame["trade_date"].astype(str),
+            format="%Y%m%d",
+            errors="coerce",
+        )
+    elif "date" in frame.columns:
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+    else:
+        return None
+    latest = dates.max()
+    return None if pd.isna(latest) else latest
+
+
+def _merge_symbol_daily(
+    existing: pd.DataFrame,
+    incoming: pd.DataFrame,
+    symbol: str,
+    name: str,
+) -> pd.DataFrame:
+    merged = normalize_tushare_daily(incoming, symbol)
+    merged["name"] = name
+    if existing.empty:
+        return merged
+    existing = existing.copy()
+    if "date" in existing.columns:
+        existing["date"] = pd.to_datetime(existing["date"])
+    elif "trade_date" in existing.columns:
+        existing["date"] = pd.to_datetime(
+            existing["trade_date"].astype(str),
+            format="%Y%m%d",
+            errors="coerce",
+        )
+    if "trade_date" not in existing.columns and "date" in existing.columns:
+        existing["trade_date"] = existing["date"].dt.strftime("%Y%m%d")
+    return (
+        pd.concat([existing, merged], ignore_index=True, sort=False)
+        .sort_values("date")
+        .drop_duplicates("trade_date", keep="last")
+        .reset_index(drop=True)
+    )
 
 
 _TRADE_CAL_CACHE: dict[tuple[str, str], set[str]] = {}
@@ -221,6 +369,147 @@ def _is_fully_suspended(tushare: TushareDataFetcher, symbol: str, start_date: st
     return end_date in suspend_dates
 
 
+def _fetch_market_daily_with_retries(
+    tushare: TushareDataFetcher,
+    trade_date: str,
+    limiter: RequestLimiter,
+    retries: int,
+    retry_base_delay: float,
+    retry_max_delay: float,
+    retry_jitter: float,
+) -> tuple[pd.DataFrame, int]:
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            limiter.wait()
+            frame = tushare.pro.daily(trade_date=trade_date)
+            if frame is None or frame.empty:
+                raise RuntimeError(f"Tushare daily returned no market rows for {trade_date}")
+            if len(frame) >= TUSHARE_DAILY_ROW_LIMIT:
+                raise RuntimeError(
+                    f"Tushare daily returned {len(frame)} rows for {trade_date}; "
+                    f"the {TUSHARE_DAILY_ROW_LIMIT}-row limit may have truncated the market"
+                )
+            if "ts_code" not in frame.columns or "trade_date" not in frame.columns:
+                raise ValueError(f"Tushare daily market response missing required columns for {trade_date}")
+            return frame, attempt
+        except Exception:
+            if attempt >= attempts:
+                raise
+            delay = min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1)))
+            delay += random.uniform(0, retry_jitter) if retry_jitter > 0 else 0
+            time.sleep(delay)
+    raise RuntimeError(f"Tushare daily market request failed for {trade_date}")
+
+
+def _refresh_symbols_by_trade_date(
+    symbols: list[tuple[str, str]],
+    start_date: str,
+    end_date: str,
+    output_dir: Path,
+    cache_dir: Path,
+    sleep_between: float,
+    retries: int,
+    retry_base_delay: float,
+    retry_max_delay: float,
+    retry_jitter: float,
+) -> tuple[list[DailyRefreshAudit], int, dict[str, Any]]:
+    """Refresh raw daily bars with one Tushare request per open trade date."""
+
+    tushare = TushareDataFetcher(cache_dir=cache_dir / "tushare")
+    trade_dates = sorted(_open_trade_dates(tushare, start_date, end_date))
+    max_trade_dates = max(
+        1,
+        int(os.getenv("ROUTINE_DAILY_BATCH_MAX_DATES", str(DEFAULT_BATCH_MAX_TRADE_DATES))),
+    )
+    if len(trade_dates) > max_trade_dates:
+        raise RuntimeError(
+            f"batch range has {len(trade_dates)} trade dates, above limit {max_trade_dates}"
+        )
+    if not trade_dates:
+        audits = [
+            _status_audit(symbol, "no_open_trade_dates", f"{start_date}-{end_date} 无交易日", attempts=0)
+            for symbol, _ in symbols
+        ]
+        return audits, 0, {"rows": 0, "sql_rows": 0, "parquet_partitions": 0, "table": "market_daily"}
+
+    limiter = RequestLimiter(sleep_between)
+    market_frames: list[pd.DataFrame] = []
+    request_count = 0
+    for index, trade_date in enumerate(trade_dates, start=1):
+        frame, attempts = _fetch_market_daily_with_retries(
+            tushare,
+            trade_date,
+            limiter,
+            retries,
+            retry_base_delay,
+            retry_max_delay,
+            retry_jitter,
+        )
+        request_count += attempts
+        market_frames.append(frame)
+        print(
+            f"market daily batch progress: {index}/{len(trade_dates)} trade dates",
+            flush=True,
+        )
+
+    name_by_symbol = {normalize_ts_code(symbol): name for symbol, name in symbols}
+    market = normalize_tushare_market_daily(
+        pd.concat(market_frames, ignore_index=True, sort=False),
+        name_by_symbol=name_by_symbol,
+    )
+    target_symbols = set(name_by_symbol)
+    market = market[market["ts_code"].isin(target_symbols)].copy()
+    minimum_coverage_rate = float(
+        os.getenv(
+            "ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE",
+            str(DEFAULT_BATCH_MIN_COVERAGE_RATE),
+        )
+    )
+    coverage = _validate_market_batch_coverage(
+        market,
+        target_symbols,
+        trade_dates,
+        minimum_coverage_rate,
+    )
+    row_counts = market.groupby("ts_code", sort=False).size().to_dict()
+
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
+    dataset = output_dir.name
+    try:
+        storage_stats = store.write_market_batch(market, dataset=dataset, partition_column="trade_date")
+        storage_error = None
+    except Exception as exc:
+        storage_stats = {"rows": 0, "sql_rows": 0, "parquet_partitions": 0, "table": "market_daily"}
+        storage_error = str(exc)
+    storage_stats["coverage"] = coverage
+    audits: list[DailyRefreshAudit] = []
+    for symbol, name in symbols:
+        key = normalize_ts_code(symbol)
+        rows = int(row_counts.get(key, 0))
+        if rows == 0:
+            audits.append(
+                _status_audit(
+                    key,
+                    BATCH_NO_TRADE_STATUS,
+                    f"{start_date}-{end_date} 的全市场结果中无该股票成交记录",
+                    attempts=1,
+                )
+            )
+        elif storage_error is not None:
+            audits.append(_failed_audit(key, storage_error, attempts=1))
+        else:
+            audits.append(
+                build_tushare_daily_audit(
+                    key,
+                    rows=rows,
+                    merged_rows=rows,
+                    status="tushare_daily_batch_upsert",
+                )
+            )
+    return audits, request_count, storage_stats
+
+
 def _refresh_one_symbol_once(
     symbol: str,
     name: str,
@@ -229,15 +518,15 @@ def _refresh_one_symbol_once(
     adjust: str,
     output_dir: Path,
     cache_dir: Path,
+    expected_trade_date: str | None = None,
 ) -> DailyRefreshAudit:
     tushare = TushareDataFetcher(cache_dir=cache_dir / "tushare")
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
     dataset = output_dir.name
     key = normalize_ts_code(symbol)
-    existing = store.read_frame(dataset, key)
     requested = _parse_trade_date(start_date)
     end = _parse_trade_date(end_date)
-    latest_existing = _latest_existing_trade_date(existing)
+    latest_existing = store.latest_trade_date(dataset, key)
     if (
         requested is not None
         and end is not None
@@ -251,7 +540,9 @@ def _refresh_one_symbol_once(
             f"本地数据已覆盖到 {end_date}，跳过重复刷新",
             attempts=0,
         )
-    effective_start = _symbol_refresh_start(existing, start_date)
+    existing = store.read_frame(dataset, key)
+    latest_existing = _latest_existing_trade_date(existing)
+    effective_start = _symbol_refresh_start(existing, start_date, adjust=adjust)
     try:
         ts_df = tushare.get_stock_daily(symbol, effective_start, end_date, adjust=adjust)
     except ValueError as exc:
@@ -263,19 +554,46 @@ def _refresh_one_symbol_once(
                 attempts=1,
             )
         raise
-    merged = normalize_tushare_daily(ts_df, symbol)
-    merged["name"] = name
-    if not existing.empty:
-        if "date" in existing.columns:
-            existing["date"] = pd.to_datetime(existing["date"])
-        if "trade_date" not in existing.columns and "date" in existing.columns:
-            existing["trade_date"] = existing["date"].dt.strftime("%Y%m%d")
-        merged = (
-            pd.concat([existing, merged], ignore_index=True, sort=False)
-            .sort_values("date")
-            .drop_duplicates("trade_date", keep="last")
-            .reset_index(drop=True)
+    expected_latest = _parse_trade_date(expected_trade_date)
+    incoming_latest = _latest_incoming_trade_date(ts_df)
+    if expected_latest is not None and (
+        incoming_latest is None or incoming_latest < expected_latest
+    ):
+        # A same-range cache may have been populated before Tushare published
+        # the newest bar. Bypass it once and fail closed if the open date is
+        # still absent.
+        ts_df = tushare.get_stock_daily(
+            symbol,
+            effective_start,
+            end_date,
+            adjust=adjust,
+            force_refresh=True,
+        )
+        incoming_latest = _latest_incoming_trade_date(ts_df)
+        if incoming_latest is None or incoming_latest < expected_latest:
+            expected_text = _format_trade_date(expected_latest)
+            if _is_fully_suspended(
+                tushare,
+                symbol,
+                expected_text,
+                expected_text,
+            ):
+                return _status_audit(
+                    symbol,
+                    SUSPENDED_STATUS,
+                    f"{expected_text} 停牌，无新增日线数据",
+                    attempts=1,
+                )
+            actual_text = (
+                _format_trade_date(incoming_latest)
+                if incoming_latest is not None
+                else "none"
             )
+            raise RuntimeError(
+                f"Tushare daily did not reach expected trade date for {symbol}: "
+                f"expected={expected_text} actual={actual_text}"
+            )
+    merged = _merge_symbol_daily(existing, ts_df, symbol, name)
     store.write_frame(merged, dataset, key)
     return build_tushare_daily_audit(symbol, rows=len(ts_df), merged_rows=len(merged))
 
@@ -294,13 +612,23 @@ def refresh_one_symbol(
     retry_max_delay: float,
     retry_jitter: float,
     retry_non_retryable_errors: bool = False,
+    expected_trade_date: str | None = None,
 ) -> DailyRefreshAudit:
     attempts = max(1, retries + 1)
     last_error = ""
     for attempt in range(1, attempts + 1):
         try:
             limiter.wait()
-            audit = _refresh_one_symbol_once(symbol, name, start_date, end_date, adjust, output_dir, cache_dir)
+            audit = _refresh_one_symbol_once(
+                symbol,
+                name,
+                start_date,
+                end_date,
+                adjust,
+                output_dir,
+                cache_dir,
+                expected_trade_date,
+            )
             return _with_attempt(audit, attempt)
         except Exception as exc:
             last_error = str(exc)
@@ -332,6 +660,7 @@ def _refresh_symbols(
     retry_jitter: float,
     retry_non_retryable_errors: bool = False,
     progress_prefix: str = "refresh progress",
+    expected_trade_date: str | None = None,
 ) -> list[DailyRefreshAudit]:
     audits: list[DailyRefreshAudit] = []
     total = len(symbols)
@@ -353,6 +682,7 @@ def _refresh_symbols(
                     retry_max_delay,
                     retry_jitter,
                     retry_non_retryable_errors=retry_non_retryable_errors,
+                    expected_trade_date=expected_trade_date,
                 )
             )
             if n % 100 == 0 or n == total:
@@ -380,6 +710,7 @@ def _refresh_symbols(
                     retry_max_delay,
                     retry_jitter,
                     retry_non_retryable_errors,
+                    expected_trade_date,
                 )
             ] = symbol
         for n, future in enumerate(as_completed(futures), start=1):
@@ -406,6 +737,7 @@ def _retry_failed_audits(
     retry_base_delay: float,
     retry_max_delay: float,
     retry_jitter: float,
+    expected_trade_date: str | None,
 ) -> tuple[list[DailyRefreshAudit], int]:
     """Retry the remaining failed symbols in slower final passes."""
 
@@ -438,6 +770,7 @@ def _retry_failed_audits(
             retry_jitter=retry_jitter,
             retry_non_retryable_errors=True,
             progress_prefix=f"final retry progress round {round_index}",
+            expected_trade_date=expected_trade_date,
         )
         for retry_audit in retry_audits:
             retried_symbols.add(retry_audit.symbol)
@@ -452,7 +785,7 @@ def refresh_daily_data(
     start_date: str,
     end_date: str | None = None,
     board: str = "all",
-    adjust: str = "qfq",
+    adjust: str | None = None,
     output_dir: Path = DAILY_DIR,
     workers: int = 2,
     limit: int | None = None,
@@ -466,31 +799,80 @@ def refresh_daily_data(
     final_retry_workers: int = 4,
     final_retry_sleep: float = 0.8,
 ) -> dict:
-    if end_date is None:
-        end_date = datetime.now().strftime("%Y%m%d")
+    market_now = datetime.now(MARKET_TIMEZONE)
+    requested_end_date = end_date or market_now.strftime("%Y%m%d")
+    end_date, end_date_adjusted = _completed_market_end_date(
+        requested_end_date,
+        now=market_now,
+    )
 
     cache_dir = PROJECT_ROOT / "data/cache/source_merge"
     tushare = TushareDataFetcher(cache_dir=cache_dir / "tushare")
     symbols = load_symbols_file(symbols_file, tushare, limit=limit) if symbols_file else load_tushare_symbols(tushare, board=board, limit=limit)
     if not symbols:
         raise RuntimeError("Tushare stock_basic returned no symbols")
+    requested_open_dates = sorted(_open_trade_dates(tushare, start_date, end_date))
+    expected_trade_date = requested_open_dates[-1] if requested_open_dates else None
 
-    audits = _refresh_symbols(
-        symbols,
-        start_date,
-        end_date,
-        adjust,
-        output_dir,
-        cache_dir,
-        workers=workers,
-        sleep_between=sleep_between,
-        retries=retries,
-        retry_base_delay=retry_base_delay,
-        retry_max_delay=retry_max_delay,
-        retry_jitter=retry_jitter,
-    )
+    refresh_mode = "per_symbol"
+    market_daily_requests = 0
+    batch_storage: dict[str, Any] = {}
+    batch_fallback_reason: str | None = None
+    if adjust is None:
+        try:
+            audits, market_daily_requests, batch_storage = _refresh_symbols_by_trade_date(
+                symbols,
+                start_date,
+                end_date,
+                output_dir,
+                cache_dir,
+                sleep_between=sleep_between,
+                retries=retries,
+                retry_base_delay=retry_base_delay,
+                retry_max_delay=retry_max_delay,
+                retry_jitter=retry_jitter,
+            )
+            refresh_mode = "batch_by_trade_date"
+        except Exception as exc:
+            batch_fallback_reason = str(exc)
+            print(
+                f"market daily batch unavailable; falling back to per-symbol refresh: "
+                f"{batch_fallback_reason}",
+                flush=True,
+            )
+            audits = _refresh_symbols(
+                symbols,
+                start_date,
+                end_date,
+                adjust,
+                output_dir,
+                cache_dir,
+                workers=workers,
+                sleep_between=sleep_between,
+                retries=retries,
+                retry_base_delay=retry_base_delay,
+                retry_max_delay=retry_max_delay,
+                retry_jitter=retry_jitter,
+                expected_trade_date=expected_trade_date,
+            )
+    else:
+        audits = _refresh_symbols(
+            symbols,
+            start_date,
+            end_date,
+            adjust,
+            output_dir,
+            cache_dir,
+            workers=workers,
+            sleep_between=sleep_between,
+            retries=retries,
+            retry_base_delay=retry_base_delay,
+            retry_max_delay=retry_max_delay,
+            retry_jitter=retry_jitter,
+            expected_trade_date=expected_trade_date,
+        )
     final_retry_unique_symbols = 0
-    if final_retry_rounds > 0:
+    if final_retry_rounds > 0 and refresh_mode == "per_symbol":
         symbols_by_code = {normalize_ts_code(symbol): (symbol, name) for symbol, name in symbols}
         audits, final_retry_unique_symbols = _retry_failed_audits(
             audits,
@@ -507,27 +889,55 @@ def refresh_daily_data(
             retry_base_delay=retry_base_delay,
             retry_max_delay=retry_max_delay,
             retry_jitter=retry_jitter,
+            expected_trade_date=expected_trade_date,
         )
 
     audit_dir = AUDIT_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S")
     audit_dir.mkdir(parents=True, exist_ok=True)
     audit_df = audits_to_frame(audits)
     audit_path = audit_dir / "daily_source_audit.csv"
-    audit_df.to_csv(audit_path, index=False)
+    atomic_write_csv(audit_df, audit_path, index=False)
     failed_symbols_path = audit_dir / "failed_symbols.csv"
     failed_df = audit_df.loc[audit_df["status"] == "failed", ["symbol", "error", "attempts"]].copy()
-    failed_df.to_csv(failed_symbols_path, index=False)
+    atomic_write_csv(failed_df, failed_symbols_path, index=False)
     suspended_symbols_path = audit_dir / "suspended_symbols.csv"
     suspended_df = audit_df.loc[audit_df["status"] == SUSPENDED_STATUS, ["symbol", "error", "attempts"]].copy()
-    suspended_df.to_csv(suspended_symbols_path, index=False)
+    atomic_write_csv(suspended_df, suspended_symbols_path, index=False)
+
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
+    dataset_latest = store.latest_dataset_trade_date(output_dir.name)
+    dataset_trade_date = (
+        dataset_latest.strftime("%Y%m%d") if dataset_latest is not None else None
+    )
+    freshness_error = None
+    if expected_trade_date and (
+        dataset_trade_date is None or dataset_trade_date < expected_trade_date
+    ):
+        freshness_error = (
+            "canonical market dataset is stale after refresh: "
+            f"expected={expected_trade_date} actual={dataset_trade_date}"
+        )
 
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_policy": "tushare_only_daily",
         "start_date": start_date,
+        "requested_end_date": requested_end_date,
         "end_date": end_date,
+        "end_date_adjusted_before_market_ready": end_date_adjusted,
+        "market_data_ready_time": os.getenv(
+            "ROUTINE_MARKET_DATA_READY_TIME",
+            DEFAULT_MARKET_DATA_READY_TIME,
+        ),
+        "expected_trade_date": expected_trade_date,
+        "dataset_trade_date": dataset_trade_date,
+        "freshness_error": freshness_error,
         "board": board,
         "adjust": adjust,
+        "refresh_mode": refresh_mode,
+        "market_daily_requests": market_daily_requests,
+        "batch_storage": batch_storage,
+        "batch_fallback_reason": batch_fallback_reason,
         "output_dir": str(output_dir),
         "storage_backend": os.getenv("MARKET_DATA_BACKEND", "mysql"),
         "market_data_sql_url_configured": bool(os.getenv("MARKET_DATA_SQL_URL")),
@@ -550,10 +960,16 @@ def refresh_daily_data(
         "success": int((audit_df["status"] != "failed").sum()),
         "failed": int((audit_df["status"] == "failed").sum()),
         "suspended_no_data": int((audit_df["status"] == SUSPENDED_STATUS).sum()),
-        "retried_symbols": int((audit_df["attempts"] > 1).sum()),
+        "retried_symbols": int(((audit_df["attempts"] > 1) & (audit_df["status"] != "failed")).sum()),
     }
+    manifest["status"] = (
+        "success"
+        if manifest["failed"] == 0 and freshness_error is None
+        else "failed"
+    )
     manifest_path = audit_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(manifest, manifest_path)
+    manifest["manifest_path"] = str(manifest_path)
     return manifest
 
 
@@ -562,7 +978,12 @@ def main() -> None:
     parser.add_argument("--start", default="20100101", help="Start date YYYYMMDD")
     parser.add_argument("--end", default=None, help="End date YYYYMMDD; default today")
     parser.add_argument("--board", default="all", choices=["all", "main", "gem"], help="Stock universe")
-    parser.add_argument("--adjust", default="qfq", choices=["qfq", "hfq", "none"], help="Adjustment type")
+    parser.add_argument(
+        "--adjust",
+        default="none",
+        choices=["qfq", "hfq", "none"],
+        help="Adjustment type; raw storage is the safe default for incremental refreshes",
+    )
     parser.add_argument("--output-dir", type=Path, default=DAILY_DIR, help="Daily parquet output directory")
     parser.add_argument("--workers", type=int, default=2, help="Concurrent workers; keep low to leave provider rate-limit buffer")
     parser.add_argument("--limit", type=int, default=None, help="Optional symbol limit for smoke tests")
@@ -597,6 +1018,11 @@ def main() -> None:
         final_retry_sleep=args.final_retry_sleep,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    # A completed Python process is not the same thing as a complete market
+    # refresh.  Propagate row-level failures to orchestrators so stale
+    # downstream features cannot be published as a successful daily run.
+    if result.get("status") != "success":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

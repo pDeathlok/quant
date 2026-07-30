@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -41,7 +40,10 @@ from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exi
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from analyze_z_skill_entry_exit_backtest import OpenFilter, apply_open_filter, build_open_filters
 from quant.data.source_merge import normalize_tushare_daily
-from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc, calculate_project_extra_features
+from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
+from quant.data.atomic_io import atomic_link_or_copy
+from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
+from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
 
@@ -264,7 +266,7 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
     try:
         if signal_rows.empty:
             return None
-        daily = pd.read_parquet(path)
+        daily = read_partitioned_symbol_file(path)
         daily = normalize_tushare_daily(daily, path.stem)
         daily = daily.sort_values("date").reset_index(drop=True)
         history_start = pd.Timestamp(start_date) - pd.Timedelta(days=450)
@@ -275,7 +277,9 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
         if "ST" in name.upper() or "退" in name:
             return None
 
-        factors = pd.concat([btd.calculate_factors_single_stock(daily), calculate_project_extra_features(daily)], axis=1)
+        shared = attach_daily_base_factors(daily, symbol=path.stem, compute_if_missing=True)
+        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
+        factors = pd.concat([btd.calculate_factors_single_stock(daily), shared[shared_cols]], axis=1)
         factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
         labels = create_b1_labels(daily, forward_days=5, exit_aware=True, use_new_labels=True)
         price = build_continuous_ohlc(daily)
@@ -330,8 +334,11 @@ def build_model_dataset(
 
     signal_df = _load_signal_cache(signals, start_date)
     by_symbol = {symbol: group[["symbol", "date", *signals]].copy() for symbol, group in signal_df.groupby("symbol")}
-    suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
-    files = [path for path in sorted(daily_dir.glob("*.parquet")) if path.name.endswith(suffixes) and path.stem in by_symbol]
+    files = [
+        path
+        for path in list_partitioned_symbol_paths(daily_dir)
+        if path.stem in by_symbol
+    ]
     frames: list[pd.DataFrame] = []
     started = perf_counter()
     executor_cls = ProcessPoolExecutor if executor_type == "processes" else ThreadPoolExecutor
@@ -817,7 +824,7 @@ def main() -> None:
         model_report_path = args.output_dir / f"z_skill_model_training_report_{timestamp}.csv"
         latest_model_report = args.output_dir / "latest_z_skill_model_training_report.csv"
         model_report.to_csv(model_report_path, index=False)
-        model_report.to_csv(latest_model_report, index=False)
+        atomic_link_or_copy(model_report_path, latest_model_report)
 
     print("adding model predictions", flush=True)
     predicted = add_predictions(data, models, signals)
@@ -836,17 +843,19 @@ def main() -> None:
     detail_path = args.output_dir / f"z_skill_model_trade_samples_{timestamp}.csv"
     latest_detail = args.output_dir / "latest_z_skill_model_trade_samples.csv"
     summary.to_csv(summary_path, index=False)
-    summary.to_csv(latest_summary, index=False)
+    atomic_link_or_copy(summary_path, latest_summary)
     playbooks.to_csv(playbook_path, index=False)
-    playbooks.to_csv(latest_playbook, index=False)
+    atomic_link_or_copy(playbook_path, latest_playbook)
     latest_scored = write_latest_scored_candidates(predicted, signals, playbooks, args.output_dir)
     if not details.empty:
         details.to_csv(detail_path, index=False)
-        details.to_csv(latest_detail, index=False)
+        atomic_link_or_copy(detail_path, latest_detail)
+    else:
+        latest_detail.unlink(missing_ok=True)
 
     report_path = write_report(model_report, summary, playbooks, args.output_dir, timestamp)
     latest_report = args.output_dir / "latest_z_skill_model_entry_exit_backtest.md"
-    shutil.copyfile(report_path, latest_report)
+    atomic_link_or_copy(report_path, latest_report)
     metadata = {
         "timestamp": timestamp,
         "signals": signals,

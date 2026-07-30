@@ -7,6 +7,9 @@ feature calculators from here instead of copying strategy-local helpers.
 
 from __future__ import annotations
 
+import re
+from time import perf_counter
+
 import numpy as np
 import pandas as pd
 
@@ -189,18 +192,28 @@ def build_continuous_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     if len(sorted_frame) < 2:
         return out
 
-    factor = pd.Series(1.0, index=sorted_frame.index, dtype=float)
-    close = pd.to_numeric(sorted_frame["close"], errors="coerce")
-    pre_close = pd.to_numeric(sorted_frame["pre_close"], errors="coerce")
-    for pos in range(len(sorted_frame) - 1, 0, -1):
-        idx = sorted_frame.index[pos]
-        prev_idx = sorted_frame.index[pos - 1]
-        prev_close = close.loc[prev_idx]
-        current_pre_close = pre_close.loc[idx]
-        ratio = current_pre_close / prev_close if pd.notna(current_pre_close) and pd.notna(prev_close) and prev_close else 1.0
-        if not np.isfinite(ratio) or ratio <= 0:
-            ratio = 1.0
-        factor.loc[prev_idx] = factor.loc[idx] * ratio
+    close = pd.to_numeric(
+        sorted_frame["close"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    pre_close = pd.to_numeric(
+        sorted_frame["pre_close"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ratios = pre_close[1:] / close[:-1]
+    ratios = np.where(
+        np.isfinite(ratios) & (ratios > 0),
+        ratios,
+        1.0,
+    )
+    factor_values = np.ones(len(sorted_frame), dtype=float)
+    factor_values[:-1] = np.cumprod(ratios[::-1])[::-1]
+    factor = pd.Series(
+        factor_values,
+        index=sorted_frame.index,
+        dtype=float,
+    )
 
     for col in ["open", "high", "low", "close"]:
         out[col] = pd.to_numeric(out[col], errors="coerce") * factor.reindex(out.index).fillna(1.0)
@@ -485,15 +498,138 @@ def calculate_project_extra_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_daily_basic_features(daily_basic_dir) -> pd.DataFrame:
-    """Load and derive project variables from Tushare daily_basic parquet files."""
+_DAILY_BASIC_DATE_PATTERN = re.compile(r"(?:^|_)(\d{8})$")
+_DAILY_BASIC_ROLLING_LOOKBACK = 20
+_DAILY_BASIC_INITIAL_HISTORY_FILES = 32
+
+
+def _daily_basic_file_date(path) -> pd.Timestamp | None:
+    match = _DAILY_BASIC_DATE_PATTERN.search(path.stem)
+    if match is None:
+        return None
+    return pd.to_datetime(match.group(1), format="%Y%m%d", errors="coerce")
+
+
+def _read_daily_basic_file(path) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(path, columns=DAILY_BASIC_SOURCE_COLUMNS)
+    except Exception:
+        # Preserve compatibility with older cache files whose schemas may not
+        # contain every current source column.
+        return pd.read_parquet(path)
+
+
+def _bounded_daily_basic_frames(
+    files,
+    *,
+    target_keys: pd.DataFrame,
+    history_rows: int,
+) -> tuple[list[pd.DataFrame], int]:
+    """Read the smallest exact history needed for target symbol/date keys.
+
+    Rolling daily_basic variables need at most ``history_rows`` prior symbol
+    observations. Files are therefore read backwards until every symbol that
+    is present on a target date has enough history. This remains exact for
+    suspended stocks because a sparse symbol automatically expands the window.
+    """
+
+    keys = target_keys[["ts_code", "trade_date"]].dropna().drop_duplicates().copy()
+    if keys.empty:
+        return [], 0
+    keys["ts_code"] = keys["ts_code"].astype(str)
+    keys["trade_date"] = keys["trade_date"].astype(str)
+    target_symbols = set(keys["ts_code"])
+    target_dates = set(keys["trade_date"])
+    start = pd.to_datetime(keys["trade_date"].min(), format="%Y%m%d", errors="coerce")
+    end = pd.to_datetime(keys["trade_date"].max(), format="%Y%m%d", errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return [_read_daily_basic_file(path) for path in files], len(files)
+
+    dated_files = [(path, _daily_basic_file_date(path)) for path in files]
+    known = [(path, file_date) for path, file_date in dated_files if pd.notna(file_date)]
+    unknown = [path for path, file_date in dated_files if pd.isna(file_date)]
+    if not known or unknown:
+        # An unparseable filename may contain any date range. Falling back is
+        # slower but preserves the historical loader's correctness contract.
+        return [_read_daily_basic_file(path) for path in files], len(files)
+
+    known.sort(key=lambda item: item[1])
+    in_range = [(path, file_date) for path, file_date in known if start <= file_date <= end]
+    before = [(path, file_date) for path, file_date in known if file_date < start]
+
+    frames: list[pd.DataFrame] = []
+    files_read = 0
+
+    def read_selected(selected) -> None:
+        nonlocal files_read
+        for path, _ in selected:
+            frame = _read_daily_basic_file(path)
+            files_read += 1
+            if "ts_code" in frame.columns:
+                frame = frame[frame["ts_code"].astype(str).isin(target_symbols)]
+            if not frame.empty:
+                frames.append(frame)
+
+    read_selected(in_range)
+
+    target_present: set[str] = set()
+    if frames:
+        current = pd.concat(frames, ignore_index=True, sort=False)
+        if {"ts_code", "trade_date"} <= set(current.columns):
+            current_keys = current["trade_date"].astype(str).isin(target_dates)
+            target_present = set(current.loc[current_keys, "ts_code"].astype(str))
+    if not target_present:
+        return frames, files_read
+
+    remaining = list(reversed(before))
+    history_counts = {symbol: 0 for symbol in target_present}
+    batch_size = max(history_rows, _DAILY_BASIC_INITIAL_HISTORY_FILES)
+    while remaining and any(count < history_rows for count in history_counts.values()):
+        batch = remaining[:batch_size]
+        remaining = remaining[batch_size:]
+        previous_len = len(frames)
+        read_selected(batch)
+        for frame in frames[previous_len:]:
+            if "ts_code" not in frame.columns:
+                continue
+            counts = frame["ts_code"].astype(str).value_counts()
+            for symbol in history_counts:
+                history_counts[symbol] += int(counts.get(symbol, 0))
+
+    return frames, files_read
+
+
+def load_daily_basic_features(
+    daily_basic_dir,
+    *,
+    target_keys: pd.DataFrame | None = None,
+    history_rows: int = _DAILY_BASIC_ROLLING_LOOKBACK,
+) -> pd.DataFrame:
+    """Load and derive project variables from Tushare daily_basic parquet files.
+
+    ``target_keys`` enables an exact incremental path: only requested symbols,
+    dates, and the prior observations needed by rolling variables are loaded.
+    Omitting it preserves the historical full-load behavior used by research
+    and model-training jobs.
+    """
+
     files = sorted(daily_basic_dir.glob("*.parquet"))
     if not files:
         return pd.DataFrame()
 
+    started = perf_counter()
+    if target_keys is None:
+        source_frames = [_read_daily_basic_file(path) for path in files]
+        files_read = len(files)
+    else:
+        source_frames, files_read = _bounded_daily_basic_frames(
+            files,
+            target_keys=target_keys,
+            history_rows=history_rows,
+        )
+
     frames = []
-    for path in files:
-        df = pd.read_parquet(path)
+    for df in source_frames:
         present = [col for col in DAILY_BASIC_SOURCE_COLUMNS if col in df.columns]
         if {"ts_code", "trade_date"} <= set(present):
             frames.append(df[present].copy())
@@ -535,16 +671,22 @@ def load_daily_basic_features(daily_basic_dir) -> pd.DataFrame:
     for source_col, out_col in [("pe_ttm", "pe_ttm_inv"), ("pb", "pb_inv"), ("ps_ttm", "ps_ttm_inv")]:
         if source_col in out.columns:
             out[out_col] = 1 / out[source_col].replace(0, np.nan)
-    return out.replace([np.inf, -np.inf], np.nan)
+    result = out.replace([np.inf, -np.inf], np.nan)
+    print(
+        "loaded daily_basic features: "
+        f"files={files_read}/{len(files)} rows={len(result)} elapsed={perf_counter() - started:.1f}s",
+        flush=True,
+    )
+    return result
 
 
-def merge_daily_basic_features(data: pd.DataFrame, daily_basic_dir) -> pd.DataFrame:
+def merge_daily_basic_features(
+    data: pd.DataFrame,
+    daily_basic_dir,
+    *,
+    min_match_rate: float | None = None,
+) -> pd.DataFrame:
     """Merge project daily_basic variables onto a daily feature frame."""
-    daily_basic = load_daily_basic_features(daily_basic_dir)
-    if daily_basic.empty:
-        print(f"daily_basic not found under {daily_basic_dir}; using daily-only variables", flush=True)
-        return data
-
     out = data.copy()
     if "trade_date" not in out.columns and "date" in out.columns:
         out["trade_date"] = pd.to_datetime(out["date"]).dt.strftime("%Y%m%d")
@@ -552,6 +694,21 @@ def merge_daily_basic_features(data: pd.DataFrame, daily_basic_dir) -> pd.DataFr
         out["trade_date"] = out["trade_date"].astype(str)
     if "ts_code" not in out.columns and "symbol" in out.columns:
         out["ts_code"] = out["symbol"].astype(str)
+
+    target_keys = (
+        out[["ts_code", "trade_date"]]
+        if {"ts_code", "trade_date"} <= set(out.columns)
+        else None
+    )
+    daily_basic = load_daily_basic_features(daily_basic_dir, target_keys=target_keys)
+    if daily_basic.empty:
+        print(f"daily_basic not found under {daily_basic_dir}; using daily-only variables", flush=True)
+        if min_match_rate is not None and len(out):
+            raise RuntimeError(
+                "daily_basic feature coverage below required threshold: "
+                f"matched=0.00% required={min_match_rate:.2%}"
+            )
+        return data
 
     existing_daily_basic_cols = [
         col for col in daily_basic.columns
@@ -563,4 +720,9 @@ def merge_daily_basic_features(data: pd.DataFrame, daily_basic_dir) -> pd.DataFr
     merged = out.merge(daily_basic, on=["ts_code", "trade_date"], how="left")
     matched = merged["turnover_rate"].notna().mean() if "turnover_rate" in merged.columns else 0.0
     print(f"merged daily_basic features: rows={len(daily_basic)} matched_rate={matched:.2%}", flush=True)
+    if min_match_rate is not None and len(merged) and matched < min_match_rate:
+        raise RuntimeError(
+            "daily_basic feature coverage below required threshold: "
+            f"matched={matched:.2%} required={min_match_rate:.2%}"
+        )
     return merged.replace([np.inf, -np.inf], np.nan)

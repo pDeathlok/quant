@@ -1,8 +1,8 @@
-"""BYD single-stock minute-level T strategy.
+"""BYD single-stock inventory-aware T strategy.
 
-This module is built for a high-inventory holder of 002594.SZ. It is not a
-general stock selector. The main objective is to reduce inventory first, then
-switch gradually from reverse T to positive T when shares are lower.
+This module is built for a personal 002594.SZ holding. It is not a general
+stock selector. The objective is to keep the closing inventory inside a
+reasonable band while using a validation-gated positive T to reduce cost.
 """
 
 from __future__ import annotations
@@ -23,32 +23,107 @@ LOT_SIZE = 100
 
 @dataclass(frozen=True)
 class BydHolding:
-    shares: int = 10500
+    shares: int = 10000
     cost: float = 110.6061
-    full_shares: int = 10500
+    full_shares: int = 10000
 
 
 @dataclass(frozen=True)
 class BydMinuteConfig:
-    core_shares: int = 6000
-    positive_t_threshold: int = 6000
-    transition_threshold: int = 7500
-    overload_threshold: int = 9000
-    first_goal_shares: int = 8500
-    second_goal_shares: int = 7500
-    final_goal_shares: int = 6000
-    max_buyback_shares_high_inventory: int = 0
-    max_buyback_shares_transition: int = 300
+    risk_floor_shares: int = 6000
+    reasonable_min_shares: int = 8000
+    preferred_shares: int = 9000
+    max_intraday_extra_shares: int = 2000
     max_positive_t_buy_shares: int = 500
+    max_positive_t_open_shares: int = 1500
     micro_sell_1: float = 0.008
     micro_sell_2: float = 0.015
     micro_sell_3: float = 0.022
     micro_buyback_discount: float = 0.008
-    max_daily_reverse_t_shares: int = 2500
+    positive_t_entry_deviation: float = 0.008
+    positive_t_previous_close_deviation: float = 0.004
+    positive_t_stack_gap: float = 0.008
+    positive_t_profit_target: float = 0.004
+    positive_t_stop_loss: float = 0.020
+    positive_t_max_holding_sessions: int = 3
+
+
+BYD_T_VALIDATION: dict[str, Any] = {
+    "status": "passed_limited",
+    "execution_enabled": True,
+    "allowed_new_entry_kinds": ["positive_t"],
+    "label": "严格横盘正T通过；反T仍暂停",
+    "asof": "2026-07-17",
+    "bars": 76032,
+    "sessions": 1584,
+    "period": "2020-01-02 至 2026-07-17",
+    "requirements": {
+        "minimum_cycles_per_selection_segment": 12,
+        "minimum_win_rate": 0.55,
+        "minimum_profit_factor": 1.20,
+        "positive_net_pnl": True,
+        "t1_violations": 0,
+    },
+    "held_out_results": [
+        {
+            "name": "训练：横盘正T",
+            "period": "2020-2023（强趋势期无开仓）",
+            "cycles": 15,
+            "win_rate": 0.9333,
+            "profit_factor": 3.0372,
+            "net_pnl": 1758.61,
+        },
+        {
+            "name": "验证：横盘正T",
+            "period": "2024-2025",
+            "cycles": 12,
+            "win_rate": 0.8333,
+            "profit_factor": 1.3500,
+            "net_pnl": 871.40,
+        },
+        {
+            "name": "样本外：横盘正T",
+            "period": "2026-01-05 至 2026-07-17",
+            "cycles": 2,
+            "win_rate": 1.0,
+            "profit_factor": None,
+            "net_pnl": 296.84,
+        },
+    ],
+    "selected_rule": {
+        "direction": "只做正T",
+        "lot_shares": 500,
+        "entry": "横盘且60日收益≤0；位于60日区间下半部；低于VWAP 0.8%并出现5分钟反转",
+        "tail_entry": "14:35后需低于VWAP 1.1%",
+        "target": "买入均价上方0.4%",
+        "stop": "买入均价下方2.0%",
+        "maximum_holding_sessions": 3,
+    },
+    "decision": (
+        "只启用低频的严格横盘正T；反T因少数大亏会吞噬多数小盈利，继续暂停。"
+        "2026样本外只有2次，仍属小样本，必须保留500股分档、止损和滚动复核。"
+    ),
+}
 
 
 def round_lot(shares: float) -> int:
     return max(int(shares // LOT_SIZE) * LOT_SIZE, 0)
+
+
+def capped_sell_delta(requested_shares: int, current_shares: int, floor_shares: int) -> int:
+    """Return a board-lot sell delta without crossing the inventory floor."""
+    capacity = round_lot(max(current_shares - floor_shares, 0))
+    return -min(round_lot(abs(requested_shares)), capacity)
+
+
+def weighted_price(parts: list[tuple[int, float | None]]) -> float | None:
+    """Return the board-lot weighted average for valid quantity/price pairs."""
+    valid = [(round_lot(shares), float(price)) for shares, price in parts if shares and price]
+    valid = [(shares, price) for shares, price in valid if shares > 0 and price > 0]
+    total_shares = sum(shares for shares, _ in valid)
+    if total_shares <= 0:
+        return None
+    return sum(shares * price for shares, price in valid) / total_shares
 
 
 def latest_qfq_cache(cache_dir: Path) -> Path:
@@ -99,12 +174,12 @@ def normalize_minutes(df: pd.DataFrame) -> pd.DataFrame:
 
 def daily_range_levels(daily: pd.DataFrame) -> dict[str, Any]:
     latest = daily.iloc[-1]
-    hist = daily.tail(80).copy()
-    range_low = float(hist["low"].shift(1).tail(60).min())
-    range_high = float(hist["high"].shift(1).tail(60).max())
-    low_20 = float(hist["low"].shift(1).tail(20).min())
-    high_20 = float(hist["high"].shift(1).tail(20).max())
-    close_120 = hist["close"].shift(1).tail(120).dropna()
+    hist = daily.tail(121).copy()
+    range_low = float(hist["low"].tail(60).min())
+    range_high = float(hist["high"].tail(60).max())
+    low_20 = float(hist["low"].tail(20).min())
+    high_20 = float(hist["high"].tail(20).max())
+    close_120 = hist["close"].tail(120).dropna()
     q20 = float(close_120.quantile(0.20)) if not close_120.empty else range_low
     q50 = float(close_120.quantile(0.50)) if not close_120.empty else (range_low + range_high) / 2
     q80 = float(close_120.quantile(0.80)) if not close_120.empty else range_high
@@ -140,6 +215,58 @@ def daily_atr(daily: pd.DataFrame, window: int = 14) -> float:
     return float(value) if pd.notna(value) and np.isfinite(float(value)) else 0.0
 
 
+def daily_sideways_snapshot(daily: pd.DataFrame) -> dict[str, Any]:
+    """Classify the next-session regime from completed daily bars only."""
+    if len(daily) < 61:
+        return {
+            "available": False,
+            "sideways": False,
+            "positive_t_allowed": False,
+            "reason": "日线不足61个交易日，无法计算横盘闸门。",
+        }
+    close = daily["close"].astype(float)
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    return_60 = float(close.iloc[-1] / close.iloc[-61] - 1)
+    ma20_slope_5 = float(ma20.iloc[-1] / ma20.iloc[-6] - 1)
+    ma_gap = float(ma20.iloc[-1] / ma60.iloc[-1] - 1)
+    high_60 = float(daily["high"].astype(float).tail(60).max())
+    low_60 = float(daily["low"].astype(float).tail(60).min())
+    range_width_60 = high_60 / low_60 - 1 if low_60 else np.nan
+    atr_pct = daily_atr(daily) / float(close.iloc[-1]) if close.iloc[-1] else np.nan
+    checks = {
+        "abs_return_60_le_12pct": abs(return_60) <= 0.12,
+        "abs_ma20_slope_5_le_2_5pct": abs(ma20_slope_5) <= 0.025,
+        "abs_ma20_ma60_gap_le_8pct": abs(ma_gap) <= 0.08,
+        "range_width_60_between_8_35pct": 0.08 <= range_width_60 <= 0.35,
+        "atr_pct_between_1_6pct": 0.01 <= atr_pct <= 0.06,
+    }
+    sideways = all(checks.values())
+    positive_allowed = sideways and return_60 <= 0
+    if positive_allowed:
+        reason = "横盘闸门通过且60日收益不为正，可以等待严格正T低吸信号。"
+    elif not sideways:
+        failed = [name for name, passed in checks.items() if not passed]
+        reason = f"横盘闸门未通过：{', '.join(failed)}。"
+    else:
+        reason = "虽处横盘范围，但60日收益仍为正；历史验证显示此时正T尾部风险较高。"
+    return {
+        "available": True,
+        "asof": pd.to_datetime(daily.iloc[-1]["date"]).strftime("%Y-%m-%d"),
+        "sideways": sideways,
+        "positive_t_allowed": positive_allowed,
+        "reason": reason,
+        "checks": checks,
+        "return_60_pct": round(return_60 * 100, 3),
+        "ma20_slope_5_pct": round(ma20_slope_5 * 100, 3),
+        "ma20_ma60_gap_pct": round(ma_gap * 100, 3),
+        "range_width_60_pct": round(range_width_60 * 100, 3),
+        "atr14_pct": round(atr_pct * 100, 3),
+        "range_low": round(low_60, 3),
+        "range_high": round(high_60, 3),
+    }
+
+
 def price_band(low: float, high: float) -> dict[str, Any]:
     lo = min(float(low), float(high))
     hi = max(float(low), float(high))
@@ -150,7 +277,12 @@ def price_band(low: float, high: float) -> dict[str, Any]:
     }
 
 
-def planned_t_ranges(daily: pd.DataFrame, levels: dict[str, Any], holding: BydHolding) -> dict[str, Any]:
+def planned_t_ranges(
+    daily: pd.DataFrame,
+    levels: dict[str, Any],
+    holding: BydHolding,
+    config: BydMinuteConfig = BydMinuteConfig(),
+) -> dict[str, Any]:
     close = float(levels["daily_close"])
     prev_close = float(levels["prev_close"])
     atr = daily_atr(daily)
@@ -167,27 +299,32 @@ def planned_t_ranges(daily: pd.DataFrame, levels: dict[str, Any], holding: BydHo
     sell_2_high = max(sell_2_low * 1.003, close + atr * 0.70)
     sell_3_low = max(close + atr * 0.78, sell_2_high * 1.002, q20 * 0.998)
     sell_3_high = min(max(sell_3_low * 1.003, close + atr * 1.05), q50)
+    sell_requests = (500, 800, 1200) if holding.shares >= config.preferred_shares else (300, 500, 800)
+    sell_deltas = [
+        capped_sell_delta(requested, holding.shares, config.reasonable_min_shares)
+        for requested in sell_requests
+    ]
     sell_zones = [
         {
             "key": "PLAN_SELL_1",
-            "label": "高确定性反T一档",
+            "label": "反T观察一档",
             "range": price_band(sell_1_low, sell_1_high),
-            "shares": -500 if holding.shares >= 9000 else -300,
-            "condition": "反弹修复到前收盘附近或半个ATR以内，先卖一笔建立T仓。",
+            "shares": sell_deltas[0],
+            "condition": "反弹修复到前收盘附近或半个ATR以内，先卖一笔建立反T仓，但不跌破合理库存下限。",
         },
         {
             "key": "PLAN_SELL_2",
-            "label": "高确定性反T二档",
+            "label": "反T观察二档",
             "range": price_band(sell_2_low, sell_2_high),
-            "shares": -800 if holding.shares >= 9000 else -500,
-            "condition": "反弹扩大到约0.5-0.7个ATR，优先降低满仓压力。",
+            "shares": sell_deltas[1],
+            "condition": "反弹扩大到约0.5-0.7个ATR，分批高抛并等待低价买回。",
         },
         {
             "key": "PLAN_SELL_3",
             "label": "强反抽减仓档",
             "range": price_band(sell_3_low, sell_3_high),
-            "shares": -1200 if holding.shares >= 9000 else -800,
-            "condition": "接近120日低位分位或1个ATR反抽，作为日内/隔日强减仓区。",
+            "shares": sell_deltas[2],
+            "condition": "接近120日低位分位或1个ATR反抽，作为较强反T区，不机械永久降仓。",
         },
     ]
     buyback_zones = []
@@ -212,7 +349,10 @@ def planned_t_ranges(daily: pd.DataFrame, levels: dict[str, Any], holding: BydHo
         "prev_close": round(prev_close, 2),
         "atr14": round(atr, 2),
         "atr14_pct": round(atr_pct, 2) if atr_pct is not None else None,
-        "stage_note": "满仓阶段只做反T减仓，不新增底仓；买回只针对已卖出的T仓。",
+        "stage_note": (
+            f"合理收盘仓位 {config.reasonable_min_shares}-{holding.full_shares} 股；"
+            f"盘中正T最多临时到 {holding.full_shares + config.max_intraday_extra_shares} 股。"
+        ),
         "no_sell_zone": {
             "label": "低位不追卖区",
             "range": price_band(low_guard, min(sell_1_low * 0.995, close + atr * 0.18)),
@@ -542,37 +682,167 @@ def timeframe_indicator_snapshot(minutes: pd.DataFrame) -> dict[str, Any]:
     return result
 
 
-def holding_stage(shares: int, config: BydMinuteConfig) -> dict[str, Any]:
-    if shares >= config.overload_threshold:
+def validated_positive_t_snapshot(
+    minutes: pd.DataFrame,
+    levels: dict[str, Any],
+    regime: dict[str, Any],
+    config: BydMinuteConfig,
+) -> dict[str, Any]:
+    """Evaluate the live leg of the historically selected positive-T rule."""
+    previous_close = float(levels["daily_close"])
+    planned_line = previous_close * (1 - config.positive_t_entry_deviation)
+    if minutes.empty:
         return {
-            "key": "OVERLOADED_REVERSE_T",
-            "label": "超载仓：反T降仓",
-            "goal_shares": config.first_goal_shares,
-            "mode": "先卖后买，买回从严",
-            "buyback_cap": config.max_buyback_shares_high_inventory,
+            "available": False,
+            "signal": False,
+            "price_line": round(planned_line, 3),
+            "reason": "等待盘中5分钟数据验证VWAP偏离、RSI和止跌反转。",
         }
-    if shares >= config.transition_threshold:
+    bars = resample_minute_bars(minutes, "5min")
+    if bars.empty:
         return {
-            "key": "REDUCE_REVERSE_T",
-            "label": "高仓：反T为主",
-            "goal_shares": config.second_goal_shares,
-            "mode": "反弹减仓，深回落少量买回",
-            "buyback_cap": config.max_buyback_shares_transition,
+            "available": False,
+            "signal": False,
+            "price_line": round(planned_line, 3),
+            "reason": "5分钟数据不足。",
         }
-    if shares >= config.positive_t_threshold:
+    latest_date = pd.to_datetime(bars["trade_time"]).dt.normalize().iloc[-1]
+    bars = bars[pd.to_datetime(bars["trade_time"]).dt.normalize().eq(latest_date)].copy()
+    if len(bars) < 6:
         return {
-            "key": "TRANSITION",
-            "label": "过渡仓：反T转正T",
-            "goal_shares": config.final_goal_shares,
-            "mode": "高抛低吸均可，但不增总仓",
-            "buyback_cap": config.max_buyback_shares_transition,
+            "available": False,
+            "signal": False,
+            "price_line": round(planned_line, 3),
+            "reason": "至少需要6根5分钟K线计算反转确认。",
+        }
+    volume = bars.get("volume", pd.Series(1.0, index=bars.index)).astype(float).clip(lower=0)
+    typical = (bars["high"] + bars["low"] + bars["close"]) / 3
+    total_volume = float(volume.sum())
+    vwap = float((typical * volume).sum() / total_volume) if total_volume else float(bars.iloc[-1]["close"])
+    latest = bars.iloc[-1]
+    current_price = float(latest["close"])
+    current_minute = pd.to_datetime(latest["trade_time"]).hour * 60 + pd.to_datetime(
+        latest["trade_time"]
+    ).minute
+    required_deviation = config.positive_t_entry_deviation
+    if current_minute >= 14 * 60 + 35:
+        required_deviation += 0.003
+    prior_close_line = previous_close * (1 - config.positive_t_previous_close_deviation)
+    vwap_line = vwap * (1 - required_deviation)
+    range_low = float(regime.get("range_low") or levels["range_low"])
+    range_high = float(regime.get("range_high") or levels["range_high"])
+    range_position = (
+        (current_price - range_low) / (range_high - range_low)
+        if range_high > range_low
+        else np.nan
+    )
+    closes = pd.concat(
+        [pd.Series([previous_close]), bars["close"].astype(float).reset_index(drop=True)],
+        ignore_index=True,
+    )
+    delta = closes.diff().dropna().tail(6)
+    average_gain = float(delta.clip(lower=0).mean())
+    average_loss = float((-delta.clip(upper=0)).mean())
+    if average_loss == 0:
+        rsi6 = 100.0 if average_gain > 0 else 50.0
+    else:
+        rs = average_gain / average_loss
+        rsi6 = 100 - 100 / (1 + rs)
+    previous_bar_close = float(bars.iloc[-2]["close"])
+    midpoint = (float(latest["high"]) + float(latest["low"])) / 2
+    turn_up = current_price > previous_bar_close and current_price >= midpoint
+    time_allowed = 9 * 60 + 45 <= current_minute <= 14 * 60 + 50
+    checks = {
+        "daily_regime": bool(regime.get("positive_t_allowed")),
+        "time_window": time_allowed,
+        "below_vwap": current_price <= vwap_line,
+        "below_previous_close": current_price <= prior_close_line,
+        "range_lower_half": np.isfinite(range_position) and -0.03 <= range_position <= 0.50,
+        "rsi6_le_40": rsi6 <= 40,
+        "turn_up": turn_up,
+    }
+    signal = all(checks.values())
+    failed = [name for name, passed in checks.items() if not passed]
+    return {
+        "available": True,
+        "signal": signal,
+        "reason": "严格横盘正T信号通过。" if signal else f"等待条件：{', '.join(failed)}。",
+        "checks": checks,
+        "asof": pd.to_datetime(latest["trade_time"]).strftime("%Y-%m-%d %H:%M"),
+        "price": round(current_price, 3),
+        "price_line": round(min(vwap_line, prior_close_line), 3),
+        "vwap": round(vwap, 3),
+        "vwap_deviation_pct": round((current_price / vwap - 1) * 100, 3),
+        "previous_close_deviation_pct": round(
+            (current_price / previous_close - 1) * 100, 3
+        ),
+        "range_position_pct": round(range_position * 100, 2)
+        if np.isfinite(range_position)
+        else None,
+        "rsi6": round(rsi6, 2),
+        "required_vwap_deviation_pct": round(required_deviation * 100, 2),
+    }
+
+
+def holding_stage(
+    shares: int,
+    config: BydMinuteConfig,
+    full_shares: int = 10000,
+) -> dict[str, Any]:
+    intraday_limit = full_shares + config.max_intraday_extra_shares
+    common = {
+        "closing_min_shares": config.reasonable_min_shares,
+        "closing_max_shares": full_shares,
+        "intraday_limit_shares": intraday_limit,
+        "intraday_excess_shares": round_lot(max(shares - full_shares, 0)),
+    }
+    if shares > full_shares:
+        return {
+            **common,
+            "key": "INTRADAY_OVERWEIGHT",
+            "label": "日内超仓：等待正T卖出",
+            "goal_shares": full_shares,
+            "mode": "只允许已记录正T仓按0.8%间距再加一档；否则等待盈利卖出",
+            "positive_t_buy_cap": 0,
+            "reverse_t_sell_cap": round_lot(max(shares - config.reasonable_min_shares, 0)),
+        }
+    if shares >= config.preferred_shares:
+        return {
+            **common,
+            "key": "FULL_T",
+            "label": "充足仓：等待严格正T",
+            "goal_shares": shares,
+            "mode": "仅横盘正T通过验证；反T继续暂停",
+            "positive_t_buy_cap": min(
+                config.max_positive_t_buy_shares,
+                round_lot(max(intraday_limit - shares, 0)),
+            ),
+            "reverse_t_sell_cap": round_lot(max(shares - config.reasonable_min_shares, 0)),
+        }
+    if shares >= config.reasonable_min_shares:
+        return {
+            **common,
+            "key": "BALANCED_T",
+            "label": "合理仓：成本优先",
+            "goal_shares": shares,
+            "mode": "保持合理库存；低于满仓时不把补仓伪装成已验证正T",
+            "positive_t_buy_cap": min(
+                config.max_positive_t_buy_shares,
+                round_lot(max(intraday_limit - shares, 0)),
+            ),
+            "reverse_t_sell_cap": round_lot(max(shares - config.reasonable_min_shares, 0)),
         }
     return {
-        "key": "POSITIVE_T",
-        "label": "可控仓：正T为主",
-        "goal_shares": max(config.core_shares, min(shares, config.final_goal_shares)),
-        "mode": "低吸后高抛，保留核心仓",
-        "buyback_cap": config.max_positive_t_buy_shares,
+        **common,
+        "key": "UNDERWEIGHT",
+        "label": "低于合理仓：优先恢复库存",
+        "goal_shares": config.reasonable_min_shares,
+        "mode": "停止常规高抛，只在低位分批恢复到合理仓位",
+        "positive_t_buy_cap": min(
+            config.max_positive_t_buy_shares,
+            round_lot(max(config.reasonable_min_shares - shares, 0)),
+        ),
+        "reverse_t_sell_cap": 0,
     }
 
 
@@ -584,17 +854,25 @@ def build_alerts(
     indicators: dict[str, Any] | None = None,
     dynamic_zones: dict[str, Any] | None = None,
     plan: dict[str, Any] | None = None,
+    regime: dict[str, Any] | None = None,
+    validated_positive: dict[str, Any] | None = None,
     sold_today_shares: int = 0,
     sold_today_price: float | None = None,
+    bought_today_shares: int = 0,
+    bought_today_price: float | None = None,
     open_t_shares: int = 0,
     open_t_price: float | None = None,
+    open_positive_shares: int = 0,
+    open_positive_price: float | None = None,
 ) -> list[dict[str, Any]]:
     price = float(snap["last"])
     shares = holding.shares
-    stage = holding_stage(shares, config)
+    stage = holding_stage(shares, config, holding.full_shares)
     alerts: list[dict[str, Any]] = []
 
     def add(kind: str, priority: int, action: str, trigger: bool, shares_delta: int, price_line: float, title: str, detail: str) -> None:
+        if shares_delta == 0:
+            return
         line = float(price_line)
         if action == "SELL" and kind == "risk":
             price_range = {"low": round(line * 0.99, 2), "high": round(line, 2), "label": f"{line * 0.99:.2f}-{line:.2f}"}
@@ -614,10 +892,6 @@ def build_alerts(
             "detail": detail,
         })
 
-    overload = stage["key"] == "OVERLOADED_REVERSE_T"
-    high_inventory = stage["key"] in {"OVERLOADED_REVERSE_T", "REDUCE_REVERSE_T"}
-    can_positive_t = stage["key"] in {"TRANSITION", "POSITIVE_T"}
-    can_buy_back = int(stage["buyback_cap"]) > 0
     micro = intraday_reverse_t_levels(snap, levels, config)
     intraday_ref = micro["reference"]
     vwap_ref = micro["vwap_reference"]
@@ -637,10 +911,24 @@ def build_alerts(
     guard_note = "15/30 分钟同步放量上行，先缩小反T股数，避免卖在真突破。" if breakout_guard else sell_note
     sold_today_shares = round_lot(sold_today_shares)
     sold_today_price = float(sold_today_price) if sold_today_price and sold_today_price > 0 else None
+    bought_today_shares = round_lot(bought_today_shares)
+    bought_today_price = float(bought_today_price) if bought_today_price and bought_today_price > 0 else None
     open_t_shares = round_lot(open_t_shares)
     open_t_price = float(open_t_price) if open_t_price and open_t_price > 0 else None
+    open_positive_shares = round_lot(open_positive_shares)
+    open_positive_price = (
+        float(open_positive_price) if open_positive_price and open_positive_price > 0 else None
+    )
     buyback_shares = round_lot(sold_today_shares + open_t_shares)
-    buyback_anchor = sold_today_price or open_t_price
+    buyback_anchor = weighted_price(
+        [
+            (sold_today_shares, sold_today_price),
+            (open_t_shares, open_t_price),
+        ]
+    )
+    can_reverse_t = int(stage["reverse_t_sell_cap"]) > 0
+    full_inventory_gap = round_lot(max(holding.full_shares - shares, 0))
+    intraday_excess = int(stage["intraday_excess_shares"])
     plan = plan or {}
     dynamic_zones = dynamic_zones or {}
     dynamic_available = bool(dynamic_zones.get("available"))
@@ -650,15 +938,80 @@ def build_alerts(
     dynamic_low = dynamic_zones.get("day_low")
     dynamic_high = dynamic_zones.get("day_high")
 
+    positive_open_shares = round_lot(bought_today_shares + open_positive_shares)
+    positive_anchor = weighted_price(
+        [
+            (bought_today_shares, bought_today_price),
+            (open_positive_shares, open_positive_price),
+        ]
+    )
+    recorded_base_shares = shares - positive_open_shares
+    positive_capacity = min(
+        round_lot(max(config.max_positive_t_open_shares - positive_open_shares, 0)),
+        round_lot(max(int(stage["intraday_limit_shares"]) - shares, 0)),
+    )
+    positive_buy_delta = min(config.max_positive_t_buy_shares, positive_capacity)
+    can_positive_t = (
+        recorded_base_shares == holding.full_shares
+        and positive_buy_delta >= LOT_SIZE
+        and bool(BYD_T_VALIDATION["execution_enabled"])
+    )
+    positive_exit_requested = max(positive_open_shares, intraday_excess)
+    positive_exit_shares = min(
+        positive_exit_requested,
+        round_lot(max(shares - config.reasonable_min_shares, 0)),
+    )
+    if positive_exit_shares > 0:
+        positive_exit_line = (
+            positive_anchor * (1 + config.positive_t_profit_target)
+            if positive_anchor is not None
+            else micro_1
+        )
+        gross_profit = (
+            (positive_exit_line - positive_anchor) * positive_exit_shares
+            if positive_anchor is not None
+            else None
+        )
+        profit_note = f"目标毛差约 {gross_profit:.0f} 元。" if gross_profit is not None else "请补录正T买入均价以计算目标差价。"
+        add(
+            "positive_t_exit",
+            0,
+            "SELL",
+            price >= positive_exit_line and (sell_confirmed or price >= positive_exit_line * 1.002),
+            -positive_exit_shares,
+            positive_exit_line,
+            "正T卖出：收盘回归基准仓",
+            (
+                f"卖出日内正T仓 {positive_exit_shares} 股，目标收盘不超过 {holding.full_shares} 股；"
+                f"正常目标价差 {config.positive_t_profit_target:.1%}，{profit_note}"
+                "允许跨日等待，但必须持续记录待卖出数量和买入均价。"
+            ),
+        )
+        if positive_anchor is not None:
+            positive_stop_line = positive_anchor * (1 - config.positive_t_stop_loss)
+            add(
+                "positive_t_stop",
+                0,
+                "SELL",
+                price <= positive_stop_line,
+                -positive_exit_shares,
+                positive_stop_line,
+                "正T止损：控制单次尾部损失",
+                (
+                    f"正T买入均价下方 {config.positive_t_stop_loss:.1%} 触发止损；"
+                    "历史回测的盈利性依赖该止损，不能改成无限期摊平。"
+                ),
+            )
+
     add(
         "risk",
         1,
         "SELL",
         price <= levels["support_break"],
-        -min(round_lot(max(shares - config.core_shares, 0)), 1500),
+        capped_sell_delta(1500, shares, config.risk_floor_shares),
         levels["support_break"],
         "箱体下破降风险",
-        "跌破 60 日箱体下沿 1.5%，不做补仓幻想，先卖出 1000-1500 股。",
+        f"跌破 60 日箱体下沿 1.5%，这是风险减仓；常规做T的 {config.reasonable_min_shares} 股下限在风控场景可被打破。",
     )
     for zone in plan.get("sell_zones", []):
         zone_range = zone.get("range") or {}
@@ -669,7 +1022,7 @@ def build_alerts(
             "planned_reverse_t",
             1,
             "SELL",
-            high_inventory and price >= line and (sell_confirmed or not snap.get("has_minute")),
+            can_reverse_t and price >= line and (sell_confirmed or not snap.get("has_minute")),
             int(zone.get("shares") or 0),
             line,
             zone.get("label") or "计划反T卖出",
@@ -680,8 +1033,8 @@ def build_alerts(
             "intraday_rebound_t",
             1,
             "SELL",
-            high_inventory and price >= dynamic_sell_1 and sell_confirmed and not breakout_guard,
-            -400 if overload else -300,
+            can_reverse_t and price >= dynamic_sell_1 and sell_confirmed and not breakout_guard,
+            capped_sell_delta(400, shares, config.reasonable_min_shares),
             dynamic_sell_1,
             "日内低点反抽一档",
             f"按今天分钟线低点 {dynamic_low:.2f} 到高点 {dynamic_high:.2f} 计算，反抽到 38.2% 附近先卖一笔。{sell_note}",
@@ -690,8 +1043,8 @@ def build_alerts(
             "intraday_rebound_t",
             1,
             "SELL",
-            high_inventory and price >= dynamic_sell_2 and sell_confirmed,
-            -700 if overload else -500,
+            can_reverse_t and price >= dynamic_sell_2 and sell_confirmed,
+            capped_sell_delta(700, shares, config.reasonable_min_shares),
             dynamic_sell_2,
             "日内低点反抽二档",
             f"按今天日内振幅中位高抛，不等回到昨收；用于把下跌日里的反抽变成降仓机会。{guard_note}",
@@ -700,8 +1053,8 @@ def build_alerts(
             "intraday_rebound_t",
             1,
             "SELL",
-            high_inventory and price >= dynamic_sell_3 and (sell_confirmed or price >= dynamic_sell_3 * 1.003),
-            -1000 if overload and not breakout_guard else -600,
+            can_reverse_t and price >= dynamic_sell_3 and (sell_confirmed or price >= dynamic_sell_3 * 1.003),
+            capped_sell_delta(600 if breakout_guard else 1000, shares, config.reasonable_min_shares),
             dynamic_sell_3,
             "日内低点反抽三档",
             f"反抽接近日内高位区，优先降低满仓压力；若随后回落，再按买回线处理。{guard_note}",
@@ -710,8 +1063,8 @@ def build_alerts(
         "micro_reverse_t",
         1,
         "SELL",
-        high_inventory and price >= micro_1 and sell_confirmed and not breakout_guard,
-        -500 if overload else -300,
+        can_reverse_t and price >= micro_1 and sell_confirmed and not breakout_guard,
+        capped_sell_delta(500, shares, config.reasonable_min_shares),
         micro_1,
         "日内小反T第一笔",
         f"不等回本，较开盘/昨收/VWAP 小幅拉起先卖一笔，建立可买回的 T 仓。{sell_note}",
@@ -720,8 +1073,8 @@ def build_alerts(
         "micro_reverse_t",
         1,
         "SELL",
-        high_inventory and price >= micro_2 and sell_confirmed,
-        -500 if breakout_guard else (-800 if overload else -500),
+        can_reverse_t and price >= micro_2 and sell_confirmed,
+        capped_sell_delta(500 if breakout_guard else 800, shares, config.reasonable_min_shares),
         micro_2,
         "日内小反T第二笔",
         f"盘中反弹扩大后再卖一笔，优先降低满仓压力。{guard_note}",
@@ -730,8 +1083,8 @@ def build_alerts(
         "micro_reverse_t",
         1,
         "SELL",
-        high_inventory and price >= micro_3 and (sell_confirmed or price >= micro_3 * 1.003),
-        -800 if breakout_guard else (-1200 if overload else -800),
+        can_reverse_t and price >= micro_3 and (sell_confirmed or price >= micro_3 * 1.003),
+        capped_sell_delta(800 if breakout_guard else 1200, shares, config.reasonable_min_shares),
         micro_3,
         "日内小反T第三笔",
         f"日内涨幅超过约 2.2%，加大反T股数；后续只在明显回落时买回。{guard_note}",
@@ -740,18 +1093,18 @@ def build_alerts(
         "reverse_t",
         2,
         "SELL",
-        high_inventory and price >= levels["mid_trim"],
-        -500 if overload else -300,
+        can_reverse_t and price >= levels["mid_trim"],
+        capped_sell_delta(500, shares, config.reasonable_min_shares),
         levels["mid_trim"],
         "反弹到箱体中位先减",
-        "当前仓位很高，反弹到中位先卖一笔，把库存往阶段目标压。",
+        "反弹到箱体中位先建立反T仓，只有回落形成足够价差才买回。",
     )
     add(
         "reverse_t",
         2,
         "SELL",
-        price >= levels["weak_trim"],
-        -700 if high_inventory else -400,
+        can_reverse_t and price >= levels["weak_trim"],
+        capped_sell_delta(700, shares, config.reasonable_min_shares),
         levels["weak_trim"],
         "中上沿动能转弱减仓",
         "到箱体 62% 分位附近，不等最高点，按纪律卖出一笔。",
@@ -760,45 +1113,91 @@ def build_alerts(
         "reverse_t",
         1,
         "SELL",
-        price >= levels["strong_trim"],
-        -1000 if high_inventory else -600,
+        can_reverse_t and price >= levels["strong_trim"],
+        capped_sell_delta(1000, shares, config.reasonable_min_shares),
         levels["strong_trim"],
         "上沿强减仓",
         "接近箱体上沿，优先降低总仓位；若盘中放量冲高回落，执行更坚决。",
     )
-    add(
-        "buyback",
-        3,
-        "BUY",
-        can_buy_back and price <= levels["range_low"] * 1.01 and buy_confirmed,
-        int(stage["buyback_cap"]),
-        levels["range_low"] * 1.01,
-        "下沿确认才买回",
-        f"只在已经降过仓且低于买回上限时使用；满仓阶段此条禁用。{buy_note}",
-    )
     if buyback_shares > 0 and buyback_anchor is not None:
         buyback_line = min(buyback_anchor * (1 - config.micro_buyback_discount), intraday_ref * 0.996, vwap_ref * 0.996)
         deep_discount = price <= buyback_anchor * (1 - config.micro_buyback_discount * 1.5)
+        buyback_delta = min(
+            buyback_shares,
+            full_inventory_gap,
+        )
         add(
             "micro_buyback",
             2,
             "BUY",
-            price <= buyback_line and (buy_confirmed or deep_discount),
-            min(buyback_shares, config.max_daily_reverse_t_shares),
+            buyback_delta > 0 and price <= buyback_line and (buy_confirmed or deep_discount),
+            buyback_delta,
             buyback_line,
             "反T买回线",
-            f"买回今天或隔日待买回的 T 仓；买回价必须低于卖出锚点，不增加原始满仓。{buy_note}",
+            f"只买回已卖出的T仓，买回后不超过 {holding.full_shares} 股；目标价差至少 {config.micro_buyback_discount:.1%}。{buy_note}",
         )
+
+    regime = regime or {}
+    validated_positive = validated_positive or {}
+    positive_buy_line = float(
+        validated_positive.get("price_line")
+        or min(
+            float(levels["daily_close"])
+            * (1 - config.positive_t_previous_close_deviation),
+            vwap_ref * (1 - config.positive_t_entry_deviation),
+        )
+    )
+    stack_ok = (
+        positive_anchor is None
+        or price <= positive_anchor * (1 - config.positive_t_stack_gap)
+    )
     add(
         "positive_t",
         3,
         "BUY",
-        can_positive_t and price <= levels["range_low"] * 1.008 and buy_confirmed,
-        min(config.max_positive_t_buy_shares, max(config.final_goal_shares - shares, 0)),
-        levels["range_low"] * 1.008,
-        "正T低吸",
-        f"仓位降到可控后才启用，低位买入的 T 仓必须在反弹时卖出。{buy_note}",
+        can_positive_t
+        and bool(regime.get("positive_t_allowed"))
+        and bool(validated_positive.get("signal"))
+        and stack_ok,
+        positive_buy_delta,
+        positive_buy_line,
+        "严格横盘正T低吸",
+        (
+            f"每档 {config.max_positive_t_buy_shares} 股，累计正T仓不超过 {config.max_positive_t_open_shares} 股；"
+            f"需低于VWAP {config.positive_t_entry_deviation:.1%}、位于60日区间下半部且5分钟止跌。"
+            f"反弹 {config.positive_t_profit_target:.1%} 止盈，回撤 {config.positive_t_stop_loss:.1%} 止损，"
+            f"最多跨 {config.positive_t_max_holding_sessions} 个交易日。{regime.get('reason', '')}"
+        ),
     )
+
+    if stage["key"] == "UNDERWEIGHT":
+        add(
+            "inventory_recovery",
+            2,
+            "BUY",
+            price <= positive_buy_line and buy_confirmed,
+            int(stage["positive_t_buy_cap"]),
+            positive_buy_line,
+            "低于合理仓：分批恢复库存",
+            f"当前低于 {config.reasonable_min_shares} 股，不再常规高抛；只在低位确认后分批恢复。{buy_note}",
+        )
+    management_kinds = {
+        "risk",
+        "micro_buyback",
+        "positive_t_exit",
+        "positive_t_stop",
+    }
+    validated_entry_kinds = set(BYD_T_VALIDATION.get("allowed_new_entry_kinds") or [])
+    for alert in alerts:
+        enabled = alert["kind"] in management_kinds or (
+            BYD_T_VALIDATION["execution_enabled"]
+            and alert["kind"] in validated_entry_kinds
+        )
+        alert["execution_enabled"] = enabled
+        if not enabled:
+            alert["research_triggered"] = bool(alert["triggered"])
+            alert["triggered"] = False
+            alert["detail"] = f"{alert['detail']} 当前仅作观察：该方向未通过历史验证。"
     return sorted(alerts, key=lambda item: (not item["triggered"], item["priority"]))
 
 
@@ -810,16 +1209,22 @@ def build_minute_payload(
     data_status: str = "daily_fallback",
     sold_today_shares: int = 0,
     sold_today_price: float | None = None,
+    bought_today_shares: int = 0,
+    bought_today_price: float | None = None,
     open_t_shares: int = 0,
     open_t_price: float | None = None,
+    open_positive_shares: int = 0,
+    open_positive_price: float | None = None,
 ) -> dict[str, Any]:
     levels = daily_range_levels(daily)
     minutes = normalize_minutes(minutes)
     snap = minute_snapshot(minutes, levels)
-    plan = planned_t_ranges(daily, levels, holding)
+    plan = planned_t_ranges(daily, levels, holding, config)
     dynamic_zones = intraday_dynamic_zones(minutes, snap)
     indicators = timeframe_indicator_snapshot(minutes)
-    stage = holding_stage(holding.shares, config)
+    regime = daily_sideways_snapshot(daily)
+    validated_positive = validated_positive_t_snapshot(minutes, levels, regime, config)
+    stage = holding_stage(holding.shares, config, holding.full_shares)
     price = float(snap["last"])
     market_value = holding.shares * price
     cost_value = holding.shares * holding.cost
@@ -834,49 +1239,64 @@ def build_minute_payload(
         indicators=indicators,
         dynamic_zones=dynamic_zones,
         plan=plan,
+        regime=regime,
+        validated_positive=validated_positive,
         sold_today_shares=sold_today_shares,
         sold_today_price=sold_today_price,
+        bought_today_shares=bought_today_shares,
+        bought_today_price=bought_today_price,
         open_t_shares=open_t_shares,
         open_t_price=open_t_price,
+        open_positive_shares=open_positive_shares,
+        open_positive_price=open_positive_price,
     )
     triggered = [item for item in alerts if item["triggered"]]
     if triggered:
         primary = triggered[0]
-    elif holding.shares >= config.overload_threshold and price < levels["mid_trim"]:
-        micro = intraday_reverse_t_levels(snap, levels, config)
-        if dynamic_zones.get("available"):
+    elif stage["key"] == "INTRADAY_OVERWEIGHT":
+        positive_anchor = weighted_price(
+            [
+                (bought_today_shares, bought_today_price),
+                (open_positive_shares, open_positive_price),
+            ]
+        )
+        positive_exit_line = (
+            positive_anchor * (1 + config.positive_t_profit_target)
+            if positive_anchor is not None
+            else None
+        )
+        primary = {
+            "action": "WAIT_RECORD_OR_EXIT",
+            "title": "超出基准仓：记录待卖T仓并等待盈利退出",
+            "detail": (
+                f"当前超过基准满仓 {stage['intraday_excess_shares']} 股；"
+                + (
+                    f"已记录均价对应的观察退出线为 {positive_exit_line:.2f}。"
+                    if positive_exit_line is not None
+                    else "请补录待卖出股数和买入均价后再计算盈利退出线。"
+                )
+                + "允许跨日，不因时间强制亏损卖出。"
+            ),
+            "shares_delta": -int(stage["intraday_excess_shares"]),
+        }
+    else:
+        if BYD_T_VALIDATION["execution_enabled"]:
             primary = {
-                "action": "WAIT_REBOUND",
-                "title": "等待日内低位反抽",
+                "action": "WAIT_STRICT_POSITIVE_T",
+                "title": "等待严格横盘正T信号",
                 "detail": (
-                    f"当前处于{dynamic_zones['state']}，今日低位区 {dynamic_zones['low_zone']['label']}；"
-                    f"若反抽到 {dynamic_zones['rebound_sell_1']:.2f}/{dynamic_zones['rebound_sell_2']:.2f}/{dynamic_zones['rebound_sell_3']:.2f} 再分批卖。"
-                ),
+                    f"{regime.get('reason', '')} {validated_positive.get('reason', '')}"
+                    "反T继续暂停。"
+                ).strip(),
                 "shares_delta": 0,
             }
         else:
-            first_zone = (plan.get("sell_zones") or [{}])[0]
-            second_zone = (plan.get("sell_zones") or [{}, {}])[1] if len(plan.get("sell_zones") or []) > 1 else {}
-            third_zone = (plan.get("sell_zones") or [{}, {}, {}])[2] if len(plan.get("sell_zones") or []) > 2 else {}
-            first_label = first_zone.get("range", {}).get("label") or f"{micro['micro_sell_1']:.2f}"
-            second_label = second_zone.get("range", {}).get("label") or f"{micro['micro_sell_2']:.2f}"
-            third_label = third_zone.get("range", {}).get("label") or f"{micro['micro_sell_3']:.2f}"
             primary = {
-                "action": "WAIT_REBOUND",
-                "title": "等待计划反T区间",
-                "detail": (
-                    f"分钟线不可用，按提前计划执行："
-                    f"{first_label} / {second_label} / {third_label} 分批卖。"
-                ),
+                "action": "WAIT_VALIDATION",
+                "title": "暂停新开T仓：历史验证未同时满足胜率和盈利性",
+                "detail": BYD_T_VALIDATION["decision"],
                 "shares_delta": 0,
             }
-    else:
-        primary = {
-            "action": "HOLD",
-            "title": "未触发交易",
-            "detail": "价格未到计划线，继续等待。",
-            "shares_delta": 0,
-        }
     recent_minutes = []
     if not minutes.empty:
         keep = minutes.tail(80)
@@ -897,6 +1317,9 @@ def build_minute_payload(
             "shares": holding.shares,
             "cost": holding.cost,
             "full_shares": holding.full_shares,
+            "reasonable_min_shares": config.reasonable_min_shares,
+            "intraday_limit_shares": holding.full_shares + config.max_intraday_extra_shares,
+            "intraday_excess_shares": int(stage["intraday_excess_shares"]),
             "market_value": market_value,
             "cost_value": cost_value,
             "unrealized_pnl": pnl,
@@ -908,6 +1331,8 @@ def build_minute_payload(
         "planned_t": plan,
         "intraday_dynamic": dynamic_zones,
         "indicators": indicators,
+        "regime": regime,
+        "validated_positive_t": validated_positive,
         "daily_levels": levels,
         "range_position_pct": range_pos * 100 if np.isfinite(range_pos) else None,
         "primary_action": primary,
@@ -915,19 +1340,29 @@ def build_minute_payload(
         "today_t": {
             "sold_shares": round_lot(sold_today_shares),
             "sold_price": sold_today_price,
+            "bought_shares": round_lot(bought_today_shares),
+            "bought_price": bought_today_price,
             "open_t_shares": round_lot(open_t_shares),
             "open_t_price": open_t_price,
+            "open_positive_shares": round_lot(open_positive_shares),
+            "open_positive_price": open_positive_price,
             "buyback_enabled": (round_lot(sold_today_shares) > 0 and bool(sold_today_price))
             or (round_lot(open_t_shares) > 0 and bool(open_t_price)),
+            "positive_exit_enabled": (
+                (round_lot(bought_today_shares) > 0 and bool(bought_today_price))
+                or (round_lot(open_positive_shares) > 0 and bool(open_positive_price))
+            ),
         },
+        "validation": BYD_T_VALIDATION,
         "intraday_levels": intraday_reverse_t_levels(snap, levels, config),
         "recent_minutes": recent_minutes,
         "playbook": [
-            "分钟线不可稳定获取时，主策略回退为提前计划区间：按前复权日线、ATR和箱体分位给出高确定性反T区。",
-            "低位不追卖，只在计划卖出一档/二档/三档触发时分批卖 500/800/1200 股。",
-            "反T卖出后必须设置买回锚点，回落到卖价下方约 0.8%-1.2% 才买回。",
-            "买回可以当日完成，也可以隔日完成；没到买回线就保留现金，不强行回补。",
-            "降到 7500 股附近，允许下沿确认后少量买回 300 股。",
-            "降到 6000 股以下，正T成为主策略：低吸 300-500 股，反弹卖出 T 仓。",
+            "成功率闸门优先：只启用通过训练、验证和样本外检查的严格横盘正T；反T继续暂停。",
+            "2020-2021强上涨阶段由滞后横盘指标自动排除，不参与开仓，不是事后删除行情。",
+            f"常规收盘仓位保持在 {config.reasonable_min_shares}-{holding.full_shares} 股；只有箱体破位风控才允许低于下限。",
+            f"正T每次 {config.max_positive_t_buy_shares} 股，最多累计 {config.max_positive_t_open_shares} 股；相邻买入至少再下跌 {config.positive_t_stack_gap:.1%}。",
+            f"正T反弹约 {config.positive_t_profit_target:.1%} 止盈、回撤 {config.positive_t_stop_loss:.1%} 止损，最多持有 {config.positive_t_max_holding_sessions} 个交易日。",
+            f"若你已人工卖出反T仓，录入待买回数量和卖出均价；回落约 {config.micro_buyback_discount:.1%} 后，盈利买回提醒仍可执行。",
+            "14:35后开仓门槛提高到低于VWAP 1.1%；没有完整5分钟信号时只展示计划价，不触发。",
         ],
     }

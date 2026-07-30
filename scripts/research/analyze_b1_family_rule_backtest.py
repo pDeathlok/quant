@@ -10,7 +10,7 @@ only, because real early/tail execution needs minute data.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +20,12 @@ import pandas as pd
 
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
-from quant.features.variable_library import build_continuous_ohlc, calculate_project_extra_features
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
+from quant.data.atomic_io import atomic_write_parquet
+from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.variable_library import build_continuous_ohlc
+from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
+from quant.strategies.custom.vegas_tunnel import OPTIMIZED_VEGAS_TUNNEL_PARAMS, add_vegas_tunnel_signals
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -183,6 +188,22 @@ def build_signal_specs() -> list[SignalSpec]:
             "日线收盘信号，T+1 开盘近似买入",
             "近三日放量下杀，随后J<-10且收盘位置>=40%",
         ),
+        SignalSpec(
+            "signal_vegas_tunnel",
+            "VEGAS",
+            "日线级",
+            "维加斯隧道回踩后右侧确认，收盘确认",
+            "T+1 开盘买入",
+            "EMA144/169 维加斯隧道上行，EMA10>EMA20>隧道上沿，近8日回踩2.5%范围后收阳放量站上EMA10",
+        ),
+        SignalSpec(
+            "signal_tvb_merged",
+            "TRIPLE_VOLUME_BREAKOUT",
+            "日线级",
+            "缩量盘整后右侧突破，收盘确认",
+            "T+1 开盘买入",
+            "2.5倍量扩展候选池，3倍量命中提升为保守主策略；突破日前平均缩量，MA5>MA10>MA20且MA20上行",
+        ),
     ]
 
 
@@ -209,7 +230,7 @@ def build_exit_rules() -> list[ExitRule]:
 
 
 def normalize_daily(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    df = read_partitioned_symbol_file(path)
     if "trade_date" in df.columns:
         df["date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce")
     else:
@@ -223,12 +244,38 @@ def normalize_daily(path: Path) -> pd.DataFrame:
     return df
 
 
-def compute_signal_flags(df: pd.DataFrame) -> pd.DataFrame:
-    extra = calculate_project_extra_features(df)
-    out = df.copy()
-    for col in extra.columns:
-        if col not in out.columns:
-            out[col] = extra[col]
+def normalize_daily_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Normalize one symbol sliced from the canonical market dataset."""
+
+    df = frame.copy()
+    if "trade_date" in df.columns:
+        df["date"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    else:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if "vol" in df.columns and "volume" not in df.columns:
+        df["volume"] = df["vol"]
+    df["symbol"] = symbol
+    if "ts_code" not in df.columns:
+        df["ts_code"] = symbol
+    return df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
+
+
+def compute_signal_flags(
+    df: pd.DataFrame,
+    *,
+    factors_attached: bool = False,
+) -> pd.DataFrame:
+    symbol = str(df["symbol"].dropna().iloc[-1]) if "symbol" in df.columns and df["symbol"].notna().any() else ""
+    out = (
+        df.copy()
+        if factors_attached
+        else attach_daily_base_factors(
+            df,
+            symbol=symbol,
+            compute_if_missing=True,
+            persist_missing=False,
+        )
+    )
 
     price = build_continuous_ohlc(out)
     close = price["close"]
@@ -376,9 +423,57 @@ def compute_signal_flags(df: pd.DataFrame) -> pd.DataFrame:
         & (close_pos >= 0.40)
     )
 
+    try:
+        vegas = add_vegas_tunnel_signals(out, **OPTIMIZED_VEGAS_TUNNEL_PARAMS)
+        flags["signal_vegas_tunnel"] = vegas["signal_vegas_tunnel"].astype(bool)
+    except Exception:
+        vegas = pd.DataFrame(index=out.index)
+        flags["signal_vegas_tunnel"] = False
+
+    try:
+        triple_volume = add_triple_volume_strategy_pool_signals(out)
+        flags["signal_tvb_merged"] = triple_volume["signal_tvb_merged"].astype(bool)
+        flags["signal_tvb_conservative"] = triple_volume["signal_tvb_conservative"].astype(bool)
+        flags["signal_tvb_expanded"] = triple_volume["signal_tvb_expanded"].astype(bool)
+    except Exception:
+        triple_volume = pd.DataFrame(index=out.index)
+        flags["signal_tvb_merged"] = False
+        flags["signal_tvb_conservative"] = False
+        flags["signal_tvb_expanded"] = False
+
     result = out[["symbol", "date", "open", "high", "low", "close", "pct_chg", "kdj_d_j"]].copy()
     if "name" in out.columns:
         result["name"] = out["name"]
+    for col in [
+        "vegas_tunnel_upper",
+        "vegas_tunnel_distance",
+        "vegas_tunnel_slope_20d",
+        "vegas_fast_spread",
+        "vegas_volume_strength",
+        "vegas_candidate_score",
+    ]:
+        if col in vegas.columns:
+            result[col] = vegas[col]
+    for col in [
+        "tvb_variant_id",
+        "tvb_variant_name",
+        "tvb_tier",
+        "tvb_score",
+        "tvb_volume_multiple",
+        "tvb_buy_plan",
+        "tvb_sell_plan",
+        "tvb_description",
+        "tvb_metrics",
+        "days_since_triple_volume",
+        "triple_volume_price",
+        "consolidation_range",
+        "breakout_pct",
+        "volume_dryness",
+        "volume_recovery",
+        "ma20_slope_5d",
+    ]:
+        if col in triple_volume.columns:
+            result[col] = triple_volume[col]
     for col in flags.columns:
         result[col] = flags[col].fillna(False).astype(bool)
     return result
@@ -400,6 +495,33 @@ def process_file(path: Path) -> pd.DataFrame | None:
         return signals if not signals.empty else None
     except Exception as exc:
         print(f"skip {path.name}: {exc}", flush=True)
+        return None
+
+
+def process_frame(
+    symbol: str,
+    frame: pd.DataFrame,
+    *,
+    factors_attached: bool = False,
+    raise_errors: bool = False,
+) -> pd.DataFrame | None:
+    """Build family signals without reopening storage for every symbol."""
+
+    try:
+        df = normalize_daily_frame(frame, symbol)
+        if len(df) < 160:
+            return None
+        if "name" in df.columns:
+            names = df["name"].fillna("").astype(str)
+            df = df[~names.str.upper().str.contains("ST") & ~names.str.contains("退")].copy()
+        signals = compute_signal_flags(df, factors_attached=factors_attached)
+        signal_cols = [spec.name for spec in build_signal_specs()]
+        signals = signals[signals[signal_cols].any(axis=1)].copy()
+        return signals if not signals.empty else None
+    except Exception as exc:
+        if raise_errors:
+            raise RuntimeError(f"{symbol}: {exc}") from exc
+        print(f"skip {symbol}: {exc}", flush=True)
         return None
 
 
@@ -430,10 +552,19 @@ def build_signal_candidates(
             print("signal cache is missing new columns; rebuilding", flush=True)
             cached = None
 
-    files = sorted(DEFAULT_DAILY_DIR.glob("*.parquet"))
+    rebuild_from = incremental_start or pd.Timestamp("2020-01-01")
+    history_start = rebuild_from - pd.Timedelta(days=600)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DEFAULT_DAILY_DIR.parent))
+    market = store.read_market_range(DEFAULT_DAILY_DIR.name, start_date=history_start.strftime("%Y%m%d"))
+    if market.empty:
+        raise RuntimeError(f"No canonical daily rows found for {history_start:%Y-%m-%d}+")
+    tasks = [
+        (str(symbol), group.reset_index(drop=True))
+        for symbol, group in market.groupby("ts_code", sort=False)
+    ]
     frames = []
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [executor.submit(process_file, path) for path in files]
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = [executor.submit(process_frame, symbol, frame) for symbol, frame in tasks]
         for n, future in enumerate(as_completed(futures), start=1):
             result = future.result()
             if result is not None and not result.empty:
@@ -442,7 +573,7 @@ def build_signal_candidates(
                 if not result.empty:
                     frames.append(result)
             if n % 500 == 0 or n == len(futures):
-                print(f"  family signals: {n}/{len(futures)} files", flush=True)
+                print(f"  family signals: {n}/{len(futures)} symbols", flush=True)
     if cached is not None and incremental_start is not None:
         old = cached[pd.to_datetime(cached["date"]) < incremental_start].copy()
         if frames:
@@ -455,8 +586,7 @@ def build_signal_candidates(
     else:
         raise RuntimeError("No family signal candidates built")
     combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
-    SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(SIGNAL_CACHE, index=False)
+    atomic_write_parquet(combined, SIGNAL_CACHE, index=False)
     return combined
 
 

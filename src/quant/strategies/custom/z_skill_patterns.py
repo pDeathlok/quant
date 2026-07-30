@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
+from quant.features.daily_factor_layer import attach_z_skill_base_factors
 from quant.features.variable_library import build_continuous_ohlc
 
 
@@ -85,8 +87,13 @@ def _stock_basic_map() -> dict[str, dict[str, str]]:
     return {}
 
 
-def _normalize_daily(path: Path, signal_date: str | None) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+def _normalize_daily(
+    path: Path,
+    signal_date: str | None,
+    source_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    target = pd.to_datetime(signal_date) if signal_date else pd.Timestamp.today().normalize()
+    df = source_frame.copy() if source_frame is not None else read_partitioned_symbol_file(path)
     if df.empty:
         return df
     out = df.copy()
@@ -137,6 +144,8 @@ def _normalize_daily(path: Path, signal_date: str | None) -> pd.DataFrame:
         cutoff = pd.to_datetime(signal_date, errors="coerce")
         if pd.notna(cutoff) and out["date"].max() < cutoff - pd.Timedelta(days=14):
             return pd.DataFrame()
+    symbol = str(out["ts_code"].dropna().iloc[-1]) if out["ts_code"].notna().any() else path.stem
+    out = attach_z_skill_base_factors(out, symbol=symbol, persist_missing=False)
     out["pre_close"] = out.get("pre_close", out["close"].shift(1))
     out["pre_close"] = out["pre_close"].replace(0, np.nan).fillna(out["close"].shift(1))
     if "pct_chg" not in out.columns:
@@ -145,28 +154,39 @@ def _normalize_daily(path: Path, signal_date: str | None) -> pd.DataFrame:
     price = build_continuous_ohlc(out)
     out[["open", "high", "low", "close"]] = price[["open", "high", "low", "close"]]
     out["pre_close"] = out["close"].shift(1).replace(0, np.nan).fillna(out["pre_close"])
-    out["amplitude"] = (out["high"] - out["low"]) / out["pre_close"].replace(0, np.nan) * 100
-    out["close_pos"] = (out["close"] - out["low"]) / (out["high"] - out["low"]).replace(0, np.nan)
-    out["vol_ratio_5"] = out["volume"] / out["volume"].shift(1).rolling(5, min_periods=1).mean()
-    out["vol_ratio_prev"] = out["volume"] / out["volume"].shift(1).replace(0, np.nan)
-    out["vol_ma10"] = out["volume"].rolling(10, min_periods=3).mean()
-    out["vol_ma20"] = out["volume"].rolling(20, min_periods=5).mean()
-    out["is_rise"] = out["close"] > out["open"]
-    out["is_shrink"] = out["volume"] < out["volume"].shift(1) * 0.75
-    out["is_beidou"] = (out["pct_chg"] >= 3) & (out["vol_ratio_5"] >= 1.5)
-    out["is_big_yin"] = (out["close"] < out["open"]) & (out["vol_ratio_5"] >= 1.5) & (out["pct_chg"] <= -2)
-    out["ma3"] = out["close"].rolling(3, min_periods=1).mean()
-    out["ma6"] = out["close"].rolling(6, min_periods=2).mean()
-    out["ma12"] = out["close"].rolling(12, min_periods=4).mean()
-    out["ma24"] = out["close"].rolling(24, min_periods=8).mean()
-    out["bbi"] = (out["ma3"] + out["ma6"] + out["ma12"] + out["ma24"]) / 4
+    if "amplitude" not in out.columns:
+        out["amplitude"] = (out["high"] - out["low"]) / out["pre_close"].replace(0, np.nan) * 100
+    if "close_pos" not in out.columns:
+        out["close_pos"] = (out["close"] - out["low"]) / (out["high"] - out["low"]).replace(0, np.nan)
+    if "vol_ratio_5" not in out.columns:
+        out["vol_ratio_5"] = out["volume"] / out["volume"].shift(1).rolling(5, min_periods=1).mean()
+    if "vol_ratio_prev" not in out.columns:
+        out["vol_ratio_prev"] = out["volume"] / out["volume"].shift(1).replace(0, np.nan)
+    if "vol_ma10" not in out.columns:
+        out["vol_ma10"] = out["volume"].rolling(10, min_periods=3).mean()
+    if "vol_ma20" not in out.columns:
+        out["vol_ma20"] = out["volume"].rolling(20, min_periods=5).mean()
+    if "is_rise" not in out.columns:
+        out["is_rise"] = out["close"] > out["open"]
+    if "is_shrink" not in out.columns:
+        out["is_shrink"] = out["volume"] < out["volume"].shift(1) * 0.75
+    if "is_beidou" not in out.columns:
+        out["is_beidou"] = (out["pct_chg"] >= 3) & (out["vol_ratio_5"] >= 1.5)
+    if "is_big_yin" not in out.columns:
+        out["is_big_yin"] = (out["close"] < out["open"]) & (out["vol_ratio_5"] >= 1.5) & (out["pct_chg"] <= -2)
+    for window, min_periods in ((3, 1), (6, 2), (12, 4), (24, 8)):
+        if f"ma{window}" not in out.columns:
+            out[f"ma{window}"] = out["close"].rolling(window, min_periods=min_periods).mean()
+    if "bbi" not in out.columns:
+        out["bbi"] = (out["ma3"] + out["ma6"] + out["ma12"] + out["ma24"]) / 4
     out["zg_white"] = out["close"].ewm(span=10, adjust=False).mean().ewm(span=10, adjust=False).mean()
-    out["dg_yellow"] = (
-        out["close"].rolling(14, min_periods=8).mean()
-        + out["close"].rolling(28, min_periods=14).mean()
-        + out["close"].rolling(57, min_periods=28).mean()
-        + out["close"].rolling(114, min_periods=60).mean()
-    ) / 4
+    if "dg_yellow" not in out.columns:
+        out["dg_yellow"] = (
+            out["close"].rolling(14, min_periods=8).mean()
+            + out["close"].rolling(28, min_periods=14).mean()
+            + out["close"].rolling(57, min_periods=28).mean()
+            + out["close"].rolling(114, min_periods=60).mean()
+        ) / 4
     out["kdj_j"] = _calculate_kdj_j(out)
     return out
 
@@ -602,9 +622,13 @@ DETECTORS = [
 ]
 
 
-def _build_one(path: Path, signal_date: str | None) -> tuple[str, dict[str, Any]] | None:
+def _build_one(
+    path: Path,
+    signal_date: str | None,
+    source_frame: pd.DataFrame | None = None,
+) -> tuple[str, dict[str, Any]] | None:
     try:
-        df = _normalize_daily(path, signal_date)
+        df = _normalize_daily(path, signal_date, source_frame)
         if df.empty:
             return None
         signals = [signal for detector in DETECTORS if (signal := detector(df)) is not None]
@@ -630,14 +654,23 @@ def build_z_skill_daily_signals(
     max_workers: int = 24,
 ) -> dict[str, dict[str, Any]]:
     """Scan raw daily files and return latest extended pattern hits by symbol."""
-    suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
-    files = sorted(path for path in Path(daily_dir).glob("*.parquet") if path.name.endswith(suffixes))
-    if not files:
+    target = pd.to_datetime(signal_date) if signal_date else pd.Timestamp.today().normalize()
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=Path(daily_dir).parent))
+    market = store.read_market_range(
+        Path(daily_dir).name,
+        start_date=(target - pd.Timedelta(days=600)).strftime("%Y%m%d"),
+        end_date=target.strftime("%Y%m%d"),
+    )
+    if market.empty:
         return {}
-    workers = max(1, min(max_workers, len(files)))
+    tasks = [
+        (Path(daily_dir) / f"{symbol}.parquet", group.reset_index(drop=True))
+        for symbol, group in market.groupby("ts_code", sort=False)
+    ]
+    workers = max(1, min(max_workers, len(tasks)))
     results: dict[str, dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_build_one, path, signal_date) for path in files]
+        futures = [pool.submit(_build_one, path, signal_date, frame) for path, frame in tasks]
         for future in as_completed(futures):
             item = future.result()
             if item is None:

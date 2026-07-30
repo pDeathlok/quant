@@ -4,11 +4,13 @@ from datetime import date
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from quant.webapp.services import (
+    add_similar_pattern_watch_symbol,
     get_byd_daily_strategy,
     get_b1_plan,
+    get_chan_model_strategy_plan,
     get_convertible_bond_allotments,
     get_convertible_bond_grid_plan,
     get_dashboard,
@@ -16,9 +18,18 @@ from quant.webapp.services import (
     get_long_stock_pool,
     get_selector_calendar,
     get_research_index,
+    get_similar_pattern_analysis,
+    get_similar_pattern_watchlist,
     get_stock_selector_payload,
+    refresh_similar_pattern_analysis,
+    reorder_similar_pattern_watchlist,
     refresh_b1_plan,
+    refresh_chan_model_strategy_plan,
     refresh_dashboard,
+    remove_similar_pattern_watch_symbol,
+    save_similar_pattern_watch_alerts,
+    save_similar_pattern_watch_note,
+    set_similar_pattern_watch_pin,
     start_latest_refresh,
 )
 
@@ -31,18 +42,72 @@ class RefreshPlanRequest(BaseModel):
     signal_date: str | None = None
 
 
+class RefreshLatestRequest(BaseModel):
+    scope: str = "all"
+
+
+class SimilarPatternWatchRequest(BaseModel):
+    symbol: str
+    note: str = Field(default="", max_length=500)
+
+
+class SimilarPatternWatchNoteRequest(BaseModel):
+    content: str = ""
+
+
+class SimilarPatternWatchOrderRequest(BaseModel):
+    symbols: list[str]
+
+
+class SimilarPatternWatchPinRequest(BaseModel):
+    pinned: bool = True
+
+
+class SimilarPatternWatchAlertConditionRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    conjunction: Literal["and", "or"] = "and"
+    kind: Literal["price", "indicator"]
+    indicator: (
+        Literal[
+            "ret_20d",
+            "drawdown_60d",
+            "vol_ratio20",
+            "dist_ma20",
+            "dist_ma60",
+            "opportunity_score",
+            "holding_score",
+        ]
+        | None
+    ) = None
+    operator: Literal["gt", "eq", "lt"]
+    value: float = Field(allow_inf_nan=False)
+
+
+class SimilarPatternWatchAlertReminderRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    note: str = Field(default="", max_length=1_000)
+    conditions: list[SimilarPatternWatchAlertConditionRequest] = Field(
+        min_length=1,
+        max_length=20,
+    )
+
+
+class SimilarPatternWatchAlertsRequest(BaseModel):
+    enabled: bool = True
+    reminders: list[SimilarPatternWatchAlertReminderRequest] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "quant-webapp"}
 
 
 def _build_byd_daily_plan(
-    shares: int = Query(default=10500, ge=0, le=200000),
+    shares: int = Query(default=10000, ge=0, le=200000),
     cost: float = Query(default=110.6061, gt=0),
-    sold_today_shares: int = Query(default=0, ge=0, le=50000),
-    sold_today_price: float | None = Query(default=None, gt=0),
-    open_t_shares: int = Query(default=0, ge=0, le=50000),
-    open_t_price: float | None = Query(default=None, gt=0),
     refresh: bool = False,
 ) -> dict[str, Any]:
     try:
@@ -50,10 +115,6 @@ def _build_byd_daily_plan(
             shares=shares,
             cost=cost,
             refresh=refresh,
-            sold_today_shares=sold_today_shares,
-            sold_today_price=sold_today_price,
-            open_t_shares=open_t_shares,
-            open_t_price=open_t_price,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"BYD 日线计划生成失败: {exc}") from exc
@@ -61,21 +122,13 @@ def _build_byd_daily_plan(
 
 @router.get("/byd/daily-plan")
 def byd_daily_plan(
-    shares: int = Query(default=10500, ge=0, le=200000),
+    shares: int = Query(default=10000, ge=0, le=200000),
     cost: float = Query(default=110.6061, gt=0),
-    sold_today_shares: int = Query(default=0, ge=0, le=50000),
-    sold_today_price: float | None = Query(default=None, gt=0),
-    open_t_shares: int = Query(default=0, ge=0, le=50000),
-    open_t_price: float | None = Query(default=None, gt=0),
     refresh: bool = False,
 ) -> dict[str, Any]:
     return _build_byd_daily_plan(
         shares=shares,
         cost=cost,
-        sold_today_shares=sold_today_shares,
-        sold_today_price=sold_today_price,
-        open_t_shares=open_t_shares,
-        open_t_price=open_t_price,
         refresh=refresh,
     )
 
@@ -140,6 +193,37 @@ def b1_research(limit: int = Query(default=200, ge=1, le=2000)) -> dict[str, Any
         return get_research_index(limit=limit)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"B1 研究结果读取失败: {exc}") from exc
+
+
+@router.get("/chan/strategy-plan")
+def chan_strategy_plan(
+    top_n: int = Query(default=20, ge=1, le=100),
+    signal_date: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        if signal_date:
+            date.fromisoformat(signal_date)
+        return get_chan_model_strategy_plan(top_n=top_n, refresh=refresh, signal_date=signal_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"缠论策略参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"缠论策略计划生成失败: {exc}") from exc
+
+
+@router.post("/chan/strategy-plan/refresh")
+def chan_strategy_plan_refresh(
+    top_n: int = Query(default=20, ge=1, le=100),
+    signal_date: str | None = None,
+) -> dict[str, Any]:
+    try:
+        if signal_date:
+            date.fromisoformat(signal_date)
+        return refresh_chan_model_strategy_plan(top_n=top_n, signal_date=signal_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"缠论策略参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"缠论策略计划刷新失败: {exc}") from exc
 
 
 @router.get("/long/stock-pool")
@@ -233,9 +317,12 @@ def selector_calendar(
 
 
 @router.post("/selector/refresh-latest")
-def selector_refresh_latest() -> dict[str, Any]:
+def selector_refresh_latest(body: RefreshLatestRequest | None = None) -> dict[str, Any]:
     try:
-        return start_latest_refresh()
+        payload = body or RefreshLatestRequest()
+        return start_latest_refresh(scope=payload.scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"最新数据刷新启动失败: {exc}") from exc
 
@@ -243,3 +330,96 @@ def selector_refresh_latest() -> dict[str, Any]:
 @router.get("/selector/refresh-latest/status")
 def selector_refresh_latest_status() -> dict[str, Any]:
     return get_latest_refresh_status()
+
+
+@router.get("/similar-patterns/watchlist")
+def similar_pattern_watchlist(include_scores: bool = True) -> dict[str, Any]:
+    try:
+        return get_similar_pattern_watchlist(include_scores=include_scores)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势自选池读取失败: {exc}") from exc
+
+
+@router.post("/similar-patterns/watchlist")
+def add_similar_pattern_watchlist_symbol(body: SimilarPatternWatchRequest) -> dict[str, Any]:
+    try:
+        return add_similar_pattern_watch_symbol(body.symbol, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势自选池保存失败: {exc}") from exc
+
+
+@router.delete("/similar-patterns/watchlist/{symbol}")
+def delete_similar_pattern_watchlist_symbol(symbol: str) -> dict[str, Any]:
+    try:
+        return remove_similar_pattern_watch_symbol(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势自选池删除失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/{symbol}/note")
+def update_similar_pattern_watchlist_note(
+    symbol: str,
+    body: SimilarPatternWatchNoteRequest,
+) -> dict[str, Any]:
+    try:
+        return save_similar_pattern_watch_note(symbol, body.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选股笔记保存失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/order")
+def update_similar_pattern_watchlist_order(body: SimilarPatternWatchOrderRequest) -> dict[str, Any]:
+    try:
+        return reorder_similar_pattern_watchlist(body.symbols)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选池排序保存失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/{symbol}/pin")
+def update_similar_pattern_watchlist_pin(
+    symbol: str,
+    body: SimilarPatternWatchPinRequest,
+) -> dict[str, Any]:
+    try:
+        return set_similar_pattern_watch_pin(symbol, body.pinned)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选股置顶保存失败: {exc}") from exc
+
+
+@router.put("/similar-patterns/watchlist/{symbol}/alerts")
+def update_similar_pattern_watchlist_alerts(
+    symbol: str,
+    body: SimilarPatternWatchAlertsRequest,
+) -> dict[str, Any]:
+    try:
+        return save_similar_pattern_watch_alerts(symbol, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"自选股提醒保存失败: {exc}") from exc
+
+
+@router.get("/similar-patterns/analysis")
+def similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
+    try:
+        return get_similar_pattern_analysis(refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势分析失败: {exc}") from exc
+
+
+@router.post("/similar-patterns/analysis/refresh")
+def refresh_similar_pattern_analysis_api() -> dict[str, Any]:
+    try:
+        return refresh_similar_pattern_analysis()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"相似走势分析刷新失败: {exc}") from exc

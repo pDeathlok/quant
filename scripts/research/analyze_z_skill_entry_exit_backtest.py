@@ -17,8 +17,7 @@ assumption.
 from __future__ import annotations
 
 import argparse
-import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +27,9 @@ import pandas as pd
 
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
+from quant.data import MarketDataStore, MarketDataStoreConfig, read_partitioned_symbol_file
+from quant.data.atomic_io import atomic_link_or_copy, atomic_write_parquet
+from quant.features.daily_factor_layer import Z_CONSUMER_ALIASES, attach_z_skill_base_factors
 from quant.features.variable_library import build_continuous_ohlc
 
 
@@ -108,8 +110,14 @@ def build_exit_rules() -> list[ExitRule]:
     return rules
 
 
-def _normalize_daily(path: Path, start_date: str) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+def _normalize_daily(
+    path: Path,
+    start_date: str,
+    source_frame: pd.DataFrame | None = None,
+    *,
+    factors_attached: bool = False,
+) -> pd.DataFrame:
+    df = source_frame.copy() if source_frame is not None else read_partitioned_symbol_file(path)
     if df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -139,33 +147,49 @@ def _normalize_daily(path: Path, start_date: str) -> pd.DataFrame:
     out = out[~st_mask].reset_index(drop=True)
     if len(out) < 130:
         return pd.DataFrame()
+    symbol = str(out["ts_code"].dropna().iloc[-1]) if out["ts_code"].notna().any() else path.stem
+    if factors_attached:
+        for target, source in Z_CONSUMER_ALIASES.items():
+            if source in out.columns:
+                out[target] = out[source]
+    else:
+        out = attach_z_skill_base_factors(out, symbol=symbol, persist_missing=False)
     price = build_continuous_ohlc(out)
     for col in ["open", "high", "low", "close"]:
         out[col] = price[col]
     out["pre_close"] = out["close"].shift(1)
     out["pct_chg"] = out["close"].pct_change() * 100
     out["pct_chg"] = out["pct_chg"].fillna(0)
-    out["amplitude"] = (out["high"] - out["low"]) / out["pre_close"].replace(0, np.nan) * 100
-    out["close_pos"] = (out["close"] - out["low"]) / (out["high"] - out["low"]).replace(0, np.nan)
-    out["vol_ratio_prev"] = out["volume"] / out["volume"].shift(1).replace(0, np.nan)
+    if "amplitude" not in out.columns:
+        out["amplitude"] = (out["high"] - out["low"]) / out["pre_close"].replace(0, np.nan) * 100
+    if "close_pos" not in out.columns:
+        out["close_pos"] = (out["close"] - out["low"]) / (out["high"] - out["low"]).replace(0, np.nan)
+    if "vol_ratio_prev" not in out.columns:
+        out["vol_ratio_prev"] = out["volume"] / out["volume"].shift(1).replace(0, np.nan)
     out["vol_ma5_prev"] = out["volume"].shift(1).rolling(5, min_periods=2).mean()
-    out["vol_ratio_5"] = out["volume"] / out["vol_ma5_prev"].replace(0, np.nan)
-    out["vol_ma10"] = out["volume"].rolling(10, min_periods=3).mean()
-    out["vol_ma20"] = out["volume"].rolling(20, min_periods=5).mean()
-    out["is_rise"] = out["close"] > out["open"]
-    out["is_big_yin"] = (out["close"] < out["open"]) & (out["vol_ratio_5"] >= 1.5) & (out["pct_chg"] <= -2)
-    out["ma3"] = out["close"].rolling(3, min_periods=1).mean()
-    out["ma6"] = out["close"].rolling(6, min_periods=2).mean()
-    out["ma12"] = out["close"].rolling(12, min_periods=4).mean()
-    out["ma24"] = out["close"].rolling(24, min_periods=8).mean()
-    out["bbi"] = (out["ma3"] + out["ma6"] + out["ma12"] + out["ma24"]) / 4
+    if "vol_ratio_5" not in out.columns:
+        out["vol_ratio_5"] = out["volume"] / out["vol_ma5_prev"].replace(0, np.nan)
+    if "vol_ma10" not in out.columns:
+        out["vol_ma10"] = out["volume"].rolling(10, min_periods=3).mean()
+    if "vol_ma20" not in out.columns:
+        out["vol_ma20"] = out["volume"].rolling(20, min_periods=5).mean()
+    if "is_rise" not in out.columns:
+        out["is_rise"] = out["close"] > out["open"]
+    if "is_big_yin" not in out.columns:
+        out["is_big_yin"] = (out["close"] < out["open"]) & (out["vol_ratio_5"] >= 1.5) & (out["pct_chg"] <= -2)
+    for window, min_periods in ((3, 1), (6, 2), (12, 4), (24, 8)):
+        if f"ma{window}" not in out.columns:
+            out[f"ma{window}"] = out["close"].rolling(window, min_periods=min_periods).mean()
+    if "bbi" not in out.columns:
+        out["bbi"] = (out["ma3"] + out["ma6"] + out["ma12"] + out["ma24"]) / 4
     out["zg_white"] = out["close"].ewm(span=10, adjust=False).mean().ewm(span=10, adjust=False).mean()
-    out["dg_yellow"] = (
-        out["close"].rolling(14, min_periods=8).mean()
-        + out["close"].rolling(28, min_periods=14).mean()
-        + out["close"].rolling(57, min_periods=28).mean()
-        + out["close"].rolling(114, min_periods=60).mean()
-    ) / 4
+    if "dg_yellow" not in out.columns:
+        out["dg_yellow"] = (
+            out["close"].rolling(14, min_periods=8).mean()
+            + out["close"].rolling(28, min_periods=14).mean()
+            + out["close"].rolling(57, min_periods=28).mean()
+            + out["close"].rolling(114, min_periods=60).mean()
+        ) / 4
     out["kdj_j"] = _calculate_kdj_j(out)
     return out
 
@@ -346,13 +370,50 @@ def process_file(path: Path, start_date: str) -> pd.DataFrame | None:
         return None
 
 
+def process_frame(
+    symbol: str,
+    frame: pd.DataFrame,
+    start_date: str,
+    *,
+    factors_attached: bool = False,
+    raise_errors: bool = False,
+) -> pd.DataFrame | None:
+    """Build z-skill signals from an in-memory canonical symbol slice."""
+
+    path = Path(f"{symbol}.parquet")
+    try:
+        df = _normalize_daily(
+            path,
+            start_date,
+            source_frame=frame,
+            factors_attached=factors_attached,
+        )
+        if df.empty:
+            return None
+        signals = compute_z_skill_flags(df)
+        signal_cols = [spec.key for spec in build_signal_specs()]
+        signals = signals[signals[signal_cols].any(axis=1)].copy()
+        return signals if not signals.empty else None
+    except Exception as exc:
+        if raise_errors:
+            raise RuntimeError(f"{symbol}: {exc}") from exc
+        print(f"skip {symbol}: {exc}", flush=True)
+        return None
+
+
 def _parse_cache_start_date(value: str) -> pd.Timestamp:
     if value.isdigit() and len(value) == 8:
         return pd.to_datetime(value, format="%Y%m%d")
     return pd.to_datetime(value)
 
 
-def build_signal_candidates(daily_dir: Path, start_date: str, force_refresh: bool, workers: int) -> pd.DataFrame:
+def build_signal_candidates(
+    daily_dir: Path,
+    start_date: str,
+    force_refresh: bool,
+    workers: int,
+    reuse_signal_cache: bool = False,
+) -> pd.DataFrame:
     start_ts = _parse_cache_start_date(start_date)
     cached: pd.DataFrame | None = None
     if SIGNAL_CACHE.exists() and not force_refresh:
@@ -364,12 +425,27 @@ def build_signal_candidates(daily_dir: Path, start_date: str, force_refresh: boo
         else:
             print("z-skill signal cache missing expected columns; rebuilding", flush=True)
             cached = None
+    if reuse_signal_cache:
+        if cached is None:
+            raise RuntimeError("--reuse-signal-cache requires a valid z-skill signal cache")
+        return (
+            cached[pd.to_datetime(cached["date"]) >= start_ts]
+            .sort_values(["symbol", "date"])
+            .reset_index(drop=True)
+        )
 
-    suffixes = (".SZ.parquet", ".SH.parquet", ".BJ.parquet")
-    files = sorted(path for path in daily_dir.glob("*.parquet") if path.name.endswith(suffixes))
+    history_start = start_ts - pd.Timedelta(days=450)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    market = store.read_market_range(daily_dir.name, start_date=history_start.strftime("%Y%m%d"))
+    if market.empty:
+        raise RuntimeError(f"No canonical daily rows found for {history_start:%Y-%m-%d}+")
+    tasks = [
+        (str(symbol), group.reset_index(drop=True))
+        for symbol, group in market.groupby("ts_code", sort=False)
+    ]
     frames = []
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = [executor.submit(process_file, path, start_date) for path in files]
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = [executor.submit(process_frame, symbol, frame, start_date) for symbol, frame in tasks]
         for n, future in enumerate(as_completed(futures), start=1):
             result = future.result()
             if result is not None and not result.empty:
@@ -377,7 +453,7 @@ def build_signal_candidates(daily_dir: Path, start_date: str, force_refresh: boo
                 if not result.empty:
                     frames.append(result)
             if n % 500 == 0 or n == len(futures):
-                print(f"  z-skill signals: {n}/{len(futures)} files", flush=True)
+                print(f"  z-skill signals: {n}/{len(futures)} symbols", flush=True)
     if cached is not None:
         old = cached[pd.to_datetime(cached["date"]) < start_ts].copy()
         if frames:
@@ -390,8 +466,7 @@ def build_signal_candidates(daily_dir: Path, start_date: str, force_refresh: boo
     else:
         raise RuntimeError("No z-skill signal candidates built")
     combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
-    SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(SIGNAL_CACHE, index=False)
+    atomic_write_parquet(combined, SIGNAL_CACHE, index=False)
     return combined[combined["date"] >= start_ts].copy()
 
 
@@ -653,6 +728,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default="2020-01-01")
     parser.add_argument("--workers", type=int, default=64)
     parser.add_argument("--force-refresh", action="store_true")
+    parser.add_argument(
+        "--reuse-signal-cache",
+        action="store_true",
+        help="Use the existing validated signal cache without rebuilding raw indicators.",
+    )
     parser.add_argument("--min-entry-rows", type=int, default=20)
     return parser.parse_args()
 
@@ -663,7 +743,13 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print("building/loading z-skill signal candidates", flush=True)
-    candidates = build_signal_candidates(args.daily_dir, args.start_date, args.force_refresh, args.workers)
+    candidates = build_signal_candidates(
+        args.daily_dir,
+        args.start_date,
+        args.force_refresh,
+        args.workers,
+        reuse_signal_cache=args.reuse_signal_cache,
+    )
     candidates = add_split(candidates)
     print(f"candidate rows: {len(candidates):,}", flush=True)
 
@@ -685,16 +771,18 @@ def main() -> None:
     latest_detail = args.output_dir / "latest_z_skill_trade_samples.csv"
 
     summary.to_csv(csv_path, index=False)
-    summary.to_csv(latest_csv, index=False)
+    atomic_link_or_copy(csv_path, latest_csv)
     playbooks.to_csv(playbook_path, index=False)
-    playbooks.to_csv(latest_playbook, index=False)
+    atomic_link_or_copy(playbook_path, latest_playbook)
     if not details.empty:
         details.to_csv(detail_path, index=False)
-        details.to_csv(latest_detail, index=False)
+        atomic_link_or_copy(detail_path, latest_detail)
+    else:
+        latest_detail.unlink(missing_ok=True)
 
     report_path = write_report(summary, playbooks, args.output_dir, timestamp)
     latest_report = args.output_dir / "latest_z_skill_entry_exit_backtest.md"
-    shutil.copyfile(report_path, latest_report)
+    atomic_link_or_copy(report_path, latest_report)
 
     print(f"summary: {csv_path}", flush=True)
     print(f"playbook: {playbook_path}", flush=True)

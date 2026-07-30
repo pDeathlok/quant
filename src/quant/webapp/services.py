@@ -2,46 +2,84 @@ from __future__ import annotations
 
 import json
 import re
+import ast
 import hashlib
+import importlib
 import importlib.util
+import multiprocessing as mp
 import os
+import queue
+import signal
+import subprocess
 import sys
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
 
+from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
+from quant.data.source_merge import normalize_ts_code
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_daily_plan, write_daily_plan
+from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.convertible_bond_allotment import build_convertible_bond_allotment_payload
 from quant.routine.convertible_bond_grid_plan import build_convertible_bond_grid_plan, refresh_convertible_bond_daily
 from quant.routine.dashboard import DASHBOARD_PATH, build_dashboard_payload, write_dashboard_json
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT, WEB_DATA_DIR
+from quant.research.similar_patterns import (
+    SimilarPatternConfig,
+    SimilarPatternResult,
+    apply_probability_calibration,
+    analyze_targets_by_threshold,
+    build_probability_variant_cases,
+    build_vector_caches_parallel,
+    classify_forecast_signal,
+    load_stock_basic,
+    optimize_similar_cases,
+    summarize_forecast,
+    vector_cache_key,
+)
+from quant.research.similar_patterns_validation import build_industry_regime, load_market_regime
+from quant.research.byd_daily_t_plan import build_daily_t_plan
 from quant.strategies.custom.byd_minute_t import BydHolding, build_minute_payload, load_daily_qfq
 from quant.strategies.custom.b1_family import add_b1_family_signals
+from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
 from quant.strategies.custom.z_skill_patterns import (
     EXTENDED_STRATEGIES,
     build_extended_daily_signals,
     _stock_basic_map,
 )
+from quant.strategies.custom.chan_model import (
+    add_chan_model_strategy_columns,
+    select_chan_model_candidates,
+    summarize_chan_model_strategy,
+)
 
 
 REPORT_DIR = PROJECT_ROOT / "reports/b1/research/xgb_project_vars_strategy"
 FAMILY_SIGNAL_CACHE = PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet"
+EXTENDED_CANDIDATE_CACHE = PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet"
 EXTENDED_SIGNAL_CACHE = PROJECT_ROOT / "data/features/z_skill_daily_signals.json"
 EXTENDED_PLAYBOOK = REPORT_DIR / "latest_z_skill_operational_playbook.csv"
 EXTENDED_MODEL_PLAYBOOK = REPORT_DIR / "latest_z_skill_model_operational_playbook.csv"
 EXTENDED_MODEL_SCORED = REPORT_DIR / "latest_z_skill_model_scored_candidates.parquet"
 EXTENDED_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.csv"
+VEGAS_TUNNEL_REPORT_DIR = PROJECT_ROOT / "reports/vegas_tunnel"
 SELECTOR_HISTORY_SIGNAL_SAMPLES = PROJECT_ROOT / "data/research/selector_history_full/selector_signal_history_samples.parquet"
 SELECTOR_BUY_HOLD_SCORE_CALIBRATION = PROJECT_ROOT / "config/selector_buy_hold_score_calibration.json"
+SELECTOR_BUY_HOLD_MODEL_DIR = PROJECT_ROOT / "models/production/selector_buy_hold"
+SELECTOR_MODEL_HISTORY = PROJECT_ROOT / "data/research/selector_model_history_2020.parquet"
 FAMILY_RULE_PATTERN = "b1_family_rule_backtest_*.csv"
 FUSION_PATTERN = "b1_model_zettaranc_fusion_*.csv"
 MODEL_FILTERED_SIGNALS = {
@@ -68,7 +106,9 @@ MODEL_SIGNAL_LABELS = {
     "YUEYUE": "跃跃欲试",
     "VIOLENCE_K": "暴力K",
 }
+_LONG_RESEARCH_MODULE_LOCK = threading.Lock()
 _TEA_MASTER_MODULE_LOCK = threading.Lock()
+_LONG_LIVE_DATA_LOCK = threading.Lock()
 STRATEGY_GROUPS = [
     {"key": "B1", "label": "B1", "status": "超跌反弹，模型+规则", "members": ["B1"]},
     {"key": "B2", "label": "B2", "status": "B1后/独立右侧确认", "members": ["B2"]},
@@ -82,6 +122,8 @@ STRATEGY_GROUPS = [
     {"key": "RHYTHM_PLATFORM", "label": "节奏/平台", "status": "呼吸结构、跃跃欲试", "members": ["BREATHING", "YUEYUE"]},
     {"key": "CHANGAN", "label": "长安战法", "status": "日线三日确认", "members": ["CHANGAN"]},
     {"key": "KENGQI", "label": "坑里起好货", "status": "日线填坑观察", "members": ["KENGQI"]},
+    {"key": "VEGAS", "label": "维加斯隧道", "status": "趋势回踩右侧确认", "members": ["VEGAS"]},
+    {"key": "TRIPLE_VOLUME_BREAKOUT", "label": "三倍量突破", "status": "缩量盘整后右侧突破", "members": ["TRIPLE_VOLUME_BREAKOUT"]},
 ]
 STRATEGY_GROUP_MEMBERS = {
     item["key"]: set(item["members"])
@@ -104,6 +146,8 @@ FAMILY_SIGNAL_COLUMNS = {
     "B3_SMALL": ("b3_small_pos_amp7", "B3", "B3 标准小阳延续", "标准 B2 后三日内小阳，涨幅0%-2%、振幅<7%"),
     "SB1": ("sb1_range10_vol12", "SB1", "SB1 洗盘观察", "前三日横盘区间<10%、放量阴线下破、J<0"),
     "SUPER_B1": ("super_washout_j10_closepos40", "SUPER_B1", "超级 B1", "近三日放量下杀，随后 J<-10 且收盘位置>=40%"),
+    "VEGAS_TUNNEL": ("signal_vegas_tunnel", "VEGAS", "维加斯隧道", "EMA144/169 隧道上行，EMA10>EMA20>隧道上沿，近8日回踩2.5%范围后收阳放量站上EMA10"),
+    "TRIPLE_VOLUME_BREAKOUT": ("signal_tvb_merged", "TRIPLE_VOLUME_BREAKOUT", "三倍量缩量盘整突破", "2.5倍量扩展候选池，3倍量命中提升为保守主策略；突破日前平均缩量，MA5>MA10>MA20且MA20上行"),
 }
 DEFAULT_ACTION_LEVELS = {"可小仓实操", "谨慎实操"}
 DEFAULT_FAMILIES = {
@@ -117,20 +161,27 @@ DEFAULT_FAMILIES = {
     "LOW_PULLBACK",
     "SUPPORT_PULLBACK",
     "RHYTHM_PLATFORM",
+    "VEGAS",
+    "TRIPLE_VOLUME_BREAKOUT",
     *MODEL_FILTERED_SIGNALS,
 }
 DEFAULT_SELECTOR_LIMIT = 50
 DEFAULT_FAMILY_CAP = 12
-SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v4"
+SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v8_robust_return_models"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
-LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v1"
+LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v6_recommendation_and_analyst_coverage"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
 WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION = "workspace_payload_v1"
 WEB_WORKSPACE_SNAPSHOT_TABLE = "web_workspace_snapshots"
+WEB_WORKSPACE_SNAPSHOT_DIR = PROJECT_ROOT / "data/workspace_snapshots"
+CONVERTIBLE_BOND_GRID_PLAN_PATH = PROJECT_ROOT / "data/web/convertible_bond_grid_plan.json"
 REFRESH_STATUS_PATH = PROJECT_ROOT / "data/routine/latest_refresh_status.json"
+REFRESH_MANIFEST_ROOT = PROJECT_ROOT / "data/routine"
 REFRESH_RUNNING_STALE_SECONDS = 6 * 60 * 60
+REFRESH_NO_PROGRESS_STALE_SECONDS = 30 * 60
+SIMILAR_PATTERNS_TIMEOUT_SECONDS = 45 * 60
 LONG_STATE_DIR = PROJECT_ROOT / "data/long_strategy_state"
 LONG_VARIANTS = {
     "tea": "core14_soft_plus",
@@ -156,11 +207,63 @@ TEA_LONG_VARIANTS = {
     "tea": "core14_soft_plus",
     "tea_safe": "core14_soft_spread",
 }
+
+
+def _selected_yaml_variant(path: Path, strategy_id: str) -> str:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    strategies = payload.get("strategies") or []
+    matches = [
+        item
+        for item in strategies
+        if str(item.get("id")) == strategy_id and bool(item.get("enabled", True))
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{path} expected one enabled strategy {strategy_id}, found {len(matches)}"
+        )
+    variant = str((matches[0].get("backtest") or {}).get("variant") or "")
+    if not variant:
+        raise ValueError(f"{path} strategy {strategy_id} has no backtest.variant")
+    return variant
+
+
+def _reload_production_strategy_configs() -> None:
+    global add_triple_volume_strategy_pool_signals
+
+    LONG_VARIANTS["v44"] = _selected_yaml_variant(
+        PROJECT_ROOT / "configs/strategies/long_dividend_quality.yaml",
+        "l1_market_regime_quality",
+    )
+    tea_variant = _selected_yaml_variant(
+        PROJECT_ROOT / "configs/strategies/tea_master_long.yaml",
+        "tea_master_regime_grid",
+    )
+    LONG_VARIANTS["tea"] = tea_variant
+    TEA_LONG_VARIANTS["tea"] = tea_variant
+    module_name = "quant.strategies.custom.triple_volume_breakout"
+    module = importlib.import_module(module_name)
+    module = importlib.reload(module)
+    add_triple_volume_strategy_pool_signals = (
+        module.add_triple_volume_strategy_pool_signals
+    )
+LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 40
 _REFRESH_LOCK = threading.Lock()
+_REFRESH_CONTEXT = threading.local()
+_REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
+_SIMILAR_PATTERN_REFRESH_GUARD = threading.Lock()
+_SIMILAR_PATTERN_REFRESH_INFLIGHT: tuple[
+    tuple[tuple[str, ...], bool],
+    Future[dict[str, Any]],
+] | None = None
 _REFRESH_STATUS: dict[str, Any] = {
     "status": "idle",
+    "run_id": None,
+    "trade_date": None,
+    "attempt": 0,
+    "resumed_from": None,
     "started_at": None,
     "finished_at": None,
+    "updated_at": None,
     "message": "尚未启动刷新任务",
     "percent": 0,
     "current_step": None,
@@ -168,14 +271,315 @@ _REFRESH_STATUS: dict[str, Any] = {
     "result": None,
     "error": None,
 }
+REFRESH_CHILD_PROCESS_MARKERS = (
+    "scripts/research/refresh_b1_feature_cache.py",
+    "scripts/research/rebuild_strategy_signal_cache.py",
+)
+REFRESH_SCOPE_LABELS = {
+    "all": "全部工作区",
+    "short": "短线策略",
+    "chan": "缠论策略",
+    "long": "长线策略",
+    "cb": "可转债策略",
+    "cbAllotment": "配债股",
+    "byd": "BYD 做T",
+    "similar": "自选池",
+}
+REFRESH_SCOPE_STEPS = {
+    "all": [
+        "refresh_data",
+        "feature_cache",
+        "daily_plan",
+        "signal_cache",
+        "model_score",
+        "selector_core",
+        "selector_extended",
+        "chan_model_strategy",
+        "long_stock_pool",
+        "convertible_bond_plan",
+        "convertible_bond_allotment",
+        "byd_daily_plan",
+        "similar_patterns",
+        "snapshot",
+    ],
+    "short": [
+        "refresh_data",
+        "feature_cache",
+        "daily_plan",
+        "signal_cache",
+        "model_score",
+        "selector_core",
+        "selector_extended",
+        "snapshot",
+    ],
+    "chan": ["refresh_data", "chan_model_strategy"],
+    "long": ["refresh_data", "long_stock_pool"],
+    "cb": ["refresh_data", "convertible_bond_plan"],
+    "cbAllotment": ["refresh_data", "convertible_bond_allotment"],
+    "byd": ["refresh_data", "byd_daily_plan"],
+    "similar": ["refresh_data", "similar_patterns"],
+}
+REFRESH_STEP_DEFINITIONS = {
+    "refresh_data": {"label": "拉取 Tushare 最新日线数据", "percent": 10},
+    "feature_cache": {"label": "增量构建 B1 特征缓存", "percent": 35},
+    "daily_plan": {"label": "生成最新策略每日计划", "percent": 45},
+    "signal_cache": {"label": "重建全市场策略规则信号", "percent": 56},
+    "model_score": {"label": "计算当日策略模型分", "percent": 70},
+    "selector_core": {"label": "计算短线核心股票池", "percent": 78},
+    "selector_extended": {"label": "计算短线全策略股票池", "percent": 88},
+    "chan_model_strategy": {"label": "生成缠论模型策略候选", "percent": 90},
+    "long_stock_pool": {"label": "计算长线策略股票池", "percent": 92},
+    "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
+    "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
+    "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
+    "similar_patterns": {"label": "刷新自选池相似走势", "percent": 97},
+    "snapshot": {"label": "写入策略股票池快照", "percent": 98},
+}
+SIMILAR_PATTERN_STATE_DIR = PROJECT_ROOT / "data/research/similar_patterns"
+SIMILAR_PATTERN_WATCHLIST_PATH = SIMILAR_PATTERN_STATE_DIR / "watchlist.json"
+SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analysis.json"
+SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
+SIMILAR_PATTERN_VALIDATION_PATH = PROJECT_ROOT / "reports/similar_patterns/validation_2025/calibration.json"
+SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS = 7
+SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY = 4  # Friday
+SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR = 15
+SIMILAR_PATTERN_VECTOR_CACHE_METADATA = "_refresh_metadata.json"
+CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH = PROJECT_ROOT / "data/routine/convertible_bond_allotments_latest.json"
+SIMILAR_PATTERN_DEFAULT_WATCHLIST = ["002594.SZ", "002788.SZ"]
+WATCHLIST_ALERT_INDICATORS = {
+    "ret_20d",
+    "drawdown_60d",
+    "vol_ratio20",
+    "dist_ma20",
+    "dist_ma60",
+    "opportunity_score",
+    "holding_score",
+}
+WATCHLIST_ALERT_OPERATORS = {"gt", "eq", "lt"}
+WATCHLIST_ALERT_MAX_REMINDERS = 20
+WATCHLIST_ALERT_MAX_CONDITIONS = 20
+WATCHLIST_ALERT_NOTE_MAX_LENGTH = 1_000
+SIMILAR_PATTERN_CONFIG = SimilarPatternConfig(
+    candidate_step_days=5,
+    candidate_start_date="2018-01-01",
+    similarity_threshold=0.055,
+    take_profit_3d=0.03,
+    stop_loss_3d=0.03,
+)
+SIMILARITY_SCORE_CONTRAST = 15.0
+
+
+def _similarity_score_ceiling(config: SimilarPatternConfig = SIMILAR_PATTERN_CONFIG) -> float:
+    """Return the fixed global upper bound of the forecast-weight formula."""
+    return float(
+        max(config.same_industry_weight, config.cross_industry_weight)
+        * max(1.0, config.same_regime_weight, config.regime_mismatch_weight)
+        * max(
+            1.0,
+            config.same_industry_regime_weight,
+            config.industry_regime_mismatch_weight,
+        )
+    )
+
+
+def _similarity_score_config() -> dict[str, float]:
+    return {
+        "similarity_score_ceiling": _similarity_score_ceiling(),
+        "similarity_score_contrast": SIMILARITY_SCORE_CONTRAST,
+    }
+
+
+def _similar_pattern_vector_cache_state_dir() -> Path:
+    return SIMILAR_PATTERN_VECTOR_CACHE_DIR / vector_cache_key(SIMILAR_PATTERN_CONFIG)
+
+
+def _read_similar_pattern_vector_cache_metadata() -> dict[str, Any]:
+    path = _similar_pattern_vector_cache_state_dir() / SIMILAR_PATTERN_VECTOR_CACHE_METADATA
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _next_similar_pattern_vector_cache_refresh_at(current: datetime) -> datetime:
+    candidate = current.replace(
+        hour=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    days_until_refresh = (SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY - current.weekday()) % 7
+    candidate = candidate + timedelta(days=days_until_refresh)
+    if candidate <= current:
+        candidate = candidate + timedelta(days=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS)
+    return candidate
+
+
+def _similar_pattern_vector_cache_in_refresh_window(current: datetime) -> bool:
+    return (
+        current.weekday() == SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY
+        and current.hour >= SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR
+    )
+
+
+def _similar_pattern_vector_cache_refreshed_this_window(
+    refreshed_at: pd.Timestamp,
+    current: datetime,
+) -> bool:
+    if pd.isna(refreshed_at) or not _similar_pattern_vector_cache_in_refresh_window(current):
+        return False
+    return refreshed_at.to_pydatetime().date() == current.date()
+
+
+def _similar_pattern_source_date_is_current(source_trade_date: str | None, current: datetime) -> bool:
+    if not source_trade_date:
+        return False
+    parsed = pd.to_datetime(source_trade_date, errors="coerce")
+    return pd.notna(parsed) and parsed.date() == current.date()
+
+
+def _latest_similar_pattern_target_date(symbols: list[str]) -> str | None:
+    """Read only watchlist files; target vectors themselves are still built live later."""
+    latest: pd.Timestamp | None = None
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    for symbol in symbols:
+        try:
+            candidate = store.latest_trade_date(DAILY_DIR.name, symbol)
+        except Exception:
+            candidate = None
+        if pd.notna(candidate) and (latest is None or candidate > latest):
+            latest = pd.Timestamp(candidate)
+    return latest.strftime("%Y-%m-%d") if latest is not None else None
+
+
+def _similar_pattern_vector_cache_refresh_decision(
+    *,
+    force: bool = False,
+    now: datetime | None = None,
+    source_trade_date: str | None = None,
+) -> dict[str, Any]:
+    state_dir = _similar_pattern_vector_cache_state_dir()
+    cache_files = list(state_dir.glob("*.npz")) if state_dir.exists() else []
+    metadata = _read_similar_pattern_vector_cache_metadata()
+    current = now or datetime.now()
+    force_from_env = os.getenv("SIMILAR_PATTERN_FORCE_VECTOR_CACHE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    refreshed_at = pd.to_datetime(metadata.get("refreshed_at"), errors="coerce")
+    inferred_legacy = False
+    if pd.isna(refreshed_at) and cache_files:
+        refreshed_at = pd.Timestamp.fromtimestamp(max(path.stat().st_mtime for path in cache_files))
+        inferred_legacy = True
+
+    if force or force_from_env:
+        due, reason = True, "forced"
+    elif not cache_files:
+        due, reason = True, "cache_missing"
+    elif int(metadata.get("errors") or 0) > 0:
+        due, reason = True, "previous_refresh_errors"
+    elif metadata.get("cached_files") is not None and int(metadata["cached_files"]) != len(cache_files):
+        due, reason = True, "cache_file_count_changed"
+    elif any(path.stat().st_size == 0 for path in cache_files):
+        due, reason = True, "empty_cache_file"
+    elif pd.isna(refreshed_at):
+        due, reason = True, "refresh_time_missing"
+    elif _similar_pattern_vector_cache_refreshed_this_window(refreshed_at, current):
+        due, reason = False, "friday_close_window_already_refreshed"
+    elif _similar_pattern_vector_cache_in_refresh_window(current):
+        if _similar_pattern_source_date_is_current(source_trade_date, current):
+            due, reason = True, "friday_close_window"
+        else:
+            due, reason = False, "waiting_for_friday_trade_close"
+    else:
+        due, reason = False, "waiting_for_friday_close"
+
+    next_refresh_at = _next_similar_pattern_vector_cache_refresh_at(current).isoformat(
+        timespec="seconds"
+    )
+    return {
+        "due": due,
+        "reason": reason,
+        "cached_files": len(cache_files),
+        "refreshed_at": refreshed_at.to_pydatetime().isoformat(timespec="seconds")
+        if pd.notna(refreshed_at)
+        else None,
+        "next_refresh_at": next_refresh_at,
+        "metadata": metadata,
+        "inferred_legacy": inferred_legacy,
+    }
+
+
+def _write_similar_pattern_vector_cache_metadata(
+    *,
+    refreshed_at: datetime,
+    source_trade_date: str | None,
+    cache_audit: pd.DataFrame,
+) -> dict[str, Any]:
+    state_dir = _similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "config_key": vector_cache_key(SIMILAR_PATTERN_CONFIG),
+        "refreshed_at": refreshed_at.isoformat(timespec="seconds"),
+        "source_trade_date": source_trade_date,
+        "refresh_interval_days": SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS,
+        "cached_files": len(list(state_dir.glob("*.npz"))),
+        "rebuilt": int(cache_audit["status"].eq("built").sum()) if not cache_audit.empty else 0,
+        "reused": int(cache_audit["status"].eq("cache_hit").sum()) if not cache_audit.empty else 0,
+        "errors": int(cache_audit["status"].eq("error").sum()) if not cache_audit.empty else 0,
+    }
+    path = state_dir / SIMILAR_PATTERN_VECTOR_CACHE_METADATA
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    return payload
+
+
+CHAN_MODEL_SCORED_PATH = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
+CHAN_MODEL_STRATEGY_DIR = PROJECT_ROOT / "reports/chan_daily/model_strategy"
+CHAN_MODEL_STRATEGY_SCORED_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_scored.parquet"
+CHAN_MODEL_LATEST_CANDIDATES_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_latest_candidates.csv"
+CHAN_MODEL_SUMMARY_PATH = CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_summary.csv"
 
 
 def _persist_refresh_status_unlocked() -> None:
-    REFRESH_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REFRESH_STATUS_PATH.write_text(
-        json.dumps(_REFRESH_STATUS, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    if (
+        _REFRESH_STATUS.get("status") in {"success", "failed"}
+        and _REFRESH_STATUS.get("run_id")
+        and not _REFRESH_STATUS.get("manifest_path")
+    ):
+        try:
+            _write_terminal_refresh_manifest_unlocked()
+        except Exception as exc:
+            _REFRESH_STATUS["manifest_error"] = str(exc)
+    atomic_write_json(_REFRESH_STATUS, REFRESH_STATUS_PATH)
+
+
+def _write_terminal_refresh_manifest_unlocked() -> Path | None:
+    if _REFRESH_STATUS.get("status") not in {"success", "failed"}:
+        return None
+    run_id = str(_REFRESH_STATUS.get("run_id") or "").strip()
+    if not run_id:
+        return None
+    started_at = _parse_refresh_timestamp(_REFRESH_STATUS.get("started_at")) or datetime.now()
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip("-") or "run"
+    run_dir = REFRESH_MANIFEST_ROOT / f"{started_at.strftime('%Y%m%d_%H%M%S')}_{safe_run_id}"
+    manifest_path = run_dir / "manifest.json"
+    _REFRESH_STATUS["manifest_path"] = str(manifest_path)
+    if manifest_path.exists():
+        return manifest_path
+    payload = {
+        "schema_version": 1,
+        "kind": "web_daily_refresh",
+        **_REFRESH_STATUS,
+    }
+    atomic_write_json(payload, manifest_path)
+    return manifest_path
 
 
 def _load_persisted_refresh_status() -> dict[str, Any] | None:
@@ -185,31 +589,276 @@ def _load_persisted_refresh_status() -> dict[str, Any] | None:
         payload = json.loads(REFRESH_STATUS_PATH.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    return _ensure_refresh_scope(payload)
+
+
+def _ensure_refresh_scope(status: dict[str, Any]) -> dict[str, Any]:
+    scoped = dict(status)
+    try:
+        scope = _normalize_refresh_scope(scoped.get("scope"))
+    except ValueError:
+        scope = "all"
+    scoped["scope"] = scope
+    scoped["scope_label"] = REFRESH_SCOPE_LABELS[scope]
+    return scoped
+
+
+def _refresh_attempt_number(
+    resume_status: dict[str, Any] | None,
+) -> int:
+    if not resume_status:
+        return 1
+    try:
+        return max(1, int(resume_status.get("attempt") or 1)) + 1
+    except (TypeError, ValueError):
+        return 2
+
+
+def _refresh_resume_source(
+    resume_status: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not resume_status:
+        return None
+    return {
+        "run_id": resume_status.get("run_id"),
+        "attempt": max(1, _refresh_attempt_number(resume_status) - 1),
+        "started_at": resume_status.get("started_at"),
+        "finished_at": resume_status.get("finished_at"),
+        "elapsed_seconds": resume_status.get("elapsed_seconds"),
+        "manifest_path": resume_status.get("manifest_path"),
+    }
+
+
+def _parse_refresh_timestamp(value: Any) -> datetime | None:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    parsed = ts.to_pydatetime()
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _last_refresh_progress_at(status: dict[str, Any]) -> datetime | None:
+    return (
+        _parse_refresh_timestamp(status.get("updated_at"))
+        or _parse_refresh_timestamp(status.get("finished_at"))
+        or _parse_refresh_timestamp(status.get("started_at"))
+    )
+
+
+def _step_status_map(status: dict[str, Any] | None) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for step in (status or {}).get("steps") or []:
+        key = str(step.get("key") or "")
+        if key:
+            mapping[key] = str(step.get("status") or "pending")
+    return mapping
+
+
+def _tail_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
+    if not status or scope not in {"all", "short"}:
+        return False
+    step_map = _step_status_map(status)
+    return step_map.get("selector_extended") == "success" and step_map.get("snapshot") != "success"
+
+
+def _source_expected_trade_date(results: dict[str, Any] | None) -> str | None:
+    refresh_data = (results or {}).get("refresh_data") or {}
+    expected = str(refresh_data.get("expected_trade_date") or "").replace("-", "")
+    if len(expected) == 8 and expected.isdigit():
+        return expected
+    return None
+
+
+def _local_market_trade_date() -> str | None:
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    latest = store.latest_dataset_trade_date(DAILY_DIR.name)
+    return latest.strftime("%Y%m%d") if latest is not None else None
+
+
+def _input_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
+    """Reuse same-day source refreshes after a downstream stage fails."""
+
+    if not status or status.get("status") != "failed":
+        return False
+    started_at = _parse_refresh_timestamp(status.get("started_at"))
+    if started_at is None or started_at.date() != datetime.now().date():
+        return False
+    results = status.get("result") or {}
+    refresh_data = results.get("refresh_data") or {}
+    if refresh_data.get("status") != "success":
+        return False
+    expected_trade_date = _source_expected_trade_date(results)
+    if expected_trade_date is None or _local_market_trade_date() != expected_trade_date:
+        return False
+    if scope in {"all", "short", "chan", "long"} and (
+        results.get("refresh_daily_basic") or {}
+    ).get("status") != "success":
+        return False
+    if scope in {"all", "short", "chan", "long"}:
+        basic_date = str(
+            (results.get("refresh_daily_basic") or {}).get("latest_trade_date")
+            or ""
+        ).replace("-", "")
+        if basic_date != expected_trade_date:
+            return False
+    reference = results.get("refresh_reference_inputs") or {}
+    if reference.get("status") != "success":
+        return False
+    if scope in {"all", "long"}:
+        analyst = (reference.get("steps") or {}).get("analyst_forecast_snapshot") or {}
+        # A degraded analyst refresh explicitly means a last-known-good
+        # snapshot is available and the reference stage had no critical error.
+        # Treat it as a reusable input checkpoint; otherwise an unrelated
+        # downstream retry needlessly repeats every market-data request.
+        if analyst.get("status") not in {"success", "skipped", "degraded"}:
+            return False
+    return True
+
+
+def _refresh_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
+    return _tail_resume_ready(status, scope) or _input_resume_ready(status, scope)
+
+
+def _new_refresh_run_id(scope: str) -> str:
+    return f"{scope}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def _owned_refresh_context_active_unlocked() -> bool:
+    context_run_id = getattr(_REFRESH_CONTEXT, "run_id", None)
+    if not context_run_id:
+        return True
+    if _REFRESH_STATUS.get("run_id") != context_run_id:
+        return False
+    return _REFRESH_STATUS.get("status") not in {"success", "failed"}
+
+
+def _refresh_child_process_pids() -> list[int]:
+    pids: list[int] = []
+    seen: set[int] = set()
+    for marker in REFRESH_CHILD_PROCESS_MARKERS:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-fl", marker],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            continue
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            pid_text, _, command = line.partition(" ")
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            if pid == os.getpid() or pid in seen:
+                continue
+            if not any(child_marker in command for child_marker in REFRESH_CHILD_PROCESS_MARKERS):
+                continue
+            seen.add(pid)
+            pids.append(pid)
+    return pids
+
+
+def _terminate_refresh_child_processes() -> int:
+    terminated = 0
+    for pid in _refresh_child_process_pids():
+        signaled = False
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            signaled = True
+        except ProcessLookupError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                signaled = True
+            except ProcessLookupError:
+                pass
+        except PermissionError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                signaled = True
+            except (ProcessLookupError, PermissionError):
+                pass
+        if signaled:
+            terminated += 1
+    return terminated
+
+
+def _terminate_active_worker_unlocked(status: dict[str, Any] | None = None) -> bool:
+    worker_key = str((status or _REFRESH_STATUS).get("active_worker_key") or "")
+    proc = _REFRESH_ACTIVE_PROCS.pop(worker_key, None) if worker_key else None
+    terminated = False
+    if proc is not None and proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=5)
+        terminated = True
+    if _terminate_refresh_child_processes():
+        terminated = True
+    _REFRESH_STATUS.pop("active_worker_key", None)
+    _REFRESH_STATUS.pop("active_worker_pid", None)
+    return terminated
+
+
+def _register_active_worker(worker_key: str, proc: mp.Process) -> None:
+    with _REFRESH_LOCK:
+        _REFRESH_ACTIVE_PROCS[worker_key] = proc
+        _REFRESH_STATUS["active_worker_key"] = worker_key
+        _REFRESH_STATUS["active_worker_pid"] = proc.pid
+        _REFRESH_STATUS["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _persist_refresh_status_unlocked()
+
+
+def _clear_active_worker(worker_key: str) -> None:
+    with _REFRESH_LOCK:
+        _REFRESH_ACTIVE_PROCS.pop(worker_key, None)
+        if _REFRESH_STATUS.get("active_worker_key") == worker_key:
+            _REFRESH_STATUS.pop("active_worker_key", None)
+            _REFRESH_STATUS.pop("active_worker_pid", None)
+            _REFRESH_STATUS["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            _persist_refresh_status_unlocked()
 
 
 def _is_refresh_status_stale(status: dict[str, Any]) -> bool:
     if status.get("status") not in {"running", "queued"}:
         return False
-    started_at = pd.to_datetime(status.get("started_at"), errors="coerce")
-    if pd.isna(started_at):
+    started = _parse_refresh_timestamp(status.get("started_at"))
+    if started is None:
         return True
-    started = started_at.to_pydatetime()
-    if started.tzinfo is not None:
-        started = started.replace(tzinfo=None)
-    return (datetime.now() - started).total_seconds() > REFRESH_RUNNING_STALE_SECONDS
+    last_progress = _last_refresh_progress_at(status) or started
+    now = datetime.now()
+    return (
+        (now - started).total_seconds() > REFRESH_RUNNING_STALE_SECONDS
+        or (now - last_progress).total_seconds() > REFRESH_NO_PROGRESS_STALE_SECONDS
+    )
 
 
 def _expire_stale_refresh_status_unlocked(status: dict[str, Any]) -> dict[str, Any]:
     if not _is_refresh_status_stale(status):
         return status
+    killed = _terminate_active_worker_unlocked(status)
     expired = dict(status)
     expired.update(
         {
             "status": "failed",
             "finished_at": datetime.now().isoformat(timespec="seconds"),
-            "message": "上一次刷新任务已超时，请重新触发更新",
-            "error": f"刷新任务超过 {REFRESH_RUNNING_STALE_SECONDS // 3600} 小时仍未完成，已标记为过期。",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "message": "上一次刷新任务长时间无进展，请重新触发更新",
+            "error": (
+                f"刷新任务超过 {REFRESH_RUNNING_STALE_SECONDS // 3600} 小时仍未完成，"
+                if _last_refresh_progress_at(status) and _parse_refresh_timestamp(status.get('started_at'))
+                and (datetime.now() - (_parse_refresh_timestamp(status.get('started_at')) or datetime.now())).total_seconds() > REFRESH_RUNNING_STALE_SECONDS
+                else f"刷新任务超过 {REFRESH_NO_PROGRESS_STALE_SECONDS // 60} 分钟无进展，"
+            ) + ("已终止卡住的后台节点并标记为过期。" if killed else "已标记为过期。"),
         }
     )
     steps = []
@@ -227,11 +876,13 @@ def _expire_stale_refresh_status_unlocked(status: dict[str, Any]) -> dict[str, A
 def _expire_interrupted_refresh_status_unlocked(status: dict[str, Any]) -> dict[str, Any]:
     if status.get("status") not in {"running", "queued"}:
         return status
+    _terminate_active_worker_unlocked(status)
     interrupted = dict(status)
     interrupted.update(
         {
             "status": "failed",
             "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
             "message": "上一次刷新任务已随服务重启中断，请重新触发更新",
             "error": "检测到服务重启后仍残留 running/queued 状态；后台线程已不存在，已自动解锁一键更新按钮。",
         }
@@ -254,6 +905,25 @@ def read_json_file(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _read_daily_payload_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        return read_json_file(path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_daily_payload_cache(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _is_daily_payload_current(payload: dict[str, Any], today: date | None = None) -> bool:
+    generated_at = pd.to_datetime(payload.get("generated_at"), errors="coerce")
+    if pd.isna(generated_at):
+        return False
+    return generated_at.date() == (today or date.today())
+
+
 def _load_project_env() -> None:
     env_path = PROJECT_ROOT / ".env"
     if not env_path.exists():
@@ -270,43 +940,114 @@ def _load_project_env() -> None:
 
 
 def get_byd_daily_strategy(
-    shares: int = 10500,
+    shares: int = 10000,
     cost: float = 110.6061,
     refresh: bool = False,
-    sold_today_shares: int = 0,
-    sold_today_price: float | None = None,
-    open_t_shares: int = 0,
-    open_t_price: float | None = None,
 ) -> dict[str, Any]:
-    """Return BYD single-stock daily range T playbook and alerts."""
+    """Return BYD's fixed, pre-market daily T plan."""
     params = {
+        "plan_version": 3,
         "shares": int(shares),
         "cost": round(float(cost), 6),
-        "sold_today_shares": int(sold_today_shares),
-        "sold_today_price": sold_today_price,
-        "open_t_shares": int(open_t_shares),
-        "open_t_price": open_t_price,
     }
     if not refresh:
-        cached = _read_workspace_snapshot("byd_daily_plan", params=params)
+        cached = _read_workspace_snapshot("byd_daily_plan", params=params, allow_sql=False)
         if cached is not None:
             return cached
     daily = _load_byd_daily_frame()
-    holding = BydHolding(shares=max(int(shares), 0), cost=float(cost), full_shares=10500)
+    holding = BydHolding(shares=max(int(shares), 0), cost=float(cost), full_shares=10000)
     payload = build_minute_payload(
         daily=daily,
         minutes=pd.DataFrame(),
         holding=holding,
-        data_status="daily_plan",
-        sold_today_shares=sold_today_shares,
-        sold_today_price=sold_today_price,
-        open_t_shares=open_t_shares,
-        open_t_price=open_t_price,
+        data_status="盘前固定日线计划",
     )
-    planned_t = payload.get("planned_t") or {}
-    snapshot_date = planned_t.get("signal_date") or payload.get("asof") or payload.get("trade_date")
-    _write_workspace_snapshot("byd_daily_plan", snapshot_date, payload, params=params)
+    daily_plan = build_daily_t_plan(
+        daily=daily,
+        intraday=_load_byd_intraday_validation_frame(),
+        shares=holding.shares,
+        full_shares=holding.full_shares,
+    )
+    positive = daily_plan["positive"]
+    if positive["execution_enabled"]:
+        primary_action = {
+            "action": "BUY_LIMIT",
+            "title": f"正T挂买单：{positive['shares']}股 × {positive['buy_price']:.2f}",
+            "detail": f"{positive['entry_rule']} {positive['exit_rule']}",
+            "shares_delta": positive["shares"],
+        }
+    else:
+        primary_action = {
+            "action": "WAIT",
+            "title": "今日不挂正T买单",
+            "detail": (
+                "历史规则本身已通过验证，但下一交易日质量分未过闸门；"
+                "不为增加次数而追价。反T仍暂停。"
+            ),
+            "shares_delta": 0,
+        }
+    payload.update(
+        {
+            "daily_t_plan": daily_plan,
+            "planned_t": daily_plan,
+            "validation": daily_plan["validation"],
+            "primary_action": primary_action,
+            "stage": {
+                "key": (
+                    "OVERWEIGHT"
+                    if holding.shares > holding.full_shares
+                    else "UNDERWEIGHT"
+                    if holding.shares < 8000
+                    else "BALANCED"
+                ),
+                "label": (
+                    f"高于满仓 {holding.shares - holding.full_shares} 股"
+                    if holding.shares > holding.full_shares
+                    else f"低于合理仓 {8000 - holding.shares} 股"
+                    if holding.shares < 8000
+                    else "合理仓位"
+                ),
+                "goal_shares": holding.full_shares,
+                "mode": daily_plan["inventory"]["note"],
+            },
+            "alerts": [],
+            "playbook": [
+                positive["entry_rule"],
+                positive["exit_rule"],
+                positive["no_fill_rule"],
+                daily_plan["reverse"]["reason"],
+                daily_plan["inventory"]["note"],
+            ],
+        }
+    )
+    for obsolete_key in [
+        "today_t",
+        "recent_minutes",
+        "intraday_dynamic",
+        "indicators",
+        "validated_positive_t",
+        "intraday_levels",
+    ]:
+        payload.pop(obsolete_key, None)
+    snapshot_date = daily_plan["signal_date"]
+    _write_workspace_snapshot(
+        "byd_daily_plan",
+        snapshot_date,
+        payload,
+        params=params,
+        write_sql=refresh,
+    )
     return payload
+
+
+@lru_cache(maxsize=1)
+def _load_byd_intraday_validation_frame() -> pd.DataFrame:
+    """Load the longest local 5-minute history for offline validation only."""
+    paths = list((PROJECT_ROOT / "data/cache").glob("baostock_002594_5min_*_qfq.parquet"))
+    if not paths:
+        raise FileNotFoundError("缺少比亚迪历史5分钟验证数据")
+    path = max(paths, key=lambda item: item.stat().st_size)
+    return pd.read_parquet(path)
 
 
 def _load_byd_daily_frame() -> pd.DataFrame:
@@ -353,15 +1094,25 @@ def _normalize_byd_daily_frame(daily: pd.DataFrame) -> pd.DataFrame:
 def _long_research_module():
     path = PROJECT_ROOT / "scripts/research/backtest_long_dividend_quality.py"
     module_name = "quant_long_dividend_quality_research"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"无法加载长线策略研究脚本: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    with _LONG_RESEARCH_MODULE_LOCK:
+        module = sys.modules.get(module_name)
+        if module is not None and getattr(module, "_quant_services_import_complete", False):
+            return module
+        if module is not None:
+            sys.modules.pop(module_name, None)
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"无法加载长线策略研究脚本: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            raise
+        module._quant_services_import_complete = True
+        return module
 
 
 @lru_cache(maxsize=1)
@@ -370,7 +1121,7 @@ def _tea_master_research_module():
     module_name = "quant_tea_master_long_research"
     with _TEA_MASTER_MODULE_LOCK:
         module = sys.modules.get(module_name)
-        if module is not None and hasattr(module, "CONFIGS"):
+        if module is not None and getattr(module, "_quant_services_import_complete", False):
             return module
         if module is not None:
             sys.modules.pop(module_name, None)
@@ -382,8 +1133,137 @@ def _tea_master_research_module():
             raise RuntimeError(f"无法加载茶大长线策略脚本: {path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            raise
+        module._quant_services_import_complete = True
         return module
+
+
+@lru_cache(maxsize=2)
+def _load_live_long_base_full_cached(
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Build the historical reference path used when no live checkpoint exists."""
+
+    module = _long_research_module()
+    requested_end = pd.to_datetime(signal_date) if signal_date else None
+    start = module.parse_date("20130101")
+    stock_basic = module.load_stock_basic()
+    daily_basic, coverage = module.load_daily_basic_monthly(start, requested_end)
+    if daily_basic.empty:
+        raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
+    features, _ = module.load_daily_monthly_features(
+        start,
+        requested_end,
+        stock_basic,
+        candidate_symbols=None,
+        use_cache=False,
+        include_daily_returns=False,
+    )
+    return features, daily_basic, stock_basic, coverage
+
+
+@lru_cache(maxsize=2)
+def _load_live_long_base_cached(
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Build live inputs from bounded price history and the latest two rebalance sections."""
+
+    module = _long_research_module()
+    requested_end = pd.to_datetime(signal_date) if signal_date else pd.Timestamp.now().normalize()
+    basic_start = requested_end - pd.DateOffset(months=LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS)
+    stock_basic = module.load_stock_basic()
+    daily_basic, coverage = module.load_daily_basic_monthly(basic_start, requested_end)
+    if daily_basic.empty:
+        raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
+    rebalance_dates = sorted(pd.to_datetime(daily_basic["date"].dropna().unique()))[-2:]
+    if not rebalance_dates:
+        raise RuntimeError("daily_basic 没有可用调仓截面")
+    price_start = pd.Timestamp(rebalance_dates[0])
+    features, _ = module.load_daily_monthly_features(
+        price_start,
+        requested_end,
+        stock_basic,
+        candidate_symbols=None,
+        use_cache=False,
+        include_daily_returns=False,
+    )
+    daily_basic = daily_basic[daily_basic["date"].isin(rebalance_dates)].copy()
+    coverage = dict(coverage)
+    coverage.update(
+        {
+            "live_windowed": True,
+            "price_history_days": 450,
+            "daily_basic_lookback_months": LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS,
+            "live_rebalance_dates": [pd.Timestamp(item).date().isoformat() for item in rebalance_dates],
+            "live_feature_rows": int(len(features)),
+            "live_daily_basic_rows": int(len(daily_basic)),
+        }
+    )
+    return features, daily_basic, stock_basic, coverage
+
+
+def _load_live_long_base(
+    signal_date: str | None,
+    *,
+    full_history: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    normalized_date = pd.to_datetime(signal_date).date().isoformat() if signal_date else None
+    with _LONG_LIVE_DATA_LOCK:
+        loader = _load_live_long_base_full_cached if full_history else _load_live_long_base_cached
+        features, daily_basic, stock_basic, coverage = loader(normalized_date)
+    return features, daily_basic, stock_basic, dict(coverage)
+
+
+def _prepare_tea_master_live_data(
+    module: Any,
+    signal_date: str | None,
+    *,
+    full_history: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    daily_features, daily_basic, stock_basic, coverage = _load_live_long_base(
+        signal_date,
+        full_history=full_history,
+    )
+    executable_start_text = max("20130101", coverage.get("first_trade_date") or "20130101")
+    executable_start = module.parse_date(executable_start_text)
+    daily_features = daily_features[daily_features["date"] >= executable_start].copy()
+    daily_basic = daily_basic[daily_basic["date"] >= executable_start].copy()
+    before_rows = len(daily_basic)
+    live_config = type(
+        "LiveTeaConfig",
+        (),
+        {
+            "variant": "tea",
+            "prefilter_min_dv_ttm": 0.0,
+            "prefilter_min_total_mv": 800000.0,
+            "prefilter_min_circ_mv": 500000.0,
+        },
+    )()
+    daily_basic = module.filter_daily_basic_point_in_time(daily_basic, live_config)
+    coverage["point_in_time_universe"] = True
+    coverage["point_in_time_universe_rows_before"] = int(before_rows)
+    coverage["point_in_time_universe_rows_after"] = int(len(daily_basic))
+    merged = daily_features.merge(
+        daily_basic.drop(columns=["trade_date"]),
+        on=["date", "ts_code"],
+        how="inner",
+    )
+    merged = module.load_financial_asof(merged)
+    merged = module.add_empty_analyst_forecast_columns(merged)
+    market_regime = module.load_market_regime(merged["date"].min(), merged["date"].max())
+    merged = merged.merge(market_regime, on="date", how="left")
+    merged["market_regime"] = merged["market_regime"].fillna("neutral")
+    for column in ["index_return_20d", "index_return_60d", "index_drawdown_60d"]:
+        if column not in merged.columns:
+            merged[column] = np.nan
+    if "index_overheat" not in merged.columns:
+        merged["index_overheat"] = False
+    return merged, stock_basic, coverage
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -442,8 +1322,49 @@ def _long_snapshot_path(snapshot_key: str) -> Path:
     return LONG_STOCK_POOL_SNAPSHOT_DIR / f"{snapshot_key}.json"
 
 
-def _read_long_stock_pool_snapshot(variant: str, signal_date: str | None) -> dict[str, Any] | None:
+def _read_long_stock_pool_snapshot(
+    variant: str,
+    signal_date: str | None,
+    allow_sql: bool = True,
+) -> dict[str, Any] | None:
     snapshot_key, _ = _long_snapshot_key(variant, signal_date)
+    requested = _canonical_workspace_snapshot_date(signal_date) if signal_date else None
+    local_candidates: list[tuple[str, Path]] = []
+    exact_path = _long_snapshot_path(snapshot_key)
+    if exact_path.exists():
+        local_candidates.append((requested or "", exact_path))
+    if LONG_STOCK_POOL_SNAPSHOT_DIR.exists():
+        for path in LONG_STOCK_POOL_SNAPSHOT_DIR.glob("*.json"):
+            if path == exact_path:
+                continue
+            try:
+                candidate_payload = read_json_file(path)
+            except Exception:
+                continue
+            if candidate_payload.get("variant") != variant:
+                continue
+            candidate_date = _canonical_workspace_snapshot_date(candidate_payload.get("signal_date"))
+            if requested and candidate_date > requested:
+                continue
+            local_candidates.append((candidate_date, path))
+    local_candidates.sort(key=lambda item: item[0], reverse=True)
+    for candidate_date, path in local_candidates:
+        try:
+            payload = read_json_file(path)
+        except Exception:
+            continue
+        cached_date = _canonical_workspace_snapshot_date(payload.get("signal_date") or candidate_date)
+        payload["cache"] = {
+            "hit": True,
+            "backend": "filesystem",
+            "snapshot_key": path.stem,
+            "snapshot_date": cached_date,
+            "requested_date": requested,
+            "stale": bool(requested and cached_date != requested),
+        }
+        return payload
+    if not allow_sql:
+        return None
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
         try:
@@ -461,14 +1382,6 @@ def _read_long_stock_pool_snapshot(variant: str, signal_date: str | None) -> dic
         except Exception:
             pass
 
-    path = _long_snapshot_path(snapshot_key)
-    if path.exists():
-        try:
-            payload = read_json_file(path)
-            payload["cache"] = {"hit": True, "backend": "json", "snapshot_key": snapshot_key}
-            return payload
-        except Exception:
-            return None
     return None
 
 
@@ -507,13 +1420,25 @@ def _long_stock_pool_snapshot_dates(variant: str) -> set[str]:
     return dates
 
 
-def _write_long_stock_pool_snapshot(payload: dict[str, Any], variant: str, signal_date: str | None) -> None:
+def _write_long_stock_pool_snapshot(
+    payload: dict[str, Any],
+    variant: str,
+    signal_date: str | None,
+    write_sql: bool = True,
+) -> None:
     snapshot_key, date_key = _long_snapshot_key(variant, signal_date)
     payload_to_store = dict(payload)
+    payload_to_store["schema_version"] = LONG_STOCK_POOL_SCHEMA_VERSION
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_path = _long_snapshot_path(snapshot_key)
+    temporary_path = snapshot_path.with_suffix(".json.tmp")
+    temporary_path.write_text(payload_json, encoding="utf-8")
+    temporary_path.replace(snapshot_path)
+    if not write_sql:
+        return
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    wrote_sql = False
     if store.config.sql_url:
         try:
             from sqlalchemy import text
@@ -556,12 +1481,8 @@ def _write_long_stock_pool_snapshot(payload: dict[str, Any], variant: str, signa
                         "payload_json": payload_json,
                     },
                 )
-            wrote_sql = True
         except Exception:
-            wrote_sql = False
-    if not wrote_sql:
-        LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        _long_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
+            return
 
 
 def _workspace_params_key(params: dict[str, Any] | None = None) -> str:
@@ -570,7 +1491,18 @@ def _workspace_params_key(params: dict[str, Any] | None = None) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _canonical_workspace_snapshot_date(value: Any) -> str:
+    text_value = str(value or "latest").strip()
+    if text_value == "latest":
+        return text_value
+    compact = text_value.replace("-", "")
+    if len(compact) == 8 and compact.isdigit():
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
+    return text_value
+
+
 def _workspace_snapshot_key(workspace: str, snapshot_date: str, params_key: str) -> str:
+    snapshot_date = _canonical_workspace_snapshot_date(snapshot_date)
     raw = json.dumps(
         {
             "schema_version": WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION,
@@ -584,56 +1516,123 @@ def _workspace_snapshot_key(workspace: str, snapshot_date: str, params_key: str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _workspace_snapshot_file_path(workspace: str, params_key: str, snapshot_date: str) -> Path:
+    safe_workspace = "".join(char for char in workspace if char.isalnum() or char in {"_", "-"})
+    date_key = _canonical_workspace_snapshot_date(snapshot_date)
+    return WEB_WORKSPACE_SNAPSHOT_DIR / safe_workspace / params_key / f"{date_key}.json"
+
+
+def _read_filesystem_workspace_snapshot(
+    workspace: str,
+    snapshot_date: str | None,
+    params_key: str,
+) -> dict[str, Any] | None:
+    directory = _workspace_snapshot_file_path(workspace, params_key, "latest").parent
+    requested = _canonical_workspace_snapshot_date(snapshot_date) if snapshot_date else None
+    candidates: list[Path] = []
+    if requested:
+        exact = _workspace_snapshot_file_path(workspace, params_key, requested)
+        if exact.exists():
+            candidates.append(exact)
+        candidates.extend(
+            sorted(
+                (
+                    path
+                    for path in directory.glob("*.json")
+                    if path != exact and path.stem != "latest" and path.stem <= requested
+                ),
+                key=lambda path: path.stem,
+                reverse=True,
+            )
+        )
+    elif directory.exists():
+        candidates = sorted(
+            (path for path in directory.glob("*.json") if path.stem != "latest"),
+            key=lambda path: path.stem,
+            reverse=True,
+        )
+    latest_path = directory / "latest.json"
+    if latest_path.exists() and latest_path not in candidates:
+        candidates.append(latest_path)
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        cached_date = _canonical_workspace_snapshot_date(
+            payload.get("trade_date") or payload.get("signal_date") or path.stem
+        )
+        if requested and cached_date != "latest" and cached_date > requested:
+            continue
+        payload["cache"] = {
+            "hit": True,
+            "backend": "filesystem",
+            "workspace": workspace,
+            "snapshot_date": cached_date,
+            "requested_date": requested,
+            "stale": bool(requested and cached_date != requested),
+        }
+        return payload
+    return None
+
+
 def _read_workspace_snapshot(
     workspace: str,
     snapshot_date: str | None = None,
     params: dict[str, Any] | None = None,
+    allow_sql: bool = True,
 ) -> dict[str, Any] | None:
+    params_key = _workspace_params_key(params)
+    filesystem_payload = _read_filesystem_workspace_snapshot(workspace, snapshot_date, params_key)
+    if filesystem_payload is not None:
+        return filesystem_payload
+    if not allow_sql:
+        return None
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if not store.config.sql_url:
         return None
-    params_key = _workspace_params_key(params)
+    requested = _canonical_workspace_snapshot_date(snapshot_date) if snapshot_date else None
     try:
         from sqlalchemy import text
 
         with store._engine().begin() as conn:
-            if snapshot_date:
-                snapshot_key = _workspace_snapshot_key(workspace, str(snapshot_date), params_key)
-                row = conn.execute(
-                    text(
-                        f"""
-                        SELECT snapshot_key, snapshot_date, payload_json
-                        FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
-                        WHERE snapshot_key = :snapshot_key
-                        """
-                    ),
-                    {"snapshot_key": snapshot_key},
-                ).mappings().first()
-            else:
-                row = conn.execute(
-                    text(
-                        f"""
-                        SELECT snapshot_key, snapshot_date, payload_json
-                        FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
-                        WHERE workspace = :workspace
-                          AND params_key = :params_key
-                        ORDER BY snapshot_date DESC, updated_at DESC
-                        LIMIT 1
-                        """
-                    ),
-                    {"workspace": workspace, "params_key": params_key},
-                ).mappings().first()
-        if not row or not row.get("payload_json"):
-            return None
-        payload = json.loads(row["payload_json"])
-        payload["cache"] = {
-            "hit": True,
-            "backend": "mysql",
-            "workspace": workspace,
-            "snapshot_key": str(row.get("snapshot_key") or ""),
-            "snapshot_date": str(row.get("snapshot_date") or ""),
-        }
-        return payload
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT snapshot_key, snapshot_date, payload_json
+                    FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
+                    WHERE workspace = :workspace
+                      AND params_key = :params_key
+                    ORDER BY updated_at DESC
+                    LIMIT 64
+                    """
+                ),
+                {"workspace": workspace, "params_key": params_key},
+            ).mappings().all()
+        eligible = []
+        for row in rows:
+            row_date = _canonical_workspace_snapshot_date(row.get("snapshot_date"))
+            if requested and row_date != "latest" and row_date > requested:
+                continue
+            eligible.append((row_date, row))
+        eligible.sort(key=lambda item: item[0] if item[0] != "latest" else "", reverse=True)
+        for row_date, row in eligible:
+            if not row.get("payload_json"):
+                continue
+            payload = json.loads(row["payload_json"])
+            payload["cache"] = {
+                "hit": True,
+                "backend": "mysql",
+                "workspace": workspace,
+                "snapshot_key": str(row.get("snapshot_key") or ""),
+                "snapshot_date": row_date,
+                "requested_date": requested,
+                "stale": bool(requested and row_date != requested),
+            }
+            return payload
+        return None
     except Exception:
         return None
 
@@ -643,8 +1642,9 @@ def _write_workspace_snapshot(
     snapshot_date: str | None,
     payload: dict[str, Any],
     params: dict[str, Any] | None = None,
+    write_sql: bool = True,
 ) -> None:
-    snapshot_date = str(snapshot_date or "latest")
+    snapshot_date = _canonical_workspace_snapshot_date(snapshot_date)
     params = params or {}
     params_key = _workspace_params_key(params)
     snapshot_key = _workspace_snapshot_key(workspace, snapshot_date, params_key)
@@ -657,6 +1657,9 @@ def _write_workspace_snapshot(
         "snapshot_date": snapshot_date,
     }
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    _write_filesystem_workspace_snapshot(workspace, params_key, snapshot_date, payload_json)
+    if not write_sql:
+        return
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if not store.config.sql_url:
         return
@@ -706,6 +1709,69 @@ def _write_workspace_snapshot(
             )
     except Exception:
         return
+
+
+def _write_filesystem_workspace_snapshot(
+    workspace: str,
+    params_key: str,
+    snapshot_date: str,
+    payload_json: str,
+) -> None:
+    snapshot_path = _workspace_snapshot_file_path(workspace, params_key, snapshot_date)
+    latest_path = _workspace_snapshot_file_path(workspace, params_key, "latest")
+    try:
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = snapshot_path.with_suffix(".json.tmp")
+        temporary_path.write_text(payload_json, encoding="utf-8")
+        temporary_path.replace(snapshot_path)
+        latest_temporary_path = latest_path.with_suffix(".json.tmp")
+        latest_temporary_path.write_text(payload_json, encoding="utf-8")
+        latest_temporary_path.replace(latest_path)
+    except Exception:
+        return
+
+
+@lru_cache(maxsize=4)
+def _chan_model_strategy_dates() -> set[str]:
+    source = CHAN_MODEL_STRATEGY_SCORED_PATH if CHAN_MODEL_STRATEGY_SCORED_PATH.exists() else CHAN_MODEL_SCORED_PATH
+    if not source.exists():
+        return set()
+    try:
+        frame = pd.read_parquet(source)
+        if "chan_model_signal" not in frame.columns:
+            frame = add_chan_model_strategy_columns(frame)
+        selected = frame[frame["chan_model_signal"].eq(1)].copy()
+        if selected.empty:
+            return set()
+        dates = pd.to_datetime(selected["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        return set(dates.dropna().tolist())
+    except Exception:
+        return set()
+
+
+def _workspace_snapshot_dates(workspace: str, params: dict[str, Any] | None = None) -> set[str]:
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    if not store.config.sql_url:
+        return set()
+    params_key = _workspace_params_key(params)
+    try:
+        from sqlalchemy import text
+
+        with store._engine().begin() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT snapshot_date
+                    FROM {WEB_WORKSPACE_SNAPSHOT_TABLE}
+                    WHERE workspace = :workspace
+                      AND params_key = :params_key
+                    """
+                ),
+                {"workspace": workspace, "params_key": params_key},
+            ).scalars().all()
+        return {str(item) for item in rows if item}
+    except Exception:
+        return set()
 
 
 def _long_entry_tranche(row: pd.Series, target_weight: float, regime: str) -> tuple[float, str]:
@@ -959,6 +2025,9 @@ def _long_status_row(
         "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
         "analyst_report_count_180d": int(_safe_float(row.get("analyst_report_count_180d"), 0.0) or 0),
         "analyst_org_count_180d": int(_safe_float(row.get("analyst_org_count_180d"), 0.0) or 0),
+        "analyst_institution_count_180d": int(_safe_float(row.get("analyst_institution_count_180d"), 0.0) or 0),
+        "analyst_research_report_count_180d": int(_safe_float(row.get("analyst_research_report_count_180d"), 0.0) or 0),
+        "analyst_consensus_report_count_180d": int(_safe_float(row.get("analyst_consensus_report_count_180d"), 0.0) or 0),
         "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
         "analyst_forward_growth_score": round(_safe_float(row.get("analyst_forward_growth_score"), 0.0) or 0.0, 2),
         "analyst_target_upside_180d": round(_safe_float(row.get("analyst_target_upside_180d"), 0.0) or 0.0, 4),
@@ -1014,9 +2083,98 @@ def _attach_analyst_forecast_for_display(frame: pd.DataFrame) -> pd.DataFrame:
     module = _long_research_module()
     out = frame.drop(columns=[col for col in frame.columns if col.startswith("analyst_")], errors="ignore")
     try:
-        return module.load_analyst_forecast_asof(out)
+        enriched = module.load_analyst_forecast_asof(out)
     except Exception:
         return module.add_empty_analyst_forecast_columns(out)
+
+    scored: list[pd.DataFrame] = []
+    growth_columns = [
+        "analyst_forward_eps_growth_180d",
+        "analyst_forward_revenue_growth_180d",
+        "analyst_forward_net_profit_growth_180d",
+    ]
+    for _, group in enriched.groupby("date", sort=False):
+        group = group.copy()
+        has_growth_metrics = group[growth_columns].notna().any(axis=1)
+        growth_score = (
+            module.percentile_score(group["analyst_forward_eps_growth_180d"].clip(-0.5, 1.5), True) * 0.35
+            + module.percentile_score(group["analyst_forward_revenue_growth_180d"].clip(-0.5, 1.5), True) * 0.30
+            + module.percentile_score(group["analyst_forward_net_profit_growth_180d"].clip(-0.8, 2.0), True) * 0.25
+            + module.percentile_score(group["analyst_report_count_180d"], True) * 0.10
+        )
+        group["analyst_forward_growth_score"] = growth_score.where(has_growth_metrics)
+        scored.append(group)
+    return pd.concat(scored, ignore_index=True) if scored else enriched
+
+
+def _upgrade_cached_tea_analyst_display(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    stocks = payload.get("stocks") or []
+    if payload.get("schema_version") == LONG_STOCK_POOL_SCHEMA_VERSION and all(
+        item.get("recommendation_level") and item.get("display_reason") for item in stocks
+    ):
+        return payload, False
+    signal_date = payload.get("signal_date")
+    if not stocks or not signal_date:
+        return payload, False
+
+    display_frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime([signal_date] * len(stocks)),
+            "ts_code": [str(item.get("ts_code")) for item in stocks],
+            "close": [item.get("close") for item in stocks],
+        }
+    )
+    enriched = _attach_analyst_forecast_for_display(display_frame).set_index("ts_code", drop=False)
+    analyst_columns = [
+        "analyst_report_count_180d",
+        "analyst_org_count_180d",
+        "analyst_institution_count_180d",
+        "analyst_research_report_count_180d",
+        "analyst_consensus_report_count_180d",
+        "analyst_forward_years_180d",
+        "analyst_forward_growth_score",
+        "analyst_target_upside_180d",
+    ]
+    upgraded = dict(payload)
+    upgraded_stocks: list[dict[str, Any]] = []
+    for item in stocks:
+        upgraded_item = dict(item)
+        code = str(item.get("ts_code"))
+        if code in enriched.index:
+            row = enriched.loc[code]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[-1]
+            for column in analyst_columns:
+                value = _safe_float(row.get(column))
+                if column in {
+                    "analyst_report_count_180d",
+                    "analyst_org_count_180d",
+                    "analyst_institution_count_180d",
+                    "analyst_research_report_count_180d",
+                    "analyst_consensus_report_count_180d",
+                    "analyst_forward_years_180d",
+                }:
+                    upgraded_item[column] = int(value or 0)
+                else:
+                    precision = 4 if column == "analyst_target_upside_180d" else 2
+                    upgraded_item[column] = round(value, precision) if value is not None else None
+        existing_since = pd.to_datetime(upgraded_item.get("recommendation_since"), errors="coerce")
+        _decorate_long_recommendation_display(
+            upgraded_item,
+            selected=upgraded_item.get("rank") is not None,
+            signal_ts=pd.Timestamp(signal_date),
+            recommendation_since=None if pd.isna(existing_since) else pd.Timestamp(existing_since),
+        )
+        upgraded_stocks.append(upgraded_item)
+    upgraded["stocks"] = upgraded_stocks
+    upgraded["state_counts"] = {
+        str(key): int(value)
+        for key, value in pd.Series(
+            [item["recommendation_level"] for item in upgraded_stocks]
+        ).value_counts().to_dict().items()
+    }
+    upgraded["schema_version"] = LONG_STOCK_POOL_SCHEMA_VERSION
+    return upgraded, True
 
 
 def _tea_t_action(row: pd.Series, regime: str) -> tuple[str, str, str]:
@@ -1162,13 +2320,195 @@ def _tea_status_row(
         "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
         "analyst_report_count_180d": int(_safe_float(row.get("analyst_report_count_180d"), 0.0) or 0),
         "analyst_org_count_180d": int(_safe_float(row.get("analyst_org_count_180d"), 0.0) or 0),
+        "analyst_institution_count_180d": int(_safe_float(row.get("analyst_institution_count_180d"), 0.0) or 0),
+        "analyst_research_report_count_180d": int(_safe_float(row.get("analyst_research_report_count_180d"), 0.0) or 0),
+        "analyst_consensus_report_count_180d": int(_safe_float(row.get("analyst_consensus_report_count_180d"), 0.0) or 0),
         "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
-        "analyst_forward_growth_score": round(_safe_float(row.get("analyst_forward_growth_score"), 0.0) or 0.0, 2),
-        "analyst_target_upside_180d": round(_safe_float(row.get("analyst_target_upside_180d"), 0.0) or 0.0, 4),
+        "analyst_forward_growth_score": (
+            round(growth_score, 2)
+            if (growth_score := _safe_float(row.get("analyst_forward_growth_score"))) is not None
+            else None
+        ),
+        "analyst_target_upside_180d": (
+            round(target_upside_score, 4)
+            if (target_upside_score := _safe_float(row.get("analyst_target_upside_180d"))) is not None
+            else None
+        ),
         "analyst_negative_warning": _safe_bool(row.get("analyst_negative_warning")),
         "close_above_ma120": bool(close is not None and _safe_float(row.get("ma_120")) is not None and close > float(row.get("ma_120"))),
         "ma_120_slope_20d": round(_safe_float(row.get("ma_120_slope_20d"), 0.0) or 0.0, 4),
     }
+
+
+def _tea_previous_target_checkpoint(variant_key: str, signal_ts: pd.Timestamp) -> set[str] | None:
+    """Recover the prior rebalance target set from the latest persisted live snapshot."""
+
+    snapshot = _read_long_stock_pool_snapshot(
+        variant_key,
+        signal_ts.date().isoformat(),
+        allow_sql=False,
+    )
+    if not snapshot or not snapshot.get("signal_date"):
+        return None
+    snapshot_ts = pd.to_datetime(snapshot["signal_date"], errors="coerce")
+    if pd.isna(snapshot_ts) or snapshot_ts > signal_ts:
+        return None
+    rows = snapshot.get("stocks") or []
+    if snapshot_ts.to_period("M") == signal_ts.to_period("M"):
+        return {
+            str(row.get("ts_code"))
+            for row in rows
+            if row.get("ts_code") and str(row.get("previous_state") or "") == "CORE"
+        }
+    return {
+        str(row.get("ts_code"))
+        for row in rows
+        if row.get("ts_code") and row.get("rank") is not None
+    }
+
+
+def _continuous_recommendation_starts(
+    targets: pd.DataFrame,
+    signal_ts: pd.Timestamp,
+) -> dict[str, pd.Timestamp]:
+    """Find the first signal date in each latest uninterrupted recommendation streak."""
+
+    if targets.empty or "rebalance_date" not in targets.columns or "ts_code" not in targets.columns:
+        return {}
+    eligible = targets[pd.to_datetime(targets["rebalance_date"], errors="coerce") <= signal_ts].copy()
+    if eligible.empty:
+        return {}
+    eligible["rebalance_date"] = pd.to_datetime(eligible["rebalance_date"], errors="coerce")
+    dates = sorted(eligible["rebalance_date"].dropna().unique())
+    if not dates:
+        return {}
+    latest_date = pd.Timestamp(dates[-1])
+    active = set(eligible.loc[eligible["rebalance_date"] == latest_date, "ts_code"].astype(str))
+    starts = {code: latest_date for code in active}
+    for candidate_date in reversed(dates[:-1]):
+        candidate_ts = pd.Timestamp(candidate_date)
+        codes = set(eligible.loc[eligible["rebalance_date"] == candidate_ts, "ts_code"].astype(str))
+        active &= codes
+        if not active:
+            break
+        for code in active:
+            starts[code] = candidate_ts
+    return starts
+
+
+def _previous_recommendation_starts(
+    variant_key: str,
+    signal_ts: pd.Timestamp,
+) -> dict[str, pd.Timestamp]:
+    snapshot = _read_long_stock_pool_snapshot(
+        variant_key,
+        signal_ts.date().isoformat(),
+        allow_sql=False,
+    )
+    if not snapshot or not snapshot.get("signal_date"):
+        return {}
+    snapshot_ts = pd.to_datetime(snapshot.get("signal_date"), errors="coerce")
+    if pd.isna(snapshot_ts) or snapshot_ts > signal_ts:
+        return {}
+    starts: dict[str, pd.Timestamp] = {}
+    for row in snapshot.get("stocks") or []:
+        code = row.get("ts_code")
+        if not code or row.get("rank") is None:
+            continue
+        started = pd.to_datetime(row.get("recommendation_since"), errors="coerce")
+        starts[str(code)] = snapshot_ts if pd.isna(started) else pd.Timestamp(started)
+    return starts
+
+
+def _decorate_long_recommendation_display(
+    item: dict[str, Any],
+    *,
+    selected: bool,
+    signal_ts: pd.Timestamp,
+    recommendation_since: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    state = str(item.get("state") or "WATCH")
+    if selected and state in {"CORE", "BUILDING", "T_ACTIVE"}:
+        level = "RECOMMENDED"
+    elif state == "EXIT":
+        level = "AVOID"
+    elif state == "REDUCE":
+        level = "CAUTION"
+    else:
+        level = "WATCH"
+
+    item["recommendation_level"] = level
+    if level == "RECOMMENDED":
+        start = pd.Timestamp(recommendation_since) if recommendation_since is not None else signal_ts
+        start = min(start.normalize(), signal_ts.normalize())
+        item["recommendation_since"] = start.date().isoformat()
+        item["recommendation_days"] = max(1, int((signal_ts.normalize() - start).days) + 1)
+    else:
+        item["recommendation_since"] = None
+        item["recommendation_days"] = None
+
+    original_reason = str(item.get("reason") or "")
+    if level == "RECOMMENDED":
+        if state == "BUILDING":
+            display_reason = "本期进入推荐池，价格与风险条件支持分批执行"
+        elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_BUY":
+            display_reason = "价格进入策略低吸区，推荐条件仍然成立"
+        elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_SELL":
+            display_reason = "价格短期偏高，但中长期推荐条件仍然成立"
+        else:
+            display_reason = "核心筛选条件延续，维持推荐"
+    elif level == "CAUTION":
+        display_reason = (
+            original_reason
+            .replace("降仓观察", "转为谨慎观察")
+            .replace("降仓", "降低推荐优先级")
+            .replace("降低组合优先级", "降低推荐优先级")
+        ) or "风险条件转弱，降低推荐优先级"
+    elif level == "AVOID":
+        display_reason = original_reason or "当前趋势条件失效，暂时回避"
+    else:
+        display_reason = original_reason or "尚未满足本期推荐条件"
+    item["display_reason"] = display_reason
+
+    levels = item.get("price_levels") or {}
+    close = _safe_float(item.get("close"))
+    aggressive = _safe_float(levels.get("entry_aggressive_price"))
+    entry = _safe_float(levels.get("entry_target_price"))
+    small_position = _safe_float(levels.get("entry_small_position_price"))
+    if level == "AVOID":
+        price_state = "TREND_INVALID"
+        price_reason = str(item.get("display_reason") or "趋势条件未恢复")
+    elif level == "CAUTION":
+        price_state = "RISK_RISING"
+        price_reason = str(item.get("display_reason") or "风险条件正在转弱")
+    elif level == "WATCH":
+        price_state = "WAIT_SIGNAL"
+        price_reason = "价格不是唯一条件，等待评分与趋势重新满足推荐门槛"
+    elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_BUY":
+        price_state = "BUY_ZONE"
+        price_reason = "价格进入策略低吸区"
+    elif state == "T_ACTIVE" and str(item.get("t_action")) == "T_SELL":
+        price_state = "WAIT_PULLBACK"
+        price_reason = "价格偏离短中期均线，等待回落"
+    elif close is not None and aggressive is not None and close <= aggressive:
+        price_state = "AGGRESSIVE"
+        price_reason = f"当前价不高于积极参考线 {aggressive:.2f}"
+    elif close is not None and entry is not None and close <= entry:
+        price_state = "BUY_ZONE"
+        price_reason = f"当前价进入建议建仓区，不高于 {entry:.2f}"
+    elif close is not None and small_position is not None and close <= small_position:
+        price_state = "SCALE_IN"
+        price_reason = f"高于理想建仓线 {entry:.2f}，仅适合分批"
+    else:
+        price_state = "WAIT_PULLBACK"
+        price_reason = (
+            f"当前价格偏高，等待回落至 {entry:.2f} 附近"
+            if entry is not None
+            else "当前缺少有效建仓参考线"
+        )
+    item["price_state"] = price_state
+    item["price_state_reason"] = price_reason
+    return item
 
 
 @lru_cache(maxsize=8)
@@ -1178,10 +2518,26 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     config = next((item for item in module.CONFIGS if item.name == config_name), None)
     if config is None:
         raise ValueError(f"未知茶大长线策略版本: {variant_key}")
-    end_text = pd.to_datetime(signal_date).strftime("%Y%m%d") if signal_date else None
-    merged, _, _, coverage = module.prepare_data(end=end_text)
+    merged, _, coverage = _prepare_tea_master_live_data(module, signal_date)
     scored = module.build_tea_scores(merged)
-    targets = module.select_targets(scored, config)
+    eligible_scored = scored.copy()
+    if signal_date:
+        eligible_scored = eligible_scored[eligible_scored["date"] <= pd.to_datetime(signal_date)].copy()
+    if eligible_scored.empty:
+        raise RuntimeError("所选日期之前没有茶大长线评分截面")
+    signal_ts = pd.to_datetime(eligible_scored["date"].max())
+    previous_recommendation_starts = _previous_recommendation_starts(variant_key, signal_ts)
+    previous_set = _tea_previous_target_checkpoint(variant_key, signal_ts)
+    if previous_set is None:
+        merged, _, coverage = _prepare_tea_master_live_data(module, signal_date, full_history=True)
+        scored = module.build_tea_scores(merged)
+        targets = module.select_targets(scored, config)
+        coverage["live_checkpoint"] = "missing_full_history_fallback"
+    else:
+        latest_scored = eligible_scored[pd.to_datetime(eligible_scored["date"]) == signal_ts].copy()
+        targets = module.select_targets(latest_scored, config, initial_current=previous_set)
+        coverage["live_checkpoint"] = "snapshot"
+        coverage["live_checkpoint_symbols"] = int(len(previous_set))
     if targets.empty:
         raise RuntimeError("茶大长线策略没有生成候选股票")
     if signal_date:
@@ -1190,15 +2546,25 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     if targets.empty:
         raise RuntimeError("所选日期之前没有茶大长线股票池")
     signal_ts = pd.to_datetime(targets["rebalance_date"].max())
-    target_dates = sorted(pd.to_datetime(targets["rebalance_date"].dropna().unique()))
-    previous_dates = [item for item in target_dates if item < signal_ts]
-    previous_target_date = previous_dates[-1] if previous_dates else None
     latest = targets[targets["rebalance_date"] == signal_ts].copy()
-    previous = targets[targets["rebalance_date"] == previous_target_date].copy() if previous_target_date is not None else pd.DataFrame()
+    recommendation_starts = (
+        _continuous_recommendation_starts(targets, signal_ts)
+        if previous_set is None
+        else previous_recommendation_starts
+    )
+    if previous_set is None:
+        target_dates = sorted(pd.to_datetime(targets["rebalance_date"].dropna().unique()))
+        previous_dates = [item for item in target_dates if item < signal_ts]
+        previous_target_date = previous_dates[-1] if previous_dates else None
+        previous = (
+            targets[targets["rebalance_date"] == previous_target_date].copy()
+            if previous_target_date is not None
+            else pd.DataFrame()
+        )
+        previous_set = set(previous["ts_code"].astype(str).tolist()) if not previous.empty else set()
     latest = latest.sort_values(["target_weight", "tea_score", "trend_score"], ascending=False)
     selected_codes = latest["ts_code"].astype(str).tolist()
     selected_set = set(selected_codes)
-    previous_set = set(previous["ts_code"].astype(str).tolist()) if not previous.empty else set()
     selected_order = {code: i + 1 for i, code in enumerate(selected_codes)}
     target_map = latest.set_index("ts_code").to_dict(orient="index") if not latest.empty else {}
 
@@ -1223,13 +2589,18 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
             enriched[key] = value
         previous_state = "CORE" if code in previous_set else "WATCH"
         rows.append(
-            _tea_status_row(
-                enriched,
-                variant=variant_key,
+            _decorate_long_recommendation_display(
+                _tea_status_row(
+                    enriched,
+                    variant=variant_key,
+                    selected=True,
+                    target_weight=float(target_map.get(code, {}).get("target_weight", 0.0) or 0.0),
+                    previous_state=previous_state,
+                    rank=selected_order.get(code),
+                ),
                 selected=True,
-                target_weight=float(target_map.get(code, {}).get("target_weight", 0.0) or 0.0),
-                previous_state=previous_state,
-                rank=selected_order.get(code),
+                signal_ts=signal_ts,
+                recommendation_since=recommendation_starts.get(code),
             )
         )
         appended.add(code)
@@ -1240,13 +2611,17 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         if isinstance(row, pd.DataFrame):
             row = row.iloc[-1]
         rows.append(
-            _tea_status_row(
-                row,
-                variant=variant_key,
+            _decorate_long_recommendation_display(
+                _tea_status_row(
+                    row,
+                    variant=variant_key,
+                    selected=False,
+                    target_weight=0.0,
+                    previous_state="CORE",
+                    rank=None,
+                ),
                 selected=False,
-                target_weight=0.0,
-                previous_state="CORE",
-                rank=None,
+                signal_ts=signal_ts,
             )
         )
         appended.add(code)
@@ -1267,13 +2642,17 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         if code in appended:
             continue
         rows.append(
-            _tea_status_row(
-                row,
-                variant=variant_key,
+            _decorate_long_recommendation_display(
+                _tea_status_row(
+                    row,
+                    variant=variant_key,
+                    selected=False,
+                    target_weight=0.0,
+                    previous_state="WATCH",
+                    rank=None,
+                ),
                 selected=False,
-                target_weight=0.0,
-                previous_state="WATCH",
-                rank=None,
+                signal_ts=signal_ts,
             )
         )
         appended.add(code)
@@ -1288,7 +2667,7 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         ),
     )
     regime = str(latest["market_regime"].dropna().iloc[0]) if not latest["market_regime"].dropna().empty else "neutral"
-    state_counts = pd.Series([row["state"] for row in rows]).value_counts().to_dict()
+    state_counts = pd.Series([row["recommendation_level"] for row in rows]).value_counts().to_dict()
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": signal_ts.date().isoformat(),
@@ -1317,23 +2696,14 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
 
     requested_end = pd.to_datetime(signal_date) if signal_date else None
     config = module.BacktestConfig(variant=variant, start="20130101", end=None)
-    start = module.parse_date(config.start)
-    stock_basic = module.load_stock_basic()
-    daily_basic, coverage = module.load_daily_basic_monthly(start, requested_end)
-    if daily_basic.empty:
-        raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
+    features, daily_basic, stock_basic, coverage = _load_live_long_base(signal_date)
     if variant in getattr(module, "PIT_UNIVERSE_VARIANTS", set()):
         candidate_symbols = None
         coverage["point_in_time_universe"] = True
     else:
         candidate_symbols = module.select_candidate_symbols_from_daily_basic(daily_basic, stock_basic, config)
         coverage["point_in_time_universe"] = False
-    features, _ = module.load_daily_monthly_features(
-        start,
-        requested_end,
-        stock_basic,
-        candidate_symbols=candidate_symbols,
-    )
+        features = features[features["ts_code"].astype(str).isin(candidate_symbols)].copy()
     if requested_end is not None:
         features = features[features["date"] <= requested_end].copy()
         daily_basic = daily_basic[daily_basic["date"] <= requested_end].copy()
@@ -1448,6 +2818,17 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
             )
         )
 
+    for item in rows:
+        code = str(item.get("ts_code"))
+        previous = previous_states.get(code) or {}
+        previous_since = pd.to_datetime(previous.get("recommendation_since"), errors="coerce")
+        _decorate_long_recommendation_display(
+            item,
+            selected=item.get("rank") is not None,
+            signal_ts=pd.Timestamp(signal_ts),
+            recommendation_since=None if pd.isna(previous_since) else pd.Timestamp(previous_since),
+        )
+
     state_order = {"CORE": 0, "T_ACTIVE": 1, "BUILDING": 2, "REDUCE": 3, "WATCH": 4, "EXIT": 5, "COOLDOWN": 6}
     rows = sorted(
         rows,
@@ -1458,7 +2839,7 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
         ),
     )
     regime = str(scored["market_regime"].dropna().iloc[0]) if "market_regime" in scored.columns and not scored["market_regime"].dropna().empty else "neutral"
-    state_counts = pd.Series([row["state"] for row in rows]).value_counts().to_dict()
+    state_counts = pd.Series([row["recommendation_level"] for row in rows]).value_counts().to_dict()
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": pd.Timestamp(signal_ts).date().isoformat(),
@@ -1471,8 +2852,8 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
         "stocks": rows,
         "notes": [
             "长线股票池使用最新可用月度信号截面生成，券商预测严格按 report_date <= signal_date 合并。",
-            "状态机当前为策略状态建议，已读取上一轮信号快照；接入真实账户持仓后可升级为完整持仓状态机。",
-            "BUILDING 的 first_tranche_weight 是更谨慎的首批建仓建议，不等同于最终目标仓位。",
+            "推荐程度与价格状态分开表达；推荐角标为连续入选的自然日数，不代表真实账户持仓。",
+            "策略目标和参考首批仅用于组合研究，不生成降仓或清仓等账户指令。",
         ],
     }
     if persist_state:
@@ -1490,22 +2871,990 @@ def get_long_stock_pool(
         variant,
     )
     if not refresh:
-        cached = _read_long_stock_pool_snapshot(variant_key, signal_date)
+        cached = _read_long_stock_pool_snapshot(variant_key, signal_date, allow_sql=False)
         if cached is not None:
+            if variant_key in TEA_LONG_VARIANTS:
+                cached, upgraded = _upgrade_cached_tea_analyst_display(cached)
+                if upgraded:
+                    _write_long_stock_pool_snapshot(cached, variant_key, signal_date, write_sql=False)
+                    cached["cache"] = {
+                        "hit": True,
+                        "backend": "filesystem",
+                        "migrated": True,
+                        "schema_version": LONG_STOCK_POOL_SCHEMA_VERSION,
+                    }
             return cached
     if variant_key in TEA_LONG_VARIANTS:
         if refresh:
             _build_tea_master_stock_pool_cached.cache_clear()
         payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
-        _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
+        _write_long_stock_pool_snapshot(payload, variant_key, signal_date, write_sql=refresh)
         payload["cache"] = {"hit": False, "backend": "generated"}
         return payload
     if refresh:
         _build_long_stock_pool_cached.cache_clear()
     payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
-    _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
+    _write_long_stock_pool_snapshot(payload, variant_key, signal_date, write_sql=refresh)
     payload["cache"] = {"hit": False, "backend": "generated"}
     return payload
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        if not np.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if pd.isna(value):
+        return None
+    return value
+
+
+def _frame_records(frame: pd.DataFrame | None, limit: int | None = None) -> list[dict[str, Any]]:
+    if frame is None or frame.empty:
+        return []
+    out = frame.head(limit).copy() if limit else frame.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return [_json_ready(record) for record in out.replace([np.inf, -np.inf], np.nan).to_dict("records")]
+
+
+def _normalize_watch_symbol(raw_symbol: str) -> str:
+    symbol = str(raw_symbol or "").strip().upper()
+    if not symbol:
+        raise ValueError("股票代码不能为空")
+    symbol = symbol.replace("_", ".")
+    symbol = normalize_ts_code(symbol)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    if store.latest_trade_date(DAILY_DIR.name, symbol) is None:
+        raise ValueError(f"本地日线数据不存在: {symbol}")
+    return symbol
+
+
+def _stock_basic_for_similar_patterns() -> pd.DataFrame:
+    return load_stock_basic(PROJECT_ROOT / "data/raw/stock_basic.parquet")
+
+
+def _stock_profile_from_basic(symbol: str, basic: pd.DataFrame | None = None) -> dict[str, str]:
+    frame = basic if basic is not None else _stock_basic_for_similar_patterns()
+    if frame is not None and not frame.empty:
+        row = frame[frame["ts_code"] == symbol]
+        if not row.empty:
+            return {
+                "symbol": symbol,
+                "name": str(row["name"].iloc[0]),
+                "industry": str(row["industry"].iloc[0]),
+            }
+    return {"symbol": symbol, "name": symbol, "industry": ""}
+
+
+def _normalize_watch_alert_conditions(
+    raw_conditions: Any,
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw_conditions, list):
+        if strict:
+            raise ValueError("提醒条件必须是列表")
+        return []
+    if len(raw_conditions) > WATCHLIST_ALERT_MAX_CONDITIONS:
+        if strict:
+            raise ValueError(f"每个提醒最多设置 {WATCHLIST_ALERT_MAX_CONDITIONS} 条条件")
+        raw_conditions = raw_conditions[:WATCHLIST_ALERT_MAX_CONDITIONS]
+
+    normalized: list[dict[str, Any]] = []
+    for index, raw_condition in enumerate(raw_conditions):
+        if not isinstance(raw_condition, dict):
+            if strict:
+                raise ValueError("提醒条件格式无效")
+            continue
+        kind = str(raw_condition.get("kind") or "")
+        if kind not in {"price", "indicator"}:
+            if strict:
+                raise ValueError("提醒条件类型必须是价格或指标")
+            continue
+        operator = str(raw_condition.get("operator") or "")
+        if operator not in WATCHLIST_ALERT_OPERATORS:
+            if strict:
+                raise ValueError("提醒条件运算符无效")
+            continue
+        conjunction = str(raw_condition.get("conjunction") or "and").lower()
+        if conjunction not in {"and", "or"}:
+            if strict:
+                raise ValueError("条件关系必须是 and 或 or")
+            conjunction = "and"
+        try:
+            value = float(raw_condition.get("value"))
+        except (TypeError, ValueError):
+            if strict:
+                raise ValueError("提醒阈值必须是数字")
+            continue
+        if not np.isfinite(value) or (kind == "price" and value <= 0):
+            if strict:
+                raise ValueError("价格阈值必须大于 0" if kind == "price" else "指标阈值必须是有限数字")
+            continue
+        condition_id = str(raw_condition.get("id") or f"condition-{index + 1}").strip()[:64]
+        condition: dict[str, Any] = {
+            "id": condition_id or f"condition-{index + 1}",
+            "conjunction": "and" if index == 0 else conjunction,
+            "kind": kind,
+            "operator": operator,
+            "value": value,
+        }
+        if kind == "indicator":
+            indicator = str(raw_condition.get("indicator") or "")
+            if indicator not in WATCHLIST_ALERT_INDICATORS:
+                if strict:
+                    raise ValueError("不支持该指标提醒")
+                continue
+            condition["indicator"] = indicator
+        normalized.append(condition)
+    return normalized
+
+
+def _normalize_watch_alert_reminders(
+    raw_reminders: Any,
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw_reminders, list):
+        if strict:
+            raise ValueError("提醒列表格式无效")
+        return []
+    if len(raw_reminders) > WATCHLIST_ALERT_MAX_REMINDERS:
+        if strict:
+            raise ValueError(f"每只股票最多设置 {WATCHLIST_ALERT_MAX_REMINDERS} 个提醒")
+        raw_reminders = raw_reminders[:WATCHLIST_ALERT_MAX_REMINDERS]
+
+    normalized: list[dict[str, Any]] = []
+    for index, raw_reminder in enumerate(raw_reminders):
+        if not isinstance(raw_reminder, dict):
+            if strict:
+                raise ValueError("提醒格式无效")
+            continue
+        note = str(raw_reminder.get("note") or "").strip()
+        if len(note) > WATCHLIST_ALERT_NOTE_MAX_LENGTH:
+            if strict:
+                raise ValueError(f"提醒备注不能超过 {WATCHLIST_ALERT_NOTE_MAX_LENGTH} 个字符")
+            note = note[:WATCHLIST_ALERT_NOTE_MAX_LENGTH]
+        conditions = _normalize_watch_alert_conditions(
+            raw_reminder.get("conditions", []),
+            strict=strict,
+        )
+        if not conditions:
+            if strict:
+                raise ValueError("每个提醒至少需要一个条件")
+            continue
+        reminder_id = str(raw_reminder.get("id") or f"reminder-{index + 1}").strip()[:64]
+        normalized.append(
+            {
+                "id": reminder_id or f"reminder-{index + 1}",
+                "note": note,
+                "conditions": conditions,
+            }
+        )
+    return normalized
+
+
+def _normalize_watch_alert_config(raw_config: Any, *, strict: bool = False) -> dict[str, Any]:
+    if not isinstance(raw_config, dict):
+        if strict:
+            raise ValueError("提醒设置格式无效")
+        raw_config = {}
+    reminders = _normalize_watch_alert_reminders(
+        raw_config.get("reminders", []),
+        strict=strict,
+    )
+    updated_at = str(raw_config.get("updated_at") or "")
+    return {
+        "enabled": bool(raw_config.get("enabled", True)) and bool(reminders),
+        "reminders": reminders,
+        "updated_at": updated_at,
+    }
+
+
+def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
+    default = {
+        "symbols": list(SIMILAR_PATTERN_DEFAULT_WATCHLIST),
+        "notes": {},
+        "pinned": [],
+        "alerts": {},
+    }
+    if not SIMILAR_PATTERN_WATCHLIST_PATH.exists():
+        return default
+    try:
+        payload = json.loads(SIMILAR_PATTERN_WATCHLIST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+    raw_symbols = payload.get("symbols", payload) if isinstance(payload, dict) else payload
+    symbols: list[str] = []
+    for item in raw_symbols if isinstance(raw_symbols, list) else []:
+        try:
+            symbol = _normalize_watch_symbol(str(item))
+        except ValueError:
+            continue
+        if symbol not in symbols:
+            symbols.append(symbol)
+
+    raw_notes = payload.get("notes", {}) if isinstance(payload, dict) else {}
+    notes: dict[str, dict[str, str]] = {}
+    if isinstance(raw_notes, dict):
+        for raw_symbol, raw_note in raw_notes.items():
+            symbol = str(raw_symbol or "").strip().upper().replace("_", ".")
+            if symbol not in symbols:
+                continue
+            if isinstance(raw_note, dict):
+                content = str(raw_note.get("content") or "")
+                updated_at = str(raw_note.get("updated_at") or "")
+            else:
+                content = str(raw_note or "")
+                updated_at = ""
+            if content:
+                notes[symbol] = {"content": content, "updated_at": updated_at}
+    symbols = symbols or list(SIMILAR_PATTERN_DEFAULT_WATCHLIST)
+    raw_pinned = payload.get("pinned", []) if isinstance(payload, dict) else []
+    pinned_values = raw_pinned if isinstance(raw_pinned, list) else []
+    pinned = [symbol for symbol in symbols if symbol in {str(item).strip().upper().replace("_", ".") for item in pinned_values}]
+    raw_alerts = payload.get("alerts", {}) if isinstance(payload, dict) else {}
+    alerts = {}
+    if isinstance(raw_alerts, dict):
+        for symbol in symbols:
+            alert_config = _normalize_watch_alert_config(raw_alerts.get(symbol, {}))
+            if alert_config["reminders"]:
+                alerts[symbol] = alert_config
+    ordered_symbols = pinned + [symbol for symbol in symbols if symbol not in pinned]
+    return {"symbols": ordered_symbols, "notes": notes, "pinned": pinned, "alerts": alerts}
+
+
+def _read_similar_pattern_watchlist_symbols() -> list[str]:
+    return list(_read_similar_pattern_watchlist_state()["symbols"])
+
+
+def _write_similar_pattern_watchlist_symbols(symbols: list[str]) -> None:
+    state = _read_similar_pattern_watchlist_state()
+    state["symbols"] = symbols
+    _write_similar_pattern_watchlist_state(state)
+
+
+def _write_similar_pattern_watchlist_state(state: dict[str, Any]) -> None:
+    SIMILAR_PATTERN_WATCHLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    symbols = list(dict.fromkeys(state.get("symbols", [])))
+    pinned_set = set(state.get("pinned", []))
+    alerts = {}
+    for symbol in symbols:
+        alert_config = _normalize_watch_alert_config(state.get("alerts", {}).get(symbol, {}))
+        if alert_config["reminders"]:
+            alerts[symbol] = alert_config
+    payload = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "symbols": symbols,
+        "pinned": [symbol for symbol in symbols if symbol in pinned_set],
+        "notes": {
+            symbol: state["notes"][symbol]
+            for symbol in symbols
+            if symbol in state["notes"]
+        },
+        "alerts": alerts,
+    }
+    SIMILAR_PATTERN_WATCHLIST_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _similar_pattern_watchlist_profiles(
+    basic: pd.DataFrame | None = None,
+    *,
+    include_scores: bool = True,
+) -> list[dict[str, Any]]:
+    state = _read_similar_pattern_watchlist_state()
+    scores = _watchlist_buy_hold_scores(tuple(state["symbols"])) if include_scores else {}
+    profiles = []
+    for symbol in state["symbols"]:
+        profile = _stock_profile_from_basic(symbol, basic)
+        note = state["notes"].get(symbol, {})
+        profile["note"] = note.get("content", "")
+        profile["note_updated_at"] = note.get("updated_at", "")
+        profile["pinned"] = symbol in state["pinned"]
+        alert_config = _normalize_watch_alert_config(state["alerts"].get(symbol, {}))
+        profile["alerts"] = alert_config
+        profile["alert_count"] = len(alert_config["reminders"])
+        profile["alert_condition_count"] = sum(
+            len(reminder["conditions"])
+            for reminder in alert_config["reminders"]
+        )
+        profile.update(scores.get(symbol, {}))
+        profiles.append(profile)
+    return profiles
+
+
+def get_similar_pattern_watchlist(*, include_scores: bool = True) -> dict[str, Any]:
+    basic = _stock_basic_for_similar_patterns()
+    return {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "stocks": _similar_pattern_watchlist_profiles(
+            basic,
+            include_scores=include_scores,
+        ),
+    }
+
+
+def add_similar_pattern_watch_symbol(symbol: str, note: str = "") -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        state["symbols"].append(normalized)
+    cleaned_note = str(note or "").strip()
+    if cleaned_note:
+        existing = str(state["notes"].get(normalized, {}).get("content") or "").strip()
+        existing_lines = {line.strip() for line in existing.splitlines() if line.strip()}
+        if cleaned_note not in existing_lines:
+            merged = f"{existing}\n{cleaned_note}".strip() if existing else cleaned_note
+            if len(merged) > 20_000:
+                raise ValueError("追加来源后笔记不能超过 20000 个字符")
+            state["notes"][normalized] = {
+                "content": merged,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist(include_scores=False)
+
+
+def remove_similar_pattern_watch_symbol(symbol: str) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    state["symbols"] = [item for item in state["symbols"] if item != normalized]
+    state["pinned"] = [item for item in state["pinned"] if item != normalized]
+    state["notes"].pop(normalized, None)
+    state["alerts"].pop(normalized, None)
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def reorder_similar_pattern_watchlist(symbols: list[str]) -> dict[str, Any]:
+    state = _read_similar_pattern_watchlist_state()
+    normalized = [_normalize_watch_symbol(symbol) for symbol in symbols]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("自选池排序不能包含重复股票")
+    if set(normalized) != set(state["symbols"]):
+        raise ValueError("自选池排序必须包含当前全部股票")
+    pinned_set = set(state["pinned"])
+    state["symbols"] = [symbol for symbol in normalized if symbol in pinned_set] + [
+        symbol for symbol in normalized if symbol not in pinned_set
+    ]
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def set_similar_pattern_watch_pin(symbol: str, pinned: bool) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        raise ValueError(f"股票不在自选池中: {normalized}")
+    symbols = [item for item in state["symbols"] if item != normalized]
+    current_pinned = [item for item in state["pinned"] if item != normalized]
+    if pinned:
+        state["pinned"] = [normalized, *current_pinned]
+        state["symbols"] = [normalized, *symbols]
+    else:
+        state["pinned"] = current_pinned
+        state["symbols"] = [*symbols[: len(current_pinned)], normalized, *symbols[len(current_pinned) :]]
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def save_similar_pattern_watch_note(symbol: str, content: str) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        raise ValueError(f"股票不在自选池中: {normalized}")
+    cleaned = str(content or "").strip()
+    if len(cleaned) > 20_000:
+        raise ValueError("笔记不能超过 20000 个字符")
+    if cleaned:
+        state["notes"][normalized] = {
+            "content": cleaned,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    else:
+        state["notes"].pop(normalized, None)
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def save_similar_pattern_watch_alerts(symbol: str, config: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_watch_symbol(symbol)
+    state = _read_similar_pattern_watchlist_state()
+    if normalized not in state["symbols"]:
+        raise ValueError(f"股票不在自选池中: {normalized}")
+    cleaned = _normalize_watch_alert_config(config, strict=True)
+    if cleaned["reminders"]:
+        cleaned["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        state["alerts"][normalized] = cleaned
+    else:
+        state["alerts"].pop(normalized, None)
+    _write_similar_pattern_watchlist_state(state)
+    return get_similar_pattern_watchlist()
+
+
+def _read_similar_pattern_validation() -> dict[str, Any]:
+    if not SIMILAR_PATTERN_VALIDATION_PATH.exists():
+        return {}
+    try:
+        return json.loads(SIMILAR_PATTERN_VALIDATION_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _similar_pattern_result_payload(
+    result: SimilarPatternResult,
+    *,
+    profile: dict[str, Any] | None = None,
+    market_regime: pd.DataFrame | None = None,
+    industry_regime: pd.DataFrame | None = None,
+    validation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile = profile or {}
+    validation = validation or {}
+    optimized_cases = result.similar_cases.copy()
+    target_market_regime = "neutral"
+    target_industry_regime = "neutral"
+    if market_regime is not None and not market_regime.empty:
+        market_map = market_regime.set_index("date")["market_regime"]
+        optimized_cases["date"] = pd.to_datetime(optimized_cases["date"], errors="coerce")
+        optimized_cases["market_regime"] = optimized_cases["date"].map(market_map).fillna("neutral")
+        eligible = market_regime[market_regime["date"] <= result.target.target_date]
+        if not eligible.empty:
+            target_market_regime = str(eligible.iloc[-1]["market_regime"])
+    if industry_regime is not None and not industry_regime.empty:
+        industry_map = industry_regime.set_index("date")["industry_regime"]
+        optimized_cases["industry_regime"] = np.where(
+            optimized_cases["industry"].fillna("").astype(str).eq(str(profile.get("industry") or "")),
+            optimized_cases["date"].map(industry_map).fillna("neutral"),
+            "cross_industry",
+        )
+        eligible = industry_regime[industry_regime["date"] <= result.target.target_date]
+        if not eligible.empty:
+            target_industry_regime = str(eligible.iloc[-1]["industry_regime"])
+    context_cases = optimized_cases.copy()
+    optimized_cases, optimization_summary = optimize_similar_cases(
+        optimized_cases,
+        SIMILAR_PATTERN_CONFIG,
+        target_date=result.target.target_date,
+        target_industry=str(profile.get("industry") or ""),
+        target_market_regime=target_market_regime,
+        target_industry_regime=target_industry_regime,
+    )
+    optimized_forecast = summarize_forecast(optimized_cases)
+    variant_cases = build_probability_variant_cases(
+        context_cases,
+        SIMILAR_PATTERN_CONFIG,
+        target_date=result.target.target_date,
+        target_industry=str(profile.get("industry") or ""),
+        target_market_regime=target_market_regime,
+        target_industry_regime=target_industry_regime,
+    )
+    variant_forecasts = {
+        name: summarize_forecast(cases).set_index("horizon")
+        for name, cases in variant_cases.items()
+    }
+    calibration_payload = validation.get("calibrations") or {}
+    calibration_map = (
+        calibration_payload
+        if any(horizon in calibration_payload for horizon in ["next_1d", "next_1m", "next_3m"])
+        else calibration_payload.get(result.target.symbol, {})
+    )
+    model_selection_payload = validation.get("model_selection") or {}
+    model_selection = (
+        model_selection_payload
+        if any(horizon in model_selection_payload for horizon in ["next_1d", "next_1m", "next_3m"])
+        else model_selection_payload.get(result.target.symbol, {})
+    )
+    raw_forecast_map = result.forecast.set_index("horizon") if not result.forecast.empty else pd.DataFrame()
+    decisions: list[dict[str, Any]] = []
+    for row_index, row in optimized_forecast.iterrows():
+        horizon = str(row["horizon"])
+        calibrated = apply_probability_calibration(row.get("up_probability"), calibration_map.get(horizon))
+        optimized_forecast.at[row_index, "calibrated_up_probability"] = calibrated
+        selected_policy = model_selection.get(horizon, {}).get("selected") or {}
+        selected_source = str(selected_policy.get("source") or "raw_baseline")
+        if selected_source == "raw_baseline" and horizon in raw_forecast_map.index:
+            selected_probability = raw_forecast_map.loc[horizon, "up_probability"]
+        elif selected_source in variant_forecasts and horizon in variant_forecasts[selected_source].index:
+            selected_probability = variant_forecasts[selected_source].loc[horizon, "up_probability"]
+        elif selected_source in {"optimized", "full_weighting"}:
+            selected_probability = row.get("up_probability")
+        elif selected_source == "calibrated":
+            selected_probability = calibrated
+        else:
+            selected_probability = row.get("up_probability")
+        optimized_forecast.at[row_index, "selected_up_probability"] = selected_probability
+        optimized_forecast.at[row_index, "probability_source"] = selected_source
+        decision_config = replace(
+            SIMILAR_PATTERN_CONFIG,
+            signal_bearish_max=float(selected_policy.get("bearish_max", SIMILAR_PATTERN_CONFIG.signal_bearish_max)),
+            signal_bullish_min=float(selected_policy.get("bullish_min", SIMILAR_PATTERN_CONFIG.signal_bullish_min)),
+            enable_risk_gate=bool(selected_policy.get("enable_risk_gate", False)),
+        )
+        decision = classify_forecast_signal(
+            selected_probability,
+            result.latest_snapshot,
+            target_market_regime,
+            decision_config,
+        )
+        decision["horizon"] = horizon
+        decision["probability_source"] = selected_source
+        decisions.append(decision)
+
+    top_cases = optimized_cases.copy()
+    if not top_cases.empty:
+        for col in ["fwd_1d", "fwd_20d", "fwd_60d", "max_drawdown_60d"]:
+            if col in top_cases.columns:
+                top_cases[col] = (pd.to_numeric(top_cases[col], errors="coerce") * 100).round(2)
+        if "similarity" in top_cases.columns:
+            raw_similarity = pd.to_numeric(top_cases["similarity"], errors="coerce")
+            forecast_weight = pd.to_numeric(
+                top_cases.get("forecast_weight", pd.Series(0.0, index=top_cases.index)),
+                errors="coerce",
+            )
+            normalized_weight = (forecast_weight / _similarity_score_ceiling()).clip(lower=0, upper=1)
+            top_cases["similarity_score"] = (
+                np.log1p(SIMILARITY_SCORE_CONTRAST * normalized_weight)
+                / np.log1p(SIMILARITY_SCORE_CONTRAST)
+                * 100
+            ).round(1)
+            top_cases["similarity"] = raw_similarity.round(4)
+    return {
+        "target": {
+            "symbol": result.target.symbol,
+            "name": result.target.name,
+            "target_date": result.target.target_date.strftime("%Y-%m-%d"),
+        },
+        "latest_snapshot": _json_ready(result.latest_snapshot),
+        "forecast": _frame_records(result.forecast),
+        "optimized_forecast": _frame_records(optimized_forecast),
+        "decisions": _json_ready(decisions),
+        "optimization_summary": _json_ready(optimization_summary),
+        "market_regime": target_market_regime,
+        "industry_regime": target_industry_regime,
+        "validation_summary": [
+            item for item in (validation.get("summary") or []) if item.get("symbol") == result.target.symbol
+        ],
+        "global_policy": _json_ready(model_selection),
+        "status_probs": _json_ready(result.status_probs),
+        "t1_scenario_plan": _frame_records(result.t1_scenario_plan),
+        "sell_model_summary": _json_ready(result.sell_model_summary or {}),
+        "sell_model_plan": _frame_records(result.sell_model_plan),
+        "top_cases": _frame_records(top_cases, limit=10),
+        "scan_summary": _json_ready(result.scan_summary or {}),
+    }
+
+
+def _read_similar_pattern_analysis_cache() -> dict[str, Any] | None:
+    if not SIMILAR_PATTERN_ANALYSIS_PATH.exists():
+        return None
+    try:
+        return json.loads(SIMILAR_PATTERN_ANALYSIS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Collect current cross-workspace hits for watchlist symbols from existing strategy payloads."""
+    targets = {str(symbol).upper() for symbol in symbols}
+    hits: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in targets}
+
+    def append_hit(symbol: str, key: str, label: str, detail: str, signal_date: Any = None) -> None:
+        try:
+            normalized = _normalize_watch_symbol(symbol)
+        except ValueError:
+            return
+        if normalized not in targets:
+            return
+        candidate = {
+            "strategy_key": key,
+            "strategy_label": label,
+            "detail": detail,
+            "signal_date": str(signal_date or ""),
+        }
+        if not any(item["strategy_key"] == key for item in hits[normalized]):
+            hits[normalized].append(candidate)
+
+    try:
+        short_payload = get_stock_selector_payload(include_extended=True, use_cache=True)
+        for item in short_payload.get("stocks") or []:
+            families = " / ".join(str(value) for value in (item.get("matched_families") or [])[:4])
+            append_hit(
+                str(item.get("symbol") or ""),
+                "short",
+                "短线",
+                families or f"命中 {int(item.get('matched_count') or 0)} 个策略组",
+                short_payload.get("signal_date"),
+            )
+    except Exception:
+        pass
+
+    try:
+        chan_payload = get_chan_model_strategy_plan(top_n=20)
+        for item in chan_payload.get("candidates") or []:
+            append_hit(
+                str(item.get("symbol") or ""),
+                "chan",
+                "缠论",
+                str(item.get("rule_name") or item.get("signal_name") or "缠论候选"),
+                chan_payload.get("signal_date"),
+            )
+    except Exception:
+        pass
+
+    try:
+        long_payload = get_long_stock_pool(variant="tea")
+        for item in long_payload.get("stocks") or []:
+            append_hit(
+                str(item.get("ts_code") or ""),
+                "long",
+                "长线",
+                f"{item.get('state') or '-'} · {item.get('action') or item.get('t_action') or '-'}",
+                long_payload.get("signal_date"),
+            )
+    except Exception:
+        pass
+
+    return hits
+
+
+def _attach_watchlist_strategy_hits(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach strategy badges without changing the similar-pattern forecast itself."""
+    symbols = [
+        str(item.get("target", {}).get("symbol") or "").upper()
+        for item in payload.get("results") or []
+        if item.get("target", {}).get("symbol")
+    ]
+    strategy_hits = _collect_watchlist_strategy_hits(symbols)
+    for item in payload.get("results") or []:
+        symbol = str(item.get("target", {}).get("symbol") or "").upper()
+        item["strategy_hits"] = strategy_hits.get(symbol, [])
+        item["strategy_hit_count"] = len(item["strategy_hits"])
+    return payload
+
+
+def _refresh_similar_pattern_analysis_once(
+    symbols: list[str],
+    progress_callback=None,
+    *,
+    force_vector_cache: bool = False,
+) -> dict[str, Any]:
+    basic = _stock_basic_for_similar_patterns()
+    source_trade_date = _latest_similar_pattern_target_date(symbols)
+    cache_schedule = _similar_pattern_vector_cache_refresh_decision(
+        force=force_vector_cache,
+        source_trade_date=source_trade_date,
+    )
+    if cache_schedule["due"]:
+        cache_audit = build_vector_caches_parallel(
+            DAILY_DIR,
+            basic,
+            SIMILAR_PATTERN_CONFIG,
+            SIMILAR_PATTERN_VECTOR_CACHE_DIR,
+            target_symbols=set(symbols),
+            workers=max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "4"))),
+            progress_callback=progress_callback,
+        )
+        cache_errors = cache_audit[cache_audit["status"].eq("error")]
+        if not cache_errors.empty:
+            examples = ", ".join(
+                f"{row.get('symbol', '?')}: {row.get('error', 'unknown error')}"
+                for row in cache_errors.head(3).to_dict("records")
+            )
+            raise RuntimeError(
+                f"相似走势周级向量缓存构建失败: errors={len(cache_errors)}; {examples}"
+            )
+        cache_metadata = _write_similar_pattern_vector_cache_metadata(
+            refreshed_at=datetime.now(),
+            source_trade_date=source_trade_date,
+            cache_audit=cache_audit,
+        )
+        cache_refreshed = True
+    else:
+        cache_audit = pd.DataFrame(columns=["status"])
+        cache_metadata = dict(cache_schedule["metadata"])
+        if cache_schedule["inferred_legacy"]:
+            inferred_at = pd.Timestamp(cache_schedule["refreshed_at"]).to_pydatetime()
+            cache_metadata = _write_similar_pattern_vector_cache_metadata(
+                refreshed_at=inferred_at,
+                source_trade_date=source_trade_date,
+                cache_audit=cache_audit,
+            )
+        cache_refreshed = False
+    results = analyze_targets_by_threshold(
+        DAILY_DIR,
+        basic,
+        SIMILAR_PATTERN_CONFIG,
+        target_symbols=symbols,
+        vector_cache_dir=SIMILAR_PATTERN_VECTOR_CACHE_DIR,
+        progress_callback=progress_callback,
+    )
+    missing_targets = [symbol for symbol in symbols if symbol not in results]
+    if missing_targets:
+        preview = ", ".join(missing_targets[:5])
+        suffix = "..." if len(missing_targets) > 5 else ""
+        raise RuntimeError(
+            f"相似走势未生成全部自选股目标结果: missing={len(missing_targets)}/{len(symbols)} "
+            f"({preview}{suffix})"
+        )
+    validation = _read_similar_pattern_validation()
+    global_model_selection = validation.get("model_selection") or {}
+    next_day_policy = (global_model_selection.get("next_1d", {}).get("selected") or {})
+    market_regime = load_market_regime(PROJECT_ROOT / "data/raw/index_000300.SH.parquet")
+    profiles = {symbol: _stock_profile_from_basic(symbol, basic) for symbol in symbols}
+    industry_regimes = {
+        str(profile.get("industry") or ""): build_industry_regime(
+            DAILY_DIR,
+            basic,
+            str(profile.get("industry") or ""),
+        )
+        for profile in profiles.values()
+        if profile.get("industry")
+    }
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "watchlist": _similar_pattern_watchlist_profiles(basic),
+        "config": {
+            "candidate_start_date": SIMILAR_PATTERN_CONFIG.candidate_start_date,
+            "candidate_step_days": SIMILAR_PATTERN_CONFIG.candidate_step_days,
+            "similarity_threshold": SIMILAR_PATTERN_CONFIG.similarity_threshold,
+            "take_profit_3d": SIMILAR_PATTERN_CONFIG.take_profit_3d,
+            "stop_loss_3d": SIMILAR_PATTERN_CONFIG.stop_loss_3d,
+            "signal_bearish_max": next_day_policy.get(
+                "bearish_max", SIMILAR_PATTERN_CONFIG.signal_bearish_max
+            ),
+            "signal_bullish_min": next_day_policy.get(
+                "bullish_min", SIMILAR_PATTERN_CONFIG.signal_bullish_min
+            ),
+            "max_effective_cases": SIMILAR_PATTERN_CONFIG.max_effective_cases,
+            "max_events_per_date": SIMILAR_PATTERN_CONFIG.max_events_per_date,
+            **_similarity_score_config(),
+        },
+        "global_policy": _json_ready(global_model_selection),
+        "results": [
+            _similar_pattern_result_payload(
+                results[symbol],
+                profile=profiles[symbol],
+                market_regime=market_regime,
+                industry_regime=industry_regimes.get(str(profiles[symbol].get("industry") or "")),
+                validation=validation,
+            )
+            for symbol in symbols
+            if symbol in results
+        ],
+        "cache": {
+            "hit": False,
+            "backend": "generated",
+            "rebuilt": int(cache_audit["status"].eq("built").sum()) if not cache_audit.empty else 0,
+            "reused": (
+                int(cache_audit["status"].eq("cache_hit").sum())
+                if not cache_audit.empty
+                else int(cache_schedule["cached_files"])
+            ),
+            "errors": int(cache_audit["status"].eq("error").sum()) if not cache_audit.empty else 0,
+            "reference_library_policy": "weekly",
+            "reference_library_refreshed": cache_refreshed,
+            "reference_library_reason": cache_schedule["reason"],
+            "reference_library_refreshed_at": cache_metadata.get("refreshed_at"),
+            "reference_library_next_refresh_at": (
+                _next_similar_pattern_vector_cache_refresh_at(
+                    datetime.fromisoformat(str(cache_metadata["refreshed_at"]))
+                ).isoformat(timespec="seconds")
+                if cache_refreshed and cache_metadata.get("refreshed_at")
+                else cache_schedule.get("next_refresh_at")
+            ),
+            "reference_library_source_trade_date": cache_metadata.get("source_trade_date"),
+            "target_vectors": "live_from_latest_daily_data",
+        },
+    }
+    payload = _attach_watchlist_strategy_hits(payload)
+    SIMILAR_PATTERN_ANALYSIS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SIMILAR_PATTERN_ANALYSIS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def refresh_similar_pattern_analysis(
+    progress_callback=None,
+    *,
+    force_vector_cache: bool = False,
+) -> dict[str, Any]:
+    """Run one analysis per watchlist revision and share it with concurrent callers."""
+    global _SIMILAR_PATTERN_REFRESH_INFLIGHT
+
+    requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
+    requested_key = (requested_symbols, bool(force_vector_cache))
+
+    while True:
+        with _SIMILAR_PATTERN_REFRESH_GUARD:
+            active = _SIMILAR_PATTERN_REFRESH_INFLIGHT
+            if active is None:
+                future: Future[dict[str, Any]] = Future()
+                _SIMILAR_PATTERN_REFRESH_INFLIGHT = (requested_key, future)
+                owner = True
+                active_key = requested_key
+            else:
+                active_key, future = active
+                owner = False
+
+        if owner:
+            try:
+                payload = _refresh_similar_pattern_analysis_once(
+                    list(requested_symbols),
+                    progress_callback=progress_callback,
+                    force_vector_cache=force_vector_cache,
+                )
+            except BaseException as exc:
+                future.set_exception(exc)
+                raise
+            else:
+                future.set_result(payload)
+                return payload
+            finally:
+                with _SIMILAR_PATTERN_REFRESH_GUARD:
+                    if (
+                        _SIMILAR_PATTERN_REFRESH_INFLIGHT is not None
+                        and _SIMILAR_PATTERN_REFRESH_INFLIGHT[1] is future
+                    ):
+                        _SIMILAR_PATTERN_REFRESH_INFLIGHT = None
+
+        if active_key == requested_key:
+            payload = future.result()
+            return {
+                **payload,
+                "cache": {
+                    **(payload.get("cache") or {}),
+                    "coalesced": True,
+                },
+            }
+
+        # A different watchlist revision is being calculated. Let it finish,
+        # then re-read the latest revision and start or join its refresh.
+        try:
+            future.result()
+        except Exception:
+            pass
+        requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
+        requested_key = (requested_symbols, bool(force_vector_cache))
+
+
+def _similar_patterns_worker(result_queue: mp.Queue) -> None:
+    def emit_progress(message: str) -> None:
+        result_queue.put({"type": "progress", "message": message})
+
+    try:
+        payload = refresh_similar_pattern_analysis(progress_callback=emit_progress)
+    except Exception as exc:
+        result_queue.put(
+            {
+                "type": "result",
+                "ok": False,
+                "error": f"{exc}\n{traceback.format_exc(limit=5)}",
+            }
+        )
+        return
+    result_queue.put({"type": "result", "ok": True, "payload": payload})
+
+
+def _drain_similar_pattern_worker_queue(result_queue: mp.Queue) -> dict[str, Any] | None:
+    final_result: dict[str, Any] | None = None
+    while True:
+        try:
+            message = result_queue.get_nowait()
+        except queue.Empty:
+            return final_result
+        if message.get("type") == "progress":
+            _set_refresh_progress(
+                step_key="similar_patterns",
+                message=f"相似走势决策台：{message.get('message') or '仍在计算'}",
+                percent=97,
+                complete_previous=False,
+            )
+            continue
+        final_result = dict(message)
+
+
+def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTERNS_TIMEOUT_SECONDS) -> dict[str, Any]:
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue = ctx.Queue()
+    proc = ctx.Process(target=_similar_patterns_worker, args=(result_queue,), daemon=False)
+    proc.start()
+    _register_active_worker("similar_patterns", proc)
+    try:
+        deadline = monotonic() + timeout_seconds
+        result: dict[str, Any] | None = None
+        while proc.is_alive():
+            result = _drain_similar_pattern_worker_queue(result_queue) or result
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            proc.join(timeout=min(5.0, remaining))
+
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            raise TimeoutError(
+                f"相似走势决策台刷新超过 {timeout_seconds // 60} 分钟无结果，已终止卡住的子进程"
+            )
+        result = _drain_similar_pattern_worker_queue(result_queue) or result
+        if result is None:
+            raise RuntimeError("相似走势决策台刷新未返回结果")
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or "相似走势决策台刷新失败"))
+        return dict(result.get("payload") or {})
+    finally:
+        _clear_active_worker("similar_patterns")
+
+
+def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
+    if not refresh:
+        cached = _read_similar_pattern_analysis_cache()
+        cached_symbols = [
+            str(item.get("target", {}).get("symbol") or "").upper()
+            for item in (cached or {}).get("results", [])
+        ]
+        watchlist_symbols = _read_similar_pattern_watchlist_symbols()
+        if cached is not None:
+            result_by_symbol = {
+                str(item.get("target", {}).get("symbol") or "").upper(): item
+                for item in cached.get("results", [])
+                if item.get("target", {}).get("symbol")
+            }
+            cached["results"] = [
+                result_by_symbol[symbol]
+                for symbol in watchlist_symbols
+                if symbol in result_by_symbol
+            ]
+            cached = _attach_watchlist_strategy_hits(cached)
+            cached["watchlist"] = _similar_pattern_watchlist_profiles(
+                _stock_basic_for_similar_patterns()
+            )
+            cached.setdefault("config", {}).update(_similarity_score_config())
+            cached["cache"] = {
+                **(cached.get("cache") or {}),
+                "hit": True,
+                "backend": "json",
+                "stale": not _is_daily_payload_current(cached),
+                "watchlist_changed": cached_symbols != watchlist_symbols,
+            }
+            return cached
+    return refresh_similar_pattern_analysis()
 
 
 def _signal_group_key(signal: dict[str, Any]) -> str:
@@ -1672,6 +4021,14 @@ def _read_selector_snapshot(
     include_extended: bool,
 ) -> dict[str, Any] | None:
     snapshot_key, _, _ = _selector_snapshot_key(signal_date, strategies, include_extended)
+    path = _selector_snapshot_path(snapshot_key)
+    if path.exists():
+        try:
+            payload = read_json_file(path)
+            payload["cache"] = {"hit": True, "backend": "filesystem", "snapshot_key": snapshot_key}
+            return payload
+        except Exception:
+            pass
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
         try:
@@ -1718,14 +4075,6 @@ def _read_selector_snapshot(
         except Exception:
             pass
 
-    path = _selector_snapshot_path(snapshot_key)
-    if path.exists():
-        try:
-            payload = read_json_file(path)
-            payload["cache"] = {"hit": True, "backend": "json", "snapshot_key": snapshot_key}
-            return payload
-        except Exception:
-            return None
     return None
 
 
@@ -1738,10 +4087,18 @@ def _write_selector_snapshot(
     snapshot_key, date_key, strategy_key = _selector_snapshot_key(signal_date, strategies, include_extended)
     payload_to_store = dict(payload)
     payload_to_store["selector_snapshot_schema_version"] = SELECTOR_SNAPSHOT_SCHEMA_VERSION
+    payload_to_store["snapshot_scope"] = {
+        "strategies": sorted({str(item).upper() for item in strategies or [] if item}) or ["ALL"],
+        "include_extended": bool(include_extended),
+    }
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
+    SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_path = _selector_snapshot_path(snapshot_key)
+    temporary_path = snapshot_path.with_suffix(".json.tmp")
+    temporary_path.write_text(payload_json, encoding="utf-8")
+    temporary_path.replace(snapshot_path)
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    wrote_sql = False
     if store.config.sql_url:
         try:
             from sqlalchemy import text
@@ -1805,12 +4162,8 @@ def _write_selector_snapshot(
                         "payload_json": payload_json,
                     },
                 )
-            wrote_sql = True
         except Exception:
-            wrote_sql = False
-    if not wrote_sql:
-        SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        _selector_snapshot_path(snapshot_key).write_text(payload_json, encoding="utf-8")
+            return
 
 
 def _strategy_keys_from_payload(payload: dict[str, Any]) -> list[str]:
@@ -1846,7 +4199,7 @@ def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    rows = _apply_current_score_normalization(rows)
+    rows = _apply_historical_score_normalization(rows)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -1872,6 +4225,19 @@ def _write_strategy_pool_snapshots(payload: dict[str, Any], include_extended: bo
     return written
 
 
+def _run_post_snapshot_cache_cleanup(results: dict[str, Any]) -> dict[str, Any]:
+    """Enforce retention after the refresh writes its newest snapshot version."""
+
+    summary = run_cache_cleanup(PROJECT_ROOT)
+    results["cache_cleanup_after_snapshot"] = summary
+    sql_status = str((summary.get("sql_snapshots") or {}).get("status") or "")
+    if summary.get("status") != "success" or sql_status in {"failed", "partial"}:
+        errors = summary.get("errors") or []
+        detail = "; ".join(str(error) for error in errors[:3]) or f"sql_status={sql_status or 'unknown'}"
+        raise RuntimeError(f"快照写入后缓存保留清理失败: {detail}")
+    return summary
+
+
 def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELECTOR_LIMIT) -> dict[str, Any]:
     rows = payload.get("stocks") or []
     complete_total = int(payload.get("total_stock_count") or len(rows))
@@ -1891,8 +4257,12 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
     start_date = date.fromisoformat(start)
     snapshot_dates = set(_selector_snapshot_dates(None, True))
     long_snapshot_dates = _long_stock_pool_snapshot_dates("tea")
+    chan_strategy_dates = _chan_model_strategy_dates()
+    chan_snapshot_dates = _workspace_snapshot_dates("chan_model_strategy", params={"top_n": 20})
     latest_snapshot = max(snapshot_dates) if snapshot_dates else None
     latest_long_snapshot = max(long_snapshot_dates) if long_snapshot_dates else None
+    latest_chan_signal = max(chan_strategy_dates) if chan_strategy_dates else None
+    latest_chan_snapshot = max(chan_snapshot_dates) if chan_snapshot_dates else None
     if end:
         end_date = date.fromisoformat(end)
     elif latest_snapshot:
@@ -1925,6 +4295,8 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
                 "is_open": not is_closed,
                 "has_selector_snapshot": iso in snapshot_dates,
                 "has_long_stock_pool_snapshot": iso in long_snapshot_dates,
+                "has_chan_model_strategy": iso in chan_strategy_dates,
+                "has_chan_model_strategy_snapshot": iso in chan_snapshot_dates,
                 "effective_signal_date": effective,
                 "disabled": is_closed,
             }
@@ -1936,6 +4308,8 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
         "end": end_date.isoformat(),
         "latest_signal_date": latest_snapshot,
         "latest_long_signal_date": latest_long_snapshot,
+        "latest_chan_signal_date": latest_chan_signal,
+        "latest_chan_snapshot_date": latest_chan_snapshot,
         "days": days,
     }
 
@@ -1976,9 +4350,37 @@ def get_convertible_bond_grid_plan(
 ) -> dict[str, Any]:
     params = {"limit": int(limit)}
     if not refresh:
-        cached = _read_workspace_snapshot("convertible_bond_grid_plan", snapshot_date=trade_date, params=params)
+        cached = _read_workspace_snapshot(
+            "convertible_bond_grid_plan",
+            snapshot_date=trade_date,
+            params=params,
+            allow_sql=False,
+        )
         if cached is not None:
             return cached
+        try:
+            legacy = json.loads(CONVERTIBLE_BOND_GRID_PLAN_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            legacy = None
+        if isinstance(legacy, dict) and legacy.get("trade_date"):
+            cached_date = _canonical_workspace_snapshot_date(legacy.get("trade_date"))
+            requested_date = _canonical_workspace_snapshot_date(trade_date) if trade_date else None
+            if not requested_date or cached_date <= requested_date:
+                legacy["cache"] = {
+                    "hit": True,
+                    "backend": "legacy_filesystem",
+                    "workspace": "convertible_bond_grid_plan",
+                    "snapshot_date": cached_date,
+                    "requested_date": requested_date,
+                    "stale": bool(requested_date and cached_date != requested_date),
+                }
+                _write_filesystem_workspace_snapshot(
+                    "convertible_bond_grid_plan",
+                    _workspace_params_key(params),
+                    cached_date,
+                    json.dumps(legacy, ensure_ascii=False, default=str),
+                )
+                return legacy
     refresh_result = None
     if refresh and trade_date:
         refresh_result = refresh_convertible_bond_daily(trade_date=trade_date)
@@ -1990,8 +4392,119 @@ def get_convertible_bond_grid_plan(
         payload.get("trade_date") or trade_date,
         payload,
         params=params,
+        write_sql=refresh,
     )
     return payload
+
+
+def _convertible_bond_allotment_min_coverage() -> float:
+    try:
+        configured = float(os.getenv("ROUTINE_ALLOTMENT_MIN_COVERAGE", "0.90"))
+    except (TypeError, ValueError):
+        configured = 0.90
+    return min(1.0, max(0.0, configured))
+
+
+def _convertible_bond_allotment_quality(
+    payload: dict[str, Any],
+    *,
+    expected_trade_date: str | None = None,
+) -> dict[str, Any]:
+    records = [item for item in payload.get("records") or [] if isinstance(item, dict)]
+    data_sources = payload.get("data_sources") or {}
+    stock_daily = data_sources.get("stock_daily")
+    daily_basic = data_sources.get("daily_basic")
+    minimum_coverage = _convertible_bond_allotment_min_coverage()
+
+    def numeric_present(value: Any) -> bool:
+        try:
+            return value is not None and bool(np.isfinite(float(value)))
+        except (TypeError, ValueError):
+            return False
+
+    def normalized_date(value: Any) -> str | None:
+        parsed = pd.to_datetime(value, errors="coerce")
+        return None if pd.isna(parsed) else parsed.date().isoformat()
+
+    def metric(count: int, total: int) -> dict[str, Any]:
+        ratio = 1.0 if total <= 0 else count / total
+        return {
+            "count": int(count),
+            "total": int(total),
+            "ratio": round(float(ratio), 6),
+            "passed": bool(ratio >= minimum_coverage),
+        }
+
+    if not isinstance(stock_daily, dict) or not isinstance(daily_basic, dict):
+        return {
+            "status": "failed",
+            "expected_trade_date": normalized_date(expected_trade_date),
+            "minimum_coverage": minimum_coverage,
+            "metrics": {},
+            "issues": ["缺少 stock_daily 或 daily_basic 数据源元信息"],
+        }
+
+    requested = max(0, int(stock_daily.get("requested") or 0))
+    matched = max(0, int(stock_daily.get("matched") or 0))
+    expected_date = normalized_date(expected_trade_date)
+    if expected_date is None:
+        price_dates = [
+            value
+            for item in records
+            if (value := normalized_date(item.get("stock_price_date"))) is not None
+        ]
+        expected_date = max(price_dates, default=None)
+
+    current_prices = sum(
+        normalized_date(item.get("stock_price_date")) == expected_date
+        for item in records
+        if expected_date is not None
+    )
+    daily_basic_matched = max(0, int(daily_basic.get("matched") or 0))
+    metrics = {
+        "stock_daily_match": metric(matched, requested),
+        "stock_price_freshness": metric(current_prices, matched),
+        "daily_basic_match": metric(daily_basic_matched, requested),
+        "kdj_daily_j": metric(
+            sum(numeric_present(item.get("kdj_daily_j")) for item in records),
+            matched,
+        ),
+        "kdj_weekly_j": metric(
+            sum(numeric_present(item.get("kdj_weekly_j")) for item in records),
+            matched,
+        ),
+        "kdj_monthly_j": metric(
+            sum(numeric_present(item.get("kdj_monthly_j")) for item in records),
+            matched,
+        ),
+    }
+    labels = {
+        "stock_daily_match": "行情匹配率",
+        "stock_price_freshness": "行情日期新鲜度",
+        "daily_basic_match": "daily_basic 匹配率",
+        "kdj_daily_j": "日线 J 完整率",
+        "kdj_weekly_j": "周线 J 完整率",
+        "kdj_monthly_j": "月线 J 完整率",
+    }
+    issues = [
+        (
+            f"{labels[key]}不足: {value['count']}/{value['total']} "
+            f"({value['ratio']:.1%} < {minimum_coverage:.1%})"
+        )
+        for key, value in metrics.items()
+        if not value["passed"]
+    ]
+    if stock_daily.get("error"):
+        issues.append(f"stock_daily 读取异常: {stock_daily['error']}")
+    if daily_basic.get("error"):
+        issues.append(f"daily_basic 读取异常: {daily_basic['error']}")
+    return {
+        "status": "success" if not issues else "failed",
+        "expected_trade_date": expected_date,
+        "minimum_coverage": minimum_coverage,
+        "metrics": metrics,
+        "issues": issues,
+    }
 
 
 def get_convertible_bond_allotments(
@@ -1999,28 +4512,57 @@ def get_convertible_bond_allotments(
     include_listed_days: int = 90,
     refresh: bool = False,
     stage_scope: str = "pipeline",
+    expected_trade_date: str | None = None,
+    validate_quality: bool = False,
 ) -> dict[str, Any]:
     params = {
         "limit": int(limit),
         "include_listed_days": int(include_listed_days),
         "stage_scope": str(stage_scope),
     }
+    cached = None
     if not refresh:
-        cached = _read_workspace_snapshot("convertible_bond_allotments", params=params)
+        cached = _read_workspace_snapshot(
+            "convertible_bond_allotments",
+            params=params,
+            allow_sql=False,
+        )
+        if cached is None:
+            cached = _read_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH)
         if cached is not None:
+            cached.setdefault("cache", {})
+            cached["cache"].update({
+                "hit": True,
+                "stale": not _is_daily_payload_current(cached),
+            })
+            cached_quality = cached.get("quality") or {}
+            cached["quality"] = _convertible_bond_allotment_quality(
+                cached,
+                expected_trade_date=cached_quality.get("expected_trade_date"),
+            )
             return cached
+    daily_refresh_required = refresh
     payload = build_convertible_bond_allotment_payload(
         limit=limit,
         include_listed_days=include_listed_days,
-        refresh=refresh,
+        refresh=daily_refresh_required,
         stage_scope=stage_scope,
     )
+    payload["quality"] = _convertible_bond_allotment_quality(
+        payload,
+        expected_trade_date=expected_trade_date,
+    )
+    _write_daily_payload_cache(CONVERTIBLE_BOND_ALLOTMENT_DAILY_PATH, payload)
     _write_workspace_snapshot(
         "convertible_bond_allotments",
         payload.get("asof") or payload.get("trade_date") or payload.get("generated_at"),
         payload,
         params=params,
+        write_sql=refresh,
     )
+    if validate_quality and payload["quality"]["status"] != "success":
+        details = "；".join(payload["quality"].get("issues") or ["未知质量问题"])
+        raise RuntimeError(f"配债股数据质量门禁失败: {details}")
     return payload
 
 
@@ -2031,6 +4573,11 @@ def refresh_dashboard() -> dict[str, Any]:
 
 def latest_report_file(pattern: str) -> Path | None:
     candidates = sorted(REPORT_DIR.glob(pattern))
+    return candidates[-1] if candidates else None
+
+
+def latest_vegas_report_file(pattern: str) -> Path | None:
+    candidates = sorted(VEGAS_TUNNEL_REPORT_DIR.glob(pattern))
     return candidates[-1] if candidates else None
 
 
@@ -2054,6 +4601,157 @@ def get_research_index(limit: int = 200) -> dict[str, Any]:
         "family_rule_rows": family_rows,
         "fusion_rows": fusion_rows,
     }
+
+
+def _numeric(value: Any, default: float | None = None) -> float | None:
+    if value is None or pd.isna(value):
+        return default
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    return numeric if np.isfinite(numeric) else default
+
+
+def _chan_candidate_record(row: pd.Series) -> dict[str, Any]:
+    return {
+        "date": str(pd.to_datetime(row.get("date")).date()) if pd.notna(row.get("date")) else "",
+        "symbol": str(row.get("symbol") or ""),
+        "name": _clean_text(row.get("name")),
+        "rule_id": _clean_text(row.get("chan_model_rule_id")),
+        "rule_name": _clean_text(row.get("chan_model_rule_name")),
+        "rule_description": _clean_text(row.get("chan_model_description")),
+        "rank_score": _numeric(row.get("chan_model_rank_score")),
+        "signal_name": _clean_text(row.get("chan_signal_name")),
+        "chan_score": _numeric(row.get("chan_score")),
+        "pred_good": _numeric(row.get("pred_target_good")),
+        "pred_big10": _numeric(row.get("pred_target_big10")),
+        "pred_win10": _numeric(row.get("pred_target_win10")),
+        "entry_gap_pct": _numeric(row.get("entry_gap_pct")),
+        "position_pct": _numeric(row.get("chan_model_position_pct")),
+        "close": _numeric(row.get("close")),
+        "entry_open": _numeric(row.get("entry_open")),
+        "center_low": _numeric(row.get("chan_center_low")),
+        "center_high": _numeric(row.get("chan_center_high")),
+        "center_width": _numeric(row.get("chan_center_width")),
+        "stroke_amplitude": _numeric(row.get("chan_stroke_amplitude")),
+        "buy_plan": _clean_text(row.get("chan_model_buy_plan")),
+        "sell_plan": _clean_text(row.get("chan_model_sell_plan")),
+        "structure_note": _clean_text(row.get("chan_structure_note")),
+    }
+
+
+def _chan_summary_records(summary: pd.DataFrame) -> list[dict[str, Any]]:
+    if summary.empty:
+        return []
+    return [
+        {
+            "rule_id": str(row.get("rule_id") or ""),
+            "split": str(row.get("split") or ""),
+            "rows": int(row.get("rows") or 0),
+            "avg_return_10d": _numeric(row.get("avg_return_10d")),
+            "median_return_10d": _numeric(row.get("median_return_10d")),
+            "win_rate_10d": _numeric(row.get("win_rate_10d")),
+            "big_win_rate_10d": _numeric(row.get("big_win_rate_10d")),
+            "profit_factor_10d": _numeric(row.get("profit_factor_10d")),
+        }
+        for _, row in summary.iterrows()
+    ]
+
+
+def _build_chan_model_strategy_payload(top_n: int = 20, signal_date: str | None = None) -> dict[str, Any]:
+    if not CHAN_MODEL_SCORED_PATH.exists():
+        raise FileNotFoundError(f"缺少缠论模型评分文件: {CHAN_MODEL_SCORED_PATH}")
+    scored = pd.read_parquet(CHAN_MODEL_SCORED_PATH)
+    strategy_frame = add_chan_model_strategy_columns(scored)
+    if signal_date is None:
+        atomic_write_parquet(strategy_frame, CHAN_MODEL_STRATEGY_SCORED_PATH, index=False)
+        atomic_write_csv(
+            strategy_frame,
+            CHAN_MODEL_STRATEGY_DIR / "chan_model_strategy_scored.csv",
+            index=False,
+        )
+
+    candidates = select_chan_model_candidates(strategy_frame, trade_date=signal_date, top_n=top_n)
+    if signal_date is None:
+        atomic_write_csv(candidates, CHAN_MODEL_LATEST_CANDIDATES_PATH, index=False)
+    summary = summarize_chan_model_strategy(strategy_frame)
+    if signal_date is None:
+        atomic_write_csv(summary, CHAN_MODEL_SUMMARY_PATH, index=False)
+
+    signal_date = (
+        str(pd.to_datetime(candidates["date"].iloc[0]).date())
+        if not candidates.empty
+        else signal_date
+    )
+    records = [_chan_candidate_record(row) for _, row in candidates.iterrows()]
+    summary_records = _chan_summary_records(summary)
+    oot_primary = next(
+        (item for item in summary_records if item["split"] == "oot" and item["rule_id"] == "chan_model_primary"),
+        None,
+    )
+    oot_expanded = next(
+        (item for item in summary_records if item["split"] == "oot" and item["rule_id"] == "chan_model_expanded"),
+        None,
+    )
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "signal_date": signal_date,
+        "top_n": int(top_n),
+        "candidate_count": len(records),
+        "primary_count": sum(1 for item in records if item["rule_id"] == "chan_model_primary"),
+        "expanded_count": sum(1 for item in records if item["rule_id"] == "chan_model_expanded"),
+        "candidates": records,
+        "summary": summary_records,
+        "oot_primary": oot_primary,
+        "oot_expanded": oot_expanded,
+        "execution_notes": [
+            "T日收盘确认缠论三买与模型分，T+1 开盘执行。",
+            "主策略优先，扩容策略仅在候选不足时补充。",
+            "T+1 高开不超过 3% 可执行；3%-6% 降仓观察；超过 6% 放弃。",
+            "优先持有 5-10 个交易日；跌破信号日低点或最近中枢下沿退出。",
+        ],
+        "files": {
+            "scored": str(CHAN_MODEL_STRATEGY_SCORED_PATH),
+            "candidates": str(CHAN_MODEL_LATEST_CANDIDATES_PATH),
+            "summary": str(CHAN_MODEL_SUMMARY_PATH),
+        },
+    }
+    return payload
+
+
+def get_chan_model_strategy_plan(
+    top_n: int = 20,
+    refresh: bool = False,
+    signal_date: str | None = None,
+) -> dict[str, Any]:
+    params = {"top_n": int(top_n)}
+    if not refresh:
+        cached = _read_workspace_snapshot(
+            "chan_model_strategy",
+            snapshot_date=signal_date,
+            params=params,
+            allow_sql=False,
+        )
+        if cached is not None:
+            return cached
+    payload = _build_chan_model_strategy_payload(top_n=top_n, signal_date=signal_date)
+    if signal_date and str(payload.get("signal_date") or "") != str(signal_date):
+        raise RuntimeError(
+            f"缠论结果日期未更新到最新交易日: expected={signal_date} actual={payload.get('signal_date')}"
+        )
+    _write_workspace_snapshot(
+        "chan_model_strategy",
+        payload.get("signal_date"),
+        payload,
+        params=params,
+        write_sql=refresh,
+    )
+    return payload
+
+
+def refresh_chan_model_strategy_plan(top_n: int = 20, signal_date: str | None = None) -> dict[str, Any]:
+    return get_chan_model_strategy_plan(top_n=top_n, refresh=True, signal_date=signal_date)
 
 
 def _fmt_pct(value: Any, digits: int = 2) -> str:
@@ -2396,6 +5094,79 @@ def _model_filtered_signal_payload(signal_key: str, model_score: pd.Series) -> d
     })
 
 
+@lru_cache(maxsize=1)
+def _vegas_tunnel_best_metrics() -> pd.Series | None:
+    path = latest_vegas_report_file("vegas_tunnel_param_grid_summary_*.csv")
+    if path is None:
+        path = latest_vegas_report_file("vegas_tunnel_summary_*.csv")
+    if path is None:
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    part = df[df["period"].astype(str) == "all"].copy() if "period" in df.columns else df.copy()
+    if part.empty:
+        part = df.copy()
+    if "trades" in part.columns:
+        liquid = part[pd.to_numeric(part["trades"], errors="coerce").fillna(0) >= 20].copy()
+        if not liquid.empty:
+            part = liquid
+    if "rank_score" not in part.columns:
+        part["rank_score"] = (
+            part["daily_sharpe"].fillna(0)
+            + 0.20 * part["avg_return_pct"].fillna(0)
+            + 0.02 * part["max_drawdown_pct"].fillna(0)
+            + part["profit_factor"].fillna(0) * 0.30
+        )
+    return part.sort_values(["rank_score", "daily_sharpe", "avg_return_pct"], ascending=False).iloc[0]
+
+
+def _vegas_tunnel_signal_payload(latest_row: pd.Series) -> dict[str, Any]:
+    best = _vegas_tunnel_best_metrics()
+    metrics = _metrics_payload(best) if best is not None else {
+        "trades": 42,
+        "avg_return_pct": 1.52,
+        "win_rate": 0.4524,
+        "max_drawdown_pct": -31.18,
+        "profit_factor": 1.7853,
+    }
+    exit_rule = str(best.get("exit_rule") if best is not None else "fixed_tp16%_sl8%_T9")
+    param_text = ""
+    if best is not None and "fast_span" in best.index:
+        param_text = (
+            f"参数：EMA{int(best['fast_span'])}/EMA{int(best['momentum_span'])}，"
+            f"隧道EMA{int(best['tunnel_short_span'])}/{int(best['tunnel_long_span'])}，"
+            f"回踩{float(best['near_tunnel_pct']):.1%}，窗口{int(best['pullback_window'])}日。"
+        )
+    distance = _safe_float(latest_row.get("vegas_tunnel_distance"), 0.0) or 0.0
+    slope = _safe_float(latest_row.get("vegas_tunnel_slope_20d"), 0.0) or 0.0
+    volume_strength = _safe_float(latest_row.get("vegas_volume_strength"), 0.0) or 0.0
+    score = _safe_float(latest_row.get("vegas_candidate_score"), 0.0) or 0.0
+    return _enrich_signal_group({
+        "strategy_key": "VEGAS_TUNNEL",
+        "strategy_family": "VEGAS",
+        "strategy_name": "维加斯隧道",
+        "timeframe": "日线级，收盘确认，T+1 开盘观察",
+        "logic": f"EMA144/169 形成上行隧道，EMA10>EMA20>隧道上沿；近8日回踩或贴近隧道2.5%范围后，当日收阳放量重新站上 EMA10。{param_text}",
+        "reason": (
+            f"距隧道上沿={distance:.2%}，"
+            f"隧道20日斜率={slope:.2%}，"
+            f"量能强度={volume_strength:.2%}，"
+            f"候选分={score:.3f}"
+        ),
+        "buy_plan": "T+1 开盘观察；高开过大不追，优先选择开盘不显著脱离确认日收盘且不跌破确认日低点的标的。",
+        "sell_plan": f"{_exit_rule_text(exit_rule)}。依据：维加斯隧道策略多卖出计划回测。",
+        "metrics": metrics,
+        "metrics_text": _metrics_text(metrics),
+        "action_level": "谨慎实操",
+        "playbook_source": "规则版",
+        "strength_score": 1.0 + min(max(score, 0.0), 1.0),
+    })
+
+
 def _stock_basic_profile(symbol: str) -> dict[str, str]:
     basic = _stock_basic_map().get(symbol, {})
     return {
@@ -2493,6 +5264,24 @@ def _signal_quality_gate(signal: dict[str, Any]) -> bool:
             and profit_factor >= 1.8
             and max_drawdown >= -15
             and win_rate >= 0.33
+        )
+
+    if family == "VEGAS":
+        return (
+            trades >= 20
+            and avg_return >= 1.0
+            and profit_factor >= 1.5
+            and max_drawdown >= -35
+            and win_rate >= 0.35
+        )
+
+    if family == "TRIPLE_VOLUME_BREAKOUT":
+        return (
+            trades >= 15
+            and avg_return >= 1.2
+            and profit_factor >= 2.5
+            and max_drawdown >= -18
+            and win_rate >= 0.55
         )
 
     if group in DEFAULT_FAMILIES and action_level in DEFAULT_ACTION_LEVELS:
@@ -2773,41 +5562,331 @@ def _aggregate_raw_scores(signal_scores: list[float], group_count: int, *, reson
     return float(best + resonance + group_bonus)
 
 
-def _rank_percentiles(values: list[float]) -> list[float]:
-    if not values:
+@lru_cache(maxsize=1)
+def _selector_buy_hold_models() -> dict[str, dict[str, Any]]:
+    try:
+        import joblib
+    except ImportError:
+        return {}
+    artifacts: dict[str, dict[str, Any]] = {}
+    for mode in ("buy", "hold"):
+        path = SELECTOR_BUY_HOLD_MODEL_DIR / f"{mode}.joblib"
+        if not path.exists():
+            continue
+        try:
+            artifact = joblib.load(path)
+        except Exception:
+            continue
+        if isinstance(artifact, dict) and artifact.get("schema_version") == "selector_buy_hold_return_model_v1":
+            artifacts[mode] = artifact
+    return artifacts
+
+
+@lru_cache(maxsize=32)
+def _selector_model_feature_rows(signal_date: str) -> dict[str, dict[str, Any]]:
+    if not SELECTOR_MODEL_HISTORY.exists():
+        return {}
+    try:
+        frame = pd.read_parquet(
+            SELECTOR_MODEL_HISTORY,
+            filters=[("date", "==", pd.Timestamp(signal_date))],
+        )
+    except Exception:
+        return {}
+    if frame.empty or "symbol" not in frame.columns:
+        return {}
+    return {
+        str(row["symbol"]): row.to_dict()
+        for _, row in frame.sort_values("date").drop_duplicates("symbol", keep="last").iterrows()
+    }
+
+
+@lru_cache(maxsize=32)
+def _selector_model_score_date(signal_date: str | None) -> str | None:
+    """Resolve the newest model-feature date available on or before the market date."""
+    if not SELECTOR_MODEL_HISTORY.exists():
+        return None
+    try:
+        dates = pd.read_parquet(SELECTOR_MODEL_HISTORY, columns=["date"])["date"]
+    except Exception:
+        return None
+    dates = pd.to_datetime(dates, errors="coerce").dropna()
+    if signal_date:
+        dates = dates[dates <= pd.Timestamp(signal_date)]
+    if dates.empty:
+        return None
+    return dates.max().strftime("%Y-%m-%d")
+
+
+def _selector_market_feature_values(signal_date: str) -> dict[str, Any]:
+    rows = _selector_model_feature_rows(signal_date)
+    if not rows:
+        return {}
+    source = next(iter(rows.values()))
+    return {
+        key: value
+        for key, value in source.items()
+        if key.startswith("selector_market_")
+    }
+
+
+def _selector_watchlist_feature_row_from_daily(
+    symbol: str,
+    signal_date: str,
+    daily: pd.DataFrame,
+) -> dict[str, Any]:
+    required = {"date", "open", "high", "low", "close", "pre_close", "pct_chg", "volume", "turnover"}
+    if daily.empty or not required.issubset(daily.columns):
+        return {}
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+    daily = daily[daily["date"] <= pd.Timestamp(signal_date)].sort_values("date").tail(80).copy()
+    if daily.empty:
+        return {}
+    numeric_columns = required - {"date"}
+    for column in numeric_columns:
+        daily[column] = pd.to_numeric(daily[column], errors="coerce")
+    returns = daily["pct_chg"] / 100.0
+    log_returns = np.log1p(returns.clip(lower=-0.999999))
+    latest = daily.iloc[-1]
+    values: dict[str, Any] = {
+        "symbol": symbol,
+        "date": latest["date"],
+        "matched_groups": [],
+        "matched_count": 0,
+        "best_profit_factor": np.nan,
+        "best_avg_return_pct": np.nan,
+        "selector_return_1d": latest["pct_chg"],
+        "selector_amplitude_1d": (latest["high"] - latest["low"]) / latest["pre_close"] * 100.0,
+        "selector_close_pos": (latest["close"] - latest["low"]) / (latest["high"] - latest["low"]),
+        "selector_gap_1d": (latest["open"] / latest["pre_close"] - 1.0) * 100.0,
+        "selector_high_1d": (latest["high"] / latest["pre_close"] - 1.0) * 100.0,
+        "selector_low_1d": (latest["low"] / latest["pre_close"] - 1.0) * 100.0,
+    }
+    for window in (3, 5, 10, 20, 60):
+        values[f"selector_return_{window}d"] = (np.exp(log_returns.tail(window).sum()) - 1.0) * 100.0
+    for window in (5, 10, 20, 60):
+        values[f"selector_volatility_{window}d"] = daily["pct_chg"].tail(window).std()
+        values[f"selector_volume_relative_{window}d"] = latest["volume"] / daily["volume"].tail(window).mean()
+    for window in (5, 10, 20):
+        values[f"selector_positive_ratio_{window}d"] = (daily["pct_chg"].tail(window) > 0).mean()
+    for window in (5, 20):
+        values[f"selector_turnover_relative_{window}d"] = latest["turnover"] / daily["turnover"].tail(window).mean()
+    values.update(_selector_market_feature_values(signal_date))
+    values["selector_excess_return_1d"] = latest["pct_chg"] - values.get("selector_market_mean_1d", np.nan)
+    return values
+
+
+@lru_cache(maxsize=4096)
+def _selector_watchlist_feature_row(symbol: str, signal_date: str) -> dict[str, Any]:
+    """Build the return-model factors for a stock outside the daily candidate list."""
+    candidate = _selector_model_feature_rows(signal_date).get(symbol)
+    if candidate is not None:
+        return dict(candidate)
+    try:
+        store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+        daily = store.read_frame(DAILY_DIR.name, symbol).copy()
+    except Exception:
+        return {}
+    return _selector_watchlist_feature_row_from_daily(symbol, signal_date, daily)
+
+
+def _historical_percentile_scores(
+    predictions: np.ndarray,
+    reference: np.ndarray,
+    normalization_width: float = 2.0,
+) -> np.ndarray:
+    values = np.asarray(reference, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.full(len(predictions), 50.0)
+    median = float(np.median(values))
+    q25, q75 = np.quantile(values, [0.25, 0.75])
+    scale = max(float((q75 - q25) / 1.349), 1e-6)
+    z_score = (np.asarray(predictions, dtype=float) - median) / scale
+    width = max(float(normalization_width), 0.1)
+    return np.clip(50.0 + 100.0 / np.pi * np.arctan(z_score / width), 0.0, 100.0)
+
+
+def _matched_group_values(value: Any) -> list[str]:
+    if value is None:
         return []
-    series = pd.Series(values, dtype="float64")
-    if series.nunique(dropna=True) <= 1:
-        return [0.5 for _ in values]
-    return series.rank(method="average", pct=True).fillna(0.5).tolist()
+    if isinstance(value, np.ndarray):
+        items = value.tolist()
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        try:
+            if bool(pd.isna(value)):
+                return []
+        except (TypeError, ValueError):
+            pass
+        items = [value]
+    return [str(item) for item in items if item is not None and str(item)]
 
 
-def _apply_current_score_normalization(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _apply_return_model_scores(
+    rows: list[dict[str, Any]],
+    feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    artifacts = _selector_buy_hold_models()
+    if not artifacts:
+        return
+    for mode, artifact in artifacts.items():
+        features = [str(column) for column in artifact.get("features") or []]
+        if not features:
+            continue
+        indexes: list[int] = []
+        feature_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            signal_date = str(row.get("date") or "")
+            symbol = str(row.get("symbol") or "")
+            source = (
+                feature_rows_by_symbol.get(symbol)
+                if feature_rows_by_symbol is not None
+                else _selector_model_feature_rows(signal_date).get(symbol)
+            )
+            if source is None:
+                continue
+            groups = set(_matched_group_values(row.get("matched_groups")))
+            values = dict(source)
+            values["matched_count"] = len(groups)
+            values["best_profit_factor"] = row.get("best_profit_factor")
+            values["best_avg_return_pct"] = row.get("best_avg_return_pct")
+            for feature in features:
+                if feature.startswith("group__"):
+                    values[feature] = float(feature.removeprefix("group__") in groups)
+            indexes.append(index)
+            feature_rows.append(values)
+        if not feature_rows:
+            continue
+        frame = pd.DataFrame(feature_rows).reindex(columns=features).replace([np.inf, -np.inf], np.nan)
+        try:
+            transformed = artifact["imputer"].transform(frame)
+            if "models" in artifact:
+                component_scores: dict[str, np.ndarray] = {}
+                for component, model in artifact["models"].items():
+                    predictions = model.predict(transformed)
+                    component_scores[component] = _historical_percentile_scores(
+                        predictions,
+                        artifact["score_references"][component],
+                        (artifact.get("normalization_widths") or {}).get(component, 2.0),
+                    )
+                buy_weight = float(artifact.get("buy_weight", 0.0))
+                scores = buy_weight * component_scores["buy"] + (1.0 - buy_weight) * component_scores["hold"]
+            else:
+                predictions = artifact["model"].predict(transformed)
+                scores = _historical_percentile_scores(
+                    predictions,
+                    artifact["score_reference"],
+                    artifact.get("normalization_width", 2.0),
+                )
+        except Exception:
+            continue
+        historical_name = "historical_buy_score" if mode == "buy" else "historical_hold_score"
+        for index, score in zip(indexes, scores):
+            rows[index][historical_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
+            rows[index][f"{mode}_score_source"] = "historical_return_model"
+
+
+def _apply_historical_score_normalization(
+    rows: list[dict[str, Any]],
+    feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Expose fixed-history scores without a date-local cross-sectional adjustment.
+
+    Historical buy and hold scores are calibrated against their respective
+    fixed historical distributions. Keeping the displayed score equal to that
+    calibrated value makes the same signal comparable across selection dates
+    and independent of the other candidates present on a given day.
+    """
     if not rows:
         return rows
-    for score_name, raw_name, historical_name in [
-        ("opportunity_score", "buy_raw_score", "historical_buy_score"),
-        ("holding_score", "hold_raw_score", "historical_hold_score"),
-    ]:
-        raw_values = [float(row.get(raw_name) or 0.0) for row in rows]
-        global_pct = _rank_percentiles(raw_values)
-        group_pct: list[float] = [0.5 for _ in rows]
-        by_group: dict[str, list[int]] = {}
-        for index, row in enumerate(rows):
-            by_group.setdefault(_primary_family(row), []).append(index)
-        for indexes in by_group.values():
-            ranked = _rank_percentiles([raw_values[index] for index in indexes])
-            for index, pct in zip(indexes, ranked):
-                group_pct[index] = pct
-        for index, row in enumerate(rows):
-            historical = _safe_float(row.get(historical_name), 50.0) or 50.0
-            score = historical * 0.45 + group_pct[index] * 35.0 + global_pct[index] * 20.0
-            row[score_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
+    _apply_return_model_scores(rows, feature_rows_by_symbol)
     for row in rows:
+        historical_buy_score = _safe_float(row.get("historical_buy_score"), 50.0)
+        historical_hold_score = _safe_float(row.get("historical_hold_score"), 50.0)
+        buy_score = float(np.clip(50.0 if historical_buy_score is None else historical_buy_score, 0.0, 100.0))
+        hold_score = float(np.clip(50.0 if historical_hold_score is None else historical_hold_score, 0.0, 100.0))
+        row["opportunity_score"] = round(buy_score, 1)
+        row["holding_score"] = round(hold_score, 1)
         row["selector_score"] = row["opportunity_score"]
-        row["score_target"] = "buy_score_normalized"
-        row.update(_score_interpretation(float(row["opportunity_score"]), float(row["holding_score"])))
+        row["score_target"] = "historical_return_model_score"
+        row.update(_score_interpretation(row["opportunity_score"], row["holding_score"]))
     return rows
+
+
+def _watchlist_buy_hold_scores(symbols: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """Score every watchlist stock with the selector's fixed-history models."""
+    if not symbols:
+        return {}
+    market_date = _latest_similar_pattern_target_date(list(symbols))
+    score_date = _selector_model_score_date(market_date)
+    if not score_date:
+        return {}
+    candidate_rows = _selector_model_feature_rows(score_date)
+    feature_rows = {
+        symbol: dict(candidate_rows[symbol])
+        for symbol in symbols
+        if symbol in candidate_rows
+    }
+    missing_symbols = [symbol for symbol in symbols if symbol not in feature_rows]
+    if missing_symbols:
+        try:
+            store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+            start_date = (pd.Timestamp(score_date) - pd.Timedelta(days=130)).strftime("%Y-%m-%d")
+            daily = store.read_market_range(
+                DAILY_DIR.name,
+                start_date=start_date,
+                end_date=score_date,
+                symbols=missing_symbols,
+                columns=[
+                    "symbol",
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "pre_close",
+                    "pct_chg",
+                    "volume",
+                    "turnover",
+                ],
+            )
+        except Exception:
+            daily = pd.DataFrame()
+        if not daily.empty:
+            symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
+            for symbol, frame in daily.groupby(symbol_column, sort=False):
+                feature = _selector_watchlist_feature_row_from_daily(str(symbol), score_date, frame.copy())
+                if feature:
+                    feature_rows[str(symbol)] = feature
+    rows = [
+        {
+            "symbol": symbol,
+            "date": score_date,
+            "matched_groups": _matched_group_values(
+                feature_rows[symbol].get("matched_groups"),
+            ),
+            "best_profit_factor": feature_rows[symbol].get("best_profit_factor"),
+            "best_avg_return_pct": feature_rows[symbol].get("best_avg_return_pct"),
+        }
+        for symbol in symbols
+        if symbol in feature_rows
+    ]
+    _apply_historical_score_normalization(rows, feature_rows)
+    return {
+        row["symbol"]: {
+            "opportunity_score": row["opportunity_score"],
+            "holding_score": row["holding_score"],
+            "buy_score": row["opportunity_score"],
+            "hold_score": row["holding_score"],
+            "score_date": score_date,
+            "score_target": row["score_target"],
+        }
+        for row in rows
+        if row.get("buy_score_source") == "historical_return_model"
+        and row.get("hold_score_source") == "historical_return_model"
+    }
 
 
 def _score_interpretation(opportunity_score: float, holding_score: float) -> dict[str, str]:
@@ -2944,7 +6023,7 @@ def build_selector_stock_row(
         "buy_raw_score": round(float(buy_raw_score), 4),
         "hold_raw_score": round(float(hold_raw_score), 4),
         "legacy_selector_score": round(float(legacy_score), 2),
-        "score_target": "buy_score_normalized",
+        "score_target": "historical_return_model_score",
         **score_info,
         "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(groups)} 个策略组共振；当前买入分按未来 5 日冲高目标做历史校准",
         "signals": ordered_signals,
@@ -2955,7 +6034,9 @@ def _primary_family(row: dict[str, Any]) -> str:
     signals = row.get("signals") or []
     if signals:
         return _signal_group_key(signals[0])
-    families = row.get("matched_groups") or row.get("matched_families") or []
+    families = _matched_group_values(row.get("matched_groups"))
+    if not families:
+        families = _matched_group_values(row.get("matched_families"))
     return str(families[0]) if families else ""
 
 
@@ -3088,6 +6169,10 @@ def _b1_model_signal(row: dict[str, Any]) -> dict[str, Any]:
 
 def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score: pd.Series | None = None) -> dict[str, Any]:
     signal_column, family, name, logic = FAMILY_SIGNAL_COLUMNS[strategy_key]
+    if family == "VEGAS":
+        return _vegas_tunnel_signal_payload(latest_row)
+    if family == "TRIPLE_VOLUME_BREAKOUT":
+        return _triple_volume_breakout_signal_payload(latest_row)
     is_intraday_approx = family in {"SB1", "SUPER_B1"}
     model_playbook = _model_playbook_for(family) if family in MODEL_FILTERED_SIGNALS and model_score is not None else None
     best = model_playbook if model_playbook is not None else _family_best_metrics_by_signal().get(signal_column)
@@ -3149,6 +6234,73 @@ def _family_signal_payload(strategy_key: str, latest_row: pd.Series, model_score
     })
 
 
+def _triple_volume_breakout_signal_payload(row: pd.Series) -> dict[str, Any]:
+    metrics = _parse_tvb_metrics(row.get("tvb_metrics"))
+    tier = str(row.get("tvb_tier") or "expanded")
+    variant_name = str(row.get("tvb_variant_name") or "三倍量缩量盘整突破")
+    volume_multiple = _safe_float(row.get("tvb_volume_multiple"), 0.0) or 0.0
+    score = _safe_float(row.get("tvb_score"), 78.0) or 78.0
+    action_level = "可小仓实操" if tier == "conservative" else "谨慎实操"
+    position = "小仓到标准短线仓" if tier == "conservative" else "观察到小仓"
+    days_since = _safe_float(row.get("days_since_triple_volume"), None)
+    consolidation = _safe_float(row.get("consolidation_range"), None)
+    breakout_pct = _safe_float(row.get("breakout_pct"), None)
+    volume_dryness = _safe_float(row.get("volume_dryness"), None)
+    details = []
+    if days_since is not None:
+        details.append(f"三倍量后第 {days_since:.0f} 天")
+    if consolidation is not None:
+        details.append(f"盘整振幅 {((consolidation - 1) * 100):.1f}%")
+    if breakout_pct is not None:
+        details.append(f"突破幅度 {_fmt_pct(breakout_pct * 100)}")
+    if volume_dryness is not None:
+        details.append(f"缩量强度 {_fmt_pct(volume_dryness * 100)}")
+    reason = "，".join(details) if details else "命中三倍量缩量盘整突破合并策略"
+    metrics_text = _metrics_text(metrics)
+    return _enrich_signal_group({
+        "strategy_key": "TRIPLE_VOLUME_BREAKOUT",
+        "strategy_family": "TRIPLE_VOLUME_BREAKOUT",
+        "strategy_name": variant_name,
+        "operation_key": f"TVB_{tier}_{volume_multiple:g}x",
+        "timeframe": "日线级，收盘确认，T+1 开盘观察",
+        "logic": str(row.get("tvb_description") or "缩量盘整后右侧突破"),
+        "reason": reason,
+        "buy_plan": f"{row.get('tvb_buy_plan') or 'T+1 开盘观察'}；建议仓位：{position}。",
+        "sell_plan": str(row.get("tvb_sell_plan") or "固定止盈5%，硬止损2.5%，最长T+9。"),
+        "metrics": metrics,
+        "metrics_text": metrics_text,
+        "action_level": action_level,
+        "playbook_source": "保守主策略" if tier == "conservative" else "扩展候选池",
+        "strength_score": (score - 70.0) / 10.0,
+    })
+
+
+def _parse_tvb_metrics(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return {
+            "trades": 35,
+            "avg_return_pct": 1.845164,
+            "win_rate": 0.628571,
+            "max_drawdown_pct": -14.194666,
+            "profit_factor": 3.014726,
+        }
+    try:
+        parsed = ast.literal_eval(str(raw))
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {
+        "trades": 35,
+        "avg_return_pct": 1.845164,
+        "win_rate": 0.628571,
+        "max_drawdown_pct": -14.194666,
+        "profit_factor": 3.014726,
+    }
+
+
 @lru_cache(maxsize=16)
 def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[dict[str, Any]]]:
     scored = _model_scored_candidates_for_date(signal_date)
@@ -3156,11 +6308,7 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
         cached = pd.read_parquet(FAMILY_SIGNAL_CACHE)
         cached["date"] = pd.to_datetime(cached["date"])
         if signal_date:
-            target = pd.to_datetime(signal_date)
-            available = cached[cached["date"] <= target]["date"]
-            if available.empty:
-                return {}
-            selected_date = available.max()
+            selected_date = pd.to_datetime(signal_date)
         else:
             selected_date = cached["date"].max()
         latest_rows = cached[cached["date"] == selected_date].copy()
@@ -3177,17 +6325,17 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
     features = pd.read_parquet(FEATURE_PATH)
     features["date"] = pd.to_datetime(features["date"])
     if signal_date:
-        target = pd.to_datetime(signal_date)
-        available = features[features["date"] <= target]["date"]
-        if available.empty:
-            return {}
-        latest_date = available.max()
+        latest_date = pd.to_datetime(signal_date)
     else:
         latest_date = features["date"].max()
     signal_rows: dict[str, list[dict[str, Any]]] = {}
     for symbol, group in features.groupby("symbol", sort=False):
         try:
             enriched = add_b1_family_signals(group)
+            triple_volume = add_triple_volume_strategy_pool_signals(group)
+            for col in triple_volume.columns:
+                if col not in enriched.columns:
+                    enriched[col] = triple_volume[col]
         except Exception:
             continue
         latest = enriched[enriched["date"] == latest_date]
@@ -3213,11 +6361,7 @@ def _family_profiles_for_date(signal_date: str | None = None) -> dict[str, dict[
     cached = pd.read_parquet(FAMILY_SIGNAL_CACHE)
     cached["date"] = pd.to_datetime(cached["date"])
     if signal_date:
-        target = pd.to_datetime(signal_date)
-        available = cached[cached["date"] <= target]["date"]
-        if available.empty:
-            return {}
-        selected_date = available.max()
+        selected_date = pd.to_datetime(signal_date)
     else:
         selected_date = cached["date"].max()
     latest_rows = cached[cached["date"] == selected_date].copy()
@@ -3247,23 +6391,95 @@ def _latest_extended_signals(signal_date: str | None) -> dict[str, dict[str, Any
                 return cached["signals"]
         except Exception:
             pass
+    cached_signals = _extended_signals_from_candidate_cache(signal_date)
+    if cached_signals:
+        return cached_signals
     signals = build_extended_daily_signals(DAILY_DIR, signal_date=signal_date, max_workers=32)
-    EXTENDED_SIGNAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    EXTENDED_SIGNAL_CACHE.write_text(
-        json.dumps(
-            {
-                "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "signal_date": signal_date,
-                "signals": signals,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    atomic_write_json(
+        {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "signal_date": signal_date,
+            "signals": signals,
+        },
+        EXTENDED_SIGNAL_CACHE,
     )
     return signals
 
 
+def _extended_signals_from_candidate_cache(signal_date: str | None) -> dict[str, dict[str, Any]]:
+    """Build selector-ready extended signals from the daily z-skill parquet cache."""
+
+    if not EXTENDED_CANDIDATE_CACHE.exists():
+        return {}
+    strategy_meta = {str(item["key"]).upper(): item for item in EXTENDED_STRATEGIES}
+    signal_cols = list(strategy_meta)
+    try:
+        cached = pd.read_parquet(EXTENDED_CANDIDATE_CACHE)
+    except Exception:
+        return {}
+    signal_cols = [col for col in signal_cols if col in cached.columns]
+    if not signal_cols:
+        return {}
+    if cached.empty or not {"date", "symbol"}.issubset(cached.columns):
+        return {}
+    cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
+    cached = cached.dropna(subset=["date", "symbol"])
+    if cached.empty:
+        return {}
+    if signal_date:
+        target = pd.to_datetime(signal_date, errors="coerce")
+        if pd.isna(target):
+            return {}
+        selected_date = target
+    else:
+        selected_date = cached["date"].max()
+    latest = cached[cached["date"] == selected_date].copy()
+    if latest.empty:
+        return {}
+
+    basic = _stock_basic_map()
+    signals_by_symbol: dict[str, dict[str, Any]] = {}
+    for _, row in latest.iterrows():
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        row_signals: list[dict[str, Any]] = []
+        for key in signal_cols:
+            value = row.get(key, False)
+            if pd.isna(value) or not bool(value):
+                continue
+            meta = strategy_meta[key]
+            label = str(meta.get("label") or key)
+            status = str(meta.get("status") or "日线观察")
+            row_signals.append(
+                {
+                    "strategy_key": key,
+                    "strategy_family": key,
+                    "strategy_name": label,
+                    "timeframe": "日线级，收盘确认，T+1 开盘观察",
+                    "logic": f"{label} 缓存命中，来自全市场扩展策略规则信号。",
+                    "reason": status,
+                    "buy_plan": "T+1 开盘观察，按策略 playbook 与模型分共同过滤。",
+                    "sell_plan": "按策略 playbook 风控退出。",
+                    "strength_score": 1.0,
+                }
+            )
+        if not row_signals:
+            continue
+        profile = basic.get(symbol, {})
+        signals_by_symbol[symbol] = {
+            "symbol": symbol,
+            "name": _clean_text(row.get("name")) or _clean_text(profile.get("name")),
+            "date": selected_date.strftime("%Y-%m-%d"),
+            "close": float(row.get("close")) if pd.notna(row.get("close")) else None,
+            "industry": _clean_text(profile.get("industry")),
+            "signals": row_signals,
+        }
+    return signals_by_symbol
+
+
 def _clear_selector_caches() -> None:
+    _reload_production_strategy_configs()
     for func in [
         _extended_playbooks,
         _extended_model_playbooks,
@@ -3273,31 +6489,94 @@ def _clear_selector_caches() -> None:
         _family_best_metrics,
         _family_best_metrics_by_signal,
         _family_risk_managed_metrics_by_signal,
+        _vegas_tunnel_best_metrics,
         _family_signals_for_date,
         _family_profiles_for_date,
         _latest_extended_signals,
+        _load_live_long_base_cached,
+        _load_live_long_base_full_cached,
+        _selector_buy_hold_score_artifact,
+        _selector_score_calibration,
+        _selector_buy_hold_models,
+        _selector_model_feature_rows,
+        _selector_model_score_date,
+        _stock_basic_map,
+        _long_research_module,
+        _tea_master_research_module,
     ]:
         try:
             func.cache_clear()
         except AttributeError:
             pass
+    for module_name in (
+        "quant_long_dividend_quality_research",
+        "quant_tea_master_long_research",
+    ):
+        sys.modules.pop(module_name, None)
 
 
-def _progress_steps() -> list[dict[str, Any]]:
+def _normalize_refresh_scope(scope: str | None = None) -> str:
+    if not scope:
+        return "all"
+    value = str(scope).strip()
+    aliases = {
+        "cb-allotment": "cbAllotment",
+        "allotment": "cbAllotment",
+        "convertible_bond": "cb",
+        "convertible-bond": "cb",
+    }
+    normalized = aliases.get(value, value)
+    if normalized not in REFRESH_SCOPE_STEPS:
+        raise ValueError(f"未知刷新范围: {scope}")
+    return normalized
+
+
+def _progress_steps(scope: str | None = None) -> list[dict[str, Any]]:
+    normalized = _normalize_refresh_scope(scope)
     return [
-        {"key": "refresh_data", "label": "拉取 Tushare 最新日线数据", "status": "pending", "percent": 10},
-        {"key": "feature_cache", "label": "增量构建 B1 特征缓存", "status": "pending", "percent": 35},
-        {"key": "daily_plan", "label": "生成最新策略每日计划", "status": "pending", "percent": 45},
-        {"key": "signal_cache", "label": "重建全市场策略规则信号", "status": "pending", "percent": 56},
-        {"key": "model_score", "label": "计算当日策略模型分", "status": "pending", "percent": 70},
-        {"key": "selector_core", "label": "计算短线核心股票池", "status": "pending", "percent": 78},
-        {"key": "selector_extended", "label": "计算短线全策略股票池", "status": "pending", "percent": 88},
-        {"key": "long_stock_pool", "label": "计算长线策略股票池", "status": "pending", "percent": 92},
-        {"key": "convertible_bond_plan", "label": "刷新可转债策略计划", "status": "pending", "percent": 94},
-        {"key": "convertible_bond_allotment", "label": "刷新配债股数据", "status": "pending", "percent": 96},
-        {"key": "byd_daily_plan", "label": "刷新 BYD 做T日线计划", "status": "pending", "percent": 97},
-        {"key": "snapshot", "label": "写入策略股票池快照", "status": "pending", "percent": 98},
+        {
+            "key": key,
+            "label": REFRESH_STEP_DEFINITIONS[key]["label"],
+            "status": "pending",
+            "percent": REFRESH_STEP_DEFINITIONS[key]["percent"],
+            "started_at": None,
+            "finished_at": None,
+            "elapsed_seconds": None,
+            "checkpoint_reused": False,
+        }
+        for key in REFRESH_SCOPE_STEPS[normalized]
     ]
+
+
+def _mark_refresh_step_started(step: dict[str, Any], now: datetime) -> None:
+    step.setdefault("started_at", None)
+    step.setdefault("finished_at", None)
+    step.setdefault("elapsed_seconds", None)
+    step.setdefault("checkpoint_reused", False)
+    if step["started_at"] is None:
+        step["started_at"] = now.isoformat(timespec="seconds")
+
+
+def _mark_refresh_step_finished(step: dict[str, Any], now: datetime) -> None:
+    _mark_refresh_step_started(step, now)
+    step["finished_at"] = now.isoformat(timespec="seconds")
+    started_at = _parse_refresh_timestamp(step["started_at"])
+    step["elapsed_seconds"] = round(
+        max(0.0, (now - started_at).total_seconds()) if started_at else 0.0,
+        3,
+    )
+
+
+def _mark_refresh_step_checkpoint_reused(
+    step: dict[str, Any],
+    now: datetime,
+) -> None:
+    timestamp = now.isoformat(timespec="seconds")
+    step["status"] = "success"
+    step["started_at"] = timestamp
+    step["finished_at"] = timestamp
+    step["elapsed_seconds"] = 0.0
+    step["checkpoint_reused"] = True
 
 
 def _set_refresh_progress(
@@ -3310,21 +6589,40 @@ def _set_refresh_progress(
     result: Any = None,
     error: str | None = None,
     complete_previous: bool = True,
+    checkpoint_reused: bool = False,
 ) -> None:
     with _REFRESH_LOCK:
+        if not _owned_refresh_context_active_unlocked():
+            return
+        now = datetime.now()
         steps = list(_REFRESH_STATUS.get("steps") or _progress_steps())
+        for step in steps:
+            step.setdefault("started_at", None)
+            step.setdefault("finished_at", None)
+            step.setdefault("elapsed_seconds", None)
+            step.setdefault("checkpoint_reused", False)
         if step_key:
             seen_current = False
             for step in steps:
                 if step["key"] == step_key:
-                    step["status"] = step_status or ("running" if status == "running" else status)
+                    next_step_status = step_status or ("running" if status == "running" else status)
+                    if checkpoint_reused:
+                        _mark_refresh_step_checkpoint_reused(step, now)
+                    else:
+                        step["checkpoint_reused"] = False
+                        step["status"] = next_step_status
+                        _mark_refresh_step_started(step, now)
+                        if next_step_status in {"success", "failed"}:
+                            _mark_refresh_step_finished(step, now)
                     seen_current = True
                 elif complete_previous and not seen_current and step["status"] in {"pending", "running"}:
                     step["status"] = "success"
-            if step_status == "success":
+                    _mark_refresh_step_finished(step, now)
+            if step_status == "success" and not checkpoint_reused:
                 for step in steps:
                     if step["key"] == step_key:
                         step["status"] = "success"
+                        _mark_refresh_step_finished(step, now)
         next_percent = percent if percent is not None else _REFRESH_STATUS.get("percent", 0)
         if status == "running":
             next_percent = max(int(_REFRESH_STATUS.get("percent", 0) or 0), int(next_percent or 0))
@@ -3337,10 +6635,20 @@ def _set_refresh_progress(
                 "steps": steps,
                 "result": result,
                 "error": error,
+                "updated_at": now.isoformat(timespec="seconds"),
             }
         )
         if status in {"success", "failed"}:
-            _REFRESH_STATUS["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            _REFRESH_STATUS["finished_at"] = now.isoformat(timespec="seconds")
+            started_at = _parse_refresh_timestamp(_REFRESH_STATUS.get("started_at"))
+            _REFRESH_STATUS["elapsed_seconds"] = round(
+                max(0.0, (now - started_at).total_seconds()) if started_at else 0.0,
+                3,
+            )
+            try:
+                _write_terminal_refresh_manifest_unlocked()
+            except Exception as exc:
+                _REFRESH_STATUS["manifest_error"] = str(exc)
         _persist_refresh_status_unlocked()
 
 
@@ -3362,151 +6670,898 @@ def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> d
 
 
 def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | None) -> list[dict[str, Any]]:
-    with ThreadPoolExecutor(max_workers=max(1, len(variants))) as executor:
-        results = [
-            future.result()
-            for future in as_completed(
-                [executor.submit(_refresh_long_stock_pool_variant, variant, signal_date) for variant in variants]
-            )
-        ]
-    return sorted(results, key=lambda item: variants.index(item["variant"]))
+    if not variants:
+        return []
+    with ThreadPoolExecutor(max_workers=min(3, len(variants))) as executor:
+        results = list(executor.map(lambda variant: _refresh_long_stock_pool_variant(variant, signal_date), variants))
+    ordered = sorted(results, key=lambda item: variants.index(item["variant"]))
+    if signal_date:
+        stale = [item for item in ordered if str(item.get("signal_date") or "") != str(signal_date)]
+        if stale:
+            details = ", ".join(f"{item['variant']}={item.get('signal_date')}" for item in stale)
+            raise RuntimeError(f"长线结果日期未更新到最新交易日: expected={signal_date}; {details}")
+    return ordered
 
 
-def _run_latest_refresh_job() -> None:
+def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    refresh_scope = _normalize_refresh_scope(scope)
+    step_map = _step_status_map(resume_status)
+    results: dict[str, Any] = dict((resume_status or {}).get("result") or {})
+    full_payload = get_stock_selector_payload(include_extended=True, use_cache=True, full_snapshot=True)
+    signal_date = full_payload.get("signal_date")
+
+    if not signal_date:
+        raise RuntimeError("断点续跑失败：未找到可复用的短线快照 signal_date")
+    expected_trade_date = _source_expected_trade_date(results)
+    if (
+        expected_trade_date is None
+        or _local_market_trade_date() != expected_trade_date
+    ):
+        raise RuntimeError("断点续跑快照已过期: source checkpoint is missing or stale")
+    expected_signal_date = pd.to_datetime(
+        expected_trade_date,
+        format="%Y%m%d",
+    ).date().isoformat()
+    if str(signal_date) != expected_signal_date:
+        raise RuntimeError(
+            f"断点续跑快照已过期: expected={expected_signal_date} actual={signal_date}"
+        )
+
+    if refresh_scope == "short":
+        _set_refresh_progress(step_key="snapshot", message="检测到断点，正在补写短线策略股票池快照", percent=98)
+        written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+        results["snapshot"] = {
+            "status": "success",
+            "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
+            "strategy_pools": written_pools,
+        }
+        _run_post_snapshot_cache_cleanup(results)
+        return results
+
+    _build_tea_master_stock_pool_cached.cache_clear()
+    _build_long_stock_pool_cached.cache_clear()
+    long_variants = ["tea", "tea_safe", "v44"]
+    trade_date = str(signal_date).replace("-", "") if signal_date else None
+
+    pending_steps = [
+        (
+            "chan_model_strategy",
+            lambda: get_chan_model_strategy_plan(20, True, signal_date),
+            "缠论模型策略候选生成失败",
+        ),
+        ("long_stock_pool", lambda: _refresh_long_stock_pool_variants(long_variants, signal_date), "长线策略股票池生成失败"),
+        ("convertible_bond_plan", lambda: get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date)), "可转债策略计划刷新失败"),
+        (
+            "convertible_bond_allotment",
+            lambda: get_convertible_bond_allotments(
+                80,
+                90,
+                True,
+                "pipeline",
+                expected_trade_date=signal_date,
+                validate_quality=True,
+            ),
+            "配债股数据刷新失败",
+        ),
+        ("byd_daily_plan", lambda: get_byd_daily_strategy(refresh=True), "BYD 做T日线计划刷新失败"),
+        ("similar_patterns", lambda: _run_similar_pattern_analysis_isolated(), "相似走势决策台刷新失败"),
+    ]
+    pending_steps = [item for item in pending_steps if step_map.get(item[0]) != "success"]
+
+    for step_key, _, _ in pending_steps:
+        _set_refresh_progress(
+            step_key=step_key,
+            message=f"检测到断点，正在续跑 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
+            percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
+            complete_previous=False,
+        )
+
+    if pending_steps:
+        with ThreadPoolExecutor(max_workers=min(6, len(pending_steps))) as executor:
+            futures = {
+                executor.submit(func): (step_key, failure_message)
+                for step_key, func, failure_message in pending_steps
+            }
+            for future in as_completed(futures):
+                step_key, failure_message = futures[future]
+                try:
+                    payload = future.result()
+                except Exception as exc:
+                    _set_refresh_progress(
+                        status="failed",
+                        step_key=step_key,
+                        step_status="failed",
+                        message="刷新任务失败",
+                        error=f"{failure_message}: {exc}\n{traceback.format_exc(limit=5)}",
+                        complete_previous=False,
+                    )
+                    raise
+                if step_key == "long_stock_pool":
+                    results[step_key] = {"status": "success", "variants": payload}
+                elif step_key == "chan_model_strategy":
+                    results[step_key] = {
+                        "status": "success",
+                        "signal_date": payload.get("signal_date"),
+                        "candidates": len(payload.get("candidates") or []),
+                        "primary_count": payload.get("primary_count"),
+                        "expanded_count": payload.get("expanded_count"),
+                    }
+                elif step_key == "convertible_bond_plan":
+                    results[step_key] = {
+                        "status": "success",
+                        "trade_date": payload.get("trade_date") or signal_date,
+                        "candidates": len(payload.get("candidates") or payload.get("items") or []),
+                        "data_refresh": payload.get("data_refresh"),
+                    }
+                elif step_key == "convertible_bond_allotment":
+                    results[step_key] = {
+                        "status": "success",
+                        "asof": payload.get("asof"),
+                        "records": len(payload.get("records") or []),
+                        "quality": payload.get("quality"),
+                    }
+                elif step_key == "similar_patterns":
+                    results[step_key] = {
+                        "status": "success",
+                        "generated_at": payload.get("generated_at"),
+                        "targets": len(payload.get("results") or []),
+                    }
+                else:
+                    planned_t = payload.get("planned_t") or {}
+                    results[step_key] = {
+                        "status": "success",
+                        "signal_date": planned_t.get("signal_date"),
+                        "alerts": len(payload.get("alerts") or []),
+                    }
+                _set_refresh_progress(
+                    step_key=step_key,
+                    step_status="success",
+                    message=f"{failure_message.removesuffix('失败')}完成",
+                    percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
+                    complete_previous=False,
+                )
+
+    _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
+    written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+    results["snapshot"] = {
+        "status": "success",
+        "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
+        "strategy_pools": written_pools,
+    }
+    if "long_stock_pool" in results:
+        results["snapshot"]["long_stock_pools"] = results["long_stock_pool"].get("variants")
+    _run_post_snapshot_cache_cleanup(results)
+    return results
+
+
+def _run_latest_refresh_job(
+    scope: str = "all",
+    resume_status: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> None:
     from quant.routine.pipeline import (
         build_features,
         generate_dashboard,
         generate_daily_plan,
+        refresh_chan_model_scores,
         refresh_data,
+        refresh_daily_basic_data,
+        refresh_reference_inputs,
         refresh_strategy_signal_cache,
         score_latest_models,
     )
 
-    with _REFRESH_LOCK:
-        _REFRESH_STATUS.update(
-            {
-                "status": "running",
-                "started_at": datetime.now().isoformat(timespec="seconds"),
-                "finished_at": None,
-                "message": "刷新任务已启动",
-                "percent": 1,
-                "current_step": "refresh_data",
-                "steps": _progress_steps(),
-                "result": None,
-                "error": None,
-            }
+    refresh_scope = _normalize_refresh_scope(scope)
+    refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
+    refresh_run_id = run_id or _new_refresh_run_id(refresh_scope)
+    _REFRESH_CONTEXT.run_id = refresh_run_id
+    resume_tail = _tail_resume_ready(resume_status, refresh_scope)
+    resume_inputs = not resume_tail and _input_resume_ready(resume_status, refresh_scope)
+    early_workspace_executor: ThreadPoolExecutor | None = None
+    early_workspace_futures: dict[Any, tuple[str, str]] = {}
+    early_workspace_results_lock = threading.Lock()
+    workspace_failure_step: str | None = None
+
+    def shutdown_early_workspaces(*, cancel_pending: bool) -> None:
+        nonlocal early_workspace_executor
+        if early_workspace_executor is None:
+            return
+        if cancel_pending:
+            for pending_future in early_workspace_futures:
+                if not pending_future.done():
+                    pending_future.cancel()
+        early_workspace_executor.shutdown(
+            wait=True,
+            cancel_futures=cancel_pending,
         )
+        early_workspace_executor = None
+
     try:
-        results: dict[str, Any] = {}
-        _set_refresh_progress(step_key="refresh_data", message="正在拉取 Tushare 最新日线数据", percent=10)
-        results["refresh_data"] = refresh_data(
-            dry_run=False,
-            progress_callback=lambda percent, message: _set_refresh_progress(
-                step_key="refresh_data",
-                message=message,
-                percent=percent,
-            ),
+        with _REFRESH_LOCK:
+            current_run_id = _REFRESH_STATUS.get("run_id")
+            if current_run_id not in {None, refresh_run_id}:
+                return
+            if current_run_id == refresh_run_id and _REFRESH_STATUS.get("status") in {"success", "failed"}:
+                return
+            attempt_started_at = (
+                _REFRESH_STATUS.get("started_at")
+                if current_run_id == refresh_run_id
+                else None
+            ) or datetime.now().isoformat(timespec="seconds")
+            attempt_steps = list(
+                _REFRESH_STATUS.get("steps")
+                if current_run_id == refresh_run_id
+                else []
+            ) or _progress_steps(refresh_scope)
+            _REFRESH_STATUS.update(
+                {
+                    "status": "running",
+                    "run_id": refresh_run_id,
+                    "trade_date": _source_expected_trade_date(
+                        (resume_status or {}).get("result")
+                    ),
+                    "attempt": (
+                        _REFRESH_STATUS.get("attempt")
+                        if current_run_id == refresh_run_id
+                        else None
+                    )
+                    or _refresh_attempt_number(resume_status),
+                    "resumed_from": _REFRESH_STATUS.get("resumed_from")
+                    if current_run_id == refresh_run_id
+                    else _refresh_resume_source(resume_status),
+                    "started_at": attempt_started_at,
+                    "finished_at": None,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "message": (
+                        f"{refresh_label}检测到断点，正在续跑尾段任务"
+                        if resume_tail
+                        else f"{refresh_label}检测到同日数据检查点，正在续跑计算阶段"
+                        if resume_inputs
+                        else f"{refresh_label}刷新任务已启动"
+                    ),
+                    "percent": 90 if resume_tail else 35 if resume_inputs else 1,
+                    "current_step": "similar_patterns" if resume_tail else "feature_cache" if resume_inputs else "refresh_data",
+                    "steps": attempt_steps,
+                    "scope": refresh_scope,
+                    "scope_label": refresh_label,
+                    "result": None,
+                    "error": None,
+                    "manifest_path": None,
+                    "manifest_error": None,
+                }
+            )
+            if resume_tail:
+                reused_keys = {
+                    str(step.get("key") or "")
+                    for step in (resume_status or {}).get("steps") or []
+                    if step.get("status") == "success"
+                }
+                now = datetime.now()
+                for step in _REFRESH_STATUS["steps"]:
+                    if step.get("key") in reused_keys:
+                        _mark_refresh_step_checkpoint_reused(step, now)
+            _persist_refresh_status_unlocked()
+        cache_cleanup = run_cache_cleanup(PROJECT_ROOT)
+        results: dict[str, Any] = (
+            dict((resume_status or {}).get("result") or {}) if resume_inputs else {}
         )
-        if results["refresh_data"].get("status") == "failed":
-            raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
+        results["cache_cleanup"] = cache_cleanup
+        if resume_tail:
+            try:
+                results = _resume_tail_refresh_from_cached_selector(refresh_scope, resume_status)
+            except RuntimeError as exc:
+                if not str(exc).startswith("断点续跑快照已过期:"):
+                    raise
+                # A stale selector snapshot is not a terminal failure when the
+                # same-day source inputs are still valid. Fall back to the
+                # compute-stage checkpoint and regenerate the selector before
+                # retrying downstream workspaces.
+                resume_tail = False
+                resume_inputs = _input_resume_ready(resume_status, refresh_scope)
+                if not resume_inputs:
+                    # Source checkpoints without an independent expected trade
+                    # date are not safe to recover from downstream artifacts.
+                    # Restart the source stages instead.
+                    results = {}
+                else:
+                    results = dict((resume_status or {}).get("result") or {})
+                results["tail_resume_fallback"] = {
+                    "status": "success",
+                    "reason": str(exc),
+                    "action": "recompute_from_same_day_inputs",
+                }
+                results["cache_cleanup"] = cache_cleanup
+            else:
+                results["cache_cleanup"] = cache_cleanup
+                _set_refresh_progress(
+                    status="success",
+                    step_key="snapshot",
+                    message="刷新任务完成，所有工作区数据与策略结果已生成",
+                    percent=100,
+                    result=results,
+                )
+                with _REFRESH_LOCK:
+                    for step in _REFRESH_STATUS["steps"]:
+                        step["status"] = "success"
+                    _persist_refresh_status_unlocked()
+                return
 
-        _set_refresh_progress(
-            step_key="refresh_data",
-            step_status="success",
-            message="Tushare 最新日线数据已拉取完成",
-            percent=35,
-            complete_previous=False,
-        )
+        if not resume_inputs:
+            _set_refresh_progress(step_key="refresh_data", message=f"{refresh_label}：正在共享拉取 Tushare 最新日线数据", percent=10)
+            results["refresh_data"] = refresh_data(
+                dry_run=False,
+                progress_callback=lambda percent, message: _set_refresh_progress(
+                    step_key="refresh_data",
+                    message=message,
+                    percent=percent,
+                ),
+            )
+            if results["refresh_data"].get("status") == "failed":
+                raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
-        _set_refresh_progress(
-            step_key="feature_cache",
-            message="正在并行增量构建 B1 特征缓存与全市场规则信号",
-            percent=35,
-            complete_previous=False,
-        )
-        _set_refresh_progress(
-            step_key="signal_cache",
-            message="正在并行增量构建 B1 特征缓存与全市场规则信号",
-            percent=35,
-            complete_previous=False,
-        )
-        daily_plan_ready = False
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(
-                    build_features,
+            if refresh_scope in {"all", "short", "chan", "long", "cbAllotment"}:
+                results["refresh_daily_basic"] = refresh_daily_basic_data(
+                    dry_run=False,
                     progress_callback=lambda percent, message: _set_refresh_progress(
-                        step_key="feature_cache",
+                        step_key="refresh_data",
                         message=message,
                         percent=percent,
                         complete_previous=False,
                     ),
-                ): ("feature_cache", "B1 特征缓存刷新失败"),
-                executor.submit(
-                    refresh_strategy_signal_cache,
-                    progress_callback=lambda percent, message: _set_refresh_progress(
-                        step_key="signal_cache",
-                        message=message,
-                        percent=max(46, min(68, percent)),
-                        complete_previous=False,
+                )
+                if results["refresh_daily_basic"].get("status") == "failed":
+                    raise RuntimeError("Tushare daily_basic 刷新失败")
+
+            results["refresh_reference_inputs"] = refresh_reference_inputs(
+                dry_run=False,
+                include_financials=refresh_scope in {"all", "long"},
+            )
+            if results["refresh_reference_inputs"].get("status") not in {"success", "skipped"}:
+                details = results["refresh_reference_inputs"].get("critical_errors") or []
+                raise RuntimeError(f"参考数据刷新失败: {details}")
+
+        _set_refresh_progress(
+            step_key="refresh_data",
+            step_status="success",
+            message=(
+                "已复用同日 Tushare 数据检查点"
+                if resume_inputs
+                else "Tushare 最新日线数据已拉取完成"
+            ),
+            percent=35,
+            complete_previous=False,
+            checkpoint_reused=resume_inputs,
+        )
+        _clear_selector_caches()
+        expected_trade_date = _source_expected_trade_date(results)
+        local_trade_date = _local_market_trade_date()
+        if expected_trade_date is None or local_trade_date != expected_trade_date:
+            raise RuntimeError(
+                "行情新鲜度门禁失败: "
+                f"expected={expected_trade_date} actual={local_trade_date}"
+            )
+        expected_signal_date = pd.to_datetime(
+            expected_trade_date,
+            format="%Y%m%d",
+        ).date().isoformat()
+        with _REFRESH_LOCK:
+            if _owned_refresh_context_active_unlocked():
+                _REFRESH_STATUS["trade_date"] = expected_trade_date
+                _REFRESH_STATUS["updated_at"] = datetime.now().isoformat(
+                    timespec="seconds"
+                )
+                _persist_refresh_status_unlocked()
+
+        # These workspaces only need the refreshed shared inputs. Start their
+        # network-heavy work before the CPU-bound short-selector branch and
+        # join the same futures at the normal downstream barrier.
+        if refresh_scope == "all":
+            early_signal_date = expected_signal_date
+            early_trade_date = early_signal_date.replace("-", "")
+            early_jobs = [
+                (
+                    "convertible_bond_plan",
+                    lambda: get_convertible_bond_grid_plan(
+                        early_trade_date,
+                        18,
+                        True,
                     ),
-                ): ("signal_cache", "策略规则信号重建失败"),
-            }
-            for future in as_completed(futures):
-                result_key, failure_message = futures[future]
-                results[result_key] = future.result()
-                if results[result_key].get("status") == "failed":
-                    raise RuntimeError(results[result_key].get("stderr_tail") or failure_message)
+                    "可转债策略计划刷新失败",
+                    "可转债策略计划已提前刷新完成",
+                ),
+                (
+                    "convertible_bond_allotment",
+                    lambda: get_convertible_bond_allotments(
+                        80,
+                        90,
+                        True,
+                        "pipeline",
+                        expected_trade_date=early_signal_date,
+                        validate_quality=True,
+                    ),
+                    "配债股数据刷新失败",
+                    "配债股数据已提前刷新完成",
+                ),
+                (
+                    "byd_daily_plan",
+                    lambda: get_byd_daily_strategy(refresh=True),
+                    "BYD 做T日线计划刷新失败",
+                    "BYD 做T日线计划已提前刷新完成",
+                ),
+            ]
+
+            def run_early_workspace(
+                step_key: str,
+                operation,
+                success_message: str,
+            ) -> Any:
+                payload = operation()
+                if step_key == "convertible_bond_plan":
+                    actual_date = str(payload.get("trade_date") or "").replace("-", "")
+                    if actual_date != early_trade_date:
+                        raise RuntimeError(
+                            "可转债计划日期未更新到目标交易日: "
+                            f"expected={early_trade_date} actual={actual_date}"
+                        )
+                elif step_key == "byd_daily_plan":
+                    actual_date = str(
+                        (payload.get("planned_t") or {}).get("signal_date") or ""
+                    ).replace("-", "")
+                    if actual_date != early_trade_date:
+                        raise RuntimeError(
+                            "BYD 日线计划日期未更新到目标交易日: "
+                            f"expected={early_trade_date} actual={actual_date}"
+                        )
+                with early_workspace_results_lock:
+                    if step_key == "convertible_bond_plan":
+                        results[step_key] = {
+                            "status": "success",
+                            "trade_date": payload.get("trade_date") or early_signal_date,
+                            "candidates": len(payload.get("candidates") or payload.get("items") or []),
+                            "data_refresh": payload.get("data_refresh"),
+                        }
+                    elif step_key == "convertible_bond_allotment":
+                        results[step_key] = {
+                            "status": "success",
+                            "asof": payload.get("asof"),
+                            "records": len(payload.get("records") or []),
+                            "quality": payload.get("quality"),
+                        }
+                    else:
+                        planned_t = payload.get("planned_t") or {}
+                        results[step_key] = {
+                            "status": "success",
+                            "signal_date": planned_t.get("signal_date"),
+                            "alerts": len(payload.get("alerts") or []),
+                        }
                 _set_refresh_progress(
-                    step_key=result_key,
+                    step_key=step_key,
                     step_status="success",
-                    message=f"{failure_message.removesuffix('失败')}完成",
-                    percent=45 if result_key == "feature_cache" else 68,
+                    message=success_message,
+                    percent=40,
                     complete_previous=False,
                 )
-                if result_key == "feature_cache" and not daily_plan_ready:
-                    _set_refresh_progress(
-                        step_key="daily_plan",
-                        message="正在生成最新策略每日计划",
-                        percent=46,
-                        complete_previous=False,
-                    )
-                    results["generate_daily_plan"] = generate_daily_plan()
-                    results["generate_dashboard"] = generate_dashboard()
-                    _set_refresh_progress(
-                        step_key="daily_plan",
-                        step_status="success",
-                        message="最新策略每日计划已生成",
-                        percent=50,
-                        complete_previous=False,
-                    )
-                    daily_plan_ready = True
+                return payload
 
-        if not daily_plan_ready:
+            pending_early_jobs = [
+                item
+                for item in early_jobs
+                if (results.get(item[0]) or {}).get("status") != "success"
+            ]
+            if pending_early_jobs:
+                early_workspace_executor = ThreadPoolExecutor(
+                    max_workers=len(pending_early_jobs),
+                    thread_name_prefix="quant-early-workspace",
+                )
+                for step_key, operation, failure_message, success_message in pending_early_jobs:
+                    _set_refresh_progress(
+                        step_key=step_key,
+                        message=f"共享数据已就绪，后台提前执行 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
+                        percent=35,
+                        complete_previous=False,
+                    )
+                    future = early_workspace_executor.submit(
+                        run_early_workspace,
+                        step_key,
+                        operation,
+                        success_message,
+                    )
+                    early_workspace_futures[future] = (step_key, failure_message)
+
+        if refresh_scope not in {"all", "short"}:
+            signal_date = expected_signal_date
+            trade_date = str(signal_date).replace("-", "") if signal_date else None
+            if refresh_scope == "chan":
+                _set_refresh_progress(step_key="chan_model_strategy", message="正在生成缠论模型策略候选", percent=92)
+                results["refresh_chan_model_scores"] = refresh_chan_model_scores(
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="chan_model_strategy",
+                        message=message,
+                        percent=percent,
+                        complete_previous=False,
+                    )
+                )
+                if results["refresh_chan_model_scores"].get("status") == "failed":
+                    raise RuntimeError(
+                        results["refresh_chan_model_scores"].get("stderr_tail") or "缠论实时评分刷新失败"
+                    )
+                payload = get_chan_model_strategy_plan(top_n=20, refresh=True, signal_date=signal_date)
+                if str(payload.get("signal_date") or "") != signal_date:
+                    raise RuntimeError(
+                        "缠论结果日期未更新到目标交易日: "
+                        f"expected={signal_date} actual={payload.get('signal_date')}"
+                    )
+                results["chan_model_strategy"] = {
+                    "status": "success",
+                    "signal_date": payload.get("signal_date"),
+                    "candidates": len(payload.get("candidates") or []),
+                    "primary_count": payload.get("primary_count"),
+                    "expanded_count": payload.get("expanded_count"),
+                }
+                _set_refresh_progress(
+                    step_key="chan_model_strategy",
+                    step_status="success",
+                    message="缠论模型策略候选生成完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "long":
+                _build_tea_master_stock_pool_cached.cache_clear()
+                _build_long_stock_pool_cached.cache_clear()
+                _set_refresh_progress(step_key="long_stock_pool", message="正在计算长线策略股票池", percent=92)
+                variants = _refresh_long_stock_pool_variants(["tea", "tea_safe", "v44"], signal_date)
+                results["long_stock_pool"] = {"status": "success", "variants": variants}
+                _set_refresh_progress(
+                    step_key="long_stock_pool",
+                    step_status="success",
+                    message="长线策略股票池生成完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "cb":
+                _set_refresh_progress(step_key="convertible_bond_plan", message="正在刷新可转债策略计划", percent=92)
+                payload = get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date))
+                actual_date = str(payload.get("trade_date") or "").replace("-", "")
+                if actual_date != trade_date:
+                    raise RuntimeError(
+                        "可转债计划日期未更新到目标交易日: "
+                        f"expected={trade_date} actual={actual_date}"
+                    )
+                results["convertible_bond_plan"] = {
+                    "status": "success",
+                    "trade_date": payload.get("trade_date") or signal_date,
+                    "candidates": len(payload.get("candidates") or payload.get("items") or []),
+                    "data_refresh": payload.get("data_refresh"),
+                }
+                _set_refresh_progress(
+                    step_key="convertible_bond_plan",
+                    step_status="success",
+                    message="可转债策略计划刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "cbAllotment":
+                _set_refresh_progress(step_key="convertible_bond_allotment", message="正在刷新配债股数据", percent=92)
+                payload = get_convertible_bond_allotments(
+                    80,
+                    90,
+                    True,
+                    "pipeline",
+                    expected_trade_date=signal_date,
+                    validate_quality=True,
+                )
+                results["convertible_bond_allotment"] = {
+                    "status": "success",
+                    "asof": payload.get("asof"),
+                    "records": len(payload.get("records") or []),
+                    "quality": payload.get("quality"),
+                }
+                _set_refresh_progress(
+                    step_key="convertible_bond_allotment",
+                    step_status="success",
+                    message="配债股数据刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "byd":
+                _set_refresh_progress(step_key="byd_daily_plan", message="正在刷新 BYD 做T日线计划", percent=92)
+                payload = get_byd_daily_strategy(refresh=True)
+                planned_t = payload.get("planned_t") or {}
+                actual_date = str(planned_t.get("signal_date") or "").replace("-", "")
+                if actual_date != trade_date:
+                    raise RuntimeError(
+                        "BYD 日线计划日期未更新到目标交易日: "
+                        f"expected={trade_date} actual={actual_date}"
+                    )
+                results["byd_daily_plan"] = {
+                    "status": "success",
+                    "signal_date": planned_t.get("signal_date"),
+                    "alerts": len(payload.get("alerts") or []),
+                }
+                _set_refresh_progress(
+                    step_key="byd_daily_plan",
+                    step_status="success",
+                    message="BYD 做T日线计划刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            elif refresh_scope == "similar":
+                _set_refresh_progress(step_key="similar_patterns", message="正在刷新相似走势决策台", percent=92)
+                payload = _run_similar_pattern_analysis_isolated()
+                results["similar_patterns"] = {
+                    "status": "success",
+                    "generated_at": payload.get("generated_at"),
+                    "targets": len(payload.get("results") or []),
+                }
+                _set_refresh_progress(
+                    step_key="similar_patterns",
+                    step_status="success",
+                    message="相似走势决策台刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+
             _set_refresh_progress(
-                step_key="daily_plan",
-                message="正在生成最新策略每日计划",
-                percent=50,
-                complete_previous=False,
+                status="success",
+                step_key=_REFRESH_STATUS.get("current_step"),
+                message=f"{refresh_label}刷新完成，共享数据与本页策略结果已生成",
+                percent=100,
+                result=results,
             )
-            results["generate_daily_plan"] = generate_daily_plan()
-            results["generate_dashboard"] = generate_dashboard()
+            with _REFRESH_LOCK:
+                for step in _REFRESH_STATUS["steps"]:
+                    step["status"] = "success"
+                _persist_refresh_status_unlocked()
+            return
+
+        expected_incremental_date = pd.to_datetime(
+            expected_trade_date,
+            format="%Y%m%d",
+        ).normalize()
+
+        def artifact_current(path: Path) -> bool:
+            if not path.exists():
+                return False
+            try:
+                dates = pd.read_parquet(path, columns=["date"])["date"]
+                latest = pd.to_datetime(dates, errors="coerce").max()
+                return pd.notna(latest) and latest.normalize() == expected_incremental_date
+            except Exception:
+                return False
+
+        def b1_gate_current() -> bool:
+            path = PROJECT_ROOT / "data/features/b1/b1_gate_manifest.json"
+            if not path.exists():
+                return False
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                processed = pd.to_datetime(
+                    payload.get("processed_through_date"),
+                    errors="coerce",
+                )
+                return (
+                    payload.get("status") == "success"
+                    and pd.notna(processed)
+                    and processed.normalize() == expected_incremental_date
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                return False
+
+        feature_ready = (
+            resume_inputs
+            and (results.get("feature_cache") or {}).get("status") == "success"
+            and artifact_current(PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet")
+        )
+        signal_ready = resume_inputs and all(
+            artifact_current(path)
+            for path in (
+                PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
+                PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
+            )
+        ) and (feature_ready or b1_gate_current())
+        if feature_ready:
+            results["feature_cache"]["checkpoint_reused"] = True
             _set_refresh_progress(
-                step_key="daily_plan",
+                step_key="feature_cache",
                 step_status="success",
-                message="最新策略每日计划已生成",
-                percent=50,
+                message="已复用同日 B1 特征缓存检查点",
+                percent=45,
+                complete_previous=False,
+                checkpoint_reused=True,
+            )
+        if signal_ready:
+            results["signal_cache"] = {
+                "status": "success",
+                "checkpoint_reused": True,
+                "date": expected_incremental_date.date().isoformat(),
+            }
+            _set_refresh_progress(
+                step_key="signal_cache",
+                step_status="success",
+                message="已复用同日全市场规则信号检查点",
+                percent=68,
+                complete_previous=False,
+                checkpoint_reused=True,
+            )
+
+        # The signal pass owns the exact B1 gate for the new date. Run it first
+        # so feature refresh computes the expensive 159-column frame only for
+        # gate hits, while preserving a full-scan fallback for stale manifests.
+        if not signal_ready:
+            _set_refresh_progress(
+                step_key="signal_cache",
+                message="正在增量构建全市场规则信号与 B1 门控",
+                percent=46,
+                complete_previous=False,
+            )
+            results["signal_cache"] = refresh_strategy_signal_cache(
+                progress_callback=lambda percent, message: _set_refresh_progress(
+                    step_key="signal_cache",
+                    message=message,
+                    percent=max(46, min(68, percent)),
+                    complete_previous=False,
+                ),
+            )
+            if results["signal_cache"].get("status") == "failed":
+                raise RuntimeError(
+                    results["signal_cache"].get("stderr_tail")
+                    or "策略规则信号重建失败"
+                )
+            _set_refresh_progress(
+                step_key="signal_cache",
+                step_status="success",
+                message="策略规则信号与 B1 门控构建完成",
+                percent=68,
                 complete_previous=False,
             )
 
-        _set_refresh_progress(step_key="model_score", message="正在计算当日策略模型分", percent=70)
-        results["model_score"] = score_latest_models()
-        if results["model_score"].get("status") == "failed":
-            raise RuntimeError(results["model_score"].get("stderr_tail") or "当日策略模型分计算失败")
+        if not feature_ready:
+            _set_refresh_progress(
+                step_key="feature_cache",
+                message="正在按 B1 门控增量构建特征缓存",
+                percent=35,
+                complete_previous=False,
+            )
+            results["feature_cache"] = build_features(
+                progress_callback=lambda percent, message: _set_refresh_progress(
+                    step_key="feature_cache",
+                    message=message,
+                    percent=percent,
+                    complete_previous=False,
+                ),
+            )
+            if results["feature_cache"].get("status") == "failed":
+                raise RuntimeError(
+                    results["feature_cache"].get("stderr_tail")
+                    or "B1 特征缓存刷新失败"
+                )
+            _set_refresh_progress(
+                step_key="feature_cache",
+                step_status="success",
+                message="B1 特征缓存刷新完成",
+                percent=45,
+                complete_previous=False,
+            )
+
+        # Generate independent outputs together after both upstream caches are
+        # complete. Model and Chan scoring are capped at four workers each so
+        # their combined CPU budget fits the 10-core production host.
+        _set_refresh_progress(
+            step_key="daily_plan",
+            message="正在并行生成每日计划、Dashboard、模型分与缠论评分",
+            percent=50,
+            complete_previous=False,
+        )
+        model_score_ready = resume_inputs and (results.get("model_score") or {}).get("status") == "success"
+        _set_refresh_progress(
+            step_key="model_score",
+            message="已复用同日策略模型分检查点" if model_score_ready else "正在计算当日策略模型分",
+            percent=70,
+            complete_previous=False,
+        )
+        if model_score_ready:
+            results["model_score"]["checkpoint_reused"] = True
+            _set_refresh_progress(
+                step_key="model_score",
+                step_status="success",
+                message="已复用同日策略模型分检查点",
+                percent=70,
+                complete_previous=False,
+                checkpoint_reused=True,
+            )
+        _set_refresh_progress(
+            step_key="chan_model_strategy",
+            message="正在并行刷新缠论实时评分",
+            percent=72,
+            complete_previous=False,
+        )
+        model_score_workers = min(
+            4,
+            max(1, int(os.getenv("ROUTINE_MODEL_SCORE_WORKERS", "4"))),
+        )
+        chan_score_workers = min(
+            4,
+            max(1, int(os.getenv("ROUTINE_CHAN_WORKERS", "4"))),
+        )
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="quant-daily-output") as executor:
+            output_futures = {
+                executor.submit(generate_daily_plan): (
+                    "generate_daily_plan",
+                    "最新策略每日计划生成失败",
+                ),
+                executor.submit(generate_dashboard, allow_incompatible=True): (
+                    "generate_dashboard",
+                    "B1 Dashboard 生成失败",
+                ),
+                executor.submit(
+                    refresh_chan_model_scores,
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="chan_model_strategy",
+                        message=message,
+                        percent=percent,
+                        complete_previous=False,
+                    ),
+                    workers=chan_score_workers,
+                ): ("refresh_chan_model_scores", "缠论实时评分刷新失败"),
+            }
+            if not model_score_ready:
+                output_futures[
+                    executor.submit(score_latest_models, workers=model_score_workers)
+                ] = ("model_score", "当日策略模型分计算失败")
+
+            completed_daily_outputs: set[str] = set()
+            for future in as_completed(output_futures):
+                result_key, failure_message = output_futures[future]
+                payload = future.result()
+                results[result_key] = payload
+                if payload.get("status") == "failed":
+                    raise RuntimeError(payload.get("stderr_tail") or failure_message)
+                if result_key == "model_score":
+                    _set_refresh_progress(
+                        step_key="model_score",
+                        step_status="success",
+                        message="当日策略模型分计算完成",
+                        percent=70,
+                        complete_previous=False,
+                    )
+                elif result_key == "refresh_chan_model_scores":
+                    _set_refresh_progress(
+                        step_key="chan_model_strategy",
+                        step_status="success",
+                        message="缠论实时评分刷新完成",
+                        percent=72,
+                        complete_previous=False,
+                    )
+                elif result_key in {
+                    "generate_daily_plan",
+                    "generate_dashboard",
+                }:
+                    completed_daily_outputs.add(result_key)
+                    if completed_daily_outputs == {
+                        "generate_daily_plan",
+                        "generate_dashboard",
+                    }:
+                        _set_refresh_progress(
+                            step_key="daily_plan",
+                            step_status="success",
+                            message=(
+                                "最新策略每日计划已生成；正式 B1 历史看板因模型兼容门禁保留上一有效版本"
+                                if results["generate_dashboard"].get("status")
+                                == "skipped"
+                                else "最新策略每日计划与 Dashboard 已生成"
+                            ),
+                            percent=72,
+                            complete_previous=False,
+                        )
         _clear_selector_caches()
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
         core_payload = get_stock_selector_payload(use_cache=False)
+        if str(core_payload.get("signal_date") or "") != expected_signal_date:
+            raise RuntimeError(
+                "核心策略结果日期未更新到最新交易日: "
+                f"expected={expected_signal_date} actual={core_payload.get('signal_date')}"
+            )
         results["selector_core"] = {
             "status": "success",
             "signal_date": core_payload.get("signal_date"),
@@ -3520,6 +7575,11 @@ def _run_latest_refresh_job() -> None:
             use_cache=False,
             full_snapshot=True,
         )
+        if str(full_payload.get("signal_date") or "") != expected_signal_date:
+            raise RuntimeError(
+                "扩展策略结果日期未更新到最新交易日: "
+                f"expected={expected_signal_date} actual={full_payload.get('signal_date')}"
+            )
         results["selector_extended"] = {
             "status": "success",
             "signal_date": full_payload.get("signal_date"),
@@ -3533,67 +7593,92 @@ def _run_latest_refresh_job() -> None:
             complete_previous=False,
         )
 
+        if refresh_scope == "short":
+            _set_refresh_progress(step_key="snapshot", message="正在写入短线策略股票池快照", percent=98)
+            written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+            results["snapshot"] = {
+                "status": "success",
+                "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
+                "strategy_pools": written_pools,
+            }
+            _run_post_snapshot_cache_cleanup(results)
+            _set_refresh_progress(
+                status="success",
+                step_key="snapshot",
+                message="短线策略刷新完成，共享数据与本页策略结果已生成",
+                percent=100,
+                result=results,
+            )
+            with _REFRESH_LOCK:
+                for step in _REFRESH_STATUS["steps"]:
+                    step["status"] = "success"
+                _persist_refresh_status_unlocked()
+            return
+
         _build_tea_master_stock_pool_cached.cache_clear()
         _build_long_stock_pool_cached.cache_clear()
         long_variants = ["tea", "tea_safe", "v44"]
         signal_date = full_payload.get("signal_date")
-        trade_date = str(signal_date).replace("-", "") if signal_date else None
+        _set_refresh_progress(
+            step_key="chan_model_strategy",
+            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
+            percent=92,
+            complete_previous=False,
+        )
         _set_refresh_progress(
             step_key="long_stock_pool",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
             percent=92,
             complete_previous=False,
         )
         _set_refresh_progress(
-            step_key="convertible_bond_plan",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
+            step_key="similar_patterns",
+            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
             percent=92,
             complete_previous=False,
         )
-        _set_refresh_progress(
-            step_key="convertible_bond_allotment",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
-            percent=92,
-            complete_previous=False,
-        )
-        _set_refresh_progress(
-            step_key="byd_daily_plan",
-            message="正在并行计算长线、可转债、配债股与 BYD 工作区",
-            percent=92,
-            complete_previous=False,
-        )
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        with ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="quant-late-workspace",
+        ) as executor:
             futures = {
+                executor.submit(get_chan_model_strategy_plan, 20, True, signal_date): (
+                    "chan_model_strategy",
+                    "缠论模型策略候选生成失败",
+                ),
                 executor.submit(_refresh_long_stock_pool_variants, long_variants, signal_date): (
                     "long_stock_pool",
                     "长线策略股票池生成失败",
                 ),
-                executor.submit(get_convertible_bond_grid_plan, trade_date, 18, bool(trade_date)): (
-                    "convertible_bond_plan",
-                    "可转债策略计划刷新失败",
+                executor.submit(_run_similar_pattern_analysis_isolated): (
+                    "similar_patterns",
+                    "相似走势决策台刷新失败",
                 ),
-                executor.submit(get_convertible_bond_allotments, 80, 90, True, "pipeline"): (
-                    "convertible_bond_allotment",
-                    "配债股数据刷新失败",
-                ),
-                executor.submit(get_byd_daily_strategy, refresh=True): ("byd_daily_plan", "BYD 做T日线计划刷新失败"),
             }
+            futures.update(early_workspace_futures)
             for future in as_completed(futures):
                 result_key, failure_message = futures[future]
                 try:
                     payload = future.result()
                 except Exception as exc:
-                    _set_refresh_progress(
-                        status="failed",
-                        step_key=result_key,
-                        step_status="failed",
-                        message="刷新任务失败",
-                        error=f"{failure_message}: {exc}\n{traceback.format_exc(limit=5)}",
-                        complete_previous=False,
-                    )
-                    raise
+                    workspace_failure_step = result_key
+                    raise RuntimeError(f"{failure_message}: {exc}") from exc
                 if result_key == "long_stock_pool":
                     results[result_key] = {"status": "success", "variants": payload}
+                elif result_key == "chan_model_strategy":
+                    if str(payload.get("signal_date") or "") != expected_signal_date:
+                        raise RuntimeError(
+                            "缠论结果日期未更新到目标交易日: "
+                            f"expected={expected_signal_date} "
+                            f"actual={payload.get('signal_date')}"
+                        )
+                    results[result_key] = {
+                        "status": "success",
+                        "signal_date": payload.get("signal_date"),
+                        "candidates": len(payload.get("candidates") or []),
+                        "primary_count": payload.get("primary_count"),
+                        "expanded_count": payload.get("expanded_count"),
+                    }
                 elif result_key == "convertible_bond_plan":
                     results[result_key] = {
                         "status": "success",
@@ -3607,6 +7692,12 @@ def _run_latest_refresh_job() -> None:
                         "asof": payload.get("asof"),
                         "records": len(payload.get("records") or []),
                     }
+                elif result_key == "similar_patterns":
+                    results[result_key] = {
+                        "status": "success",
+                        "generated_at": payload.get("generated_at"),
+                        "targets": len(payload.get("results") or []),
+                    }
                 else:
                     planned_t = payload.get("planned_t") or {}
                     results[result_key] = {
@@ -3614,18 +7705,20 @@ def _run_latest_refresh_job() -> None:
                         "signal_date": planned_t.get("signal_date"),
                         "alerts": len(payload.get("alerts") or []),
                     }
-                _set_refresh_progress(
-                    step_key=result_key,
-                    step_status="success",
-                    message=f"{failure_message.removesuffix('失败')}完成",
-                    percent={
-                        "long_stock_pool": 94,
-                        "convertible_bond_plan": 95,
-                        "convertible_bond_allotment": 96,
-                        "byd_daily_plan": 97,
-                    }[result_key],
-                    complete_previous=False,
-                )
+                if future not in early_workspace_futures:
+                    _set_refresh_progress(
+                        step_key=result_key,
+                        step_status="success",
+                        message=f"{failure_message.removesuffix('失败')}完成",
+                        percent={
+                            "chan_model_strategy": 93,
+                            "long_stock_pool": 94,
+                            "similar_patterns": 97,
+                        }[result_key],
+                        complete_previous=False,
+                    )
+
+        shutdown_early_workspaces(cancel_pending=False)
 
         _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
         written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
@@ -3635,6 +7728,7 @@ def _run_latest_refresh_job() -> None:
             "strategy_pools": written_pools,
             "long_stock_pools": results["long_stock_pool"]["variants"],
         }
+        _run_post_snapshot_cache_cleanup(results)
 
         _set_refresh_progress(
             status="success",
@@ -3647,30 +7741,79 @@ def _run_latest_refresh_job() -> None:
             for step in _REFRESH_STATUS["steps"]:
                 step["status"] = "success"
     except Exception as exc:
+        # Let running early work finish (and merge any successful checkpoint
+        # payloads) before persisting the terminal failure state. This avoids
+        # background threads mutating results after the run has ended.
+        shutdown_early_workspaces(cancel_pending=True)
         _set_refresh_progress(
             status="failed",
-            step_key=_REFRESH_STATUS.get("current_step"),
+            step_key=workspace_failure_step or _REFRESH_STATUS.get("current_step"),
             message="刷新任务失败",
+            result=results if "results" in locals() else None,
             error=f"{exc}\n{traceback.format_exc(limit=5)}",
         )
+    finally:
+        shutdown_early_workspaces(cancel_pending=True)
+        if getattr(_REFRESH_CONTEXT, "run_id", None) == refresh_run_id:
+            delattr(_REFRESH_CONTEXT, "run_id")
 
 
-def start_latest_refresh() -> dict[str, Any]:
+def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
+    refresh_scope = _normalize_refresh_scope(scope)
+    refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
+    resume_status: dict[str, Any] | None = None
+    run_id = _new_refresh_run_id(refresh_scope)
     with _REFRESH_LOCK:
-        if _REFRESH_STATUS.get("status") == "running":
-            return dict(_REFRESH_STATUS)
-        thread = threading.Thread(target=_run_latest_refresh_job, name="quant-latest-refresh", daemon=True)
+        current_status = _ensure_refresh_scope(dict(_REFRESH_STATUS))
+        if current_status.get("status") == "running":
+            if _is_refresh_status_stale(current_status):
+                current_status = _expire_stale_refresh_status_unlocked(current_status)
+                if _refresh_resume_ready(current_status, refresh_scope):
+                    resume_status = dict(current_status)
+            else:
+                return dict(current_status)
+        elif current_status.get("status") == "failed":
+            if _refresh_resume_ready(current_status, refresh_scope):
+                resume_status = dict(current_status)
+        elif current_status.get("status") == "idle":
+            persisted = _load_persisted_refresh_status()
+            if persisted and persisted.get("status") != "idle":
+                persisted = _ensure_refresh_scope(persisted)
+                if persisted.get("status") in {"running", "queued"}:
+                    persisted = _expire_interrupted_refresh_status_unlocked(persisted)
+                if _refresh_resume_ready(persisted, refresh_scope):
+                    resume_status = dict(persisted)
+        thread = threading.Thread(
+            target=_run_latest_refresh_job,
+            args=(refresh_scope, resume_status, run_id),
+            name=f"quant-{refresh_scope}-refresh",
+            daemon=True,
+        )
+        attempt_started_at = datetime.now().isoformat(timespec="seconds")
         _REFRESH_STATUS.update(
             {
                 "status": "queued",
-                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "run_id": run_id,
+                "trade_date": _source_expected_trade_date(
+                    (resume_status or {}).get("result")
+                ),
+                "attempt": _refresh_attempt_number(resume_status),
+                "resumed_from": _refresh_resume_source(resume_status),
+                "started_at": attempt_started_at,
                 "finished_at": None,
-                "message": "刷新任务已进入后台队列",
-                "percent": 0,
-                "current_step": None,
-                "steps": _progress_steps(),
+                "updated_at": attempt_started_at,
+                "message": f"{refresh_label}刷新任务已进入后台队列"
+                if not resume_status
+                else f"{refresh_label}检测到断点，已进入自动续跑队列",
+                "percent": 0 if not resume_status else int(resume_status.get("percent") or 35),
+                "current_step": None if not resume_status else str(resume_status.get("current_step") or "feature_cache"),
+                "steps": _progress_steps(refresh_scope),
+                "scope": refresh_scope,
+                "scope_label": refresh_label,
                 "result": None,
                 "error": None,
+                "manifest_path": None,
+                "manifest_error": None,
             }
         )
         _persist_refresh_status_unlocked()
@@ -3688,7 +7831,7 @@ def get_latest_refresh_status() -> dict[str, Any]:
                 return dict(_expire_stale_refresh_status_unlocked(persisted))
         if _is_refresh_status_stale(_REFRESH_STATUS):
             return dict(_expire_stale_refresh_status_unlocked(_REFRESH_STATUS))
-        return dict(_REFRESH_STATUS)
+        return _ensure_refresh_scope(_REFRESH_STATUS)
 
 
 def _selected_extended_keys(strategies: list[str] | None) -> set[str]:
@@ -3842,7 +7985,7 @@ def get_stock_selector_payload(
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    rows = _apply_current_score_normalization(rows)
+    rows = _apply_historical_score_normalization(rows)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -3866,8 +8009,8 @@ def get_stock_selector_payload(
             "选股器按合并后的策略组聚合命中；同一策略组下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中按策略组去重计算。",
             "2026-06-14 已统一短线和长线为前复权价格口径；模型训练、标签、策略回测和页面价格展示使用同一套价格体系。",
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
-            "买入分为 0-100 历史归一化评分，按未来 5 日最大冲高收益和冲高 >=5% 概率校准，并混合同策略内分位和全策略分位。",
-            "持有分为 0-100 保守辅助评分，按未来 5 日收盘收益和正收益概率校准；当前历史验证显示持有目标预测较弱，不等同于收益承诺。",
+            "买入分为跨日期可比的 0-100 固定历史分位，模型按未来 5 日最大冲高收益训练，不再混入当日候选名单分位。",
+            "持有分为跨日期可比的 0-100 固定历史分位，以未来 5 日收盘收益排名为主、冲高能力为辅助做多任务训练；分数用于历史排序，不等同于收益承诺。",
             f"前端默认先过滤为可操作候选，再展示保守预期收益分 Top{DEFAULT_SELECTOR_LIMIT}；MySQL 快照仍保存完整规则全集，便于后续复盘和重新训练。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",

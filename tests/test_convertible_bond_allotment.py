@@ -306,6 +306,77 @@ def test_convertible_bond_allotment_adds_stock_price_and_kdj(monkeypatch, tmp_pa
     assert record["kdj_monthly_j"] is not None
 
 
+@pytest.mark.parametrize(
+    ("stock_code", "ts_code"),
+    [
+        ("300001", "300001.SZ"),
+        ("920826", "920826.BJ"),
+    ],
+    ids=["shenzhen", "beijing_920"],
+)
+def test_convertible_bond_allotment_reads_partitioned_market_daily(
+    monkeypatch,
+    tmp_path,
+    stock_code,
+    ts_code,
+):
+    from quant.data import MarketDataStore, MarketDataStoreConfig
+    import quant.routine.convertible_bond_allotment as module
+
+    basic_path = tmp_path / "missing_basic.parquet"
+    issue_path = tmp_path / "missing_issue.parquet"
+    pipeline_path = tmp_path / "pipeline.parquet"
+    cninfo_issue_path = tmp_path / "missing_cninfo_issue.parquet"
+    daily_dir = tmp_path / "daily"
+    pd.DataFrame(
+        [
+            {
+                "stock_code": stock_code,
+                "stock_name": "测试股份",
+                "announcement_title": "测试股份向不特定对象发行可转换公司债券审核问询函回复",
+                "announce_date": "2026-06-10",
+                "announcement_url": "http://example.test/a",
+                "stage": "inquiry",
+                "status": "问询回复",
+            }
+        ]
+    ).to_parquet(pipeline_path, index=False)
+    dates = pd.bdate_range("2025-01-02", periods=320)
+    daily = pd.DataFrame(
+        {
+            "ts_code": [ts_code] * len(dates),
+            "trade_date": dates.strftime("%Y%m%d"),
+            "open": [10 + idx * 0.03 for idx in range(len(dates))],
+            "high": [10.5 + idx * 0.03 for idx in range(len(dates))],
+            "low": [9.5 + idx * 0.03 for idx in range(len(dates))],
+            "close": [10.2 + idx * 0.03 for idx in range(len(dates))],
+            "vol": [100000 + idx for idx in range(len(dates))],
+        }
+    )
+    store = MarketDataStore(
+        MarketDataStoreConfig(backend="parquet", root=tmp_path, mirror_parquet=True)
+    )
+    store.write_market_batch(daily)
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(tmp_path))
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    monkeypatch.setattr(module, "CB_BASIC_PATH", basic_path)
+    monkeypatch.setattr(module, "CB_ISSUE_PATH", issue_path)
+    monkeypatch.setattr(module, "CB_PIPELINE_PATH", pipeline_path)
+    monkeypatch.setattr(module, "CB_CNINFO_ISSUE_PATH", cninfo_issue_path)
+    monkeypatch.setattr(module, "STOCK_DAILY_DIR", daily_dir)
+
+    payload = module.build_convertible_bond_allotment_payload(today=date(2026, 6, 18))
+
+    record = payload["records"][0]
+    assert record["stock_price"] == round(daily["close"].iloc[-1], 2)
+    assert record["stock_price_date"] == dates[-1].strftime("%Y-%m-%d")
+    assert record["kdj_daily_j"] is not None
+    assert record["kdj_weekly_j"] is not None
+    assert record["kdj_monthly_j"] is not None
+    assert payload["data_sources"]["stock_daily"]["matched"] == 1
+
+
 def test_convertible_bond_allotment_keeps_watchlist_metrics_as_manual_reference_only(monkeypatch, tmp_path):
     import quant.routine.convertible_bond_allotment as module
 

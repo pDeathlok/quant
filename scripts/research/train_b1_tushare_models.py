@@ -36,12 +36,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 import build_training_data_parallel as btd
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.b1_gate import calculate_b1_gate
+from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
 from quant.features.variable_library import (
     PROJECT_FACTOR_COLUMNS,
-    build_continuous_ohlc,
-    calc_bbi as project_calc_bbi,
-    calculate_project_extra_features,
     merge_daily_basic_features,
 )
 from quant.ml.label_maker import create_b1_labels
@@ -70,14 +70,25 @@ MODEL_PARAMS = {
 def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
     path_str, start_date = args
     path = Path(path_str)
+    start_ts = pd.to_datetime(start_date)
+    history_start = start_ts - pd.Timedelta(days=450)
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=path.parent.parent))
+    df = store.read_market_range(path.parent.name, start_date=history_start.strftime("%Y%m%d"), symbols=[path.stem])
+    return process_daily_frame((path.stem, df, start_date))
+
+
+def process_daily_frame(
+    args: tuple[str, pd.DataFrame, str] | tuple[str, pd.DataFrame, str, bool],
+) -> pd.DataFrame | None:
+    symbol, df, start_date, *options = args
+    raise_errors = bool(options[0]) if options else False
     try:
-        df = pd.read_parquet(path)
-        df = normalize_tushare_daily(df, path.stem)
+        start_ts = pd.to_datetime(start_date)
+        history_start = start_ts - pd.Timedelta(days=450)
+        df = normalize_tushare_daily(df, symbol)
         if "vol" in df.columns and "volume" in df.columns:
             df = df.drop(columns=["vol"])
         df = df.sort_values("date").reset_index(drop=True)
-        start_ts = pd.to_datetime(start_date)
-        history_start = start_ts - pd.Timedelta(days=450)
         df = df[df["date"] >= history_start].reset_index(drop=True)
         if len(df) < 130:
             return None
@@ -86,21 +97,30 @@ def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
         if "ST" in name.upper() or "退" in name:
             return None
 
-        factors = pd.concat([btd.calculate_factors_single_stock(df), calculate_project_extra_features(df)], axis=1)
+        shared = attach_daily_base_factors(
+            df,
+            symbol=symbol,
+            compute_if_missing=True,
+            persist_missing=False,
+        )
+        # The B1 gate is much cheaper than the full project factor set and the
+        # forward-label build.  During an incremental daily refresh only a tiny
+        # fraction of symbols pass the gate, so reject the rest before doing
+        # the expensive work.  The mask intentionally uses the same continuous
+        # OHLC and shared KDJ definitions as the full path below.
+        b1_signal = calculate_b1_gate(
+            df,
+            shared_factors=shared,
+        )["b1_gate"]
+        if not bool((b1_signal & (df["date"] >= start_ts)).any()):
+            return None
+
+        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
+        factors = pd.concat([btd.calculate_factors_single_stock(df), shared[shared_cols]], axis=1)
         factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
         labels = create_b1_labels(df, forward_days=5, exit_aware=True, use_new_labels=True)
         result = pd.concat([df, factors, labels], axis=1)
 
-        price = build_continuous_ohlc(result)
-        pct_change = price["close"].pct_change() * 100
-        amplitude = (price["high"] - price["low"]) / price["low"].replace(0, np.nan) * 100
-        b1_signal = (
-            (pct_change >= -2)
-            & (pct_change <= 2)
-            & (amplitude < 7)
-            & (project_calc_bbi(price["close"]) > price["close"].rolling(60, min_periods=20).mean())
-            & (result["kdj_d_j"] < 0)
-        )
         keep_cols = [
             "ts_code",
             "trade_date",
@@ -116,7 +136,9 @@ def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
         out = result.loc[(result["date"] >= start_ts) & b1_signal, present].copy()
         return out if len(out) else None
     except Exception as exc:
-        print(f"skip {path.name}: {exc}", flush=True)
+        if raise_errors:
+            raise RuntimeError(f"{symbol}: {exc}") from exc
+        print(f"skip {symbol}: {exc}", flush=True)
         return None
 
 
@@ -132,26 +154,56 @@ def build_dataset(
     worker_step: int = 16,
     load_target: float = 0.80,
     load_hard_limit: float = 1.20,
+    max_symbol_error_rate: float | None = None,
+    allow_empty: bool = False,
+    symbols: list[str] | None = None,
 ) -> pd.DataFrame:
-    files = sorted(
-        path for path in daily_dir.glob("*.parquet")
-        if len(path.stem) == 9 and path.stem[6] == "." and path.stem[-2:] in {"SZ", "SH", "BJ"}
+    start_ts = pd.to_datetime(start_date)
+    history_start = (start_ts - pd.Timedelta(days=450)).strftime("%Y%m%d")
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+    market = store.read_market_range(
+        daily_dir.name,
+        start_date=history_start,
+        symbols=symbols,
     )
+    if market.empty:
+        raise RuntimeError(f"No canonical Tushare daily rows found for {history_start}+")
+    source_dates = pd.to_datetime(
+        market.get("date", market.get("trade_date")),
+        errors="coerce",
+    )
+    source_latest_trade_date = source_dates.max()
+    symbols = sorted(market["ts_code"].dropna().astype(str).unique().tolist())
     if limit:
-        files = files[:limit]
-    if not files:
-        raise RuntimeError(f"No standard Tushare daily files found in {daily_dir}")
+        symbols = symbols[:limit]
+        market = market[market["ts_code"].astype(str).isin(symbols)]
 
     frames: list[pd.DataFrame] = []
-    tasks = [(str(path), start_date) for path in files]
+    symbol_errors: list[str] = []
+    tasks = [
+        (str(symbol), group.reset_index(drop=True), start_date, True)
+        for symbol, group in market.groupby("ts_code", sort=True)
+    ]
     executor_cls = ThreadPoolExecutor if executor_type == "threads" else ProcessPoolExecutor
 
-    def consume_batch(batch: list[tuple[str, str]], batch_workers: int, processed_before: int) -> tuple[int, float]:
+    def consume_batch(
+        batch: list[tuple[str, pd.DataFrame, str, bool]],
+        batch_workers: int,
+        processed_before: int,
+    ) -> tuple[int, float]:
         started = perf_counter()
         with executor_cls(max_workers=batch_workers) as executor:
-            futures = [executor.submit(process_daily_file, task) for task in batch]
+            futures = {
+                executor.submit(process_daily_frame, task): task[0]
+                for task in batch
+            }
             for offset, future in enumerate(as_completed(futures), start=1):
-                frame = future.result()
+                symbol = futures[future]
+                try:
+                    frame = future.result()
+                except Exception as exc:
+                    symbol_errors.append(f"{symbol}: {exc}")
+                    frame = None
                 if frame is not None and len(frame):
                     frames.append(frame)
                 n = processed_before + offset
@@ -194,10 +246,40 @@ def build_dataset(
             )
             current_workers = next_workers
 
-    if not frames:
+    allowed_error_rate = (
+        float(os.getenv("B1_FEATURE_MAX_SYMBOL_ERROR_RATE", "0.001"))
+        if max_symbol_error_rate is None
+        else float(max_symbol_error_rate)
+    )
+    error_rate = len(symbol_errors) / max(len(tasks), 1)
+    if error_rate > allowed_error_rate:
+        samples = "; ".join(symbol_errors[:10])
+        raise RuntimeError(
+            "B1 feature coverage gate failed: "
+            f"errors={len(symbol_errors)}/{len(tasks)} ({error_rate:.4%}) "
+            f"> allowed={allowed_error_rate:.4%}; samples={samples}"
+        )
+    if not frames and not allow_empty:
         raise RuntimeError("No B1 training rows were produced")
-    data = pd.concat(frames, ignore_index=True).sort_values(["date", "symbol"]).reset_index(drop=True)
-    return data.replace([np.inf, -np.inf], np.nan)
+    if frames:
+        data = (
+            pd.concat(frames, ignore_index=True)
+            .sort_values(["date", "symbol"])
+            .reset_index(drop=True)
+            .replace([np.inf, -np.inf], np.nan)
+        )
+    else:
+        data = pd.DataFrame()
+    data.attrs["source_symbol_count"] = len(tasks)
+    data.attrs["source_latest_trade_date"] = (
+        source_latest_trade_date.strftime("%Y-%m-%d")
+        if pd.notna(source_latest_trade_date)
+        else None
+    )
+    data.attrs["symbol_error_count"] = len(symbol_errors)
+    data.attrs["symbol_error_rate"] = error_rate
+    data.attrs["symbol_error_samples"] = symbol_errors[:10]
+    return data
 
 
 class AucGapEarlyStopping(TrainingCallback):
@@ -469,6 +551,11 @@ def main() -> None:
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--dataset-out", type=Path, default=PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet")
+    parser.add_argument(
+        "--reuse-dataset",
+        action="store_true",
+        help="Train from dataset-out without rebuilding market features.",
+    )
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "models/research/b1_xgb_project_vars")
     parser.add_argument("--report-dir", type=Path, default=PROJECT_ROOT / "reports/b1/research/xgb_project_vars")
     parser.add_argument("--select-k", type=int, default=0, help="0 means use all available factors; positive values enable SelectKBest")
@@ -486,20 +573,27 @@ def main() -> None:
         f"multiplier={args.auto_worker_multiplier}, max_auto={args.max_auto_workers})",
         flush=True,
     )
-    data = build_dataset(
-        args.daily_dir,
-        args.start,
-        workers=workers,
-        limit=args.limit,
-        executor_type=args.executor,
-        adaptive_workers=args.adaptive_workers,
-        min_workers=args.min_workers,
-        max_workers=args.max_auto_workers,
-        worker_step=args.worker_step,
-        load_target=args.load_target,
-        load_hard_limit=args.load_hard_limit,
-    )
-    data = merge_daily_basic_features(data, args.daily_basic_dir)
+    if args.reuse_dataset:
+        if not args.dataset_out.exists():
+            raise FileNotFoundError(f"Training dataset does not exist: {args.dataset_out}")
+        data = pd.read_parquet(args.dataset_out)
+        data["date"] = pd.to_datetime(data["date"], errors="coerce")
+        print(f"reusing training dataset: {args.dataset_out} rows={len(data)}", flush=True)
+    else:
+        data = build_dataset(
+            args.daily_dir,
+            args.start,
+            workers=workers,
+            limit=args.limit,
+            executor_type=args.executor,
+            adaptive_workers=args.adaptive_workers,
+            min_workers=args.min_workers,
+            max_workers=args.max_auto_workers,
+            worker_step=args.worker_step,
+            load_target=args.load_target,
+            load_hard_limit=args.load_hard_limit,
+        )
+        data = merge_daily_basic_features(data, args.daily_basic_dir)
     data = assign_symbol_splits(data, args.oot_start, args.test_size, args.random_state)
     validate_label_splits(data)
     args.dataset_out.parent.mkdir(parents=True, exist_ok=True)

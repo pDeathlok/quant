@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
@@ -307,6 +309,9 @@ def load_daily_monthly_features(
     end: pd.Timestamp | None,
     stock_basic: pd.DataFrame,
     candidate_symbols: set[str] | None = None,
+    *,
+    use_cache: bool = True,
+    include_daily_returns: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cache_key_source = "|".join(
         [
@@ -319,27 +324,47 @@ def load_daily_monthly_features(
     cache_key = hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()[:16]
     feature_cache = RESEARCH_CACHE_DIR / f"daily_monthly_features_{cache_key}.parquet"
     returns_cache = RESEARCH_CACHE_DIR / f"daily_returns_{cache_key}.parquet"
-    if feature_cache.exists() and returns_cache.exists():
+    cache_ready = feature_cache.exists() and (
+        returns_cache.exists() or not include_daily_returns
+    )
+    if use_cache and cache_ready:
         print(f"loading cached daily features: {feature_cache.name}", flush=True)
-        return pd.read_parquet(feature_cache), pd.read_parquet(returns_cache)
+        cached_returns = (
+            pd.read_parquet(returns_cache)
+            if include_daily_returns
+            else pd.DataFrame()
+        )
+        return pd.read_parquet(feature_cache), cached_returns
 
     history_start = start - pd.Timedelta(days=450)
     frames: list[pd.DataFrame] = []
     returns: list[pd.DataFrame] = []
     stock_meta = stock_basic.set_index("ts_code") if not stock_basic.empty else pd.DataFrame()
 
-    paths = sorted(DAILY_DIR.glob("*.parquet"))
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    market = store.read_market_range(
+        DAILY_DIR.name,
+        start_date=history_start.strftime("%Y%m%d"),
+        end_date=end.strftime("%Y%m%d") if end is not None else None,
+        symbols=candidate_symbols,
+        columns=["ts_code", "trade_date", "open", "high", "low", "close", "pct_chg"],
+    )
+    if market.empty:
+        legacy_frames = []
+        for path in sorted(DAILY_DIR.glob("*.parquet")):
+            frame = pd.read_parquet(path)
+            if "ts_code" not in frame.columns or frame["ts_code"].isna().all():
+                frame["ts_code"] = path.stem
+            legacy_frames.append(frame)
+        market = pd.concat(legacy_frames, ignore_index=True, sort=False) if legacy_frames else pd.DataFrame()
     processed = 0
-    for n, path in enumerate(paths, start=1):
-        ts_code = normalize_ts_code(path)
+    grouped = market.groupby("ts_code", sort=True) if not market.empty else []
+    for _, (ts_code, source_frame) in enumerate(grouped, start=1):
         if candidate_symbols is not None and ts_code not in candidate_symbols:
             continue
         processed += 1
         try:
-            df = pd.read_parquet(
-                path,
-                columns=["ts_code", "trade_date", "open", "high", "low", "close", "pct_chg"],
-            )
+            df = source_frame.copy()
         except Exception:
             continue
         if df.empty:
@@ -370,11 +395,12 @@ def load_daily_monthly_features(
         df["downside_volatility_60d"] = downside.rolling(60).std() * np.sqrt(252)
         df["ma_120_slope_20d"] = df["ma_120"] / df["ma_120"].shift(20) - 1
 
-        daily_return = df.loc[
-            df["date"] >= start,
-            ["date", "trade_date", "ts_code", "ret_1d", "close", "ma_20", "ma_60", "ma_120"],
-        ].copy()
-        returns.append(daily_return)
+        if include_daily_returns:
+            daily_return = df.loc[
+                df["date"] >= start,
+                ["date", "trade_date", "ts_code", "ret_1d", "close", "ma_20", "ma_60", "ma_120"],
+            ].copy()
+            returns.append(daily_return)
 
         monthly_idx = df.groupby(df["date"].dt.to_period("M"))["date"].idxmax()
         monthly = df.loc[
@@ -408,10 +434,12 @@ def load_daily_monthly_features(
     if not frames:
         raise RuntimeError(f"No usable daily data found under {DAILY_DIR}")
     features = pd.concat(frames, ignore_index=True)
-    daily_returns = pd.concat(returns, ignore_index=True)
-    RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(feature_cache, index=False)
-    daily_returns.to_parquet(returns_cache, index=False)
+    daily_returns = pd.concat(returns, ignore_index=True) if returns else pd.DataFrame()
+    if use_cache:
+        RESEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        features.to_parquet(feature_cache, index=False)
+        if include_daily_returns:
+            daily_returns.to_parquet(returns_cache, index=False)
     return features, daily_returns
 
 
@@ -610,6 +638,9 @@ def add_empty_analyst_forecast_columns(features: pd.DataFrame) -> pd.DataFrame:
     defaults = {
         "analyst_report_count_180d": 0.0,
         "analyst_org_count_180d": 0.0,
+        "analyst_institution_count_180d": 0.0,
+        "analyst_research_report_count_180d": 0.0,
+        "analyst_consensus_report_count_180d": 0.0,
         "analyst_eps_mean_180d": np.nan,
         "analyst_pe_mean_180d": np.nan,
         "analyst_target_price_mean_180d": np.nan,
@@ -643,6 +674,7 @@ def load_raw_analyst_reports() -> pd.DataFrame:
         "source",
         "ts_code",
         "report_date",
+        "report_title",
         "org_name",
         "author_name",
         "quarter",
@@ -652,6 +684,7 @@ def load_raw_analyst_reports() -> pd.DataFrame:
         "target_price",
         "net_profit",
         "revenue",
+        "report_count",
         "snapshot_only",
     ]
     for column in keep_columns:
@@ -752,6 +785,19 @@ def load_analyst_forecast_asof(features: pd.DataFrame) -> pd.DataFrame:
                 target_upside = float(target_mean / close - 1.0)
             visible_orgs = pd.Series(org_values[lo_180:hi]).dropna()
             visible = symbol_reports.iloc[lo_180:hi]
+            detailed_reports = visible[
+                visible["source"].isin(["akshare_em_research", "akshare_cninfo_rating"])
+                & visible["org_name"].notna()
+            ].copy()
+            institution_count = detailed_reports["org_name"].nunique(dropna=True)
+            research_report_count = len(
+                detailed_reports.drop_duplicates(
+                    ["source", "report_date", "org_name", "author_name", "report_title"],
+                    keep="last",
+                )
+            )
+            consensus_report_counts = pd.to_numeric(visible["report_count"], errors="coerce").dropna()
+            consensus_report_count = float(consensus_report_counts.max()) if not consensus_report_counts.empty else 0.0
             forward = visible[visible["forecast_year"] >= date.year].copy()
             forward_years = forward["forecast_year"].dropna().nunique()
             forward_eps_growth = np.nan
@@ -780,6 +826,9 @@ def load_analyst_forecast_asof(features: pd.DataFrame) -> pd.DataFrame:
                     "date": date,
                     "analyst_report_count_180d": float(max(0, hi - lo_180)),
                     "analyst_org_count_180d": float(visible_orgs.nunique(dropna=True)),
+                    "analyst_institution_count_180d": float(institution_count),
+                    "analyst_research_report_count_180d": float(research_report_count),
+                    "analyst_consensus_report_count_180d": consensus_report_count,
                     "analyst_eps_mean_180d": window_mean(*metric_cumsums["eps"][1:], lo_180, hi),
                     "analyst_pe_mean_180d": window_mean(*metric_cumsums["pe"][1:], lo_180, hi),
                     "analyst_target_price_mean_180d": target_mean,

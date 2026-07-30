@@ -7,13 +7,52 @@ Tushare数据获取器
 使用前需要设置环境变量 TUSHARE_TOKEN 或在配置文件中设置
 """
 
+from __future__ import annotations
+
 import os
+import time
 from typing import Dict, List, Optional, Union
 import pandas as pd
 from pathlib import Path
 import tushare as ts
 
+from quant.data.atomic_io import atomic_write_parquet
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
+
+
+def validate_daily_basic_frame(
+    frame: pd.DataFrame,
+    trade_date: str,
+    *,
+    minimum_rows: int = 1,
+) -> pd.DataFrame:
+    """Validate a daily_basic response before it is allowed into any cache."""
+
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError(f"Tushare daily_basic returned a non-DataFrame for {trade_date}")
+    required = {"ts_code", "trade_date"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(
+            f"Tushare daily_basic missing required columns for {trade_date}: {missing}"
+        )
+    if len(frame) < max(1, minimum_rows):
+        raise ValueError(
+            f"Tushare daily_basic returned {len(frame)} rows for {trade_date}; "
+            f"minimum is {max(1, minimum_rows)}"
+        )
+    normalized_dates = frame["trade_date"].astype(str).str.replace("-", "", regex=False)
+    if frame["trade_date"].isna().any() or set(normalized_dates) != {trade_date}:
+        raise ValueError(
+            f"Tushare daily_basic trade_date mismatch for {trade_date}: "
+            f"{sorted(set(normalized_dates))[:5]}"
+        )
+    codes = frame["ts_code"].astype(str).str.strip()
+    if frame["ts_code"].isna().any() or codes.eq("").any():
+        raise ValueError(f"Tushare daily_basic contains blank ts_code for {trade_date}")
+    if codes.duplicated().any():
+        raise ValueError(f"Tushare daily_basic contains duplicate ts_code for {trade_date}")
+    return frame
 
 
 class TushareDataFetcher:
@@ -54,7 +93,9 @@ class TushareDataFetcher:
         symbol: str,
         start_date: str,
         end_date: str,
-        adjust: str = "qfq"
+        adjust: str = "qfq",
+        *,
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
         """
         获取股票日线数据
@@ -72,11 +113,11 @@ class TushareDataFetcher:
         ts_code = self._normalize_symbol(symbol)
         
         cache_key = f"tushare_{ts_code}_{start_date}_{end_date}_{adjust}"
-        if cache_key in self._memory_cache:
+        if not force_refresh and cache_key in self._memory_cache:
             return self._memory_cache[cache_key]
         
         file_path = self.cache_dir / f"{cache_key}.parquet"
-        if file_path.exists():
+        if not force_refresh and file_path.exists():
             df = pd.read_parquet(file_path)
             self._memory_cache[cache_key] = df
             return df
@@ -125,7 +166,7 @@ class TushareDataFetcher:
         df = df.sort_values('date').reset_index(drop=True)
         
         # 保存缓存
-        df.to_parquet(file_path, index=False)
+        atomic_write_parquet(df, file_path, index=False)
         self._memory_cache[cache_key] = df
         
         return df
@@ -326,7 +367,13 @@ class TushareDataFetcher:
         
         return df
     
-    def get_stock_basic(self, market: str = "all") -> pd.DataFrame:
+    def get_stock_basic(
+        self,
+        market: str = "all",
+        *,
+        force_refresh: bool = False,
+        max_age_hours: float | None = None,
+    ) -> pd.DataFrame:
         """
         获取股票基本信息
         
@@ -337,18 +384,28 @@ class TushareDataFetcher:
             DataFrame 包含 ts_code, symbol, name, industry, list_date 等
         """
         cache_key = f"tushare_stock_basic_{market}"
-        if cache_key in self._memory_cache:
+        if max_age_hours is None:
+            max_age_hours = float(os.getenv("TUSHARE_STOCK_BASIC_TTL_HOURS", "24"))
+        if cache_key in self._memory_cache and not force_refresh:
             return self._memory_cache[cache_key]
         
         file_path = self.cache_dir / f"{cache_key}.parquet"
-        if file_path.exists():
+        cache_age_hours = (time.time() - file_path.stat().st_mtime) / 3600 if file_path.exists() else None
+        cache_fresh = cache_age_hours is not None and cache_age_hours <= max(0.0, max_age_hours)
+        if file_path.exists() and cache_fresh and not force_refresh:
             df = pd.read_parquet(file_path)
             self._memory_cache[cache_key] = df
             return df
         
-        df = self.pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry,list_date,market')
+        df = self.pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,area,industry,list_date,market",
+        )
         
-        df.to_parquet(file_path, index=False)
+        temp_path = file_path.with_suffix(f".{os.getpid()}.tmp.parquet")
+        df.to_parquet(temp_path, index=False)
+        os.replace(temp_path, file_path)
         self._memory_cache[cache_key] = df
         
         return df
@@ -372,16 +429,26 @@ class TushareDataFetcher:
         fields = fields or default_fields
         cache_key = f"tushare_daily_basic_{trade_date}"
         if cache_key in self._memory_cache:
-            return self._memory_cache[cache_key]
+            try:
+                return validate_daily_basic_frame(self._memory_cache[cache_key], trade_date)
+            except ValueError:
+                del self._memory_cache[cache_key]
 
         file_path = self.cache_dir / f"{cache_key}.parquet"
         if file_path.exists():
-            df = pd.read_parquet(file_path)
-            self._memory_cache[cache_key] = df
-            return df
+            try:
+                df = validate_daily_basic_frame(pd.read_parquet(file_path), trade_date)
+            except Exception:
+                file_path.unlink(missing_ok=True)
+            else:
+                self._memory_cache[cache_key] = df
+                return df
 
-        df = self.pro.daily_basic(trade_date=trade_date, fields=fields)
-        df.to_parquet(file_path, index=False)
+        df = validate_daily_basic_frame(
+            self.pro.daily_basic(trade_date=trade_date, fields=fields),
+            trade_date,
+        )
+        atomic_write_parquet(df, file_path, index=False)
         self._memory_cache[cache_key] = df
         return df
 
@@ -836,6 +903,8 @@ class TushareDataFetcher:
             return f"{symbol}.SH"
         elif symbol.startswith("0") or symbol.startswith("3"):
             return f"{symbol}.SZ"
+        elif symbol.startswith(("4", "8", "9")):
+            return f"{symbol}.BJ"
         else:
             return symbol
     

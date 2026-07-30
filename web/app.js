@@ -1,6 +1,18 @@
+const DEFAULT_WORKSPACE_PAGE = "similar";
+const WORKSPACE_PAGE_BY_HASH = {
+  "#similar": "similar",
+  "#chan": "chan",
+  "#long": "long",
+  "#byd": "byd",
+  "#cb-allotment": "cbAllotment",
+  "#cb": "cb",
+  "#short": "short",
+};
+const workspacePageFromHash = (hash) => WORKSPACE_PAGE_BY_HASH[hash] || DEFAULT_WORKSPACE_PAGE;
+
 const state = {
   payload: null,
-  activePage: window.location.hash === "#long" ? "long" : window.location.hash === "#byd" ? "byd" : window.location.hash === "#cb-allotment" ? "cbAllotment" : window.location.hash === "#cb" ? "cb" : "short",
+  activePage: workspacePageFromHash(window.location.hash),
   selectedStrategies: new Set(),
   selectedSymbol: null,
   query: "",
@@ -13,6 +25,9 @@ const state = {
   longPayload: null,
   longVariant: "tea",
   longLoading: false,
+  chanPayload: null,
+  chanLoading: false,
+  chanSelectedSymbol: null,
   bydPayload: null,
   bydLoading: false,
   bydLastNoticeKey: "",
@@ -22,13 +37,193 @@ const state = {
   selectedCbCode: null,
   cbAllotmentPayload: null,
   cbAllotmentLoading: false,
+  cbAllotmentError: "",
   cbAllotmentSort: null,
   cbAllotmentStatusFilters: new Set(),
+  similarPayload: null,
+  similarLoading: false,
+  similarError: "",
+  similarSelectedSymbol: null,
+  similarRefreshPromise: null,
+  similarRefreshQueued: false,
+  similarPendingRemovals: new Set(),
   loading: false,
 };
 
 const API_BASE = "/api";
+const SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS = 45 * 60 * 1000;
+const WATCHLIST_ALERT_INDICATORS = {
+  ret_20d: { label: "20日涨跌幅", unit: "%", source: "snapshot" },
+  drawdown_60d: { label: "60日回撤", unit: "%", source: "snapshot" },
+  vol_ratio20: { label: "20日量比", unit: "倍", source: "snapshot" },
+  dist_ma20: { label: "距20日均线", unit: "%", source: "snapshot" },
+  dist_ma60: { label: "距60日均线", unit: "%", source: "snapshot" },
+  opportunity_score: { label: "买入评分", unit: "分", source: "watchlist" },
+  holding_score: { label: "持有评分", unit: "分", source: "watchlist" },
+};
 const REFRESH_STATUS_STORAGE_KEY = "quant.selector.latestRefreshStatus";
+const BYD_HOLDING_STORAGE_KEY = "quant.byd.holding.v1";
+const WORKSPACE_TAB_ORDER_STORAGE_KEY = "quant.workspaceTabOrder.v1";
+const BYD_HOLDING_INPUT_IDS = [
+  "bydSharesInput",
+  "bydCostInput",
+];
+const REFRESH_SCOPE_LABELS = {
+  all: "全部",
+  short: "短线",
+  chan: "缠论",
+  long: "长线",
+  cb: "可转债",
+  cbAllotment: "配债股",
+  byd: "BYD",
+  similar: "自选池",
+};
+const REFRESH_BUTTON_LABELS = {
+  refreshAllButton: "更新全部",
+  refreshLatestButton: "更新本页",
+  longRefreshLatestButton: "更新本页",
+  chanRefreshLatestButton: "更新本页",
+  cbRefreshLatestButton: "更新本页",
+  cbAllotmentRefreshLatestButton: "更新本页",
+  cbAllotmentRefreshButton: "更新行情与配债",
+  bydRefreshLatestButton: "更新本页",
+  similarRefreshLatestButton: "更新本页",
+};
+
+const WORKSPACE_TABS = [
+  { key: "short", label: "短线策略", description: "每日选股 / 交易计划", panelId: "shortPage" },
+  { key: "chan", label: "缠论策略", description: "三买模型 / T+1 计划", panelId: "chanPage" },
+  { key: "long", label: "长线策略", description: "组合候选 / 仓位择时", panelId: "longPage" },
+  { key: "cb", label: "可转债策略", description: "低位候选 / 分批计划", panelId: "cbPage" },
+  { key: "cbAllotment", label: "配债股", description: "发行流程 / 关键日期", panelId: "cbAllotmentPage" },
+  { key: "byd", label: "BYD 做T", description: "盘前计划 / 正T优先", panelId: "bydPage" },
+  { key: "similar", label: "自选池", description: "相似走势 / 策略联动", panelId: "similarPage" },
+];
+let focusWorkspaceTabAfterRender = false;
+let workspaceTabDragKey = "";
+let suppressWorkspaceTabClick = false;
+
+function normalizeWorkspaceTabOrder(value) {
+  const knownKeys = WORKSPACE_TABS.map((tab) => tab.key);
+  const supplied = Array.isArray(value) ? value.filter((key) => knownKeys.includes(key)) : [];
+  return [...new Set([...supplied, ...knownKeys])];
+}
+
+function loadWorkspaceTabOrder() {
+  try {
+    return normalizeWorkspaceTabOrder(JSON.parse(localStorage.getItem(WORKSPACE_TAB_ORDER_STORAGE_KEY) || "[]"));
+  } catch (_error) {
+    return normalizeWorkspaceTabOrder([]);
+  }
+}
+
+let workspaceTabOrder = loadWorkspaceTabOrder();
+
+function orderedWorkspaceTabs() {
+  const tabByKey = new Map(WORKSPACE_TABS.map((tab) => [tab.key, tab]));
+  return workspaceTabOrder.map((key) => tabByKey.get(key)).filter(Boolean);
+}
+
+function syncWorkspaceTabDomOrder(focusKey = "") {
+  document.querySelectorAll(".workspace-tabs").forEach((nav) => {
+    workspaceTabOrder.forEach((key) => {
+      const button = nav.querySelector(`.page-tab[data-page="${key}"]`);
+      if (button) nav.appendChild(button);
+    });
+  });
+  if (focusKey) {
+    document.querySelector(`.page-view.active .page-tab[data-page="${focusKey}"]`)?.focus({ preventScroll: true });
+  }
+}
+
+function saveWorkspaceTabOrder(order, focusKey = "") {
+  workspaceTabOrder = normalizeWorkspaceTabOrder(order);
+  try {
+    localStorage.setItem(WORKSPACE_TAB_ORDER_STORAGE_KEY, JSON.stringify(workspaceTabOrder));
+  } catch (_error) {
+    // The current session still keeps the chosen order when storage is unavailable.
+  }
+  syncWorkspaceTabDomOrder(focusKey);
+}
+
+function reorderWorkspaceTab(sourceKey, targetKey, placeAfter = false) {
+  if (!sourceKey || !targetKey || sourceKey === targetKey) return false;
+  const nextOrder = workspaceTabOrder.filter((key) => key !== sourceKey);
+  const targetIndex = nextOrder.indexOf(targetKey);
+  if (targetIndex < 0) return false;
+  nextOrder.splice(targetIndex + (placeAfter ? 1 : 0), 0, sourceKey);
+  if (nextOrder.join("|") === workspaceTabOrder.join("|")) return false;
+  saveWorkspaceTabOrder(nextOrder, sourceKey);
+  return true;
+}
+
+function moveWorkspaceTabByOffset(key, offset) {
+  const currentIndex = workspaceTabOrder.indexOf(key);
+  const nextIndex = Math.max(0, Math.min(workspaceTabOrder.length - 1, currentIndex + offset));
+  if (currentIndex < 0 || nextIndex === currentIndex) return false;
+  const nextOrder = [...workspaceTabOrder];
+  nextOrder.splice(currentIndex, 1);
+  nextOrder.splice(nextIndex, 0, key);
+  saveWorkspaceTabOrder(nextOrder, key);
+  return true;
+}
+
+function clearWorkspaceTabDropTargets() {
+  document.querySelectorAll(".page-tab.tab-drop-before, .page-tab.tab-drop-after").forEach((button) => {
+    button.classList.remove("tab-drop-before", "tab-drop-after");
+  });
+}
+
+function setBydHoldingSaveStatus(message, tone = "") {
+  const status = document.querySelector("#bydHoldingSaveStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("saved", tone === "saved");
+  status.classList.toggle("error", tone === "error");
+}
+
+function saveBydHoldingInputs() {
+  const values = Object.fromEntries(BYD_HOLDING_INPUT_IDS.map((id) => [
+    id,
+    document.querySelector(`#${id}`)?.value ?? "",
+  ]));
+  const shares = Number(values.bydSharesInput);
+  const cost = Number(values.bydCostInput);
+  if (!Number.isFinite(shares) || shares < 0 || !Number.isFinite(cost) || cost <= 0) {
+    setBydHoldingSaveStatus("持仓股数或成本价无效，未保存", "error");
+    return false;
+  }
+  try {
+    localStorage.setItem(BYD_HOLDING_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      savedAt: new Date().toISOString(),
+      values,
+    }));
+    setBydHoldingSaveStatus(`持仓已永久保存 · ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`, "saved");
+    return true;
+  } catch {
+    setBydHoldingSaveStatus("浏览器禁止本地存储，持仓未保存", "error");
+    return false;
+  }
+}
+
+function restoreBydHoldingInputs() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(BYD_HOLDING_STORAGE_KEY) || "null");
+  } catch {
+    localStorage.removeItem(BYD_HOLDING_STORAGE_KEY);
+    setBydHoldingSaveStatus("已忽略损坏的持仓记录，请重新填写", "error");
+    return;
+  }
+  if (!saved?.values) return;
+  const values = saved.values;
+  BYD_HOLDING_INPUT_IDS.forEach((id) => {
+    const input = document.querySelector(`#${id}`);
+    if (input && values[id] !== undefined) input.value = values[id];
+  });
+  setBydHoldingSaveStatus("已恢复永久保存的持仓和成本", "saved");
+}
 
 const longStrategies = [
   {
@@ -171,11 +366,49 @@ const fmtRate = (value, digits = 1) => {
   if (value == null || Number.isNaN(Number(value))) return "-";
   return `${(Number(value) * 100).toFixed(digits)}%`;
 };
+const fmtNumber = (value, digits = 2) => {
+  if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : "-";
+};
 const fmtPrice = (value) => {
   if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
   const numeric = Number(value);
   return Number.isFinite(numeric) && numeric > 0 ? numeric.toFixed(2) : "-";
 };
+const t1ReturnBucketOrder = (bucket) => {
+  const text = String(bucket || "");
+  const knownOrder = {
+    "大跌<=-3%": 0,
+    "小跌-3~-1%": 1,
+    "震荡-1~1%": 2,
+    "小涨1~3%": 3,
+    "大涨>=3%": 4,
+  };
+  if (Object.prototype.hasOwnProperty.call(knownOrder, text)) return knownOrder[text];
+  const numbers = text.match(/-?\d+(?:\.\d+)?/g)?.map(Number).filter(Number.isFinite) || [];
+  if (!numbers.length) return Number.POSITIVE_INFINITY;
+  return Math.min(...numbers);
+};
+const t1VolumeBucketOrder = (bucket) => {
+  const text = String(bucket || "");
+  const knownOrder = {
+    "缩量<0.8": 0,
+    "平量0.8~1.3": 1,
+    "放量1.3~2": 2,
+    "巨量>2": 3,
+  };
+  if (Object.prototype.hasOwnProperty.call(knownOrder, text)) return knownOrder[text];
+  return text;
+};
+const sortT1ScenarioRows = (rows) => [...(rows || [])].sort((a, b) => {
+  const returnDiff = t1ReturnBucketOrder(a.t1_return_bucket) - t1ReturnBucketOrder(b.t1_return_bucket);
+  if (returnDiff !== 0) return returnDiff;
+  const volumeA = t1VolumeBucketOrder(a.t1_volume_bucket);
+  const volumeB = t1VolumeBucketOrder(b.t1_volume_bucket);
+  if (typeof volumeA === "number" && typeof volumeB === "number") return volumeA - volumeB;
+  return String(volumeA).localeCompare(String(volumeB), "zh-Hans-CN");
+});
 const fmtWeight = (value) => {
   if (value == null || value === "" || Number.isNaN(Number(value))) return "-";
   return `${(Number(value) * 100).toFixed(1)}%`;
@@ -191,6 +424,7 @@ const fmtRange = (range) => {
   const high = fmtPrice(range.high);
   return low === high ? low : `${low}-${high}`;
 };
+const hashPage = () => workspacePageFromHash(window.location.hash);
 const formatBuyPlanText = (text) => {
   if (!text) return "";
   let normalized = String(text)
@@ -206,68 +440,209 @@ const formatBuyPlanText = (text) => {
     return `${signalText}${openText}${suffix}`;
   });
 };
-const pageHash = (page) => page === "long" ? "#long" : page === "byd" ? "#byd" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
+const pageHash = (page) => page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#byd" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
 const currentLongStrategy = () => longStrategies.find((item) => item.key === state.longVariant) || longStrategies[0];
+
+function ensureWorkspaceTabs() {
+  document.querySelectorAll(".workspace-tabs").forEach((nav, navIndex) => {
+    if (nav.dataset.workspaceTabsReady === "true") return;
+    nav.dataset.workspaceTabsReady = "true";
+    nav.setAttribute("role", "tablist");
+    nav.setAttribute("aria-orientation", "horizontal");
+    nav.innerHTML = orderedWorkspaceTabs().map((tab) => `
+      <button
+        id="workspace-tab-${navIndex}-${tab.key}"
+        class="page-tab"
+        type="button"
+        role="tab"
+        data-page="${tab.key}"
+        aria-controls="${tab.panelId}"
+        aria-selected="false"
+        aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
+        draggable="true"
+        tabindex="-1"
+        title="按住拖动排序；Alt + 左右方向键也可调整"
+      >
+        <strong>${tab.label}</strong>
+        <span>${tab.description}</span>
+      </button>
+    `).join("");
+  });
+  if (!document.querySelector("#chanDateSlot")) {
+    const actions = document.querySelector("#chanPage .toolbar-actions");
+    if (actions) {
+      const slot = document.createElement("div");
+      slot.id = "chanDateSlot";
+      actions.insertBefore(slot, actions.firstElementChild || null);
+    }
+  }
+}
+
+function revealActiveWorkspaceTab() {
+  const activePage = document.querySelector(".page-view.active");
+  const nav = activePage?.querySelector(".workspace-tabs");
+  const activeTab = nav?.querySelector(".page-tab.active");
+  if (!nav || !activeTab || nav.scrollWidth <= nav.clientWidth) return;
+  const navRect = nav.getBoundingClientRect();
+  const tabRect = activeTab.getBoundingClientRect();
+  const behavior = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  if (tabRect.left < navRect.left) {
+    nav.scrollBy({ left: tabRect.left - navRect.left - 8, behavior });
+  } else if (tabRect.right > navRect.right) {
+    nav.scrollBy({ left: tabRect.right - navRect.right + 8, behavior });
+  }
+}
+
+function loadActivePageData() {
+  if (state.activePage === "long" && !state.longPayload && !state.longLoading) {
+    loadLongStockPool().catch(showError);
+  } else if (state.activePage === "chan" && !state.chanPayload && !state.chanLoading) {
+    loadChanModelStrategy().catch(showError);
+  } else if (state.activePage === "cb" && !state.cbPayload && !state.cbLoading) {
+    loadConvertibleBondPlan().catch(showError);
+  } else if (state.activePage === "cbAllotment" && !state.cbAllotmentPayload && !state.cbAllotmentLoading) {
+    loadConvertibleBondAllotments().catch(showError);
+  } else if (state.activePage === "byd" && !state.bydPayload && !state.bydLoading) {
+    loadBydMinuteStrategy().catch(showError);
+  } else if (state.activePage === "similar" && !state.similarPayload && !state.similarLoading) {
+    loadSimilarPatterns().catch(showError);
+  } else if (state.activePage === "short" && !state.payload && !state.loading) {
+    loadSelector({ latest: true }).catch(showError);
+  }
+}
 
 function longPositionPlan(item) {
   const target = Number(item.target_weight || 0);
   const first = Number(item.first_tranche_weight || 0);
-  if (target > 0) {
+  const { level } = recommendationLevel(item);
+  if (level === "RECOMMENDED" && target > 0) {
     return `
-      <strong>目标 ${fmtWeight(target)}</strong>
-      <em>首批 ${fmtWeight(first)}</em>
-      <em>建仓 <= ${fmtPrice(item.price_levels?.entry_target_price)}</em>
+      <strong>策略目标 ${fmtWeight(target)}</strong>
+      <em>参考首批 ${fmtWeight(first)}</em>
+      <em>不代表账户已持仓</em>
     `;
   }
-  if (item.state === "BUILDING") {
+  if (level === "CAUTION") {
     return `
-      <strong>待入池</strong>
-      <em>当前目标 0%</em>
-      <em>观察建仓 <= ${fmtPrice(item.price_levels?.entry_target_price)}</em>
+      <strong>本期不推荐</strong>
+      <em>风险条件正在转弱</em>
+      <em>等待重新满足筛选条件</em>
     `;
   }
-  if (item.state === "REDUCE") {
+  if (level === "AVOID") {
     return `
-      <strong>降仓观察</strong>
-      <em>未纳入本期目标仓</em>
-      <em>跌破 ${fmtPrice(item.price_levels?.reduce_ma60_price)} 降风险</em>
-    `;
-  }
-  if (item.state === "EXIT") {
-    return `
-      <strong>不建仓</strong>
-      <em>目标 0%</em>
-      <em>清仓线 ${fmtPrice(item.price_levels?.exit_ma120_price)}</em>
+      <strong>暂时回避</strong>
+      <em>不提供建仓或清仓指令</em>
+      <em>等待趋势恢复</em>
     `;
   }
   return `
-    <strong>观察</strong>
-    <em>等待席位/价格确认</em>
-    <em>建仓 <= ${fmtPrice(item.price_levels?.entry_target_price)}</em>
+    <strong>保留观察</strong>
+    <em>尚未进入推荐池</em>
+    <em>等待评分与趋势确认</em>
   `;
 }
 
+function recommendationLevel(item) {
+  const level = item.recommendation_level || (
+    ["CORE", "BUILDING", "T_ACTIVE"].includes(item.state) ? "RECOMMENDED"
+      : item.state === "EXIT" ? "AVOID"
+        : item.state === "REDUCE" ? "CAUTION"
+          : "WATCH"
+  );
+  const labels = { RECOMMENDED: "推荐", WATCH: "观察", CAUTION: "谨慎", AVOID: "回避" };
+  return { level, label: labels[level] || "观察" };
+}
+
+function recommendationBadge(item, includeDays = true) {
+  const recommendation = recommendationLevel(item);
+  const days = Number(item.recommendation_days || 0);
+  const dayBadge = includeDays && recommendation.level === "RECOMMENDED" && days > 0
+    ? `<span class="recommendation-days" aria-label="连续推荐 ${days} 天" title="连续推荐 ${days} 天">${days}</span>`
+    : "";
+  return `<span class="state-pill recommendation-pill ${recommendation.level}">${recommendation.label}${dayBadge}</span>`;
+}
+
+function priceStateText(item) {
+  const labels = {
+    AGGRESSIVE: "积极区",
+    BUY_ZONE: "建仓区",
+    SCALE_IN: "分批区",
+    WAIT_PULLBACK: "等待回落",
+    WAIT_SIGNAL: "等待信号",
+    RISK_RISING: "风险升高",
+    TREND_INVALID: "趋势失效",
+  };
+  return labels[item.price_state] || "等待信号";
+}
+
+function longPricePlan(item) {
+  const levels = item.price_levels || {};
+  const { level } = recommendationLevel(item);
+  if (level === "AVOID") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>趋势恢复前不提供建仓参考</em><em>年线防守位 ${fmtPrice(levels.exit_ma120_price)}</em>`;
+  }
+  if (level === "CAUTION") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>风险参考 MA60 ${fmtPrice(levels.reduce_ma60_price)}</em><em>转强后再评估建仓</em>`;
+  }
+  if (level === "WATCH") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>建仓参考 ${fmtPrice(levels.entry_target_price)}</em><em>需先满足推荐条件</em>`;
+  }
+  if (item.price_state === "WAIT_PULLBACK") {
+    return `<strong>${fmtPrice(item.close)}</strong><em>等待回落至 ${fmtPrice(levels.entry_target_price)} 附近</em><em>小仓上限 ${fmtPrice(levels.entry_small_position_price)}</em>`;
+  }
+  return `<strong>${fmtPrice(item.close)}</strong><em>积极参考 ${fmtPrice(levels.entry_aggressive_price)}</em><em>建仓参考 ${fmtPrice(levels.entry_target_price)}</em>`;
+}
+
 function analystCoverageText(item) {
-  const reports = Number(item.analyst_report_count_180d || 0);
-  const orgs = Number(item.analyst_org_count_180d || 0);
+  const dataPoints = Number(item.analyst_report_count_180d || 0);
+  const institutions = Number(item.analyst_institution_count_180d || 0);
+  const researchReports = Number(item.analyst_research_report_count_180d || 0);
+  const consensusReports = Number(item.analyst_consensus_report_count_180d || 0);
   const forwardYears = Number(item.analyst_forward_years_180d || 0);
-  if (!reports) {
+  if (!dataPoints) {
     return { main: "近180日无结构化预测", sub: "使用财务/估值/趋势因子" };
   }
-  const orgText = orgs <= 1 ? "一致预期" : `${orgs}家机构`;
-  const yearText = forwardYears ? `未来${forwardYears}年` : "无前瞻年度";
-  return { main: `${reports}条 · ${orgText}`, sub: `${yearText} · 成长 ${Number(item.analyst_forward_growth_score || 0).toFixed(1)}` };
+  const coverageText = institutions && researchReports
+    ? `${institutions}家机构 · ${researchReports}份研报`
+    : consensusReports
+      ? `一致预期 · 覆盖${consensusReports}份研报`
+      : `${dataPoints}项预测数据`;
+  const yearText = forwardYears ? `覆盖未来${forwardYears}年` : "无有效前瞻年度";
+  const growth = item.analyst_forward_growth_score;
+  const growthText = growth == null || !Number.isFinite(Number(growth))
+    ? "成长评分 暂无"
+    : `成长评分 ${Number(growth).toFixed(1)}`;
+  return {
+    main: coverageText,
+    sub: `${yearText} · ${growthText}`,
+    title: "成长评分为0–100相对分位：前瞻EPS增长35% + 营收增长30% + 净利润增长25% + 预测覆盖10%；越高表示相对成长预期越强，不代表预期收益率。",
+  };
 }
 
 async function fetchJson(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    cache: "no-store",
-    ...options,
-    headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
-      ...(options.headers || {}),
-    },
-  });
+  const { timeoutMs = 0, ...fetchOptions } = options;
+  const controller = timeoutMs > 0 && !fetchOptions.signal ? new AbortController() : null;
+  const timeoutId = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      cache: "no-store",
+      ...fetchOptions,
+      ...(controller ? { signal: controller.signal } : {}),
+      headers: {
+        ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}),
+        ...(fetchOptions.headers || {}),
+      },
+    });
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error(`${path} 加载超时，请稍后重试`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== null) window.clearTimeout(timeoutId);
+  }
   if (!response.ok) {
     let detail = "";
     try {
@@ -278,6 +653,15 @@ async function fetchJson(path, options = {}) {
     throw new Error(`${path} 加载失败: ${response.status}${detail ? ` · ${detail}` : ""}`);
   }
   return response.json();
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function selectedStrategyParam() {
@@ -305,9 +689,23 @@ function setRefreshMessage(message) {
   });
 }
 
+function workspaceRequestOptions(options = {}) {
+  return { timeoutMs: options.refresh ? 120000 : 15000 };
+}
+
+function renderShortPage() {
+  renderHeader();
+  renderStrategyFilters();
+  renderStockRows();
+  renderStockDetail();
+  renderNotes();
+  renderCalendar();
+  renderDateStatus();
+}
+
 async function loadSelector(options = {}) {
   state.loading = true;
-  render();
+  renderShortPage();
   if (options.latest && state.calendar?.latest_signal_date) {
     state.signalDate = state.calendar.latest_signal_date;
   }
@@ -322,7 +720,7 @@ async function loadSelector(options = {}) {
   const suffix = query.toString();
   const path = suffix ? `/selector/stocks?${suffix}` : "/selector/stocks";
   try {
-    state.payload = await fetchJson(path);
+    state.payload = await fetchJson(path, workspaceRequestOptions(options));
     state.signalDate = requestedSignalDate || state.payload.signal_date || state.signalDate;
     const dateInput = document.querySelector("#signalDateInput");
     if (dateInput) {
@@ -339,8 +737,731 @@ async function loadSelector(options = {}) {
     throw error;
   } finally {
     state.loading = false;
-    render();
+    renderShortPage();
   }
+}
+
+function mergeSimilarPayloadWithWatchlist(payload, watchlist) {
+  const stocks = Array.isArray(watchlist) ? watchlist : [];
+  const symbols = new Set(stocks.map((item) => item.symbol));
+  return {
+    ...(payload || {}),
+    watchlist: stocks,
+    results: (payload?.results || []).filter((item) => symbols.has(item.target?.symbol)),
+    config: payload?.config || {},
+  };
+}
+
+function mergeWatchlistProfiles(currentWatchlist, incomingWatchlist) {
+  const currentBySymbol = new Map(
+    (Array.isArray(currentWatchlist) ? currentWatchlist : []).map((item) => [item.symbol, item]),
+  );
+  return (Array.isArray(incomingWatchlist) ? incomingWatchlist : []).map((item) => ({
+    ...(currentBySymbol.get(item.symbol) || {}),
+    ...item,
+  }));
+}
+
+function enrichWatchlistProfiles(currentWatchlist, enrichedWatchlist) {
+  const enrichedBySymbol = new Map(
+    (Array.isArray(enrichedWatchlist) ? enrichedWatchlist : []).map((item) => [item.symbol, item]),
+  );
+  const scoreFields = [
+    "opportunity_score",
+    "holding_score",
+    "buy_score",
+    "hold_score",
+    "score_date",
+    "score_target",
+  ];
+  return (Array.isArray(currentWatchlist) ? currentWatchlist : []).map((item) => {
+    const enriched = enrichedBySymbol.get(item.symbol);
+    if (!enriched) return item;
+    const current = { ...item };
+    scoreFields.forEach((field) => delete current[field]);
+    return { ...current, ...enriched };
+  });
+}
+
+function syncSimilarLoadingControls() {
+  const refreshButton = document.querySelector("#similarRefreshButton");
+  if (refreshButton) {
+    refreshButton.disabled = state.similarLoading;
+    refreshButton.textContent = state.similarLoading ? "刷新中" : "刷新分析";
+  }
+}
+
+async function loadSimilarPatternsOnce(options = {}) {
+  state.similarLoading = true;
+  state.similarError = "";
+  renderSimilarPatternsPage();
+  try {
+    const watchlistPayload = await fetchJson("/similar-patterns/watchlist?include_scores=false");
+    const currentWatchlist = state.similarPayload?.watchlist || [];
+    const latestPersistedWatchlist = mergeWatchlistProfiles(
+      currentWatchlist,
+      watchlistPayload.stocks || [],
+    );
+    state.similarPayload = mergeSimilarPayloadWithWatchlist({
+      ...(state.similarPayload || {}),
+      generated_at: state.similarPayload?.generated_at || watchlistPayload.updated_at,
+    }, latestPersistedWatchlist);
+    renderSimilarPatternsPage();
+    const path = options.refresh ? "/similar-patterns/analysis?refresh=true" : "/similar-patterns/analysis";
+    const requestOptions = options.refresh
+      ? { ...workspaceRequestOptions(options), timeoutMs: SIMILAR_ANALYSIS_REFRESH_TIMEOUT_MS }
+      : workspaceRequestOptions(options);
+    const analysisPayload = await fetchJson(path, requestOptions);
+    const latestWatchlist = enrichWatchlistProfiles(
+      state.similarPayload?.watchlist || latestPersistedWatchlist,
+      analysisPayload.watchlist || [],
+    );
+    state.similarPayload = mergeSimilarPayloadWithWatchlist(analysisPayload, latestWatchlist);
+    const results = state.similarPayload.results || [];
+    if (!state.similarSelectedSymbol && results.length) {
+      state.similarSelectedSymbol = results[0].target?.symbol || null;
+    }
+    if (state.similarSelectedSymbol && !results.some((item) => item.target?.symbol === state.similarSelectedSymbol)) {
+      state.similarSelectedSymbol = results[0]?.target?.symbol || null;
+    }
+  } catch (error) {
+    state.similarError = error.message || "自选池分析加载失败";
+    showError(error);
+    throw error;
+  } finally {
+    state.similarLoading = false;
+    renderSimilarPatternsPage();
+  }
+}
+
+function loadSimilarPatterns(options = {}) {
+  if (state.similarRefreshPromise) {
+    if (options.refresh) state.similarRefreshQueued = true;
+    return state.similarRefreshPromise;
+  }
+  const request = (async () => {
+    let nextOptions = options;
+    do {
+      state.similarRefreshQueued = false;
+      await loadSimilarPatternsOnce(nextOptions);
+      nextOptions = { refresh: true };
+    } while (state.similarRefreshQueued);
+  })();
+  const sharedRequest = request.finally(() => {
+    if (state.similarRefreshPromise === sharedRequest) state.similarRefreshPromise = null;
+  });
+  state.similarRefreshPromise = sharedRequest;
+  return sharedRequest;
+}
+
+async function addSimilarWatchSymbol(symbol, options = {}) {
+  const payload = await fetchJson("/similar-patterns/watchlist", {
+    method: "POST",
+    body: JSON.stringify({ symbol, note: options.note || "" }),
+  });
+  applySimilarWatchlistPayload(payload);
+  if (options.refresh !== false) {
+    loadSimilarPatterns({ refresh: true }).catch((error) => {
+      showWatchlistToast(error.message || "已加入自选池，但后台计算失败", "error");
+    });
+  }
+  return payload;
+}
+
+async function removeSimilarWatchSymbol(symbol) {
+  if (state.similarPendingRemovals.has(symbol)) return;
+  state.similarPendingRemovals.add(symbol);
+  renderSimilarPatternsPage();
+  try {
+    const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+    if (state.similarSelectedSymbol === symbol) state.similarSelectedSymbol = null;
+    applySimilarWatchlistPayload(payload);
+    await loadSimilarPatterns({ refresh: true });
+  } finally {
+    state.similarPendingRemovals.delete(symbol);
+    renderSimilarPatternsPage();
+  }
+}
+
+async function saveSimilarWatchNote(symbol, content) {
+  const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}/note`, {
+    method: "PUT",
+    body: JSON.stringify({ content }),
+  });
+  const saved = (payload.stocks || []).find((item) => item.symbol === symbol);
+  const current = (state.similarPayload?.watchlist || []).find((item) => item.symbol === symbol);
+  if (saved && current) Object.assign(current, saved);
+  renderSimilarPatternsPage();
+  return saved;
+}
+
+function applySimilarWatchlistPayload(payload) {
+  const currentPayload = {
+    ...(state.similarPayload || {}),
+    generated_at: state.similarPayload?.generated_at || payload.updated_at,
+  };
+  const latestWatchlist = mergeWatchlistProfiles(
+    state.similarPayload?.watchlist || [],
+    payload.stocks || [],
+  );
+  state.similarPayload = mergeSimilarPayloadWithWatchlist(currentPayload, latestWatchlist);
+  const symbols = new Set(state.similarPayload.watchlist.map((item) => item.symbol));
+  if (state.similarSelectedSymbol && !symbols.has(state.similarSelectedSymbol)) {
+    state.similarSelectedSymbol = null;
+  }
+  renderSimilarPatternsPage();
+}
+
+async function saveSimilarWatchOrder(symbols) {
+  const payload = await fetchJson("/similar-patterns/watchlist/order", {
+    method: "PUT",
+    body: JSON.stringify({ symbols }),
+  });
+  applySimilarWatchlistPayload(payload);
+  return payload;
+}
+
+async function setSimilarWatchPinned(symbol, pinned) {
+  const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}/pin`, {
+    method: "PUT",
+    body: JSON.stringify({ pinned }),
+  });
+  applySimilarWatchlistPayload(payload);
+  return payload;
+}
+
+async function saveSimilarWatchAlerts(symbol, alerts) {
+  const payload = await fetchJson(`/similar-patterns/watchlist/${encodeURIComponent(symbol)}/alerts`, {
+    method: "PUT",
+    body: JSON.stringify(alerts),
+  });
+  applySimilarWatchlistPayload(payload);
+  return payload;
+}
+
+function watchlistAlertConfig(item) {
+  const alerts = item?.alerts || {};
+  return {
+    enabled: Boolean(alerts.enabled),
+    reminders: Array.isArray(alerts.reminders) ? alerts.reminders : [],
+    updated_at: alerts.updated_at || "",
+  };
+}
+
+function watchlistAlertNumber(value) {
+  if (value === null || value === undefined || value === "") return Number.NaN;
+  return Number(value);
+}
+
+function watchlistAlertMetricValue(item, result, indicator) {
+  const definition = WATCHLIST_ALERT_INDICATORS[indicator];
+  if (!definition) return Number.NaN;
+  const source = definition.source === "watchlist" ? item : (result?.latest_snapshot || {});
+  return watchlistAlertNumber(source?.[indicator]);
+}
+
+function watchlistAlertConditionState(currentValue, condition) {
+  const threshold = Number(condition?.value);
+  const available = Number.isFinite(currentValue) && Number.isFinite(threshold);
+  const triggered = available && (
+    condition.operator === "lt"
+      ? currentValue < threshold
+      : condition.operator === "eq"
+        ? Math.abs(currentValue - threshold) < 1e-8
+        : currentValue > threshold
+  );
+  return { available, triggered };
+}
+
+function evaluateWatchlistReminder(item, result, reminder) {
+  const conditions = (reminder.conditions || []).map((condition) => ({
+    ...condition,
+    currentValue: condition.kind === "indicator"
+      ? watchlistAlertMetricValue(item, result, condition.indicator)
+      : watchlistAlertNumber(result?.latest_snapshot?.close),
+  })).map((condition) => ({
+    ...condition,
+    ...watchlistAlertConditionState(condition.currentValue, condition),
+  }));
+  const andGroups = [];
+  conditions.forEach((condition, index) => {
+    if (!andGroups.length || (index > 0 && condition.conjunction === "or")) {
+      andGroups.push([]);
+    }
+    andGroups[andGroups.length - 1].push(condition);
+  });
+  return {
+    ...reminder,
+    configured: conditions.length > 0,
+    availableCount: conditions.filter((condition) => condition.available).length,
+    triggered: andGroups.length > 0
+      && andGroups.some((group) => group.every((condition) => condition.triggered)),
+    conditions,
+  };
+}
+
+function evaluateWatchlistAlert(item, result = similarResultForSymbol(item?.symbol)) {
+  const config = watchlistAlertConfig(item);
+  const reminders = config.reminders.map((reminder, reminderIndex) => ({
+    ...evaluateWatchlistReminder(item, result, reminder),
+    reminderIndex,
+  }));
+  const triggeredReminders = config.enabled
+    ? reminders.filter((reminder) => reminder.triggered)
+    : [];
+  return {
+    ...config,
+    configured: reminders.length > 0,
+    count: reminders.length,
+    conditionCount: reminders.reduce((total, reminder) => total + reminder.conditions.length, 0),
+    triggered: triggeredReminders.length > 0,
+    triggeredReminders,
+    reminders,
+  };
+}
+
+function watchlistAlertBell(item, alertState) {
+  const className = alertState.triggered
+    ? "triggered"
+    : alertState.configured
+      ? (alertState.enabled ? "configured" : "disabled")
+      : "empty";
+  const status = alertState.triggered
+    ? `${alertState.triggeredReminders.length} 个提醒已触发`
+    : alertState.configured
+      ? (alertState.enabled ? `已设置 ${alertState.count} 个提醒` : "提醒已停用")
+      : "尚未设置提醒";
+  const name = item?.name || item?.symbol || "股票";
+  return `
+    <button
+      type="button"
+      class="watchlist-alert-bell ${className}"
+      data-watchlist-alert-bell="${escapeHtml(item?.symbol || "")}"
+      aria-label="${escapeHtml(`${name}：${status}，点击设置提醒`)}"
+      title="${escapeHtml(`${status}，点击设置`)}"
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="watchlist-alert-bell-body" d="M6 9a6 6 0 0 1 12 0v3.5c0 1.8.7 3.5 2 4.8l.7.7H3.3l.7-.7c1.3-1.3 2-3 2-4.8V9Z"></path>
+        <path d="M9.5 20a2.7 2.7 0 0 0 5 0"></path>
+      </svg>
+    </button>
+  `;
+}
+
+const similarActionClass = (action) => {
+  const text = String(action || "");
+  if (text.includes("卖出") || text.includes("减仓")) return "similar-action-sell";
+  if (text.includes("低吸") || text.includes("持有/可")) return "similar-action-buy";
+  return "";
+};
+
+function similarForecastLabel(horizon) {
+  if (horizon === "next_1d") return "次日";
+  if (horizon === "next_1m") return "1个月";
+  if (horizon === "next_3m") return "3个月";
+  return horizon || "-";
+}
+
+function selectedSimilarResult() {
+  const results = state.similarPayload?.results || [];
+  return results.find((item) => item.target?.symbol === state.similarSelectedSymbol) || results[0] || null;
+}
+
+function similarResultForSymbol(symbol) {
+  return (state.similarPayload?.results || []).find((item) => item.target?.symbol === symbol) || null;
+}
+
+function similarForecastRow(item, horizon) {
+  const optimized = (item?.optimized_forecast || []).find((row) => row.horizon === horizon);
+  return optimized || (item?.forecast || []).find((row) => row.horizon === horizon) || {};
+}
+
+function similarDecision(item, horizon) {
+  return (item?.decisions || []).find((row) => row.horizon === horizon) || {};
+}
+
+function similarSignalLabel(signal) {
+  if (signal === "bullish") return "看涨";
+  if (signal === "bearish") return "看跌";
+  return "观望";
+}
+
+function similarProbabilitySourceLabel(source) {
+  const labels = {
+    raw_baseline: "原始相似样本",
+    event_dedupe: "事件去重",
+    nonlinear: "非线性权重",
+    regime_industry: "市场/行业状态权重",
+    recency: "时间衰减",
+    full_weighting: "完整组合权重",
+    optimized: "完整组合权重",
+    calibrated: "全池滚动校准",
+  };
+  return labels[source] || source || "统一策略";
+}
+
+function watchlistStrategyHits(item) {
+  return item?.strategy_hits || [];
+}
+
+function watchlistStrategyBadges(item, includeDetail = false) {
+  const hits = watchlistStrategyHits(item);
+  if (!hits.length) return `<span class="strategy-hit-empty">仅自选观察</span>`;
+  return `<div class="strategy-hit-list">${hits.map((hit) => `
+    <span class="strategy-hit-badge ${hit.strategy_key || ""}" title="${hit.detail || hit.strategy_label || ""}">
+      <strong>${hit.strategy_label || hit.strategy_key || "策略"}</strong>
+      ${includeDetail ? `<em>${hit.detail || "已命中"}</em>` : ""}
+    </span>
+  `).join("")}</div>`;
+}
+
+function strategyResonanceLabel(item) {
+  const count = watchlistStrategyHits(item).length;
+  if (count >= 2) return `${count} 策略共振`;
+  if (count === 1) return "策略命中";
+  return "观察中";
+}
+
+function compactWatchlistDate(value) {
+  const digits = String(value || "").replaceAll("-", "").slice(0, 8);
+  if (!/^\d{8}$/.test(digits)) return "";
+  return `${Number(digits.slice(4, 6))}.${Number(digits.slice(6, 8))}`;
+}
+
+function watchlistSourceNote(dateValue, sourceText) {
+  const dateLabel = compactWatchlistDate(dateValue);
+  return [dateLabel, String(sourceText || "").trim()].filter(Boolean).join(" ");
+}
+
+function xueqiuStockUrl(symbol) {
+  const normalized = String(symbol || "").trim().toUpperCase();
+  const match = normalized.match(/^(\d{6})(?:\.(SH|SZ|BJ))?$/);
+  if (!match) return "";
+  const code = match[1];
+  const market = match[2]
+    || (/^(?:920|[48])/.test(code) ? "BJ" : /^[69]/.test(code) ? "SH" : "SZ");
+  return `https://xueqiu.com/S/${market}${code}`;
+}
+
+function fallbackSimilarityScore(row, config) {
+  const current = Number(row.forecast_weight);
+  const ceiling = Number(config?.similarity_score_ceiling);
+  const contrast = Number(config?.similarity_score_contrast);
+  if (Number.isFinite(current) && Number.isFinite(ceiling) && ceiling > 0 && Number.isFinite(contrast) && contrast > 0) {
+    const normalized = Math.max(0, Math.min(1, current / ceiling));
+    return (Math.log1p(contrast * normalized) / Math.log1p(contrast) * 100).toFixed(1);
+  }
+  if (row.similarity_score != null && !Number.isNaN(Number(row.similarity_score))) {
+    return Number(row.similarity_score).toFixed(1);
+  }
+  return "-";
+}
+
+function renderSimilarPatternsPage() {
+  const payload = state.similarPayload;
+  const meta = document.querySelector("#similarMeta");
+  const watchCount = document.querySelector("#similarWatchCount");
+  const watchlist = document.querySelector("#similarWatchlist");
+  const overview = document.querySelector("#similarSelectedOverview");
+  const scenarioRows = document.querySelector("#similarScenarioRows");
+  const modelList = document.querySelector("#similarSellModel");
+  const topRows = document.querySelector("#similarTopRows");
+  const detailTitle = document.querySelector("#similarDetailTitle");
+  const detailMeta = document.querySelector("#similarDetailMeta");
+  const modelMeta = document.querySelector("#similarModelMeta");
+  const signalSummary = document.querySelector("#similarSignalSummary");
+  if (!meta || !watchlist || !overview || !scenarioRows || !modelList || !topRows) return;
+  syncSimilarLoadingControls();
+
+  if (state.similarLoading && !payload) {
+    meta.textContent = "正在计算自选池相似走势";
+    if (signalSummary) signalSummary.innerHTML = `<article class="similar-summary-card loading"><span>策略共振</span><strong>分析中</strong><em>正在汇总其他策略命中</em></article>`;
+    overview.innerHTML = `<article class="panel"><p class="subline">正在扫描历史相似片段...</p></article>`;
+    return;
+  }
+  if (state.similarError && !payload) {
+    meta.textContent = "自选池加载失败";
+    if (signalSummary) signalSummary.innerHTML = `
+      <article class="similar-summary-card error">
+        <span>数据状态</span>
+        <strong>加载失败</strong>
+        <em>${state.similarError}</em>
+      </article>
+    `;
+    watchlist.innerHTML = `<tr><td colspan="10" class="empty-cell">${state.similarError} · <button type="button" data-similar-retry>重新加载</button></td></tr>`;
+    overview.innerHTML = "";
+    return;
+  }
+  if (!payload) {
+    meta.textContent = "切到自选池后加载";
+    if (signalSummary) signalSummary.innerHTML = "";
+    watchlist.innerHTML = `<tr><td colspan="10" class="empty-cell">切到自选池后加载</td></tr>`;
+    overview.innerHTML = "";
+    return;
+  }
+
+  const watch = payload.watchlist || [];
+  const results = payload.results || [];
+  const resonantResults = results.filter((item) => watchlistStrategyHits(item).length > 0);
+  const totalStrategyHits = resonantResults.reduce((total, item) => total + watchlistStrategyHits(item).length, 0);
+  const bullishCount = results.filter((item) => similarDecision(item, "next_1d").signal === "bullish").length;
+  const rankedWatch = [...watch];
+  const alertEntries = rankedWatch.map((item) => ({
+    item,
+    alertState: evaluateWatchlistAlert(item),
+  }));
+  const alertStateBySymbol = new Map(alertEntries.map(({ item, alertState }) => [item.symbol, alertState]));
+  const configuredAlertCount = alertEntries.reduce((total, { alertState }) => total + alertState.count, 0);
+  const triggeredAlertEntries = alertEntries.filter(({ alertState }) => alertState.triggered);
+  const triggeredReminderCount = triggeredAlertEntries.reduce(
+    (total, { alertState }) => total + alertState.triggeredReminders.length,
+    0,
+  );
+  meta.textContent = state.similarError
+    ? `分析加载失败，笔记仍可编辑 · 自选 ${watch.length} 只`
+    : state.similarLoading
+      ? results.length
+        ? `自选 ${watch.length} 只 · 正在后台刷新，当前显示上次结果`
+        : `自选 ${watch.length} 只 · 正在加载分析，笔记可先编辑`
+      : `更新于 ${payload.generated_at || "-"} · 全池统一策略 · T+1 观望区 ${payload.config?.signal_bearish_max ?? 45}%～${payload.config?.signal_bullish_min ?? 55}% · 自选 ${watch.length} 只`;
+  if (watchCount) watchCount.textContent = `${watch.length} 只股票`;
+  if (signalSummary) {
+    signalSummary.innerHTML = `
+      <article class="similar-summary-card primary">
+        <span>多策略确认</span>
+        <strong>${resonantResults.length} <small>/ ${watch.length} 只</small></strong>
+        <em>${resonantResults.length ? `累计 ${totalStrategyHits} 次策略命中` : "暂未命中其他策略"}</em>
+      </article>
+      <article class="similar-summary-card">
+        <span>T+1 看涨</span>
+        <strong>${bullishCount} <small>只</small></strong>
+        <em>来自相似走势统一模型</em>
+      </article>
+      <article class="similar-summary-card">
+        <span>当前自选</span>
+        <strong>${watch.length} <small>只</small></strong>
+        <em>${configuredAlertCount ? `${configuredAlertCount} 个提醒 · ${triggeredReminderCount} 个触发` : "优先查看带“策略命中”的股票"}</em>
+      </article>
+    `;
+  }
+  watchlist.innerHTML = rankedWatch.map((item) => {
+    const result = similarResultForSymbol(item.symbol);
+    const target = result?.target || {};
+    const snapshot = result?.latest_snapshot || {};
+    const nextDay = similarForecastRow(result, "next_1d");
+    const nextMonth = similarForecastRow(result, "next_1m");
+    const nextDayDecision = similarDecision(result, "next_1d");
+    const selectedClass = item.symbol === state.similarSelectedSymbol ? "active" : "";
+    const strategyHits = watchlistStrategyHits(result);
+    const resonanceClass = strategyHits.length ? "has-strategy-hit" : "";
+    const xueqiuUrl = xueqiuStockUrl(item.symbol);
+    const rawBuyScore = item.opportunity_score ?? item.buy_score;
+    const rawHoldScore = item.holding_score ?? item.hold_score;
+    const buyScore = rawBuyScore == null ? Number.NaN : Number(rawBuyScore);
+    const holdScore = rawHoldScore == null ? Number.NaN : Number(rawHoldScore);
+    const scoreDate = item.score_date || "-";
+    const removePending = state.similarPendingRemovals.has(item.symbol);
+    const alertState = alertStateBySymbol.get(item.symbol) || evaluateWatchlistAlert(item, result);
+    return `
+      <tr
+        class="similar-watch-row ${selectedClass} ${resonanceClass} ${item.pinned ? "is-pinned" : ""}"
+        data-similar-symbol="${item.symbol}"
+        data-watchlist-symbol="${item.symbol}"
+        data-watchlist-name="${escapeHtml(item.name || item.symbol)}"
+        data-watchlist-note="${escapeHtml(item.note || "")}"
+        data-watchlist-pinned="${item.pinned ? "true" : "false"}"
+        draggable="true"
+        tabindex="0"
+        title="按住拖动排序；右键可置顶或设置提醒"
+      >
+        <td class="similar-stock-cell">
+          <strong>${item.name || item.symbol}${item.pinned ? `<span class="watchlist-pin-badge">置顶</span>` : ""}${watchlistAlertBell(item, alertState)}</strong>
+          <span>${item.symbol} · ${item.industry || "-"}</span>
+          <em>${target.target_date || "-"}</em>
+        </td>
+        <td class="similar-resonance-cell">
+          <span class="similar-resonance-label">${strategyResonanceLabel(result)}</span>
+          ${watchlistStrategyBadges(result)}
+        </td>
+        <td class="similar-score-cell" title="历史模型评分日期 ${scoreDate}">
+          <strong>${Number.isFinite(buyScore) ? buyScore.toFixed(1) : "—"}</strong>
+          <span>买入分</span>
+        </td>
+        <td class="similar-score-cell" title="历史模型评分日期 ${scoreDate}">
+          <strong>${Number.isFinite(holdScore) ? holdScore.toFixed(1) : "—"}</strong>
+          <span>持有分</span>
+        </td>
+        <td class="similar-market-cell">
+          <strong>${fmtPrice(snapshot.close)}</strong>
+          <span>20日 ${fmtPct(snapshot.ret_20d)}</span>
+          <em>回撤 ${fmtPct(snapshot.drawdown_60d)} · 量比 ${snapshot.vol_ratio20 ?? "-"}</em>
+        </td>
+        <td class="similar-decision-cell">
+          <strong class="similar-signal-${nextDayDecision.signal || "observe"}">${similarSignalLabel(nextDayDecision.signal)}</strong>
+          <span>上涨概率 ${fmtPct(nextDay.selected_up_probability ?? nextDay.calibrated_up_probability ?? nextDay.up_probability)}</span>
+          <em>${result?.optimization_summary?.effective_sample_size ?? result?.scan_summary?.matched_cases ?? "-"} 个有效样本</em>
+        </td>
+        <td class="similar-medium-cell">
+          <strong>${fmtPct(nextMonth.selected_up_probability ?? nextMonth.calibrated_up_probability ?? nextMonth.up_probability)}</strong>
+          <span>1月上涨概率</span>
+          <em>收益中位 ${fmtPct(nextMonth.median)}</em>
+        </td>
+        <td class="similar-note-cell">
+          <button type="button" class="similar-note-button" data-similar-note="${item.symbol}" aria-label="编辑 ${escapeHtml(item.name || item.symbol)} 的笔记">
+            <strong>${item.note ? "查看 / 编辑" : "写笔记"}</strong>
+            <span>${item.note ? escapeHtml(item.note) : "记录操作计划、关注价位等"}</span>
+          </button>
+        </td>
+        <td class="similar-xueqiu-cell">
+          ${xueqiuUrl ? `
+            <a class="xueqiu-stock-link" data-similar-xueqiu href="${escapeHtml(xueqiuUrl)}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(item.name || item.symbol)}">
+              雪球
+            </a>
+          ` : `<span class="xueqiu-stock-unavailable">—</span>`}
+        </td>
+        <td class="similar-row-actions">
+          <button type="button" data-similar-remove="${item.symbol}" ${state.similarLoading || removePending ? "disabled" : ""}>
+            ${removePending ? "删除中" : "删除"}
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join("") || `<tr><td colspan="10" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
+
+  const selected = selectedSimilarResult();
+  overview.innerHTML = selected ? (() => {
+    const item = selected;
+    const target = item.target || {};
+    const snapshot = item.latest_snapshot || {};
+    const forecast = item.optimized_forecast?.length ? item.optimized_forecast : (item.forecast || []);
+    const nextDecision = similarDecision(item, "next_1d");
+    const validation = (item.validation_summary || []).find((row) => row.horizon === "next_1d") || {};
+    const strategyHits = watchlistStrategyHits(item);
+    return `
+      <article class="similar-card active ${strategyHits.length ? "has-strategy-hit" : ""}">
+        <div class="similar-card-head">
+          <div>
+            <span class="similar-detail-kicker">当前决策</span>
+            <strong>${target.name || target.symbol}</strong>
+            <span>${target.symbol} · ${target.target_date || "-"}</span>
+          </div>
+          <span class="similar-resonance-label">${strategyResonanceLabel(item)}</span>
+        </div>
+        <div class="similar-decision-banner similar-signal-${nextDecision.signal || "observe"}">
+          <strong>T+1 ${similarSignalLabel(nextDecision.signal)}</strong>
+          <span>${item.market_regime || "neutral"} / 行业 ${item.industry_regime || "neutral"}${nextDecision.risk_gate === "blocked" ? ` · 风险闸门：${(nextDecision.reasons || []).join("、")}` : ""}</span>
+        </div>
+        <div class="watchlist-strategy-summary ${strategyHits.length ? "has-hits" : ""}">
+          <div><span>策略依据</span><strong>${strategyHits.length ? `${strategyHits.length} 个其他策略同时命中` : "暂无其他策略确认"}</strong></div>
+          ${watchlistStrategyBadges(item, true)}
+        </div>
+        <div class="similar-snapshot">
+          <div><span>收盘</span><strong>${fmtPrice(snapshot.close)}</strong></div>
+          <div><span>20日涨跌</span><strong>${fmtPct(snapshot.ret_20d)}</strong></div>
+          <div><span>60日回撤</span><strong>${fmtPct(snapshot.drawdown_60d)}</strong></div>
+          <div><span>量比</span><strong>${snapshot.vol_ratio20 ?? "-"}</strong></div>
+        </div>
+        <div class="similar-forecast">
+          ${forecast.map((row) => {
+            const rowDecision = similarDecision(item, row.horizon);
+            return `
+            <div class="similar-forecast-row">
+              <span>${similarForecastLabel(row.horizon)} 选择上涨 ${fmtPct(row.selected_up_probability ?? row.calibrated_up_probability ?? row.up_probability)} · ${similarProbabilitySourceLabel(row.probability_source)}</span>
+              <strong>${rowDecision.bearish_max ?? "-"}/${rowDecision.bullish_min ?? "-"} · 中位 ${fmtPct(row.median)}</strong>
+            </div>
+          `}).join("")}
+        </div>
+        <div class="similar-validation-strip">
+          <span>2025+ T+1 验证</span>
+          <strong>本股覆盖 ${fmtPct(validation.selected_model_coverage ?? validation.coverage)} · 命中 ${fmtPct(validation.selected_model_accuracy ?? validation.direction_accuracy)}</strong>
+          <small>全池命中 ${fmtPct(validation.global_model_accuracy)} · ${similarProbabilitySourceLabel(validation.selected_model)}</small>
+        </div>
+      </article>
+    `;
+  })() : `<article class="panel"><p class="subline">暂无分析结果，点击刷新分析</p></article>`;
+
+  if (!selected) {
+    if (detailTitle) detailTitle.textContent = "选择股票";
+    if (detailMeta) detailMeta.textContent = "查看 T+1 量价情景";
+    scenarioRows.innerHTML = `<tr><td colspan="7" class="empty-cell">暂无数据</td></tr>`;
+    modelList.innerHTML = `<p class="subline">暂无模型结果</p>`;
+    topRows.innerHTML = `<tr><td colspan="8" class="empty-cell">暂无数据</td></tr>`;
+    return;
+  }
+
+  if (detailTitle) detailTitle.textContent = `${selected.target?.name || selected.target?.symbol} T+1 情景`;
+  if (detailMeta) detailMeta.textContent = `${selected.target?.symbol} · ${selected.scan_summary?.matched_cases || 0} 个相似阶段`;
+  scenarioRows.innerHTML = sortT1ScenarioRows(selected.t1_scenario_plan).map((row) => `
+    <tr>
+      <td>${row.t1_return_bucket}</td>
+      <td>${row.t1_volume_bucket}</td>
+      <td>${row.sample_count}</td>
+      <td>${fmtPct(row.hit_up_3d_prob)}</td>
+      <td>${fmtPct(row.hit_down_3d_prob)}</td>
+      <td>${fmtPct(row.median_fwd_20d)}</td>
+      <td class="${similarActionClass(row.action)}">${row.action}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="7" class="empty-cell">暂无情景样本</td></tr>`;
+
+  const summary = selected.sell_model_summary || {};
+  if (modelMeta) modelMeta.textContent = `${summary.status || "-"} · 样本 ${summary.sample_count || 0} · 止盈 ${fmtPct(summary.take_profit_3d)} / 止损 ${fmtPct(summary.stop_loss_3d)}`;
+  modelList.innerHTML = (selected.sell_model_plan || []).map((row) => `
+    <div class="similar-model-item">
+      <div>
+        <strong>${row.scenario}</strong>
+        <span>T+1 ${fmtPct(row.t1_return)} · 量比 ${row.t1_volume_ratio}</span>
+      </div>
+      <div>
+        <span>上冲 ${fmtPct(row.model_hit_up_3d_prob)} / 下破 ${fmtPct(row.model_hit_down_3d_prob)}</span>
+        <strong class="${similarActionClass(row.recommendation)}">${row.recommendation}</strong>
+      </div>
+    </div>
+  `).join("") || `<p class="subline">模型样本不足</p>`;
+
+  const topCases = selected.top_cases || [];
+  topRows.innerHTML = topCases.map((row) => `
+    <tr>
+      <td>${row.rank}</td>
+      <td>${row.name || row.symbol}<br><span class="subline">${row.symbol}</span></td>
+      <td>${row.industry || "-"}</td>
+      <td>${row.date || "-"}</td>
+      <td><strong>${fallbackSimilarityScore(row, payload.config)}</strong></td>
+      <td>${fmtPct(row.fwd_1d)}</td>
+      <td>${fmtPct(row.fwd_20d)}</td>
+      <td>${fmtPct(row.fwd_60d)}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="8" class="empty-cell">暂无相似阶段</td></tr>`;
+}
+
+function similarWatchItem(symbol) {
+  return (state.similarPayload?.watchlist || []).find((item) => item.symbol === symbol) || null;
+}
+
+function positionSimilarNoteTooltip(clientX, clientY) {
+  const tooltip = document.querySelector("#similarNoteTooltip");
+  if (!tooltip || tooltip.hidden) return;
+  const gap = 12;
+  const width = tooltip.offsetWidth || 320;
+  const height = tooltip.offsetHeight || 100;
+  tooltip.style.left = `${Math.max(gap, Math.min(clientX + gap, window.innerWidth - width - gap))}px`;
+  tooltip.style.top = `${Math.max(gap, Math.min(clientY + gap, window.innerHeight - height - gap))}px`;
+}
+
+function showSimilarNoteTooltip(row, clientX, clientY) {
+  const tooltip = document.querySelector("#similarNoteTooltip");
+  const item = similarWatchItem(row?.dataset.similarSymbol);
+  if (!tooltip || !item?.note) return;
+  tooltip.querySelector("strong").textContent = `${item.name || item.symbol} · 笔记与操作计划`;
+  tooltip.querySelector("p").textContent = item.note;
+  tooltip.hidden = false;
+  row.setAttribute("aria-describedby", "similarNoteTooltip");
+  positionSimilarNoteTooltip(clientX, clientY);
+}
+
+function hideSimilarNoteTooltip(row = null) {
+  const tooltip = document.querySelector("#similarNoteTooltip");
+  if (tooltip) tooltip.hidden = true;
+  row?.removeAttribute("aria-describedby");
 }
 
 async function loadLongStockPool(options = {}) {
@@ -352,7 +1473,7 @@ async function loadLongStockPool(options = {}) {
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
   try {
-    const payload = await fetchJson(`/long/stock-pool?${query.toString()}`);
+    const payload = await fetchJson(`/long/stock-pool?${query.toString()}`, workspaceRequestOptions(options));
     if (state.longVariant === requestedVariant) {
       state.longPayload = payload;
     }
@@ -370,22 +1491,14 @@ async function loadLongStockPool(options = {}) {
 async function loadBydMinuteStrategy(options = {}) {
   state.bydLoading = true;
   renderBydPage();
-  const shares = Number(document.querySelector("#bydSharesInput")?.value || 10500);
+  const shares = Number(document.querySelector("#bydSharesInput")?.value || 10000);
   const cost = Number(document.querySelector("#bydCostInput")?.value || 110.6061);
-  const soldTodayShares = Number(document.querySelector("#bydSoldTodaySharesInput")?.value || 0);
-  const soldTodayPrice = Number(document.querySelector("#bydSoldTodayPriceInput")?.value || 0);
-  const openTShares = Number(document.querySelector("#bydOpenTInput")?.value || 0);
-  const openTPrice = Number(document.querySelector("#bydOpenTPriceInput")?.value || 0);
   const query = new URLSearchParams();
   query.set("shares", String(shares));
   query.set("cost", String(cost));
-  if (soldTodayShares > 0) query.set("sold_today_shares", String(soldTodayShares));
-  if (soldTodayPrice > 0) query.set("sold_today_price", String(soldTodayPrice));
-  if (openTShares > 0) query.set("open_t_shares", String(openTShares));
-  if (openTPrice > 0) query.set("open_t_price", String(openTPrice));
   if (options.refresh) query.set("refresh", "true");
   try {
-    state.bydPayload = await fetchJson(`/byd/daily-plan?${query.toString()}`);
+    state.bydPayload = await fetchJson(`/byd/daily-plan?${query.toString()}`, workspaceRequestOptions(options));
     maybeShowBydTradeToast(state.bydPayload, options);
   } catch (error) {
     showError(error);
@@ -404,7 +1517,7 @@ async function loadConvertibleBondPlan(options = {}) {
   query.set("limit", "18");
   if (options.refresh) query.set("refresh", "true");
   try {
-    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`);
+    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`, workspaceRequestOptions(options));
     const plans = state.cbPayload.strategy_plans || [];
     if (!state.selectedCbStrategy && plans.length) {
       state.selectedCbStrategy = "all";
@@ -427,15 +1540,19 @@ async function loadConvertibleBondPlan(options = {}) {
 
 async function loadConvertibleBondAllotments(options = {}) {
   state.cbAllotmentLoading = true;
+  state.cbAllotmentError = "";
   renderConvertibleBondAllotments();
   const query = new URLSearchParams();
   query.set("limit", "120");
   query.set("include_listed_days", "180");
   query.set("stage_scope", "pipeline");
-  if (options.refresh) query.set("refresh", "true");
   try {
-    state.cbAllotmentPayload = await fetchJson(`/convertible-bonds/allotments?${query.toString()}`);
+    state.cbAllotmentPayload = await fetchJson(
+      `/convertible-bonds/allotments?${query.toString()}`,
+      workspaceRequestOptions(options)
+    );
   } catch (error) {
+    state.cbAllotmentError = error.message;
     showError(error);
     throw error;
   } finally {
@@ -560,17 +1677,179 @@ function maybeShowBydTradeToast(payload, options = {}) {
 }
 
 async function loadCalendar() {
-  state.calendar = await fetchJson("/selector/calendar?start=2020-01-01");
-  if (!state.signalDate && state.calendar.latest_signal_date) {
-    state.signalDate = state.calendar.latest_signal_date;
+  state.calendar = await fetchJson("/selector/calendar?start=2020-01-01", { timeoutMs: 15000 });
+  const latestPageDate = state.activePage === "chan"
+    ? (state.calendar.latest_chan_snapshot_date || state.calendar.latest_chan_signal_date)
+    : state.calendar.latest_signal_date;
+  if (!state.signalDate && latestPageDate) {
+    state.signalDate = latestPageDate;
     const input = document.querySelector("#signalDateInput");
     if (input) input.value = state.signalDate;
   }
   if (!state.calendarMonth) {
-    state.calendarMonth = (state.signalDate || state.calendar.latest_signal_date || "").slice(0, 7);
+    state.calendarMonth = (state.signalDate || latestPageDate || state.calendar.latest_signal_date || "").slice(0, 7);
   }
   renderCalendar();
   renderDateStatus();
+}
+
+async function loadChanModelStrategy(options = {}) {
+  state.chanLoading = true;
+  renderChanModelPage();
+  const query = new URLSearchParams({ top_n: String(options.topN || 20) });
+  if (!state.signalDate) {
+    state.signalDate = state.calendar?.latest_chan_snapshot_date
+      || state.calendar?.latest_chan_signal_date
+      || state.calendar?.latest_signal_date
+      || "";
+  }
+  state.signalDate = applySelectableSignalDate(state.signalDate);
+  if (state.signalDate) query.set("signal_date", state.signalDate);
+  if (options.refresh) query.set("refresh", "true");
+  try {
+    state.chanPayload = await fetchJson(`/chan/strategy-plan?${query.toString()}`, workspaceRequestOptions(options));
+    state.signalDate = state.signalDate || state.chanPayload?.signal_date || "";
+    const dateInput = document.querySelector("#signalDateInput");
+    if (dateInput) dateInput.value = state.signalDate || state.chanPayload?.signal_date || "";
+    const rows = state.chanPayload?.candidates || [];
+    if (!rows.some((item) => item.symbol === state.chanSelectedSymbol)) {
+      state.chanSelectedSymbol = rows[0]?.symbol || null;
+    }
+  } finally {
+    state.chanLoading = false;
+    renderChanModelPage();
+  }
+}
+
+function chanCandidates() {
+  return state.chanPayload?.candidates || [];
+}
+
+function selectedChanCandidate() {
+  return chanCandidates().find((item) => item.symbol === state.chanSelectedSymbol) || chanCandidates()[0] || null;
+}
+
+function chanRuleLabel(item) {
+  if (!item?.rule_name && !item?.rule_id) return "-";
+  return item.rule_name || (item.rule_id === "chan_model_primary" ? "主策略" : "扩容策略");
+}
+
+function chanMetricCard(label, value, subtext = "") {
+  return `
+    <article class="signal-card chan-mini-card">
+      <span>${label}</span>
+      <strong>${value}</strong>
+      ${subtext ? `<p>${subtext}</p>` : ""}
+    </article>
+  `;
+}
+
+function renderChanModelPage() {
+  const payload = state.chanPayload;
+  const rows = chanCandidates();
+  const selected = selectedChanCandidate();
+  const meta = document.querySelector("#chanPlanMeta");
+  const count = document.querySelector("#chanCandidateCount");
+  const metrics = document.querySelector("#chanMetrics");
+  const tbody = document.querySelector("#chanRows");
+  const detail = document.querySelector("#chanDetail");
+  const detailTitle = document.querySelector("#chanDetailTitle");
+  const detailMeta = document.querySelector("#chanDetailMeta");
+  const notes = document.querySelector("#chanNotes");
+  if (meta) {
+    meta.textContent = state.chanLoading
+      ? "正在加载缠论模型候选"
+      : payload
+      ? `${payload.signal_date || "-"} 收盘后分析 · T+1 开盘条件触发买入`
+      : "等待加载";
+  }
+  if (count) count.textContent = state.chanLoading ? "加载中" : `${rows.length} 只候选`;
+  if (metrics) {
+    const primary = payload?.oot_primary || {};
+    const expanded = payload?.oot_expanded || {};
+    metrics.innerHTML = payload ? `
+      <div class="chan-performance-title">
+        <strong>历史样本表现</strong>
+        <span>OOT · 持有 10 日</span>
+      </div>
+      <div class="chan-performance-item">
+        <span>主策略</span>
+        <strong>${fmtPct(primary.avg_return_10d)}</strong>
+        <em>胜率 ${fmtRate(primary.win_rate_10d)} · PF ${Number(primary.profit_factor_10d || 0).toFixed(2)}</em>
+      </div>
+      <div class="chan-performance-item">
+        <span>扩容策略</span>
+        <strong>${fmtPct(expanded.avg_return_10d)}</strong>
+        <em>胜率 ${fmtRate(expanded.win_rate_10d)} · PF ${Number(expanded.profit_factor_10d || 0).toFixed(2)}</em>
+      </div>
+    ` : `
+      <div class="chan-performance-title"><strong>历史样本表现</strong><span>${state.chanLoading ? "加载中" : "-"}</span></div>
+    `;
+  }
+  if (tbody) {
+    tbody.innerHTML = rows.length ? rows.map((item) => `
+      <tr class="${item.symbol === state.chanSelectedSymbol ? "selected-row" : ""}" data-chan-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload?.signal_date || item.date, `触发 ${chanRuleLabel(item)}`))}" tabindex="0">
+        <td><strong>${item.symbol}</strong><span>${item.name || ""}</span></td>
+        <td><span class="tag ${item.rule_id === "chan_model_primary" ? "strong" : ""}">${chanRuleLabel(item)}</span></td>
+        <td>${Number(item.rank_score || 0).toFixed(3)}</td>
+        <td>
+          <div class="score-stack">
+            <strong>${Number(item.pred_good || 0).toFixed(3)}</strong>
+            <em>大赚 ${Number(item.pred_big10 || 0).toFixed(3)}</em>
+          </div>
+        </td>
+        <td>${Number(item.chan_score || 0).toFixed(1)}</td>
+        <td>${fmtPct(item.entry_gap_pct, 1)}</td>
+        <td>${fmtWeight(item.position_pct)}</td>
+      </tr>
+    `).join("") : `<tr><td colspan="7" class="empty-cell">${state.chanLoading ? "正在加载候选" : "暂无缠论模型候选"}</td></tr>`;
+  }
+  if (detailTitle) detailTitle.textContent = selected ? `${selected.symbol} ${selected.name || ""}` : "选择候选";
+  if (detailMeta) detailMeta.textContent = selected ? `${chanRuleLabel(selected)} · ${selected.signal_name || "缠论结构信号"}` : "";
+  if (detail) {
+    detail.innerHTML = selected ? `
+      <div class="signal-cards chan-detail-cards">
+        <article class="signal-card">
+          <div class="signal-card-head">
+            <div>
+              <span>${selected.industry || "未分类行业"}</span>
+              <h4>${selected.rule_description || selected.structure_note || "模型筛选候选"}</h4>
+            </div>
+            <span>排名 ${Number(selected.rank_score || 0).toFixed(3)}</span>
+          </div>
+          <div class="metric-strip">
+            <span>10日预测胜率 ${fmtRate(selected.pred_win10)}</span>
+            <span>好交易概率 ${fmtRate(selected.pred_good)}</span>
+            <span>大收益概率 ${fmtRate(selected.pred_big10)}</span>
+            <span>最大仓位 ${fmtWeight(selected.position_pct)}</span>
+          </div>
+        </article>
+        <div class="chan-mini-grid">
+          ${chanMetricCard("信号收盘", fmtPrice(selected.close), "T日收盘后确认")}
+          ${chanMetricCard("中枢区间", `${fmtPrice(selected.center_low)}-${fmtPrice(selected.center_high)}`, `宽度 ${fmtRate(selected.center_width)}`)}
+          ${chanMetricCard("T+1 开盘跳空", fmtPct(selected.entry_gap_pct, 1), "高开过大按计划降仓或放弃")}
+          ${chanMetricCard("笔振幅", fmtRate(selected.stroke_amplitude), "过滤过热结构")}
+        </div>
+        <article class="signal-card">
+          <div class="signal-grid">
+            <div>
+              <span>买入计划</span>
+              <p>${formatBuyPlanText(selected.buy_plan || "T+1 开盘满足条件后买入；不满足则空仓观察。")}</p>
+            </div>
+            <div>
+              <span>卖出计划</span>
+              <p>${selected.sell_plan || "T+2 起根据止盈、止损和持仓天数规则处理。"}</p>
+            </div>
+            <div>
+              <span>结构备注</span>
+              <p>${selected.structure_note || selected.signal_name || "等待更多结构信息。"}</p>
+            </div>
+          </div>
+        </article>
+      </div>
+    ` : `<div class="empty-state">${state.chanLoading ? "正在加载缠论策略候选" : "暂无候选"}</div>`;
+  }
+  if (notes) notes.innerHTML = (payload?.notes || []).map((item) => `<li>${item}</li>`).join("");
 }
 
 function monthOffset(month, offset) {
@@ -641,13 +1920,19 @@ function renderCalendar() {
   const blanks = Array.from({ length: leadingBlanks }, () => `<span class="calendar-empty"></span>`).join("");
   wrap.innerHTML = blanks + monthDays.map((day) => {
     const active = day.date === selected || (!state.signalDate && day.date === state.payload?.signal_date);
+    const status = state.activePage === "chan" && day.is_open
+      ? (day.has_chan_model_strategy || day.has_chan_model_strategy_snapshot ? "ready" : "open_missing_data")
+      : day.status;
+    const label = state.activePage === "chan" && day.is_open
+      ? (day.has_chan_model_strategy || day.has_chan_model_strategy_snapshot ? "缠论已生成" : "缠论无候选")
+      : day.label;
     return `
       <button
-        class="calendar-day ${day.status} ${active ? "selected" : ""}"
+        class="calendar-day ${status} ${active ? "selected" : ""}"
         data-date="${day.date}"
         type="button"
         ${day.disabled ? "disabled" : ""}
-        title="${day.date} · ${day.label}${day.effective_signal_date && day.effective_signal_date !== day.date ? ` · 实际使用 ${day.effective_signal_date}` : ""}"
+        title="${day.date} · ${label}${day.effective_signal_date && day.effective_signal_date !== day.date ? ` · 实际使用 ${day.effective_signal_date}` : ""}"
       >
         <span>${day.date.slice(5)}</span>
       </button>
@@ -665,6 +1950,10 @@ function renderCalendar() {
       if (state.activePage === "long") {
         state.longPayload = null;
         await loadLongStockPool().catch(showError);
+      } else if (state.activePage === "chan") {
+        state.chanPayload = null;
+        state.chanSelectedSymbol = null;
+        await loadChanModelStrategy().catch(showError);
       } else if (state.activePage === "cb") {
         state.cbPayload = null;
         await loadConvertibleBondPlan().catch(showError);
@@ -688,6 +1977,8 @@ function renderDateStatus() {
   if (!day) {
     statusEl.textContent = state.activePage === "long"
       ? (selected ? `${selected} 长线股票池可按最近可用截面生成` : "选择长线股票池日期")
+      : state.activePage === "chan"
+      ? (selected ? `${selected} 缠论策略将按该日模型候选生成` : "选择缠论策略日期")
       : state.activePage === "cb"
       ? (selected ? `${selected} 可转债将使用本地最近可用行情` : "选择可转债计划日期")
       : "选择已生成快照的交易日";
@@ -698,6 +1989,8 @@ function renderDateStatus() {
     input.classList.add("date-missing");
     statusEl.textContent = state.activePage === "long"
       ? `${selected} 长线将使用该日之前最近可用截面`
+      : state.activePage === "chan"
+      ? `${selected} 缠论策略将按该日模型候选生成`
       : state.activePage === "cb"
       ? `${selected} 可转债将回看最近可用行情`
       : `${selected} 为交易日，但暂未生成策略快照；将回看 ${day.effective_signal_date || "最近可用日"}`;
@@ -706,6 +1999,8 @@ function renderDateStatus() {
     input.classList.add("date-closed");
     statusEl.textContent = state.activePage === "long"
       ? `${selected} 为休市日，长线将回看最近可用交易日`
+      : state.activePage === "chan"
+      ? `${selected} 为休市日，缠论策略将回看最近交易日`
       : state.activePage === "cb"
       ? `${selected} 为休市日，可转债将回看最近交易日`
       : `${selected} 为休市日`;
@@ -716,6 +2011,12 @@ function renderDateStatus() {
       statusEl.textContent = day.has_long_stock_pool_snapshot
         ? `${selected} 已有长线股票池快照`
         : `${selected} 长线将使用该日之前最近可用截面`;
+    } else if (state.activePage === "chan") {
+      statusEl.textContent = day.has_chan_model_strategy
+        ? `${selected} 已有缠论模型策略候选`
+        : day.has_chan_model_strategy_snapshot
+        ? `${selected} 已完成策略回溯，暂无符合规则的候选`
+        : `${selected} 暂无缠论模型候选`;
     } else if (state.activePage === "cb") {
       statusEl.textContent = `${selected} 可生成可转债低位网格计划`;
     } else {
@@ -729,7 +2030,7 @@ function renderStrategyFilters() {
   wrap.innerHTML = (state.payload?.available_strategies || []).map((item) => {
     const active = state.selectedStrategies.has(item.key);
     return `
-      <button class="filter-chip ${active ? "active" : ""}" data-strategy="${item.key}" type="button">
+      <button class="filter-chip ${active ? "active" : ""}" data-strategy="${item.key}" type="button" aria-pressed="${active}">
         <strong>${item.label}</strong>
         <span>${item.status}</span>
       </button>
@@ -762,7 +2063,7 @@ function renderStockRows() {
     return;
   }
   body.innerHTML = rows.map((item) => `
-    <tr class="${item.symbol === state.selectedSymbol ? "selected-row" : ""}" data-symbol="${item.symbol}">
+    <tr class="${item.symbol === state.selectedSymbol ? "selected-row" : ""}" data-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(item.date || state.payload?.signal_date, `触发 ${(item.matched_families || []).join(" / ")} 策略`))}" tabindex="0">
       <td>
         <strong class="copyable-symbol">${item.symbol}</strong>
         <span>${item.name || ""}</span>
@@ -856,9 +2157,12 @@ function renderNotes() {
 }
 
 function renderPageShell() {
+  ensureWorkspaceTabs();
   const shortPage = document.querySelector("#shortPage");
+  const chanPage = document.querySelector("#chanPage");
   const longPage = document.querySelector("#longPage");
   const bydPage = document.querySelector("#bydPage");
+  const similarPage = document.querySelector("#similarPage");
   const cbPage = document.querySelector("#cbPage");
   const cbAllotmentPage = document.querySelector("#cbAllotmentPage");
   const filterSection = document.querySelector("#strategyFilterSection");
@@ -868,20 +2172,25 @@ function renderPageShell() {
   const dateControl = document.querySelector("#sharedDateControl");
   const longDateSlot = document.querySelector("#longDateSlot");
   const cbDateSlot = document.querySelector("#cbDateSlot");
+  const chanDateSlot = document.querySelector("#chanDateSlot");
   const shortActions = document.querySelector("#searchInput")?.parentElement;
   const searchInput = document.querySelector("#searchInput");
   shortPage?.classList.toggle("active", state.activePage === "short");
+  chanPage?.classList.toggle("active", state.activePage === "chan");
   longPage?.classList.toggle("active", state.activePage === "long");
   bydPage?.classList.toggle("active", state.activePage === "byd");
+  similarPage?.classList.toggle("active", state.activePage === "similar");
   cbPage?.classList.toggle("active", state.activePage === "cb");
   cbAllotmentPage?.classList.toggle("active", state.activePage === "cbAllotment");
   filterSection?.classList.toggle("hidden", state.activePage !== "short");
   clearButton?.classList.toggle("hidden", state.activePage !== "short");
   longStrategySection?.classList.toggle("hidden", state.activePage !== "long");
   cbStrategySection?.classList.toggle("hidden", state.activePage !== "cb");
-  if (dateControl && longDateSlot && cbDateSlot && shortActions && searchInput) {
+  if (dateControl && longDateSlot && cbDateSlot && chanDateSlot && shortActions && searchInput) {
     if (state.activePage === "long") {
       longDateSlot.appendChild(dateControl);
+    } else if (state.activePage === "chan") {
+      chanDateSlot.appendChild(dateControl);
     } else if (state.activePage === "cb") {
       cbDateSlot.appendChild(dateControl);
     } else if (dateControl.parentElement !== shortActions) {
@@ -889,7 +2198,22 @@ function renderPageShell() {
     }
   }
   document.querySelectorAll(".page-tab").forEach((button) => {
-    button.classList.toggle("active", button.dataset.page === state.activePage);
+    const active = button.dataset.page === state.activePage;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  WORKSPACE_TABS.forEach((tab) => {
+    const panel = document.querySelector(`#${tab.panelId}`);
+    panel?.setAttribute("role", "tabpanel");
+    panel?.setAttribute("aria-label", tab.label);
+    panel?.setAttribute("aria-hidden", String(tab.key !== state.activePage));
+  });
+  window.requestAnimationFrame(() => {
+    revealActiveWorkspaceTab();
+    if (!focusWorkspaceTabAfterRender) return;
+    document.querySelector(".page-view.active .page-tab.active")?.focus({ preventScroll: true });
+    focusWorkspaceTabAfterRender = false;
   });
 }
 
@@ -944,6 +2268,9 @@ function renderLongStrategies() {
 
 function stateLabel(stateName) {
   const labels = {
+    RECOMMENDED: "推荐",
+    CAUTION: "谨慎",
+    AVOID: "回避",
     WATCH: "观察",
     BUILDING: "建仓",
     CORE: "核心",
@@ -961,7 +2288,9 @@ function renderLongStockPool() {
   const counts = document.querySelector("#longStateCounts");
   if (!body || !meta || !counts) return;
   document.querySelectorAll(".long-variant-button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.longVariant === state.longVariant);
+    const active = button.dataset.longVariant === state.longVariant;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
   });
   if (state.longLoading) {
     meta.textContent = "正在生成长线股票池...";
@@ -977,7 +2306,12 @@ function renderLongStockPool() {
     return;
   }
   meta.textContent = `${payload.variant_name} · 信号日 ${payload.signal_date} · 市场 ${payload.market_regime} · ${payload.stocks.length} 只`;
-  counts.innerHTML = Object.entries(payload.state_counts || {}).map(([key, value]) => (
+  const recommendationCounts = (payload.stocks || []).reduce((result, item) => {
+    const { level } = recommendationLevel(item);
+    result[level] = (result[level] || 0) + 1;
+    return result;
+  }, {});
+  counts.innerHTML = Object.entries(recommendationCounts).map(([key, value]) => (
     `<span class="state-pill ${key}">${stateLabel(key)} ${value}</span>`
   )).join("");
   if (!payload.stocks.length) {
@@ -985,8 +2319,8 @@ function renderLongStockPool() {
     return;
   }
   body.innerHTML = payload.stocks.map((item) => `
-    <tr>
-      <td><span class="state-pill ${item.state}">${stateLabel(item.state)}</span></td>
+    <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload.signal_date, `${payload.variant_name} · ${recommendationLevel(item).label}`))}" tabindex="0">
+      <td>${recommendationBadge(item)}</td>
       <td>
         <strong>${item.ts_code}</strong>
         <span>${item.name || ""}</span>
@@ -994,8 +2328,8 @@ function renderLongStockPool() {
       <td>${item.industry || "-"}</td>
       <td>
         <span class="score-stack left">
-          <strong>${item.action || "-"}</strong>
-          <em>${item.t_action || "HOLD"} · ${item.t_profile || "-"}</em>
+          <strong>${priceStateText(item)}</strong>
+          <em>${item.price_state_reason || "等待价格与趋势确认"}</em>
         </span>
       </td>
       <td>
@@ -1011,25 +2345,21 @@ function renderLongStockPool() {
       </td>
       <td>
         <span class="score-stack price-plan">
-          <strong>${fmtPrice(item.close)}</strong>
-          <em>积极建仓 <= ${fmtPrice(item.price_levels?.entry_aggressive_price)}</em>
-          <em>做T低吸 ${item.price_levels?.t_buy_text || "-"}</em>
-          <em>做T高抛 ${item.price_levels?.t_sell_text || "-"}</em>
-          <em>降仓 < ${fmtPrice(item.price_levels?.reduce_ma60_price)} · 清仓 < ${fmtPrice(item.price_levels?.exit_ma120_price)}</em>
+          ${longPricePlan(item)}
         </span>
       </td>
       <td>
         ${(() => {
           const coverage = analystCoverageText(item);
           return `
-        <span class="score-stack">
+        <span class="score-stack" title="${coverage.title || ""}">
           <strong>${coverage.main}</strong>
           <em>${coverage.sub}</em>
         </span>
           `;
         })()}
       </td>
-      <td class="reason-cell">${item.reason || item.t_reason || "-"}</td>
+      <td class="reason-cell">${item.display_reason || item.reason || "-"}</td>
     </tr>
   `).join("");
 }
@@ -1048,11 +2378,11 @@ function renderConvertibleBondPage() {
   const generatedAt = document.querySelector("#generatedAt");
   if (state.cbLoading) {
     if (generatedAt) generatedAt.textContent = "正在加载可转债计划";
-    meta.textContent = "正在生成可转债计划...";
+    meta.textContent = "正在读取最近可用的可转债计划快照...";
     metrics.innerHTML = "";
     if (strategyWrap) strategyWrap.innerHTML = "";
-    rows.innerHTML = `<tr><td colspan="11" class="empty-cell">正在按低位网格策略筛选可转债...</td></tr>`;
-    detail.innerHTML = `<div class="empty-state">正在生成分批买入和网格计划...</div>`;
+    rows.innerHTML = `<tr><td colspan="11" class="empty-cell">正在读取低位网格策略候选...</td></tr>`;
+    detail.innerHTML = `<div class="empty-state">正在读取分批买入和网格计划...</div>`;
     return;
   }
   if (!rootPayload || !payload) {
@@ -1074,7 +2404,7 @@ function renderConvertibleBondPage() {
   if (strategyWrap) {
     const totalGroups = cbCandidateGroups("all");
     const allCard = `
-        <button class="cb-strategy-card ${activeStrategyKey === "all" ? "active" : ""}" type="button" data-cb-strategy="all">
+        <button class="cb-strategy-card ${activeStrategyKey === "all" ? "active" : ""}" type="button" data-cb-strategy="all" aria-pressed="${activeStrategyKey === "all"}">
           <span>全策略</span>
           <strong>全部策略命中</strong>
           <em>${totalGroups.length} 只去重候选 · 点击转债查看全部计划</em>
@@ -1085,7 +2415,7 @@ function renderConvertibleBondPage() {
       const bt2024 = strategy.backtest?.from_2024 || {};
       const active = strategy.key === activeStrategyKey;
       return `
-        <button class="cb-strategy-card ${active ? "active" : ""}" type="button" data-cb-strategy="${strategy.key || ""}">
+        <button class="cb-strategy-card ${active ? "active" : ""}" type="button" data-cb-strategy="${strategy.key || ""}" aria-pressed="${active}">
           <span>${strategy.style || "策略"}</span>
           <strong>${strategy.name || strategy.key || "-"}</strong>
           <em>${(plan.candidates || []).length} 只 · 2024+ 年化 ${fmtRate(bt2024.annual_return, 2)} · Sharpe ${bt2024.sharpe == null ? "-" : Number(bt2024.sharpe).toFixed(2)} · 回撤 ${fmtRate(bt2024.max_drawdown, 2)}</em>
@@ -1102,7 +2432,10 @@ function renderConvertibleBondPage() {
     });
   }
   const strategyName = activeStrategyKey === "all" ? "全部可转债策略" : (payload.strategy?.name || "可转债策略");
-  meta.textContent = `${strategyName} · 信号日 ${payload.trade_date || rootPayload.trade_date} · ${market.entry_permission || "-"}`;
+  const snapshotNote = rootPayload.cache?.stale
+    ? ` · 最近可用快照 ${rootPayload.cache.snapshot_date || payload.trade_date || rootPayload.trade_date}`
+    : "";
+  meta.textContent = `${strategyName} · 信号日 ${payload.trade_date || rootPayload.trade_date} · ${market.entry_permission || "-"}${snapshotNote}`;
   metrics.innerHTML = `
     <div><span>去重候选</span><strong>${candidates.length} 只</strong></div>
     <div><span>当前策略</span><strong>${activeStrategyKey === "all" ? `${plans.length} 套` : (payload.strategy?.name || "-")}</strong></div>
@@ -1226,6 +2559,21 @@ function allotmentStatusClass(stage) {
   if (stage === "issuing") return "watching";
   if (stage === "delisted") return "delisted";
   return "listed";
+}
+
+function allotmentStockCell(item) {
+  const stockCode = item.stock_code || "";
+  const stockName = item.stock_name || "";
+  const xueqiuUrl = xueqiuStockUrl(stockCode);
+  if (!xueqiuUrl) {
+    return `<strong>${escapeHtml(stockCode || "--")}</strong><em>${escapeHtml(stockName || "--")}</em>`;
+  }
+  return `
+    <a class="allotment-xueqiu-link" data-allotment-xueqiu href="${escapeHtml(xueqiuUrl)}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(stockName || stockCode)}">
+      <strong>${escapeHtml(stockCode)}</strong>
+      <em>${escapeHtml(stockName || "--")} · 雪球 ↗</em>
+    </a>
+  `;
 }
 
 const allotmentSortConfig = {
@@ -1383,7 +2731,20 @@ function renderConvertibleBondAllotments() {
   }
   const payload = state.cbAllotmentPayload;
   if (!payload) {
-    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">切到配债股页面后加载后端数据</td></tr>`;
+    const errorMessage = state.cbAllotmentError;
+    if (generatedAt && state.activePage === "cbAllotment") {
+      generatedAt.textContent = errorMessage ? "配债股数据加载失败" : "等待加载配债股数据";
+    }
+    summary.innerHTML = `
+      <span>数据状态</span>
+      <strong>${errorMessage ? "加载失败" : "等待加载"}</strong>
+      <em>${errorMessage || "切到配债股页面后读取后端数据"}</em>
+      <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">${errorMessage ? "重试" : "加载数据"}</button>
+    `;
+    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">${errorMessage || "切到配债股页面后加载后端数据"}</td></tr>`;
+    document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", () => {
+      loadConvertibleBondAllotments().catch(showError);
+    });
     return;
   }
   if (generatedAt && state.activePage === "cbAllotment") generatedAt.textContent = `更新于 ${payload.generated_at || ""}`;
@@ -1391,6 +2752,11 @@ function renderConvertibleBondAllotments() {
   const basicRows = source.basic?.rows ?? 0;
   const issueRows = source.issue?.rows ?? 0;
   const issueAvailable = Boolean(source.issue?.available);
+  const quality = payload.quality || {};
+  const qualityMetrics = quality.metrics || {};
+  const stockDailyQuality = qualityMetrics.stock_daily_match || {};
+  const weeklyJQuality = qualityMetrics.kdj_weekly_j || {};
+  const monthlyJQuality = qualityMetrics.kdj_monthly_j || {};
   const allRecords = payload.records || [];
   const statusOptions = allotmentStatusOptions(allRecords);
   renderAllotmentStatusFilters(statusOptions);
@@ -1398,32 +2764,25 @@ function renderConvertibleBondAllotments() {
   summary.innerHTML = `
     <span>数据状态</span>
     <strong>${filteredRecords.length} / ${allRecords.length} 条前置阶段</strong>
-    <em>六阶段队列 ${source.pipeline?.rows ?? 0} 行 · 发行明细 ${source.cninfo_issue?.rows ?? 0} 行 · cb_issue ${issueAvailable ? `${issueRows} 行` : "未可用"}</em>
-    <button id="cbAllotmentRefreshButton" class="secondary-button" type="button">刷新配债数据</button>
+    <em>行情 ${stockDailyQuality.count ?? source.stock_daily?.matched ?? 0}/${stockDailyQuality.total ?? source.stock_daily?.requested ?? 0} · 周/月 J ${weeklyJQuality.count ?? "-"}/${weeklyJQuality.total ?? "-"}、${monthlyJQuality.count ?? "-"}/${monthlyJQuality.total ?? "-"} · 六阶段队列 ${source.pipeline?.rows ?? 0} 行 · 发行明细 ${source.cninfo_issue?.rows ?? 0} 行 · cb_issue ${issueAvailable ? `${issueRows} 行` : "未可用"}</em>
+    <button id="cbAllotmentRefreshButton" class="secondary-button" type="button" data-refresh-scope="cbAllotment">更新行情与配债</button>
   `;
-  document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", async () => {
-    const button = document.querySelector("#cbAllotmentRefreshButton");
-    button.disabled = true;
-    button.textContent = "刷新中";
-    try {
-      await loadConvertibleBondAllotments({ refresh: true });
-    } catch (error) {
-      showError(error);
-    }
+  document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", () => {
+    startLatestDataRefresh("cbAllotment");
   });
   const records = sortedAllotmentRecords(filteredRecords);
   if (!records.length) {
-    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">当前状态下暂无配债股；可切换状态或点击刷新配债数据</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="16" class="empty-cell">当前状态下暂无配债股；可切换状态或点击更新行情与配债</td></tr>`;
     return;
   }
   rows.innerHTML = records.map((item) => `
-    <tr>
+    <tr data-watchlist-symbol="${item.stock_code || ""}" data-watchlist-name="${item.stock_name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(item.stock_price_date || item.announce_date || payload.asof, `配债股${item.status ? ` · ${item.status}` : ""}`))}" tabindex="0">
       <td><span class="allotment-status ${allotmentStatusClass(item.stage)}">${item.status || "-"}</span></td>
-      <td><strong>${item.stock_code || "--"}</strong><em>${item.stock_name || "--"}</em></td>
+      <td>${allotmentStockCell(item)}</td>
       <td><strong>${fmtPrice(item.stock_price)}</strong><em>${item.stock_price_date || "--"}</em></td>
-      <td>${fmtPrice(item.kdj_daily_j)}</td>
-      <td>${fmtPrice(item.kdj_weekly_j)}</td>
-      <td>${fmtPrice(item.kdj_monthly_j)}</td>
+      <td>${fmtNumber(item.kdj_daily_j)}</td>
+      <td>${fmtNumber(item.kdj_weekly_j)}</td>
+      <td>${fmtNumber(item.kdj_monthly_j)}</td>
       <td>${fmtPct(item.rights_value_pct)}</td>
       <td>${item.shares_for_one_lot || item.shares_for_10_bonds || "--"}</td>
       <td>${item.announce_date || "--"}</td>
@@ -1450,6 +2809,9 @@ function renderBydPage() {
   const alerts = document.querySelector("#bydAlerts");
   const alertCount = document.querySelector("#bydAlertCount");
   const playbook = document.querySelector("#bydPlaybook");
+  const validationStatus = document.querySelector("#bydValidationStatus");
+  const validationDecision = document.querySelector("#bydValidationDecision");
+  const validationMetrics = document.querySelector("#bydValidationMetrics");
   if (!primary || !metrics || !ladder || !alerts || !playbook) return;
   if (state.bydLoading) {
     if (status) status.textContent = "正在刷新日线计划...";
@@ -1459,6 +2821,8 @@ function renderBydPage() {
     if (intradayZones) intradayZones.innerHTML = "";
     alerts.innerHTML = "";
     playbook.innerHTML = "";
+    if (validationStatus) validationStatus.textContent = "正在读取回测结论";
+    if (validationMetrics) validationMetrics.innerHTML = "";
     return;
   }
   if (!payload) {
@@ -1469,22 +2833,39 @@ function renderBydPage() {
     if (intradayZones) intradayZones.innerHTML = "";
     alerts.innerHTML = "";
     playbook.innerHTML = "";
+    if (validationStatus) validationStatus.textContent = "等待加载";
+    if (validationMetrics) validationMetrics.innerHTML = "";
     return;
   }
   const holding = payload.holding || {};
   const minute = payload.minute || {};
-  const levels = payload.daily_levels || {};
-  const intraday = payload.intraday_levels || {};
-  const plan = payload.planned_t || {};
-  const dynamic = payload.intraday_dynamic || {};
+  const plan = payload.daily_t_plan || payload.planned_t || {};
+  const positive = plan.positive || {};
+  const reverse = plan.reverse || {};
+  const inventory = plan.inventory || {};
   const action = payload.primary_action || {};
-  const triggered = (payload.alerts || []).filter((item) => item.triggered);
+  const validation = payload.validation || plan.validation || {};
   if (status) status.textContent = `${payload.data_status || "-"} · ${payload.generated_at || ""}`;
   if (stageLabel) stageLabel.textContent = payload.stage?.label || "-";
   if (subline) {
-    subline.textContent = `${holding.shares || 0} 股 · 成本 ${fmtPrice(holding.cost)} · 最新 ${fmtPrice(minute.last)} · ${minute.asof || ""}`;
+    subline.textContent = `${holding.shares || 0} 股 · 成本 ${fmtPrice(holding.cost)} · 日线收盘 ${fmtPrice(plan.reference_close || minute.last)} · 数据日 ${plan.signal_date || minute.asof || ""}`;
   }
-  const actionClass = triggered.length ? "triggered" : "waiting";
+  if (validationStatus) {
+    validationStatus.textContent = `${validation.label || "未提供验证结果"} · ${validation.period || ""}`;
+    validationStatus.classList.toggle("positive", Boolean(validation.execution_enabled));
+    validationStatus.classList.toggle("negative", validation.execution_enabled === false);
+  }
+  if (validationDecision) validationDecision.textContent = validation.decision || "没有验证结论，不启用新开T仓。";
+  if (validationMetrics) {
+    validationMetrics.innerHTML = (validation.held_out_results || []).map((item) => `
+      <article>
+        <span>${item.name || "候选"}</span>
+        <strong class="${Number(item.net_pnl || 0) >= 0 ? "positive" : "negative"}">${fmtMoney(item.net_pnl)}</strong>
+        <em>${item.cycles || 0} 笔 · 胜率 ${fmtPct(Number(item.win_rate || 0) * 100, 1)} · 盈利因子 ${item.profit_factor == null ? "∞（无亏损）" : Number(item.profit_factor).toFixed(2)}</em>
+      </article>
+    `).join("");
+  }
+  const actionClass = positive.execution_enabled ? "triggered" : "waiting";
   primary.innerHTML = `
     <div class="byd-action-card ${actionClass}">
       <span>${action.action || "-"}</span>
@@ -1492,8 +2873,8 @@ function renderBydPage() {
       <p>${action.detail || ""}</p>
       <div>
         <em>建议股数 ${Number(action.shares_delta || 0) > 0 ? "+" : ""}${action.shares_delta || 0}</em>
-        <em>箱体位置 ${fmtPct(payload.range_position_pct, 1)}</em>
-        <em>日线计划</em>
+        <em>买入 ${fmtPrice(positive.buy_price)}</em>
+        <em>目标 ${fmtPrice(positive.target_price)}</em>
       </div>
     </div>
   `;
@@ -1502,109 +2883,52 @@ function renderBydPage() {
     <div><span>库存比例</span><strong>${fmtPct((holding.inventory_ratio || 0) * 100, 1)}</strong></div>
     <div><span>浮动盈亏</span><strong class="${Number(holding.unrealized_pnl || 0) < 0 ? "negative" : "positive"}">${fmtMoney(holding.unrealized_pnl)}</strong></div>
     <div><span>盈亏率</span><strong class="${Number(holding.unrealized_pnl_pct || 0) < 0 ? "negative" : "positive"}">${fmtPct(holding.unrealized_pnl_pct, 2)}</strong></div>
-    <div><span>阶段目标</span><strong>${payload.stage?.goal_shares || "-"} 股</strong></div>
-    <div><span>模式</span><strong>${payload.stage?.mode || "-"}</strong></div>
+    <div><span>合理收盘仓</span><strong>${inventory.reasonable_min_shares || 8000}-${inventory.full_shares || 10000} 股</strong></div>
+    <div><span>盘中上限</span><strong>${inventory.intraday_max_shares || 12000} 股</strong></div>
   `;
   if (intradayZones) {
-    const sellZones = plan.sell_zones || [];
-    const buybackZones = plan.buyback_zones || [];
-    if (sellZones.length) {
-      intradayZones.innerHTML = `
-        <article class="basis-zone">
-          <span>计划依据</span>
-          <strong>${fmtPrice(plan.reference_close)}</strong>
-          <em>ATR ${fmtPrice(plan.atr14)} · ${fmtPct(plan.atr14_pct, 2)}</em>
-        </article>
-        <article class="no-sell-zone">
-          <span>${plan.no_sell_zone?.label || "低位不追卖区"}</span>
-          <strong>${fmtRange(plan.no_sell_zone?.range)}</strong>
-          <em>${plan.no_sell_zone?.action || "等待反弹"}</em>
-        </article>
-        ${sellZones.map((zone) => `
-          <article class="sell-zone">
-            <span>${zone.label}</span>
-            <strong>${fmtRange(zone.range)}</strong>
-            <em>${Number(zone.shares) > 0 ? "+" : ""}${zone.shares} 股 · ${zone.condition}</em>
-          </article>
-        `).join("")}
-        ${buybackZones.map((zone) => `
-          <article class="buyback-zone">
-            <span>${zone.label}</span>
-            <strong>${fmtRange(zone.buy_range)}</strong>
-            <em>买回 ${zone.shares} 股 · 对应卖出 ${fmtRange(zone.sell_range)}</em>
-          </article>
-        `).join("")}
-        <article class="risk-zone">
-          <span>${plan.risk_zone?.label || "下破风控区"}</span>
-          <strong>${fmtRange(plan.risk_zone?.range)}</strong>
-          <em>${plan.risk_zone?.action || "风控减仓"}</em>
-        </article>
-      `;
-    } else if (dynamic.available) {
-      intradayZones.innerHTML = `
-        <article>
-          <span>日内状态</span>
-          <strong>${dynamic.state || "-"}</strong>
-          <em>区间位置 ${fmtPct(dynamic.current_position_pct, 1)}</em>
-        </article>
-        <article>
-          <span>今日低位区</span>
-          <strong>${fmtRange(dynamic.low_zone)}</strong>
-          <em>低位不追卖，只等反抽</em>
-        </article>
-        <article>
-          <span>反抽卖出一档</span>
-          <strong>${fmtPrice(dynamic.rebound_sell_1)}</strong>
-          <em>从低点反抽 38.2%</em>
-        </article>
-        <article>
-          <span>反抽卖出二档</span>
-          <strong>${fmtPrice(dynamic.rebound_sell_2)}</strong>
-          <em>从低点反抽 50%</em>
-        </article>
-        <article>
-          <span>反抽卖出三档</span>
-          <strong>${fmtPrice(dynamic.rebound_sell_3)}</strong>
-          <em>从低点反抽 61.8%</em>
-        </article>
-        <article>
-          <span>今日高位区</span>
-          <strong>${fmtRange(dynamic.high_zone)}</strong>
-          <em>靠近这里优先降仓</em>
-        </article>
-      `;
-    } else {
-      intradayZones.innerHTML = `
-        <article>
-          <span>计划区间</span>
-          <strong>暂无计划数据</strong>
-          <em>当前只能使用前复权日线兜底价位</em>
-        </article>
-      `;
-    }
+    intradayZones.innerHTML = `
+      <article class="${positive.execution_enabled ? "buyback-zone" : "no-sell-zone"}">
+        <span>正T优先 · ${positive.status || "等待"}</span>
+        <strong>买 ${fmtPrice(positive.buy_price)} → 卖 ${fmtPrice(positive.target_price)}</strong>
+        <em>${positive.entry_rule || "买点不到不买"} ${positive.exit_rule || "目标不到尾盘退出"}</em>
+      </article>
+      <article class="no-sell-zone">
+        <span>反T · ${reverse.status || "暂停"}</span>
+        <strong>观察卖 ${fmtPrice(reverse.sell_price)} → 买回 ${fmtPrice(reverse.buyback_price)}</strong>
+        <em>${reverse.reason || "反T未通过验证，不执行"}</em>
+      </article>
+      <article class="basis-zone">
+        <span>计划口径</span>
+        <strong>${plan.signal_date || "-"} 收盘后生成</strong>
+        <em>${plan.basis || "盘前固定，盘中不更新"}</em>
+      </article>
+      <article class="basis-zone">
+        <span>仓位处理放在T计划之后</span>
+        <strong>${holding.shares || 0} / ${inventory.full_shares || 10000} 股</strong>
+        <em>${inventory.note || "完成T后再处理仓位偏离"}</em>
+      </article>
+    `;
   }
   ladder.innerHTML = `
-    <div><span>下破风险线</span><strong>${fmtPrice(levels.support_break)}</strong><em>跌破卖 1000-1500 股</em></div>
-    <div><span>箱体下沿</span><strong>${fmtPrice(levels.range_low)}</strong><em>满仓不买，降仓后才买回</em></div>
-    <div><span>兜底一档</span><strong>${fmtPrice(intraday.micro_sell_1)}</strong><em>无计划数据时使用</em></div>
-    <div><span>兜底二档</span><strong>${fmtPrice(intraday.micro_sell_2)}</strong><em>无计划数据时使用</em></div>
-    <div><span>兜底三档</span><strong>${fmtPrice(intraday.micro_sell_3)}</strong><em>无计划数据时使用</em></div>
-    <div><span>中位减仓线</span><strong>${fmtPrice(levels.mid_trim)}</strong><em>高仓先卖 300-500 股</em></div>
-    <div><span>中上沿线</span><strong>${fmtPrice(levels.weak_trim)}</strong><em>动能转弱卖 400-700 股</em></div>
-    <div><span>强减仓线</span><strong>${fmtPrice(levels.strong_trim)}</strong><em>上沿卖 600-1000 股</em></div>
-    <div><span>箱体上沿</span><strong>${fmtPrice(levels.range_high)}</strong><em>保留突破观察，不机械卖飞</em></div>
+    <div><span>日线参考收盘</span><strong>${fmtPrice(plan.reference_close)}</strong><em>${plan.signal_date || "-"}</em></div>
+    <div><span>正T买入点</span><strong>${fmtPrice(positive.buy_price)}</strong><em>到价买 ${positive.shares || 0} 股；不到不买</em></div>
+    <div><span>正T目标价</span><strong>${fmtPrice(positive.target_price)}</strong><em>成交后立即准备卖出同等股数</em></div>
+    <div><span>正T兜底退出</span><strong>14:50 后</strong><em>目标未到则直接卖出完成T</em></div>
+    <div><span>反T观察卖点</span><strong>${fmtPrice(reverse.sell_price)}</strong><em>当前不执行</em></div>
+    <div><span>反T观察买回</span><strong>${fmtPrice(reverse.buyback_price)}</strong><em>未通过盈利闸门</em></div>
   `;
-  if (alertCount) alertCount.textContent = `${triggered.length} 条触发 / ${(payload.alerts || []).length} 条计划`;
-  alerts.innerHTML = (payload.alerts || []).map((item) => `
-    <article class="byd-alert ${item.triggered ? "triggered" : ""}">
+  if (alertCount) alertCount.textContent = positive.execution_enabled ? "1 条正T可执行" : "今日等待";
+  alerts.innerHTML = [positive, reverse].map((item, index) => `
+    <article class="byd-alert ${item.execution_enabled ? "triggered" : "research-only"}">
       <div>
-        <span>${item.action}</span>
-        <strong>${item.title}</strong>
-        <p>${item.detail}</p>
+        <span>${item.execution_enabled ? "可执行" : "观察"}</span>
+        <strong>${index === 0 ? "正T计划" : "反T计划"} · ${item.status || "-"}</strong>
+        <p>${index === 0 ? `${item.entry_rule || ""} ${item.exit_rule || ""}` : item.reason || ""}</p>
       </div>
       <aside>
-        <strong>${fmtRange(item.price_range) || fmtPrice(item.price_line)}</strong>
-        <em>${Number(item.shares_delta) > 0 ? "+" : ""}${item.shares_delta} 股</em>
+        <strong>${index === 0 ? fmtPrice(item.buy_price) : fmtPrice(item.sell_price)}</strong>
+        <em>${item.shares || 0} 股</em>
       </aside>
     </article>
   `).join("");
@@ -1614,20 +2938,28 @@ function renderBydPage() {
 function render() {
   renderPageShell();
   if (state.activePage === "short") {
-    renderHeader();
-    renderStrategyFilters();
-    renderStockRows();
-    renderStockDetail();
-    renderNotes();
+    renderShortPage();
+  } else if (state.activePage === "long") {
+    renderCalendar();
+    renderDateStatus();
+    renderLongOverview();
+    renderLongStrategies();
+    renderLongStockPool();
+  } else if (state.activePage === "chan") {
+    renderCalendar();
+    renderDateStatus();
+    renderChanModelPage();
+  } else if (state.activePage === "cb") {
+    renderCalendar();
+    renderDateStatus();
+    renderConvertibleBondPage();
+  } else if (state.activePage === "cbAllotment") {
+    renderConvertibleBondAllotments();
+  } else if (state.activePage === "byd") {
+    renderBydPage();
+  } else if (state.activePage === "similar") {
+    renderSimilarPatternsPage();
   }
-  renderCalendar();
-  renderDateStatus();
-  renderLongOverview();
-  renderLongStrategies();
-  renderLongStockPool();
-  renderConvertibleBondPage();
-  renderConvertibleBondAllotments();
-  renderBydPage();
 }
 
 function showError(error) {
@@ -1694,6 +3026,8 @@ document.querySelector("#reloadButton").addEventListener("click", async () => {
     }
     if (state.activePage === "long") {
       await loadLongStockPool({ refresh: true });
+    } else if (state.activePage === "chan") {
+      await loadChanModelStrategy({ refresh: true });
     } else {
       await loadSelector({ refresh: true });
     }
@@ -1723,10 +3057,11 @@ function setRefreshStatus(status) {
   state.latestRefreshStatus = status;
   const time = status.finished_at || status.started_at || "";
   const percent = Number(status.percent || 0);
+  const scopeLabel = status.scope_label || REFRESH_SCOPE_LABELS[status.scope] || "";
   localStorage.setItem(REFRESH_STATUS_STORAGE_KEY, JSON.stringify(status));
   const statusHtml = `
     <div class="refresh-status-line">
-      <span>${status.message || status.status}${time ? ` · ${time}` : ""}</span>
+      <span>${scopeLabel ? `${scopeLabel} · ` : ""}${status.message || status.status}${time ? ` · ${time}` : ""}</span>
       <strong>${percent}%</strong>
     </div>
     <div class="refresh-progress-track">
@@ -1741,10 +3076,45 @@ function setRefreshStatus(status) {
 }
 
 function setRefreshButtonRunning(isRunning) {
-  document.querySelectorAll("#refreshLatestButton, #longRefreshLatestButton").forEach((button) => {
+  document.querySelectorAll("#refreshAllButton, [data-refresh-scope]").forEach((button) => {
     button.disabled = isRunning;
-    button.textContent = isRunning ? "更新中" : "一键更新数据";
+    button.textContent = isRunning ? "更新中" : (REFRESH_BUTTON_LABELS[button.id] || "更新本页");
   });
+}
+
+async function reloadAfterRefresh(status) {
+  const scope = status?.scope || "all";
+  const shouldReloadShort = scope === "all" || scope === "short";
+  const shouldReloadChan = scope === "all" || scope === "chan";
+  const shouldReloadLong = scope === "all" || scope === "long";
+  const shouldReloadCb = scope === "all" || scope === "cb";
+  const shouldReloadAllotment = scope === "all" || scope === "cbAllotment";
+  const shouldReloadByd = scope === "all" || scope === "byd";
+
+  if (shouldReloadShort) {
+    state.signalDate = "";
+    state.selectedSymbol = null;
+    await loadCalendar().catch(showError);
+  }
+  if (shouldReloadChan) state.chanPayload = null;
+  if (shouldReloadLong) state.longPayload = null;
+  if (shouldReloadCb) state.cbPayload = null;
+  if (shouldReloadAllotment) state.cbAllotmentPayload = null;
+  if (shouldReloadByd) state.bydPayload = null;
+
+  if (state.activePage === "long" && shouldReloadLong) {
+    await loadLongStockPool();
+  } else if (state.activePage === "chan" && shouldReloadChan) {
+    await loadChanModelStrategy();
+  } else if (state.activePage === "cb" && shouldReloadCb) {
+    await loadConvertibleBondPlan();
+  } else if (state.activePage === "cbAllotment" && shouldReloadAllotment) {
+    await loadConvertibleBondAllotments();
+  } else if (state.activePage === "byd" && shouldReloadByd) {
+    await loadBydMinuteStrategy();
+  } else if (state.activePage === "short" && shouldReloadShort) {
+    await loadSelector();
+  }
 }
 
 function startRefreshPolling() {
@@ -1764,18 +3134,7 @@ async function pollLatestRefresh() {
   setRefreshStatus(status);
   if (status.status === "success") {
     stopRefreshPolling();
-    state.signalDate = "";
-    state.selectedSymbol = null;
-    state.longPayload = null;
-    await loadCalendar().catch(showError);
-    if (state.activePage === "long") {
-      await loadLongStockPool();
-    } else if (state.activePage === "cb") {
-      state.cbPayload = null;
-      await loadConvertibleBondPlan();
-    } else {
-      await loadSelector();
-    }
+    await reloadAfterRefresh(status);
     setRefreshButtonRunning(false);
   } else if (status.status === "failed") {
     stopRefreshPolling();
@@ -1808,10 +3167,13 @@ async function restoreLatestRefreshStatus() {
   }
 }
 
-async function startLatestDataRefresh() {
+async function startLatestDataRefresh(scope = "all") {
   setRefreshButtonRunning(true);
   try {
-    const status = await fetchJson("/selector/refresh-latest", { method: "POST" });
+    const status = await fetchJson("/selector/refresh-latest", {
+      method: "POST",
+      body: JSON.stringify({ scope }),
+    });
     setRefreshStatus(status);
     startRefreshPolling();
     await pollLatestRefresh();
@@ -1821,45 +3183,122 @@ async function startLatestDataRefresh() {
   }
 }
 
-document.querySelectorAll("#refreshLatestButton, #longRefreshLatestButton").forEach((button) => {
-  button.addEventListener("click", startLatestDataRefresh);
+document.querySelector("#refreshAllButton")?.addEventListener("click", () => {
+  startLatestDataRefresh("all");
+});
+
+ensureWorkspaceTabs();
+
+document.querySelectorAll("[data-refresh-scope]").forEach((button) => {
+  button.addEventListener("click", () => {
+    startLatestDataRefresh(button.dataset.refreshScope || "all");
+  });
 });
 
 document.querySelectorAll(".page-tab").forEach((button) => {
-  button.addEventListener("click", () => {
-    state.activePage = button.dataset.page || "short";
-    const nextHash = pageHash(state.activePage);
+  button.addEventListener("click", (event) => {
+    if (suppressWorkspaceTabClick) {
+      event.preventDefault();
+      suppressWorkspaceTabClick = false;
+      return;
+    }
+    hideWatchlistContextMenu();
+    const nextPage = button.dataset.page || "short";
+    const nextHash = pageHash(nextPage);
     if (window.location.hash !== nextHash) {
       window.location.hash = nextHash;
+      return;
     }
-    render();
-    if (state.activePage === "long" && !state.longPayload && !state.longLoading) {
-      loadLongStockPool().catch(showError);
-    } else if (state.activePage === "cb" && !state.cbPayload && !state.cbLoading) {
-      loadConvertibleBondPlan().catch(showError);
-    } else if (state.activePage === "cbAllotment" && !state.cbAllotmentPayload && !state.cbAllotmentLoading) {
-      loadConvertibleBondAllotments().catch(showError);
-    } else if (state.activePage === "byd" && !state.bydPayload && !state.bydLoading) {
-      loadBydMinuteStrategy().catch(showError);
-    } else if (state.activePage === "short" && !state.payload && !state.loading) {
-      loadSelector({ latest: true }).catch(showError);
+    state.activePage = nextPage;
+    renderPageShell();
+    loadActivePageData();
+  });
+});
+
+document.querySelectorAll(".workspace-tabs").forEach((nav) => {
+  nav.addEventListener("dragstart", (event) => {
+    const button = event.target.closest(".page-tab");
+    if (!button) return;
+    workspaceTabDragKey = button.dataset.page || "";
+    button.classList.add("dragging");
+    nav.classList.add("is-reordering");
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", workspaceTabDragKey);
     }
+  });
+
+  nav.addEventListener("dragover", (event) => {
+    const target = event.target.closest(".page-tab");
+    if (!target || !workspaceTabDragKey || target.dataset.page === workspaceTabDragKey) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    clearWorkspaceTabDropTargets();
+    const placeAfter = event.clientX >= target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2;
+    target.classList.add(placeAfter ? "tab-drop-after" : "tab-drop-before");
+  });
+
+  nav.addEventListener("dragleave", (event) => {
+    if (!nav.contains(event.relatedTarget)) clearWorkspaceTabDropTargets();
+  });
+
+  nav.addEventListener("drop", (event) => {
+    const target = event.target.closest(".page-tab");
+    if (!target || !workspaceTabDragKey) return;
+    event.preventDefault();
+    const placeAfter = event.clientX >= target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2;
+    const moved = reorderWorkspaceTab(workspaceTabDragKey, target.dataset.page || "", placeAfter);
+    suppressWorkspaceTabClick = moved;
+    if (moved) window.setTimeout(() => { suppressWorkspaceTabClick = false; }, 250);
+    clearWorkspaceTabDropTargets();
+  });
+
+  nav.addEventListener("dragend", () => {
+    document.querySelectorAll(".page-tab.dragging").forEach((button) => button.classList.remove("dragging"));
+    document.querySelectorAll(".workspace-tabs.is-reordering").forEach((item) => item.classList.remove("is-reordering"));
+    clearWorkspaceTabDropTargets();
+    workspaceTabDragKey = "";
+  });
+
+  nav.addEventListener("keydown", (event) => {
+    if (!event.target.matches(".page-tab")) return;
+    if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault();
+      moveWorkspaceTabByOffset(event.target.dataset.page || "", event.key === "ArrowLeft" ? -1 : 1);
+      return;
+    }
+    const tabs = [...nav.querySelectorAll(".page-tab")];
+    const currentIndex = tabs.indexOf(event.target);
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabs.length;
+    if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = tabs.length - 1;
+    if (nextIndex === currentIndex) return;
+    event.preventDefault();
+    focusWorkspaceTabAfterRender = true;
+    tabs[nextIndex].click();
   });
 });
 
 window.addEventListener("hashchange", () => {
-  state.activePage = window.location.hash === "#long" ? "long" : window.location.hash === "#byd" ? "byd" : window.location.hash === "#cb-allotment" ? "cbAllotment" : window.location.hash === "#cb" ? "cb" : "short";
-  render();
-  if (state.activePage === "long" && !state.longPayload && !state.longLoading) {
-    loadLongStockPool().catch(showError);
-  } else if (state.activePage === "cb" && !state.cbPayload && !state.cbLoading) {
-    loadConvertibleBondPlan().catch(showError);
-  } else if (state.activePage === "cbAllotment" && !state.cbAllotmentPayload && !state.cbAllotmentLoading) {
-    loadConvertibleBondAllotments().catch(showError);
-  } else if (state.activePage === "byd" && !state.bydPayload && !state.bydLoading) {
-    loadBydMinuteStrategy().catch(showError);
-  } else if (state.activePage === "short" && !state.payload && !state.loading) {
-    loadSelector({ latest: true }).catch(showError);
+  hideWatchlistContextMenu();
+  state.activePage = hashPage();
+  renderPageShell();
+  loadActivePageData();
+});
+
+document.querySelector("#chanRefreshButton")?.addEventListener("click", async () => {
+  const button = document.querySelector("#chanRefreshButton");
+  button.disabled = true;
+  button.textContent = "刷新中";
+  try {
+    await loadChanModelStrategy({ refresh: true });
+  } catch (error) {
+    showError(error);
+  } finally {
+    button.disabled = false;
+    button.textContent = "刷新计划";
   }
 });
 
@@ -1874,20 +3313,6 @@ document.querySelector("#cbRefreshButton")?.addEventListener("click", async () =
   } finally {
     button.disabled = false;
     button.textContent = "刷新计划";
-  }
-});
-
-document.querySelector("#cbAllotmentRefreshButton")?.addEventListener("click", async () => {
-  const button = document.querySelector("#cbAllotmentRefreshButton");
-  button.disabled = true;
-  button.textContent = "刷新中";
-  try {
-    await loadConvertibleBondAllotments({ refresh: true });
-  } catch (error) {
-    showError(error);
-  } finally {
-    button.disabled = false;
-    button.textContent = "刷新配债数据";
   }
 });
 
@@ -1917,6 +3342,7 @@ document.querySelector("#longPoolRefresh").addEventListener("click", async () =>
 });
 
 document.querySelector("#bydRefreshButton")?.addEventListener("click", async () => {
+  if (!saveBydHoldingInputs()) return;
   const button = document.querySelector("#bydRefreshButton");
   button.disabled = true;
   button.textContent = "刷新中";
@@ -1936,31 +3362,674 @@ document.querySelector("#bydTradeToast")?.addEventListener("click", (event) => {
   dismissBydTradeToast(action === "seen");
 });
 
-document.querySelectorAll("#bydSharesInput, #bydCostInput, #bydSoldTodaySharesInput, #bydSoldTodayPriceInput, #bydOpenTInput, #bydOpenTPriceInput").forEach((input) => {
+BYD_HOLDING_INPUT_IDS.map((id) => document.querySelector(`#${id}`)).filter(Boolean).forEach((input) => {
   input.addEventListener("change", () => {
+    if (!saveBydHoldingInputs()) return;
     if (state.activePage === "byd") {
       loadBydMinuteStrategy().catch(showError);
     }
   });
 });
 
+let watchlistContextTarget = null;
+let watchlistToastTimer = null;
+let similarWatchDragSymbol = "";
+let suppressSimilarWatchRowClick = false;
+let watchlistAlertDraft = null;
+let watchlistAlertRuleSequence = 0;
+
+function hideWatchlistContextMenu() {
+  const menu = document.querySelector("#watchlistContextMenu");
+  if (menu) menu.hidden = true;
+  watchlistContextTarget = null;
+}
+
+function showWatchlistToast(message, tone = "success") {
+  const toast = document.querySelector("#watchlistToast");
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.toggle("error", tone === "error");
+  toast.classList.add("show");
+  window.clearTimeout(watchlistToastTimer);
+  watchlistToastTimer = window.setTimeout(() => toast.classList.remove("show"), 2400);
+}
+
+function openWatchlistContextMenu(target, clientX, clientY) {
+  const menu = document.querySelector("#watchlistContextMenu");
+  if (!menu || !target?.dataset.watchlistSymbol) return;
+  watchlistContextTarget = {
+    symbol: target.dataset.watchlistSymbol,
+    name: target.dataset.watchlistName || target.dataset.watchlistSymbol,
+    note: target.dataset.watchlistNote || "",
+    inWatchlist: Boolean(target.closest("#similarWatchlist")),
+    pinned: target.dataset.watchlistPinned === "true",
+  };
+  const addButton = menu.querySelector("[data-watchlist-context-add]");
+  const pinButton = menu.querySelector("[data-watchlist-context-pin]");
+  const alertButton = menu.querySelector("[data-watchlist-context-alert]");
+  if (addButton) addButton.hidden = watchlistContextTarget.inWatchlist;
+  if (pinButton) {
+    pinButton.hidden = !watchlistContextTarget.inWatchlist;
+    pinButton.textContent = watchlistContextTarget.pinned ? "取消置顶" : "置顶";
+  }
+  if (alertButton) alertButton.hidden = !watchlistContextTarget.inWatchlist;
+  menu.hidden = false;
+  const width = menu.offsetWidth || 150;
+  const height = menu.offsetHeight || 44;
+  menu.style.left = `${Math.max(8, Math.min(clientX, window.innerWidth - width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(clientY, window.innerHeight - height - 8))}px`;
+  menu.querySelector("button:not([hidden])")?.focus();
+}
+
+document.addEventListener("contextmenu", (event) => {
+  const target = event.target.closest("[data-watchlist-symbol]");
+  const canAdd = ["short", "chan", "long", "cbAllotment"].includes(state.activePage);
+  const canManage = state.activePage === "similar" && Boolean(target?.closest("#similarWatchlist"));
+  if (!target || (!canAdd && !canManage)) return;
+  event.preventDefault();
+  openWatchlistContextMenu(target, event.clientX, event.clientY);
+});
+
+document.addEventListener("keydown", (event) => {
+  const target = event.target.closest?.("[data-watchlist-symbol]");
+  if (target && (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))) {
+    event.preventDefault();
+    const rect = target.getBoundingClientRect();
+    openWatchlistContextMenu(target, rect.left + 24, rect.top + 24);
+    return;
+  }
+  if (event.key === "Escape") hideWatchlistContextMenu();
+});
+
+document.querySelector("[data-watchlist-context-add]")?.addEventListener("click", async () => {
+  const target = watchlistContextTarget;
+  if (!target) return;
+  const button = document.querySelector("[data-watchlist-context-add]");
+  button.disabled = true;
+  try {
+    await addSimilarWatchSymbol(target.symbol, { note: target.note });
+    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}，数据后台计算中`);
+  } catch (error) {
+    showWatchlistToast(error.message || "加入自选池失败", "error");
+  } finally {
+    button.disabled = false;
+    hideWatchlistContextMenu();
+  }
+});
+
+document.querySelector("[data-watchlist-context-pin]")?.addEventListener("click", async () => {
+  const target = watchlistContextTarget;
+  if (!target?.inWatchlist) return;
+  const button = document.querySelector("[data-watchlist-context-pin]");
+  button.disabled = true;
+  try {
+    await setSimilarWatchPinned(target.symbol, !target.pinned);
+    showWatchlistToast(`${target.name} 已${target.pinned ? "取消置顶" : "置顶"}`);
+  } catch (error) {
+    showWatchlistToast(error.message || "置顶状态保存失败", "error");
+  } finally {
+    button.disabled = false;
+    hideWatchlistContextMenu();
+  }
+});
+
+function nextWatchlistAlertId(kind) {
+  watchlistAlertRuleSequence += 1;
+  return `${kind}-${Date.now().toString(36)}-${watchlistAlertRuleSequence}`;
+}
+
+function watchlistAlertOperatorOptions(selected) {
+  return `
+    <option value="gt" ${selected === "gt" ? "selected" : ""}>大于 ＞</option>
+    <option value="eq" ${selected === "eq" ? "selected" : ""}>等于 ＝</option>
+    <option value="lt" ${selected === "lt" ? "selected" : ""}>小于 ＜</option>
+  `;
+}
+
+function watchlistAlertConjunctionOptions(selected) {
+  return `
+    <option value="and" ${selected === "and" ? "selected" : ""}>AND · 并且</option>
+    <option value="or" ${selected === "or" ? "selected" : ""}>OR · 或者</option>
+  `;
+}
+
+function watchlistAlertIndicatorOptions(selected) {
+  return Object.entries(WATCHLIST_ALERT_INDICATORS).map(([key, definition]) => `
+    <option value="${key}" ${selected === key ? "selected" : ""}>${definition.label}</option>
+  `).join("");
+}
+
+function formatWatchlistAlertCurrent(value, kind, indicator = "") {
+  const numeric = watchlistAlertNumber(value);
+  if (!Number.isFinite(numeric)) return "当前值：等待分析数据";
+  if (kind === "price") return `当前值：${fmtPrice(numeric)}`;
+  const definition = WATCHLIST_ALERT_INDICATORS[indicator] || {};
+  const digits = indicator === "vol_ratio20" ? 2 : 1;
+  return `当前值：${numeric.toFixed(digits)}${definition.unit || ""}`;
+}
+
+function syncWatchlistAlertDraftFromForm() {
+  if (!watchlistAlertDraft) return;
+  watchlistAlertDraft.enabled = Boolean(document.querySelector("#watchlistAlertEnabled")?.checked);
+  watchlistAlertDraft.reminders = [...document.querySelectorAll("[data-watchlist-alert-reminder]")].map((card) => ({
+    id: card.dataset.alertReminderId,
+    note: card.querySelector("[data-alert-reminder-note]")?.value ?? "",
+    conditions: [...card.querySelectorAll("[data-watchlist-alert-condition]")].map((row, index) => ({
+      id: row.dataset.alertConditionId,
+      conjunction: index === 0
+        ? "and"
+        : (row.querySelector("[data-alert-condition-conjunction]")?.value === "or" ? "or" : "and"),
+      kind: row.querySelector("[data-alert-condition-kind]")?.value === "indicator" ? "indicator" : "price",
+      indicator: row.querySelector("[data-alert-condition-indicator]")?.value || "ret_20d",
+      operator: row.querySelector("[data-alert-condition-operator]")?.value || "gt",
+      value: row.querySelector("[data-alert-condition-value]")?.value ?? "",
+    })),
+  }));
+}
+
+function defaultWatchlistAlertCondition() {
+  return {
+    id: nextWatchlistAlertId("condition"),
+    conjunction: "and",
+    kind: "price",
+    indicator: "ret_20d",
+    operator: "gt",
+    value: "",
+  };
+}
+
+function renderWatchlistAlertCondition(item, result, condition, index) {
+  const currentValue = condition.kind === "indicator"
+    ? watchlistAlertMetricValue(item, result, condition.indicator)
+    : result?.latest_snapshot?.close;
+  const currentLabel = formatWatchlistAlertCurrent(currentValue, condition.kind, condition.indicator);
+  return `
+    <div class="watchlist-alert-condition" data-watchlist-alert-condition data-alert-condition-id="${escapeHtml(condition.id)}">
+      ${index === 0 ? `
+        <div class="watchlist-alert-join-first">当</div>
+      ` : `
+        <label class="watchlist-alert-join">
+          <span>关系</span>
+          <select data-alert-condition-conjunction>${watchlistAlertConjunctionOptions(condition.conjunction)}</select>
+        </label>
+      `}
+      <label class="watchlist-alert-condition-type">
+        <span>类型</span>
+        <select data-alert-condition-kind>
+          <option value="price" ${condition.kind === "price" ? "selected" : ""}>价格</option>
+          <option value="indicator" ${condition.kind === "indicator" ? "selected" : ""}>指标</option>
+        </select>
+        <small>${currentLabel}</small>
+      </label>
+      <label class="watchlist-alert-indicator-select" ${condition.kind === "indicator" ? "" : "hidden"}>
+        <span>指标</span>
+        <select data-alert-condition-indicator>${watchlistAlertIndicatorOptions(condition.indicator)}</select>
+      </label>
+      <label>
+        <span>比较</span>
+        <select data-alert-condition-operator>${watchlistAlertOperatorOptions(condition.operator)}</select>
+      </label>
+      <label>
+        <span>数值</span>
+        <input
+          data-alert-condition-value
+          type="number"
+          ${condition.kind === "price" ? 'min="0.001"' : ""}
+          step="0.001"
+          required
+          value="${escapeHtml(condition.value)}"
+          placeholder="请输入数值"
+        />
+      </label>
+      <div class="watchlist-alert-condition-actions">
+        <button type="button" data-alert-condition-add aria-label="在下方新增条件">＋</button>
+        <button type="button" data-alert-condition-remove aria-label="删除当前条件">−</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderWatchlistAlertDraft() {
+  if (!watchlistAlertDraft) return;
+  const item = similarWatchItem(watchlistAlertDraft.symbol);
+  const result = similarResultForSymbol(watchlistAlertDraft.symbol);
+  const reminders = document.querySelector("#watchlistAlertReminders");
+  const enabled = document.querySelector("#watchlistAlertEnabled");
+  if (!reminders || !enabled) return;
+  enabled.checked = watchlistAlertDraft.enabled;
+  reminders.innerHTML = watchlistAlertDraft.reminders.map((reminder, reminderIndex) => `
+    <section class="watchlist-alert-reminder" data-watchlist-alert-reminder data-alert-reminder-id="${escapeHtml(reminder.id)}">
+      <div class="watchlist-alert-reminder-head">
+        <div>
+          <h4>提醒 ${reminderIndex + 1}</h4>
+          <span>${reminder.conditions.length} 条条件</span>
+        </div>
+        <button type="button" data-alert-reminder-remove>删除提醒</button>
+      </div>
+      <label class="watchlist-alert-reminder-note">
+        <span>提醒备注</span>
+        <input
+          type="text"
+          maxlength="1000"
+          data-alert-reminder-note
+          value="${escapeHtml(reminder.note)}"
+          placeholder="例如：突破前高后关注量能"
+        />
+      </label>
+      <div class="watchlist-alert-conditions">
+        ${reminder.conditions.map((condition, index) => renderWatchlistAlertCondition(item, result, condition, index)).join("")}
+      </div>
+    </section>
+  `).join("") || `
+    <div class="watchlist-alert-empty">
+      <strong>还没有提醒</strong>
+      <span>点击“添加提醒”创建提醒 1，并设置价格或指标条件。</span>
+    </div>
+  `;
+}
+
+function openWatchlistAlertDialog(symbol) {
+  const item = similarWatchItem(symbol);
+  const dialog = document.querySelector("#watchlistAlertDialog");
+  if (!item || !dialog) return;
+  const alerts = watchlistAlertConfig(item);
+  const alertState = evaluateWatchlistAlert(item);
+  watchlistAlertDraft = {
+    symbol,
+    name: item.name || symbol,
+    enabled: alertState.configured ? alerts.enabled : true,
+    reminders: alerts.reminders.map((reminder) => ({
+      ...reminder,
+      conditions: reminder.conditions.map((condition) => ({ ...condition })),
+    })),
+  };
+  document.querySelector("#watchlistAlertTitle").textContent = `${watchlistAlertDraft.name} · 提醒设置`;
+  document.querySelector("#watchlistAlertMeta").textContent = `${symbol} · 每个提醒独立判断，可填写自己的备注`;
+  renderWatchlistAlertDraft();
+  dialog.showModal();
+  const focusSelector = watchlistAlertDraft.reminders.length
+    ? "[data-alert-reminder-note]"
+    : "[data-watchlist-alert-add-reminder]";
+  window.setTimeout(() => document.querySelector(focusSelector)?.focus(), 0);
+}
+
+function closeWatchlistAlertDialog() {
+  const dialog = document.querySelector("#watchlistAlertDialog");
+  if (dialog?.open) dialog.close();
+  watchlistAlertDraft = null;
+}
+
+document.querySelector("[data-watchlist-context-alert]")?.addEventListener("click", () => {
+  const target = watchlistContextTarget;
+  if (!target?.inWatchlist) return;
+  hideWatchlistContextMenu();
+  openWatchlistAlertDialog(target.symbol);
+});
+
+document.querySelector("[data-watchlist-alert-add-reminder]")?.addEventListener("click", () => {
+  if (!watchlistAlertDraft) return;
+  syncWatchlistAlertDraftFromForm();
+  if (watchlistAlertDraft.reminders.length >= 20) {
+    showWatchlistToast("每只股票最多设置 20 个提醒", "error");
+    return;
+  }
+  const reminder = {
+    id: nextWatchlistAlertId("reminder"),
+    note: "",
+    conditions: [defaultWatchlistAlertCondition()],
+  };
+  watchlistAlertDraft.reminders.push(reminder);
+  renderWatchlistAlertDraft();
+  window.setTimeout(() => {
+    document.querySelector(`[data-alert-reminder-id="${reminder.id}"] [data-alert-reminder-note]`)?.focus();
+  }, 0);
+});
+
+document.querySelector("#watchlistAlertDialog")?.addEventListener("click", (event) => {
+  if (!watchlistAlertDraft) {
+    if (event.target === event.currentTarget) closeWatchlistAlertDialog();
+    return;
+  }
+  const reminderCard = event.target.closest("[data-watchlist-alert-reminder]");
+  const reminderId = reminderCard?.dataset.alertReminderId;
+  if (event.target.closest("[data-alert-reminder-remove]") && reminderId) {
+    syncWatchlistAlertDraftFromForm();
+    watchlistAlertDraft.reminders = watchlistAlertDraft.reminders.filter((reminder) => reminder.id !== reminderId);
+    renderWatchlistAlertDraft();
+    return;
+  }
+  const conditionRow = event.target.closest("[data-watchlist-alert-condition]");
+  const conditionId = conditionRow?.dataset.alertConditionId;
+  if (event.target.closest("[data-alert-condition-add]") && reminderId && conditionId) {
+    syncWatchlistAlertDraftFromForm();
+    const reminder = watchlistAlertDraft.reminders.find((item) => item.id === reminderId);
+    if (!reminder) return;
+    if (reminder.conditions.length >= 20) {
+      showWatchlistToast("每个提醒最多设置 20 条条件", "error");
+      return;
+    }
+    const index = reminder.conditions.findIndex((condition) => condition.id === conditionId);
+    const condition = defaultWatchlistAlertCondition();
+    reminder.conditions.splice(index + 1, 0, condition);
+    renderWatchlistAlertDraft();
+    window.setTimeout(() => {
+      document.querySelector(`[data-alert-condition-id="${condition.id}"] [data-alert-condition-conjunction]`)?.focus();
+    }, 0);
+    return;
+  }
+  if (event.target.closest("[data-alert-condition-remove]") && reminderId && conditionId) {
+    syncWatchlistAlertDraftFromForm();
+    const reminder = watchlistAlertDraft.reminders.find((item) => item.id === reminderId);
+    if (!reminder) return;
+    if (reminder.conditions.length === 1) {
+      showWatchlistToast("每个提醒至少保留一条条件", "error");
+      return;
+    }
+    reminder.conditions = reminder.conditions.filter((condition) => condition.id !== conditionId);
+    renderWatchlistAlertDraft();
+    return;
+  }
+  if (event.target === event.currentTarget) closeWatchlistAlertDialog();
+});
+
+document.querySelector("#watchlistAlertReminders")?.addEventListener("change", (event) => {
+  if (!event.target.matches("[data-alert-condition-kind], [data-alert-condition-indicator]")) return;
+  syncWatchlistAlertDraftFromForm();
+  renderWatchlistAlertDraft();
+});
+
+document.querySelector("#watchlistAlertClose")?.addEventListener("click", closeWatchlistAlertDialog);
+document.querySelector("#watchlistAlertCancel")?.addEventListener("click", closeWatchlistAlertDialog);
+document.querySelector("#watchlistAlertDialog")?.addEventListener("cancel", () => {
+  watchlistAlertDraft = null;
+});
+
+document.querySelector("#watchlistAlertForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!watchlistAlertDraft) return;
+  syncWatchlistAlertDraftFromForm();
+  const reminders = watchlistAlertDraft.reminders.map((reminder) => ({
+    ...reminder,
+    note: reminder.note.trim(),
+    conditions: reminder.conditions.map((condition, index) => ({
+      ...condition,
+      conjunction: index === 0 ? "and" : condition.conjunction,
+      value: Number(condition.value),
+      ...(condition.kind === "price" ? { indicator: undefined } : {}),
+    })),
+  }));
+  const invalidCondition = reminders.flatMap((reminder) => reminder.conditions).find((condition) => (
+    !Number.isFinite(condition.value) || (condition.kind === "price" && condition.value <= 0)
+  ));
+  if (invalidCondition) {
+    showWatchlistToast("请填写有效的提醒阈值", "error");
+    return;
+  }
+  const symbol = watchlistAlertDraft.symbol;
+  const count = reminders.length;
+  const conditionCount = reminders.reduce((total, reminder) => total + reminder.conditions.length, 0);
+  const button = document.querySelector("#watchlistAlertSave");
+  button.disabled = true;
+  button.textContent = "保存中";
+  try {
+    await saveSimilarWatchAlerts(symbol, {
+      enabled: watchlistAlertDraft.enabled && count > 0,
+      reminders,
+    });
+    closeWatchlistAlertDialog();
+    showWatchlistToast(count ? `已保存 ${count} 个提醒、${conditionCount} 条条件` : "提醒设置已清空");
+  } catch (error) {
+    showWatchlistToast(error.message || "提醒保存失败", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存提醒";
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#watchlistContextMenu")) hideWatchlistContextMenu();
+});
+window.addEventListener("resize", hideWatchlistContextMenu);
+window.addEventListener("scroll", hideWatchlistContextMenu, true);
+
+document.querySelector("#similarAddForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = document.querySelector("#similarSymbolInput");
+  const symbol = input?.value?.trim();
+  if (!symbol) return;
+  const button = event.submitter;
+  if (button) button.disabled = true;
+  try {
+    await addSimilarWatchSymbol(symbol);
+    if (input) input.value = "";
+    showWatchlistToast(`${symbol} 已加入自选池，数据后台计算中`);
+  } catch (error) {
+    showError(error);
+  } finally {
+    if (button) button.disabled = false;
+  }
+});
+
+document.querySelector("#similarRefreshButton")?.addEventListener("click", async () => {
+  try {
+    await loadSimilarPatterns({ refresh: true });
+  } catch (error) {
+    showError(error);
+  }
+});
+
+function openSimilarNoteDialog(symbol) {
+  const item = (state.similarPayload?.watchlist || []).find((row) => row.symbol === symbol);
+  const dialog = document.querySelector("#similarNoteDialog");
+  const form = document.querySelector("#similarNoteForm");
+  const textarea = document.querySelector("#similarNoteInput");
+  if (!item || !dialog || !form || !textarea) return;
+  form.dataset.similarNoteSymbol = symbol;
+  document.querySelector("#similarNoteTitle").textContent = `${item.name || symbol} · 笔记与操作计划`;
+  document.querySelector("#similarNoteMeta").textContent = item.note_updated_at
+    ? `${symbol} · 上次保存 ${item.note_updated_at}`
+    : `${symbol} · 尚未保存笔记`;
+  textarea.value = item.note || "";
+  dialog.showModal();
+  window.setTimeout(() => textarea.focus(), 0);
+}
+
+function closeSimilarNoteDialog() {
+  const dialog = document.querySelector("#similarNoteDialog");
+  if (dialog?.open) dialog.close();
+  const form = document.querySelector("#similarNoteForm");
+  if (form) delete form.dataset.similarNoteSymbol;
+}
+
+document.querySelector("#similarNoteCancel")?.addEventListener("click", closeSimilarNoteDialog);
+document.querySelector("#similarNoteCancelBottom")?.addEventListener("click", closeSimilarNoteDialog);
+document.querySelector("#similarNoteDialog")?.addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeSimilarNoteDialog();
+});
+document.querySelector("#similarNoteForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const symbol = event.currentTarget.dataset.similarNoteSymbol;
+  if (!symbol) return;
+  const button = document.querySelector("#similarNoteSave");
+  const content = document.querySelector("#similarNoteInput")?.value || "";
+  button.disabled = true;
+  button.textContent = "保存中";
+  try {
+    await saveSimilarWatchNote(symbol, content);
+    closeSimilarNoteDialog();
+    showWatchlistToast(content.trim() ? "笔记已保存" : "笔记已清空");
+  } catch (error) {
+    showWatchlistToast(error.message || "笔记保存失败", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存笔记";
+  }
+});
+
+document.querySelector("#similarPage")?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-similar-xueqiu]")) return;
+  const alertBell = event.target.closest("[data-watchlist-alert-bell]");
+  if (alertBell) {
+    openWatchlistAlertDialog(alertBell.dataset.watchlistAlertBell);
+    return;
+  }
+  const retryButton = event.target.closest("[data-similar-retry]");
+  if (retryButton) {
+    loadSimilarPatterns().catch(showError);
+    return;
+  }
+  const removeButton = event.target.closest("[data-similar-remove]");
+  if (removeButton) {
+    removeSimilarWatchSymbol(removeButton.dataset.similarRemove).catch(showError);
+    return;
+  }
+  const noteButton = event.target.closest("[data-similar-note]");
+  if (noteButton) {
+    openSimilarNoteDialog(noteButton.dataset.similarNote);
+    return;
+  }
+  const card = event.target.closest("[data-similar-symbol]");
+  if (!card) return;
+  if (suppressSimilarWatchRowClick) {
+    suppressSimilarWatchRowClick = false;
+    return;
+  }
+  state.similarSelectedSymbol = card.dataset.similarSymbol;
+  renderSimilarPatternsPage();
+});
+
+function clearSimilarWatchDropTargets() {
+  document.querySelectorAll(".similar-watch-row.watch-drop-before, .similar-watch-row.watch-drop-after").forEach((row) => {
+    row.classList.remove("watch-drop-before", "watch-drop-after");
+  });
+}
+
+function reorderSimilarWatchRows(sourceSymbol, targetSymbol, placeAfter = false) {
+  const watch = state.similarPayload?.watchlist || [];
+  const source = watch.find((item) => item.symbol === sourceSymbol);
+  const target = watch.find((item) => item.symbol === targetSymbol);
+  if (!source || !target || sourceSymbol === targetSymbol) return false;
+  if (Boolean(source.pinned) !== Boolean(target.pinned)) {
+    showWatchlistToast("置顶股票和普通股票请在各自区域内排序", "error");
+    return false;
+  }
+  const order = watch.map((item) => item.symbol).filter((symbol) => symbol !== sourceSymbol);
+  const targetIndex = order.indexOf(targetSymbol);
+  order.splice(targetIndex + (placeAfter ? 1 : 0), 0, sourceSymbol);
+  suppressSimilarWatchRowClick = true;
+  saveSimilarWatchOrder(order)
+    .then(() => showWatchlistToast("自选池顺序已保存"))
+    .catch((error) => showWatchlistToast(error.message || "自选池排序保存失败", "error"));
+  window.setTimeout(() => { suppressSimilarWatchRowClick = false; }, 300);
+  return true;
+}
+
+document.querySelector("#similarWatchlist")?.addEventListener("dragstart", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row) return;
+  similarWatchDragSymbol = row.dataset.similarSymbol || "";
+  row.classList.add("dragging");
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", similarWatchDragSymbol);
+  }
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("dragover", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row || !similarWatchDragSymbol || row.dataset.similarSymbol === similarWatchDragSymbol) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  clearSimilarWatchDropTargets();
+  const placeAfter = event.clientY >= row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+  row.classList.add(placeAfter ? "watch-drop-after" : "watch-drop-before");
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("drop", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row || !similarWatchDragSymbol) return;
+  event.preventDefault();
+  const placeAfter = event.clientY >= row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+  reorderSimilarWatchRows(similarWatchDragSymbol, row.dataset.similarSymbol || "", placeAfter);
+  clearSimilarWatchDropTargets();
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("dragend", () => {
+  document.querySelectorAll(".similar-watch-row.dragging").forEach((row) => row.classList.remove("dragging"));
+  clearSimilarWatchDropTargets();
+  similarWatchDragSymbol = "";
+});
+
+document.querySelector("#similarWatchlist")?.addEventListener("keydown", (event) => {
+  const row = event.target.closest(".similar-watch-row");
+  if (!row || !event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+  const rows = [...document.querySelectorAll("#similarWatchlist .similar-watch-row")];
+  const currentIndex = rows.indexOf(row);
+  const nextIndex = currentIndex + (event.key === "ArrowUp" ? -1 : 1);
+  const target = rows[nextIndex];
+  if (!target) return;
+  event.preventDefault();
+  const moved = reorderSimilarWatchRows(
+    row.dataset.similarSymbol || "",
+    target.dataset.similarSymbol || "",
+    event.key === "ArrowDown",
+  );
+  if (moved) window.setTimeout(() => document.querySelector(`#similarWatchlist [data-similar-symbol="${row.dataset.similarSymbol}"]`)?.focus(), 0);
+});
+
+document.querySelector("#similarPage")?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const row = event.target.closest("[data-similar-symbol]");
+  if (!row || event.target.closest("button, input, a")) return;
+  event.preventDefault();
+  state.similarSelectedSymbol = row.dataset.similarSymbol;
+  renderSimilarPatternsPage();
+});
+
+document.querySelector("#similarPage")?.addEventListener("mouseover", (event) => {
+  const row = event.target.closest("[data-similar-symbol]");
+  if (!row || row.contains(event.relatedTarget)) return;
+  showSimilarNoteTooltip(row, event.clientX, event.clientY);
+});
+
+document.querySelector("#similarPage")?.addEventListener("mousemove", (event) => {
+  if (!event.target.closest("[data-similar-symbol]")) return;
+  positionSimilarNoteTooltip(event.clientX, event.clientY);
+});
+
+document.querySelector("#similarPage")?.addEventListener("mouseout", (event) => {
+  const row = event.target.closest("[data-similar-symbol]");
+  if (!row || row.contains(event.relatedTarget)) return;
+  hideSimilarNoteTooltip(row);
+});
+
+document.querySelector("#similarPage")?.addEventListener("focusin", (event) => {
+  const row = event.target.closest("[data-similar-symbol]");
+  if (!row) return;
+  const rect = row.getBoundingClientRect();
+  showSimilarNoteTooltip(row, rect.left + Math.min(rect.width / 2, 280), rect.top + 24);
+});
+
+document.querySelector("#similarPage")?.addEventListener("focusout", (event) => {
+  const row = event.target.closest("[data-similar-symbol]");
+  if (!row || row.contains(event.relatedTarget)) return;
+  hideSimilarNoteTooltip(row);
+});
+
+document.querySelector("#chanPage")?.addEventListener("click", (event) => {
+  const row = event.target.closest("[data-chan-symbol]");
+  if (!row) return;
+  state.chanSelectedSymbol = row.dataset.chanSymbol;
+  renderChanModelPage();
+});
+
 const initialDateInput = document.querySelector("#signalDateInput");
 if (initialDateInput) initialDateInput.value = "";
 state.signalDate = "";
+restoreBydHoldingInputs();
 renderPageShell();
 renderLongStrategies();
 renderLongStockPool();
 restoreLatestRefreshStatus().catch(showError);
-loadCalendar().catch(showError).finally(() => {
-  if (state.activePage === "long") {
-    loadLongStockPool().catch(showError);
-  } else if (state.activePage === "cb") {
-    loadConvertibleBondPlan().catch(showError);
-  } else if (state.activePage === "cbAllotment") {
-    loadConvertibleBondAllotments().catch(showError);
-  } else if (state.activePage === "byd") {
-    loadBydMinuteStrategy().catch(showError);
-  } else {
-    loadSelector({ latest: true }).catch(showError);
-  }
-});
+loadCalendar().catch(showError);
+loadActivePageData();

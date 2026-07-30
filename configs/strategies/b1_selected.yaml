@@ -1,49 +1,52 @@
-# B1 selected production strategies.
-#
-# Strategy record:
-#   docs/strategies/b1_selected_strategy_record.md
-#
-# Summary:
-#   - B1 is a mean-reversion candidate signal with the old hard volume-increase
-#     condition removed.
-#   - Entry uses fixed thresholds instead of daily top-rank selection, so the
-#     routine can stay empty when no signal is good enough.
-#   - pred_up8_es controls upside elasticity.
-#   - pred_down3_es controls the risk of falling through the stop before rebound.
-#   - b1_stable is the current primary strategy.
-#   - b1_aggressive is retained as a stricter high-quality opportunity strategy.
+release:
+  id: b1-20260722
+  lifecycle: production
+  consumer: quant.routine.b1_daily_plan
+  model_dir: models/production/b1
+  model_manifest: models/production/b1/manifest.json
+  model_names:
+    - up5_es
+    - up8_es
+    - up10_es
+    - down2_es
+    - down3_es
+  backtest_summary: reports/b1/current/summary.csv
+  compatibility_audit: reports/b1/current/model_compatibility_audit.json
+
 strategies:
   - id: b1_stable
     name: B1 稳健版
     enabled: true
+    priority: 1
+    backtest_combo: stable_up10_020_down3_040_fixed8_sl15_T5
     entry:
-      min_up8: 0.55
-      max_down3: 0.55
+      min_up10: 0.20
+      max_down3: 0.40
     exit:
-      kind: trailing
-      hold_days: 6
-      take_profit: 0.04
+      kind: fixed
+      hold_days: 4
+      take_profit: 0.08
       stop_loss: 0.015
-      trail_drawdown: 0.02
-    description: pred_up8_es>=0.55 + pred_down3_es<=0.55 + 4%目标后2%回撤止盈 + 1.5%止损 + T+7到期
+    description: pred_up10_es>=0.20 + pred_down3_es<=0.40 + 8%止盈 + 1.5%止损 + T+5到期
 
   - id: b1_aggressive
     name: B1 进攻版
     enabled: true
+    priority: 2
+    backtest_combo: aggressive_up8_070_down3_045_expiry_T9
     entry:
-      min_up8: 0.65
-      max_down3: 0.50
+      min_up8: 0.70
+      max_down3: 0.45
     exit:
-      kind: trailing
+      kind: expiry
       hold_days: 8
-      take_profit: 0.05
-      stop_loss: 0.015
-      trail_drawdown: 0.02
-    description: pred_up8_es>=0.65 + pred_down3_es<=0.50 + 5%目标后2%回撤止盈 + 1.5%止损 + T+9到期
+    description: pred_up8_es>=0.70 + pred_down3_es<=0.45 + T+9收盘到期退出
 
   - id: b1_baseline
     name: B1 旧基准
-    enabled: true
+    enabled: false
+    priority: 99
+    backtest_combo: baseline_up8_055_trail5_dd2_sl2_T9
     entry:
       min_up8: 0.55
     exit:

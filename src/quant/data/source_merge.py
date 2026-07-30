@@ -22,6 +22,7 @@ TUSHARE_DAILY_COLUMNS = [
     "volume",
     "amount",
 ]
+TUSHARE_MARKET_DAILY_COLUMNS = [*TUSHARE_DAILY_COLUMNS, "name", "industry", "turnover"]
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ def normalize_ts_code(symbol: str) -> str:
         return f"{symbol}.SH"
     if symbol.startswith(("0", "3")):
         return f"{symbol}.SZ"
-    if symbol.startswith(("4", "8")):
+    if symbol.startswith(("4", "8", "9")):
         return f"{symbol}.BJ"
     return symbol
 
@@ -90,6 +91,44 @@ def normalize_tushare_daily(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         out["vol"] = out["volume"]
     out = out.sort_values("date").drop_duplicates("trade_date", keep="last").reset_index(drop=True)
     return _order_columns(out)
+
+
+def normalize_tushare_market_daily(
+    df: pd.DataFrame,
+    name_by_symbol: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Normalize a complete Tushare trade-date response without per-symbol loops."""
+
+    out = df.copy().rename(columns={"pct_change": "pct_chg"})
+    out = out.loc[:, ~out.columns.duplicated()].copy()
+    if "ts_code" not in out.columns:
+        raise ValueError("Tushare market daily data missing ts_code")
+    if "trade_date" not in out.columns:
+        if "date" not in out.columns:
+            raise ValueError("Tushare market daily data missing trade_date/date")
+        out["trade_date"] = _normalize_date(out["date"])
+    else:
+        out["trade_date"] = out["trade_date"].astype(str).str.replace("-", "", regex=False)
+    out["ts_code"] = out["ts_code"].astype(str).map(normalize_ts_code)
+    out["symbol"] = out["ts_code"]
+    out["date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d")
+    if name_by_symbol is not None:
+        out["name"] = out["ts_code"].map(name_by_symbol).fillna(out["ts_code"])
+    if "vol" in out.columns and "volume" in out.columns:
+        out["volume"] = out["volume"].combine_first(out["vol"])
+    elif "vol" in out.columns:
+        out["volume"] = out["vol"]
+    elif "volume" in out.columns:
+        out["vol"] = out["volume"]
+    out = (
+        out.sort_values(["trade_date", "ts_code"])
+        .drop_duplicates(["ts_code", "trade_date"], keep="last")
+        .reset_index(drop=True)
+    )
+    for column in TUSHARE_MARKET_DAILY_COLUMNS:
+        if column not in out.columns:
+            out[column] = pd.NA
+    return out[TUSHARE_MARKET_DAILY_COLUMNS].copy()
 
 
 def build_tushare_daily_audit(symbol: str, rows: int, merged_rows: int, status: str = "tushare_daily") -> DailyRefreshAudit:

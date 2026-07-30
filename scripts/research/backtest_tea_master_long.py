@@ -429,9 +429,13 @@ def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(scored, ignore_index=True)
 
 
-def select_targets(scored: pd.DataFrame, config: TeaConfig) -> pd.DataFrame:
+def select_targets(
+    scored: pd.DataFrame,
+    config: TeaConfig,
+    initial_current: set[str] | None = None,
+) -> pd.DataFrame:
     targets: list[pd.DataFrame] = []
-    current: set[str] = set()
+    current: set[str] = set(initial_current or ())
     for date, group in scored.groupby("date", sort=True):
         group = group.copy()
         regime = str(group["market_regime"].dropna().iloc[0]) if not group["market_regime"].dropna().empty else "neutral"
