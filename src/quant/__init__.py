@@ -10,12 +10,23 @@ __author__ = "Quant Team"
 # 导出核心模块。策略和回测依赖 akquant，日常刷新入口不需要它们。
 try:
     from .strategies import *
-    from .backtest import BacktestEngine, GridSearchOptimizer
+    from .backtest import (
+        AShareExecutionConfig,
+        AShareTradabilityPolicy,
+        BacktestArtifacts,
+        BacktestEngine,
+        GridSearchOptimizer,
+    )
 except ModuleNotFoundError as exc:
     if exc.name != "akquant":
         raise
 from .data import DataStorage, TushareDataFetcher, MarketDataStore, MarketDataStoreConfig
-from .analysis import PerformanceAnalyzer, AttributionAnalyzer
+from .analysis import (
+    PerformanceAnalyzer,
+    AttributionAnalyzer,
+    FactorAnalyzer,
+    write_backtest_report,
+)
 from .ml import (
     MLDataSet,
     ModelTrainer,
@@ -36,6 +47,9 @@ __all__ = [
     "RightSideBottomFishingStrategy",
 
     # 回测
+    "AShareExecutionConfig",
+    "AShareTradabilityPolicy",
+    "BacktestArtifacts",
     "BacktestEngine",
     "GridSearchOptimizer",
 
@@ -48,6 +62,8 @@ __all__ = [
     # 分析
     "PerformanceAnalyzer",
     "AttributionAnalyzer",
+    "FactorAnalyzer",
+    "write_backtest_report",
 
     # 机器学习
     "MLDataSet",

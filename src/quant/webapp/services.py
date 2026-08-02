@@ -190,7 +190,7 @@ DEFAULT_FAMILY_CAP = 12
 SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v8_robust_return_models"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
-LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v6_recommendation_and_analyst_coverage"
+LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v7_good_stock_good_price"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
 WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION = "workspace_payload_v1"
@@ -302,6 +302,7 @@ SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
 SIMILAR_PATTERN_VALIDATION_PATH = PROJECT_ROOT / "reports/similar_patterns/validation_2025/calibration.json"
 SIMILAR_PATTERN_CALIBRATION_MAX_FLAT_SPAN = 15.0
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS = 7
+SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS = 5
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY = 4  # Friday
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR = 15
 SIMILAR_PATTERN_VECTOR_CACHE_METADATA = "_refresh_metadata.json"
@@ -438,27 +439,40 @@ def _similar_pattern_vector_cache_refresh_decision(
         refreshed_at = pd.Timestamp.fromtimestamp(max(path.stat().st_mtime for path in cache_files))
         inferred_legacy = True
 
+    refresh_age_days = (
+        max(0.0, (current - refreshed_at.to_pydatetime()).total_seconds() / 86_400)
+        if pd.notna(refreshed_at)
+        else None
+    )
+    minimum_age_reached = (
+        refresh_age_days is None
+        or refresh_age_days >= SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS
+    )
+    repair_reason: str | None = None
+    if not cache_files:
+        repair_reason = "cache_missing"
+    elif int(metadata.get("errors") or 0) > 0:
+        repair_reason = "previous_refresh_errors"
+    elif metadata.get("cached_files") is not None and int(metadata["cached_files"]) != len(cache_files):
+        repair_reason = "cache_file_count_changed"
+    elif any(path.stat().st_size == 0 for path in cache_files):
+        repair_reason = "empty_cache_file"
+    elif pd.isna(refreshed_at):
+        repair_reason = "refresh_time_missing"
+
     if force or force_from_env:
         due, reason = True, "forced"
-    elif not cache_files:
-        due, reason = True, "cache_missing"
-    elif int(metadata.get("errors") or 0) > 0:
-        due, reason = True, "previous_refresh_errors"
-    elif metadata.get("cached_files") is not None and int(metadata["cached_files"]) != len(cache_files):
-        due, reason = True, "cache_file_count_changed"
-    elif any(path.stat().st_size == 0 for path in cache_files):
-        due, reason = True, "empty_cache_file"
-    elif pd.isna(refreshed_at):
-        due, reason = True, "refresh_time_missing"
-    elif _similar_pattern_vector_cache_refreshed_this_window(refreshed_at, current):
-        due, reason = False, "friday_close_window_already_refreshed"
-    elif _similar_pattern_vector_cache_in_refresh_window(current):
-        if _similar_pattern_source_date_is_current(source_trade_date, current):
-            due, reason = True, "friday_close_window"
-        else:
-            due, reason = False, "waiting_for_friday_trade_close"
-    else:
+    elif not _similar_pattern_vector_cache_in_refresh_window(current):
         due, reason = False, "waiting_for_friday_close"
+    elif not _similar_pattern_source_date_is_current(source_trade_date, current):
+        due, reason = False, "waiting_for_friday_trade_close"
+    elif not minimum_age_reached:
+        if _similar_pattern_vector_cache_refreshed_this_window(refreshed_at, current):
+            due, reason = False, "friday_close_window_already_refreshed"
+        else:
+            due, reason = False, "minimum_refresh_age_not_reached"
+    else:
+        due, reason = True, repair_reason or "friday_close_window"
 
     next_refresh_at = _next_similar_pattern_vector_cache_refresh_at(current).isoformat(
         timespec="seconds"
@@ -471,6 +485,8 @@ def _similar_pattern_vector_cache_refresh_decision(
         if pd.notna(refreshed_at)
         else None,
         "next_refresh_at": next_refresh_at,
+        "refresh_age_days": refresh_age_days,
+        "minimum_refresh_age_days": SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS,
         "metadata": metadata,
         "inferred_legacy": inferred_legacy,
     }
@@ -490,6 +506,7 @@ def _write_similar_pattern_vector_cache_metadata(
         "refreshed_at": refreshed_at.isoformat(timespec="seconds"),
         "source_trade_date": source_trade_date,
         "refresh_interval_days": SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS,
+        "minimum_refresh_age_days": SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS,
         "cached_files": len(list(state_dir.glob("*.npz"))),
         "rebuilt": int(cache_audit["status"].eq("built").sum()) if not cache_audit.empty else 0,
         "reused": int(cache_audit["status"].eq("cache_hit").sum()) if not cache_audit.empty else 0,
@@ -1182,6 +1199,8 @@ def _read_long_stock_pool_snapshot(
             payload = read_json_file(path)
         except Exception:
             continue
+        if payload.get("schema_version") != LONG_STOCK_POOL_SCHEMA_VERSION:
+            continue
         cached_date = _canonical_workspace_snapshot_date(payload.get("signal_date") or candidate_date)
         payload["cache"] = {
             "hit": True,
@@ -1752,6 +1771,209 @@ def _attach_analyst_forecast_for_display(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(scored, ignore_index=True) if scored else enriched
 
 
+def _long_good_stock_assessment(row: pd.Series) -> dict[str, Any]:
+    """Evaluate business quality without using valuation or price trend."""
+
+    industry = str(row.get("industry") or "")
+    is_financial = bool(re.search(r"银行|证券|保险|多元金融|金融服务", industry))
+    score = _safe_float(row.get("good_stock_score"), 0.0) or 0.0
+    profitability = _safe_float(row.get("profitability_score"), 0.0) or 0.0
+    growth = _safe_float(row.get("fundamental_growth_score"), 0.0) or 0.0
+    balance = _safe_float(row.get("balance_sheet_score"), 0.0) or 0.0
+    stability = _safe_float(row.get("business_stability_score"), 0.0) or 0.0
+    risk = _safe_float(row.get("risk_score"), 0.0) or 0.0
+    coverage = _safe_float(row.get("good_stock_data_coverage"), 0.0) or 0.0
+    listing_years = _safe_float(row.get("listing_years"), 0.0) or 0.0
+    roe = _safe_float(row.get("roe"))
+    margin = _safe_float(row.get("netprofit_margin"))
+    revenue_growth = _safe_float(row.get("or_yoy"))
+    eps_growth = _safe_float(row.get("basic_eps_yoy"))
+    debt = _safe_float(row.get("debt_to_assets"))
+
+    profitable = roe is not None and roe > 0 and (
+        is_financial or (margin is not None and margin > 0)
+    )
+    balance_ok = is_financial or (debt is not None and debt <= 88)
+    severe_deterioration = (
+        revenue_growth is not None
+        and eps_growth is not None
+        and revenue_growth <= -25
+        and eps_growth <= -40
+    )
+    is_good_stock = bool(
+        score >= 60
+        and profitability >= 50
+        and risk >= 25
+        and coverage >= 0.60
+        and listing_years >= 2
+        and profitable
+        and balance_ok
+        and not severe_deterioration
+    )
+
+    strengths: list[str] = []
+    if profitability >= 70:
+        strengths.append("盈利能力较强")
+    elif profitability >= 55:
+        strengths.append("盈利能力达标")
+    if growth >= 65:
+        strengths.append("成长质量较好")
+    if balance >= 65:
+        strengths.append("财务安全性较好")
+    if stability >= 65:
+        strengths.append("经营稳定性较好")
+    if not strengths:
+        strengths.append("综合基本面达到观察标准")
+
+    return {
+        "is_good_stock": is_good_stock,
+        "good_stock_score": round(score, 2),
+        "profitability_score": round(profitability, 2),
+        "fundamental_growth_score": round(growth, 2),
+        "balance_sheet_score": round(balance, 2),
+        "business_stability_score": round(stability, 2),
+        "good_stock_data_coverage": round(coverage, 2),
+        "good_stock_reason": "、".join(strengths),
+        "is_financial_industry": is_financial,
+    }
+
+
+def _long_good_price_assessment(row: pd.Series) -> dict[str, Any]:
+    """Evaluate price only after a stock has passed the quality gate."""
+
+    close = _safe_float(row.get("close"))
+    reference = _safe_float(row.get("target_price"))
+    value_score = _safe_float(row.get("value_score"), 0.0) or 0.0
+    ma120 = _safe_float(row.get("ma_120"))
+    ma120_slope = _safe_float(row.get("ma_120_slope_20d"))
+    ratio = close / reference if close and reference and reference > 0 else None
+
+    if ratio is None:
+        price_position_score = 0.0
+    elif ratio <= 0.98:
+        price_position_score = 100.0
+    elif ratio <= 1.00:
+        price_position_score = 100.0 - (ratio - 0.98) / 0.02 * 10.0
+    elif ratio <= 1.08:
+        price_position_score = 90.0 - (ratio - 1.00) / 0.08 * 30.0
+    elif ratio <= 1.20:
+        price_position_score = 60.0 - (ratio - 1.08) / 0.12 * 40.0
+    else:
+        price_position_score = max(0.0, 20.0 - (ratio - 1.20) * 50.0)
+
+    good_price_score = float(np.clip(value_score * 0.60 + price_position_score * 0.40, 0, 100))
+    trend_guard = bool(
+        close is not None
+        and ma120 is not None
+        and ma120_slope is not None
+        and close >= ma120 * 0.90
+        and ma120_slope >= -0.06
+    )
+    is_good_price = bool(
+        ratio is not None
+        and ratio <= 1.08
+        and value_score >= 55
+        and good_price_score >= 60
+        and trend_guard
+    )
+    near_good_price = bool(
+        not is_good_price
+        and ratio is not None
+        and ratio <= 1.15
+        and value_score >= 50
+        and trend_guard
+    )
+
+    if is_good_price:
+        price_state = "GOOD_PRICE"
+        price_reason = f"估值分 {value_score:.1f}，当前价位进入好价格区"
+    elif not trend_guard:
+        price_state = "WAIT_STABILITY"
+        price_reason = "价格结构偏弱，先等待长期趋势企稳"
+    elif near_good_price:
+        price_state = "NEAR_GOOD_PRICE"
+        price_reason = "已接近好价格区，继续等待安全边际"
+    else:
+        price_state = "WAIT_PRICE"
+        price_reason = "公司质量达标，当前价格仍需等待"
+
+    return {
+        "is_good_price": is_good_price,
+        "good_price_score": round(good_price_score, 2),
+        "price_position_score": round(price_position_score, 2),
+        "price_state": price_state,
+        "price_state_reason": price_reason,
+        "price_to_reference": round(ratio, 4) if ratio is not None else None,
+        "price_levels": {
+            "current_price": round(close, 2) if close is not None else None,
+            "patient_price": round(reference * 0.98, 2) if reference is not None else None,
+            "reference_price": round(reference, 2) if reference is not None else None,
+            "good_price_upper": round(reference * 1.08, 2) if reference is not None else None,
+            "trend_reference_price": round(ma120, 2) if ma120 is not None else None,
+        },
+    }
+
+
+def _tea_good_stock_price_row(
+    row: pd.Series,
+    *,
+    variant: str,
+    rank: int | None = None,
+) -> dict[str, Any]:
+    stock = _long_good_stock_assessment(row)
+    price = _long_good_price_assessment(row)
+    recommended = bool(stock["is_good_stock"] and price["is_good_price"])
+    level = "RECOMMENDED" if recommended else "WATCH"
+    display_reason = (
+        f"好股票：{stock['good_stock_reason']}；好价格：{price['price_state_reason']}"
+        if recommended
+        else f"好股票：{stock['good_stock_reason']}；观察价格：{price['price_state_reason']}"
+    )
+    close = _safe_float(row.get("close"))
+    analyst_growth = _safe_float(row.get("analyst_forward_growth_score"))
+    analyst_upside = _safe_float(row.get("analyst_target_upside_180d"))
+    return {
+        "ts_code": str(row.get("ts_code")),
+        "name": row.get("name"),
+        "industry": row.get("industry"),
+        "variant": variant,
+        "rank": rank,
+        "state": level,
+        "action": "推荐" if recommended else "观察",
+        "recommendation_level": level,
+        "recommendation_since": None,
+        "recommendation_days": None,
+        "display_reason": display_reason,
+        "close": close,
+        "target_price": _safe_float(row.get("target_price")),
+        "long_score": stock["good_stock_score"],
+        "growth_score": stock["fundamental_growth_score"],
+        "quality_score": round(_safe_float(row.get("quality_score"), 0.0) or 0.0, 2),
+        "value_score": round(_safe_float(row.get("value_score"), 0.0) or 0.0, 2),
+        "trend_score": round(_safe_float(row.get("trend_score"), 0.0) or 0.0, 2),
+        "risk_score": round(_safe_float(row.get("risk_score"), 0.0) or 0.0, 2),
+        "roe": _safe_float(row.get("roe")),
+        "netprofit_margin": _safe_float(row.get("netprofit_margin")),
+        "or_yoy": _safe_float(row.get("or_yoy")),
+        "basic_eps_yoy": _safe_float(row.get("basic_eps_yoy")),
+        "debt_to_assets": _safe_float(row.get("debt_to_assets")),
+        "pe_ttm": round(_safe_float(row.get("pe_ttm"), 0.0) or 0.0, 2),
+        "pb": round(_safe_float(row.get("pb"), 0.0) or 0.0, 2),
+        "dv_ttm": round(_safe_float(row.get("dv_ttm"), 0.0) or 0.0, 2),
+        "market_regime": str(row.get("market_regime") or "neutral"),
+        "analyst_report_count_180d": int(_safe_float(row.get("analyst_report_count_180d"), 0.0) or 0),
+        "analyst_org_count_180d": int(_safe_float(row.get("analyst_org_count_180d"), 0.0) or 0),
+        "analyst_institution_count_180d": int(_safe_float(row.get("analyst_institution_count_180d"), 0.0) or 0),
+        "analyst_research_report_count_180d": int(_safe_float(row.get("analyst_research_report_count_180d"), 0.0) or 0),
+        "analyst_consensus_report_count_180d": int(_safe_float(row.get("analyst_consensus_report_count_180d"), 0.0) or 0),
+        "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
+        "analyst_forward_growth_score": round(analyst_growth, 2) if analyst_growth is not None else None,
+        "analyst_target_upside_180d": round(analyst_upside, 4) if analyst_upside is not None else None,
+        **stock,
+        **price,
+    }
+
+
 def _upgrade_cached_tea_analyst_display(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     stocks = payload.get("stocks") or []
     if payload.get("schema_version") == LONG_STOCK_POOL_SCHEMA_VERSION and all(
@@ -2171,148 +2393,31 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     if eligible_scored.empty:
         raise RuntimeError("所选日期之前没有茶大长线评分截面")
     signal_ts = pd.to_datetime(eligible_scored["date"].max())
-    previous_recommendation_starts = _previous_recommendation_starts(variant_key, signal_ts)
-    previous_set = _tea_previous_target_checkpoint(variant_key, signal_ts)
-    if previous_set is None:
-        merged, _, coverage = _prepare_tea_master_live_data(module, signal_date, full_history=True)
-        scored = module.build_tea_scores(merged)
-        targets = module.select_targets(scored, config)
-        coverage["live_checkpoint"] = "missing_full_history_fallback"
-    else:
-        latest_scored = eligible_scored[pd.to_datetime(eligible_scored["date"]) == signal_ts].copy()
-        targets = module.select_targets(latest_scored, config, initial_current=previous_set)
-        coverage["live_checkpoint"] = "snapshot"
-        coverage["live_checkpoint_symbols"] = int(len(previous_set))
-    if targets.empty:
-        raise RuntimeError("茶大长线策略没有生成候选股票")
-    if signal_date:
-        requested = pd.to_datetime(signal_date)
-        targets = targets[targets["rebalance_date"] <= requested].copy()
-    if targets.empty:
-        raise RuntimeError("所选日期之前没有茶大长线股票池")
-    signal_ts = pd.to_datetime(targets["rebalance_date"].max())
-    latest = targets[targets["rebalance_date"] == signal_ts].copy()
-    recommendation_starts = (
-        _continuous_recommendation_starts(targets, signal_ts)
-        if previous_set is None
-        else previous_recommendation_starts
-    )
-    if previous_set is None:
-        target_dates = sorted(pd.to_datetime(targets["rebalance_date"].dropna().unique()))
-        previous_dates = [item for item in target_dates if item < signal_ts]
-        previous_target_date = previous_dates[-1] if previous_dates else None
-        previous = (
-            targets[targets["rebalance_date"] == previous_target_date].copy()
-            if previous_target_date is not None
-            else pd.DataFrame()
-        )
-        previous_set = set(previous["ts_code"].astype(str).tolist()) if not previous.empty else set()
-    latest = latest.sort_values(["target_weight", "tea_score", "trend_score"], ascending=False)
-    selected_codes = latest["ts_code"].astype(str).tolist()
-    selected_set = set(selected_codes)
-    selected_order = {code: i + 1 for i, code in enumerate(selected_codes)}
-    target_map = latest.set_index("ts_code").to_dict(orient="index") if not latest.empty else {}
-
-    scored_date = scored[pd.to_datetime(scored["date"]) == signal_ts].copy()
+    scored_date = eligible_scored[pd.to_datetime(eligible_scored["date"]) == signal_ts].copy()
     if scored_date.empty:
-        scored_date = scored[pd.to_datetime(scored["date"]) <= signal_ts].sort_values("date").drop_duplicates("ts_code", keep="last").copy()
+        scored_date = eligible_scored.sort_values("date").drop_duplicates("ts_code", keep="last").copy()
     scored_date = _attach_analyst_forecast_for_display(scored_date)
-    scored_by_symbol = scored_date.set_index("ts_code", drop=False)
 
-    rows: list[dict[str, Any]] = []
-    appended: set[str] = set()
-    for code in selected_codes:
-        if code not in scored_by_symbol.index:
-            continue
-        row = scored_by_symbol.loc[code]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[-1]
-        enriched = row.copy()
-        for key, value in target_map.get(code, {}).items():
-            if str(key).startswith("analyst_"):
-                continue
-            enriched[key] = value
-        previous_state = "CORE" if code in previous_set else "WATCH"
-        rows.append(
-            _decorate_long_recommendation_display(
-                _tea_status_row(
-                    enriched,
-                    variant=variant_key,
-                    selected=True,
-                    target_weight=float(target_map.get(code, {}).get("target_weight", 0.0) or 0.0),
-                    previous_state=previous_state,
-                    rank=selected_order.get(code),
-                ),
-                selected=True,
-                signal_ts=signal_ts,
-                recommendation_since=recommendation_starts.get(code),
-            )
-        )
-        appended.add(code)
-
-    removed_codes = [code for code in previous_set if code not in selected_set and code in scored_by_symbol.index]
-    for code in removed_codes:
-        row = scored_by_symbol.loc[code]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[-1]
-        rows.append(
-            _decorate_long_recommendation_display(
-                _tea_status_row(
-                    row,
-                    variant=variant_key,
-                    selected=False,
-                    target_weight=0.0,
-                    previous_state="CORE",
-                    rank=None,
-                ),
-                selected=False,
-                signal_ts=signal_ts,
-            )
-        )
-        appended.add(code)
-
-    candidate = scored_date[~scored_date["ts_code"].astype(str).isin(appended)].copy()
-    watch_filter = (
-        (candidate["tea_score"] >= max(config.min_tea_score - 4, 62))
-        & (candidate["quality_score"] >= max(config.min_quality_score - 5, 55))
-        & (candidate["trend_score"] >= max(config.min_trend_score - 8, 45))
-        & (candidate["risk_score"] >= 25)
-    )
-    watch_rows = candidate[watch_filter].sort_values(
-        ["tea_score", "trend_score", "quality_score", "risk_score"],
-        ascending=False,
-    ).head(25)
-    for _, row in watch_rows.iterrows():
-        code = str(row.get("ts_code"))
-        if code in appended:
-            continue
-        rows.append(
-            _decorate_long_recommendation_display(
-                _tea_status_row(
-                    row,
-                    variant=variant_key,
-                    selected=False,
-                    target_weight=0.0,
-                    previous_state="WATCH",
-                    rank=None,
-                ),
-                selected=False,
-                signal_ts=signal_ts,
-            )
-        )
-        appended.add(code)
-
-    state_order = {"CORE": 0, "T_ACTIVE": 1, "BUILDING": 2, "REDUCE": 3, "WATCH": 4, "EXIT": 5, "COOLDOWN": 6}
+    rows = [
+        _tea_good_stock_price_row(row, variant=variant_key)
+        for _, row in scored_date.iterrows()
+    ]
+    rows = [row for row in rows if row["is_good_stock"]]
     rows = sorted(
         rows,
         key=lambda item: (
-            state_order.get(str(item.get("state")), 99),
-            item.get("rank") or 999,
-            -(item.get("long_score") or 0),
+            0 if item["recommendation_level"] == "RECOMMENDED" else 1,
+            -(item.get("good_price_score") or 0),
+            -(item.get("good_stock_score") or 0),
         ),
-    )
-    regime = str(latest["market_regime"].dropna().iloc[0]) if not latest["market_regime"].dropna().empty else "neutral"
+    )[:40]
+    for index, item in enumerate(rows, start=1):
+        item["rank"] = index
+
+    regime_values = scored_date["market_regime"].dropna().astype(str)
+    regime = str(regime_values.iloc[0]) if not regime_values.empty else "neutral"
     state_counts = pd.Series([row["recommendation_level"] for row in rows]).value_counts().to_dict()
+    analyst_covered = sum(1 for row in rows if row.get("analyst_report_count_180d", 0) > 0)
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": signal_ts.date().isoformat(),
@@ -2322,12 +2427,18 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         "market_regime": regime,
         "coverage": coverage,
         "state_counts": {str(k): int(v) for k, v in state_counts.items()},
+        "quality_price_summary": {
+            "good_stock_count": len(rows),
+            "recommended_count": int(state_counts.get("RECOMMENDED", 0)),
+            "watch_count": int(state_counts.get("WATCH", 0)),
+            "analyst_covered_count": analyst_covered,
+        },
         "stocks": rows,
         "notes": [
-            "茶大长线股票池使用独立策略脚本生成，不复用旧股息质量策略版本树。",
-            "行情使用本地前复权日线；财务指标按 ann_date <= signal_date 合并。",
-            "股票池包含目标持仓、上期移出后的降仓/清仓观察，以及高分观察池。",
-            "目标仓位是组合目标，first_tranche_weight 是新进标的更谨慎的首批建仓建议。",
+            "长线页面只回答好股票与好价格，不承担卖出、降仓或持仓管理。",
+            "好股票由盈利能力、成长质量、财务安全和经营稳定性决定，价格与趋势不参与好股票资格。",
+            "好股票统一进入观察池；同时满足估值、价格位置和长期趋势保护时升级为推荐。",
+            "券商预测严格按 report_date <= signal_date 展示，目前不参与好股票或好价格评分。",
         ],
     }
 
@@ -2866,20 +2977,17 @@ def get_similar_pattern_watchlist(*, include_scores: bool = True) -> dict[str, A
 def add_similar_pattern_watch_symbol(symbol: str, note: str = "") -> dict[str, Any]:
     normalized = _normalize_watch_symbol(symbol)
     state = _read_similar_pattern_watchlist_state()
-    if normalized not in state["symbols"]:
-        state["symbols"].append(normalized)
+    if normalized in state["symbols"]:
+        return get_similar_pattern_watchlist(include_scores=False)
+    state["symbols"].append(normalized)
     cleaned_note = str(note or "").strip()
     if cleaned_note:
-        existing = str(state["notes"].get(normalized, {}).get("content") or "").strip()
-        existing_lines = {line.strip() for line in existing.splitlines() if line.strip()}
-        if cleaned_note not in existing_lines:
-            merged = f"{existing}\n{cleaned_note}".strip() if existing else cleaned_note
-            if len(merged) > 20_000:
-                raise ValueError("追加来源后笔记不能超过 20000 个字符")
-            state["notes"][normalized] = {
-                "content": merged,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-            }
+        if len(cleaned_note) > 20_000:
+            raise ValueError("笔记不能超过 20000 个字符")
+        state["notes"][normalized] = {
+            "content": cleaned_note,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
     _write_similar_pattern_watchlist_state(state)
     return get_similar_pattern_watchlist(include_scores=False)
 
@@ -3478,6 +3586,10 @@ def _refresh_similar_pattern_analysis_once(
             "reference_library_refreshed": cache_refreshed,
             "reference_library_reason": cache_schedule["reason"],
             "reference_library_refreshed_at": cache_metadata.get("refreshed_at"),
+            "reference_library_refresh_age_days": cache_schedule.get("refresh_age_days"),
+            "reference_library_minimum_refresh_age_days": cache_schedule[
+                "minimum_refresh_age_days"
+            ],
             "reference_library_next_refresh_at": (
                 _next_similar_pattern_vector_cache_refresh_at(
                     datetime.fromisoformat(str(cache_metadata["refreshed_at"]))

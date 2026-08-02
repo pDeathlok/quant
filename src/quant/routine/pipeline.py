@@ -18,6 +18,8 @@ from quant.application.workspace_refresh import (
     refresh_daily_workspaces,
 )
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.atomic_io import atomic_write_json as publish_json
+from quant.features.market_regime import classify_market_regime
 from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.dashboard import write_dashboard_json
 from quant.routine.b1_daily_plan import write_daily_plan
@@ -220,8 +222,66 @@ def refresh_reference_inputs(dry_run: bool = True, include_financials: bool = Tr
             )
     else:
         result = refresh_reference_data(end_date=end_date, include_financials=False)
+    if result.get("end_date") and result.get("status") in {"success", "partial"}:
+        regime_result = refresh_market_regime_snapshot(str(result["end_date"]))
+        result.setdefault("steps", {})["market_regime"] = regime_result
+        if regime_result.get("status") == "failed":
+            result["status"] = "failed"
+            result.setdefault("critical_errors", []).append(
+                "market_regime: " + str(regime_result.get("error") or "refresh failed")
+            )
     result["elapsed_seconds"] = round(time.monotonic() - started, 3)
     return result
+
+
+def refresh_market_regime_snapshot(
+    end_date: str,
+    *,
+    raw_dir: Path | None = None,
+    output_dir: Path | None = None,
+    store: MarketDataStore | None = None,
+) -> dict:
+    """Build the daily regime snapshot from already-refreshed project data."""
+
+    effective_raw_dir = raw_dir or PROJECT_ROOT / "data/raw"
+    effective_output_dir = output_dir or PROJECT_ROOT / "data/features/market_regime"
+    index_path = effective_raw_dir / "index_000300.SH.parquet"
+    try:
+        if not index_path.is_file():
+            raise FileNotFoundError(index_path)
+        index_daily = pd.read_parquet(index_path)
+        lookback_days = int(os.getenv("ROUTINE_MARKET_REGIME_LOOKBACK_DAYS", "252"))
+        if lookback_days < 90:
+            raise ValueError("ROUTINE_MARKET_REGIME_LOOKBACK_DAYS must be at least 90")
+        start_date = (pd.Timestamp(end_date) - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
+        market_store = store or MarketDataStore(
+            MarketDataStoreConfig.from_env(root=effective_raw_dir)
+        )
+        market_daily = market_store.read_market_range(
+            "daily",
+            start_date=start_date,
+            end_date=end_date,
+            columns=["trade_date", "ts_code", "close", "amount"],
+        )
+        snapshot = classify_market_regime(index_daily, market_daily, as_of=end_date)
+        if snapshot["as_of"] != end_date:
+            raise RuntimeError(
+                f"market regime snapshot stale: expected {end_date}, got {snapshot['as_of']}"
+            )
+        dated_path = effective_output_dir / f"{end_date}.json"
+        latest_path = effective_output_dir / "latest.json"
+        publish_json(snapshot, dated_path)
+        publish_json(snapshot, latest_path)
+        return {
+            "status": "success",
+            "as_of": snapshot["as_of"],
+            "regime": snapshot["regime"],
+            "score": snapshot["score"],
+            "path": str(dated_path),
+            "latest_path": str(latest_path),
+        }
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc), "end_date": end_date}
 
 
 def _latest_long_analyst_symbols(limit: int = 80) -> list[str]:

@@ -50,6 +50,48 @@ def test_reference_and_analyst_interfaces_run_in_parallel(monkeypatch) -> None:
     assert len(thread_ids) == 2
 
 
+def test_market_regime_snapshot_is_published_from_canonical_data(tmp_path) -> None:
+    dates = pd.date_range("2026-01-01", periods=80, freq="B")
+    end_date = dates[-1].strftime("%Y%m%d")
+    index = pd.DataFrame(
+        {
+            "trade_date": [date.strftime("%Y%m%d") for date in dates],
+            "ts_code": "000300.SH",
+            "close": range(100, 180),
+        }
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    index.to_parquet(raw_dir / "index_000300.SH.parquet", index=False)
+
+    class Store:
+        def read_market_range(self, *args, **kwargs):
+            return pd.DataFrame(
+                [
+                    {
+                        "trade_date": date.strftime("%Y%m%d"),
+                        "ts_code": symbol,
+                        "close": 10 + offset,
+                        "amount": 1_000_000 + offset,
+                    }
+                    for offset, date in enumerate(dates)
+                    for symbol in ("000001.SZ", "600000.SH")
+                ]
+            )
+
+    output_dir = tmp_path / "features/market_regime"
+    result = pipeline.refresh_market_regime_snapshot(
+        end_date,
+        raw_dir=raw_dir,
+        output_dir=output_dir,
+        store=Store(),
+    )
+
+    assert result["status"] == "success"
+    assert (output_dir / f"{end_date}.json").is_file()
+    assert json.loads((output_dir / "latest.json").read_text())["as_of"] == end_date
+
+
 def test_analyst_snapshot_reuses_today_checkpoint(monkeypatch, tmp_path) -> None:
     output = tmp_path / "data/raw/analyst_forecasts.parquet"
     output.parent.mkdir(parents=True)

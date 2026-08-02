@@ -16,6 +16,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from quant import (  # noqa: E402
+    AShareExecutionConfig,
     B1Strategy,
     BacktestEngine,
     BreakoutStrategy,
@@ -163,7 +164,11 @@ def main() -> None:
         args.data,
     )
     strategy = STRATEGIES[args.strategy]()
-    engine = BacktestEngine(data=data, strategy=strategy)
+    engine = BacktestEngine(
+        data=data,
+        strategy=strategy,
+        execution_config=AShareExecutionConfig(),
+    )
 
     print(f"策略: {strategy.name}")
     print(f"行情: {data_source}")

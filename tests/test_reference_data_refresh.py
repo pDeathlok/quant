@@ -45,6 +45,27 @@ class FakePro:
             }
         )
 
+    def stk_limit(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "trade_date": [kwargs["trade_date"]],
+                "ts_code": ["000001.SZ"],
+                "pre_close": [10.0],
+                "up_limit": [11.0],
+                "down_limit": [9.0],
+            }
+        )
+
+    def suspend_d(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=["trade_date", "ts_code", "suspend_type", "suspend_timing"]
+        )
+
+    def stock_st(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=["trade_date", "ts_code", "name", "type", "type_name"]
+        )
+
 
 class FakeFetcher:
     def __init__(self) -> None:
@@ -91,6 +112,10 @@ def test_reference_refresh_is_idempotent_and_updates_every_dataset(tmp_path: Pat
     assert len(pd.read_parquet(raw_dir / "fina_indicator.parquet")) == 1
     assert len(pd.read_parquet(raw_dir / "income.parquet")) == 1
     assert len(pd.read_parquet(raw_dir / "cashflow.parquet")) == 1
+    tradability = pd.read_parquet(raw_dir / "tradability" / "20260721.parquet")
+    assert tradability["ts_code"].tolist() == ["000001.SZ"]
+    assert first["steps"]["tradability"]["coverage_rate"] == 1.0
+    assert second["steps"]["tradability"]["status"] == "success"
     assert not pd.read_parquet(raw_dir / "fina_indicator.parquet").duplicated(["ts_code", "ann_date", "end_date"]).any()
     assert second["steps"]["financials"]["status"] == "skipped"
     assert "already completed today" in second["steps"]["financials"]["reason"]

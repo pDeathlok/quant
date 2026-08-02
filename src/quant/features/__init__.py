@@ -8,6 +8,7 @@ from .variable_library import (
     load_daily_basic_features,
     merge_daily_basic_features,
 )
+from .market_regime import classify_market_regime
 
 __all__ = [
     "PROJECT_FACTOR_COLUMNS",
@@ -16,4 +17,5 @@ __all__ = [
     "calculate_project_extra_features",
     "load_daily_basic_features",
     "merge_daily_basic_features",
+    "classify_market_regime",
 ]

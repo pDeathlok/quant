@@ -367,8 +367,74 @@ CONFIGS = [
 ]
 
 
+def _rolling_last_percentile(
+    series: pd.Series,
+    *,
+    window: int = 60,
+    min_periods: int = 24,
+) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+
+    def percentile(values: np.ndarray) -> float:
+        valid = values[np.isfinite(values)]
+        if len(valid) < min_periods or not np.isfinite(values[-1]):
+            return np.nan
+        return float((valid <= values[-1]).mean() * 100.0)
+
+    return numeric.rolling(window, min_periods=min_periods).apply(percentile, raw=True)
+
+
+def add_historical_valuation_features(features: pd.DataFrame) -> pd.DataFrame:
+    """Add point-in-time PE/PB/PR percentiles using only trailing observations."""
+
+    out = features.sort_values(["ts_code", "date"]).copy()
+    roe_percent = pd.to_numeric(out["roe"], errors="coerce")
+    roe_decimal = roe_percent / 100.0
+    pe = pd.to_numeric(out["pe_ttm"], errors="coerce").where(lambda item: item > 0)
+    pb = pd.to_numeric(out["pb"], errors="coerce").where(lambda item: item > 0)
+    valid_roe = roe_decimal.where(roe_decimal > 0.0)
+
+    # The project's ROE source is stored in percentage points. Normalizing to
+    # a decimal first preserves the requested identities:
+    # PR = PE / roe_decimal / 100 = PE / ROE_percent
+    # PR = PB / roe_decimal^2 / 100 = 100 * PB / ROE_percent^2
+    out["pr_pe"] = pe / valid_roe / 100.0
+    out["pr_pb"] = pb / valid_roe.pow(2) / 100.0
+    denominator = pd.concat([out["pr_pe"].abs(), out["pr_pb"].abs()], axis=1).max(axis=1)
+    out["pr_formula_gap"] = (out["pr_pe"] - out["pr_pb"]).abs() / denominator.replace(0, np.nan)
+    out["pr"] = out["pr_pe"]
+
+    grouped = out.groupby("ts_code", sort=False)
+    for source, target in [
+        ("pe_ttm", "pe_hist_percentile"),
+        ("pb", "pb_hist_percentile"),
+        ("pr", "pr_hist_percentile"),
+    ]:
+        clean = pd.to_numeric(out[source], errors="coerce")
+        if source in {"pe_ttm", "pb"}:
+            clean = clean.where(clean > 0)
+        out[target] = (
+            clean.groupby(out["ts_code"], sort=False, group_keys=False)
+            .apply(_rolling_last_percentile)
+            .reset_index(level=0, drop=True)
+            .reindex(out.index)
+        )
+    out["valuation_history_points"] = grouped["pe_ttm"].transform(
+        lambda values: pd.to_numeric(values, errors="coerce").where(lambda item: item > 0).rolling(60).count()
+    )
+    out["historical_value_score"] = (
+        100.0
+        - out[["pe_hist_percentile", "pb_hist_percentile", "pr_hist_percentile"]]
+        .mul([0.30, 0.25, 0.45])
+        .sum(axis=1, min_count=3)
+    ).clip(0, 100)
+    return out.sort_values(["date", "ts_code"]).reset_index(drop=True)
+
+
 def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
     out = features.copy()
+    if "pr_hist_percentile" not in out.columns:
+        out = add_historical_valuation_features(out)
     out["listing_years"] = (out["date"] - out["list_date"]).dt.days / 365.25
     out["target_price"] = pd.concat(
         [out["ma_60"] * 1.02, out["ma_120"] * 1.05, out["median_close_60"]],
@@ -383,6 +449,56 @@ def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
     scored: list[pd.DataFrame] = []
     for _, group in out.groupby("date", sort=True):
         group = group.copy()
+        group["profitability_score"] = (
+            percentile_score(group["roe"], True) * 0.60
+            + percentile_score(group["netprofit_margin"], True) * 0.40
+        ).clip(0, 100)
+        group["fundamental_growth_score"] = (
+            percentile_score(group["or_yoy"].clip(-80, 200), True) * 0.55
+            + percentile_score(group["basic_eps_yoy"].clip(-100, 300), True) * 0.45
+        ).clip(0, 100)
+        group["balance_sheet_score"] = percentile_score(
+            group["debt_to_assets"],
+            False,
+        )
+        financial_mask = group["industry"].astype(str).str.contains(
+            "银行|证券|保险|多元金融|金融服务",
+            regex=True,
+            na=False,
+        )
+        # Debt ratios are not comparable between financial institutions and
+        # ordinary operating companies. Keep a neutral balance-sheet score for
+        # financials until capital-adequacy data is available.
+        group.loc[financial_mask, "balance_sheet_score"] = 50.0
+        group["business_stability_score"] = (
+            percentile_score(group["dv_ttm_stability_36m"], True) * 0.50
+            + percentile_score(group["downside_volatility_60d"], False) * 0.50
+        ).clip(0, 100)
+        group["good_stock_data_coverage"] = (
+            group[
+                [
+                    "roe",
+                    "netprofit_margin",
+                    "or_yoy",
+                    "basic_eps_yoy",
+                    "debt_to_assets",
+                ]
+            ]
+            .notna()
+            .sum(axis=1)
+            / 5.0
+        )
+        group["good_stock_score"] = (
+            group["profitability_score"] * 0.35
+            + group["fundamental_growth_score"] * 0.20
+            + group["balance_sheet_score"] * 0.20
+            + group["business_stability_score"] * 0.15
+            + (
+                percentile_score(group["volatility_60d"], False) * 0.45
+                + percentile_score(group["downside_volatility_60d"], False) * 0.55
+            )
+            * 0.10
+        ).clip(0, 100)
         group["quality_score"] = (
             percentile_score(group["roe"], True) * 0.35
             + percentile_score(group["netprofit_margin"], True) * 0.20
@@ -406,6 +522,25 @@ def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
             + percentile_score(group["downside_volatility_60d"], False) * 0.45
             + percentile_score(group["turnover_rate"].clip(0, 10), False) * 0.10
         ).fillna(50)
+        ordinary_quality_gate = (
+            (group["netprofit_margin"].fillna(-1) > 0)
+            & (group["debt_to_assets"].fillna(999) <= 88)
+        )
+        financial_quality_gate = group["roe"].fillna(-1) > 0
+        severe_deterioration = (
+            (group["or_yoy"].fillna(0) <= -25)
+            & (group["basic_eps_yoy"].fillna(0) <= -40)
+        )
+        group["is_good_stock"] = (
+            (group["good_stock_score"] >= 60)
+            & (group["profitability_score"] >= 50)
+            & (group["risk_score"] >= 25)
+            & (group["good_stock_data_coverage"] >= 0.60)
+            & (group["listing_years"] >= 2)
+            & ~group["name"].astype(str).str.contains("ST|退", regex=True, na=False)
+            & np.where(financial_mask, financial_quality_gate, ordinary_quality_gate)
+            & ~severe_deterioration
+        )
         group["volume_score"] = (
             percentile_score(group["turnover_rate"].clip(0, 8), True) * 0.50
             + percentile_score(group["circ_mv"], True) * 0.20

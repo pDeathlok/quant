@@ -193,6 +193,15 @@ def test_strategy_watchlist_add_includes_default_source_note() -> None:
     assert "配债股${item.status ?" in APP_JS
 
 
+def test_allotment_watchlist_note_includes_one_lot_shares_and_rights_value() -> None:
+    assert "function allotmentWatchlistSourceNote(item, payload)" in APP_JS
+    assert "const oneLotShares = item.shares_for_one_lot ?? item.shares_for_10_bonds;" in APP_JS
+    assert "`一手股数 ${oneLotText}`" in APP_JS
+    assert '`含权量 ${rightsValueText === "-" ? "待计算" : rightsValueText}`' in APP_JS
+    assert 'data-watchlist-note="${escapeHtml(allotmentWatchlistSourceNote(item, payload))}"' in APP_JS
+    assert "20260731-allotment-watchlist-note-v1" in INDEX_HTML
+
+
 def test_allotment_kdj_values_use_signed_number_formatter() -> None:
     assert "const fmtNumber = (value, digits = 2) => {" in APP_JS
     assert "return Number.isFinite(numeric) ? numeric.toFixed(digits) : \"-\";" in APP_JS

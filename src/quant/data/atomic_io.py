@@ -59,6 +59,21 @@ def atomic_write_json(payload: Any, target: Path, *, indent: int = 2) -> Path:
     return target
 
 
+def atomic_write_text(text: str, target: Path) -> Path:
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = _temporary_path(target)
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _publish(temp_path, target)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return target
+
+
 def atomic_link_or_copy(source: Path, target: Path) -> Path:
     """Atomically publish an alias, preferring a zero-copy hard link."""
 

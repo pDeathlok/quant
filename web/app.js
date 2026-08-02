@@ -1070,6 +1070,24 @@ function watchlistSourceNote(dateValue, sourceText) {
   return [dateLabel, String(sourceText || "").trim()].filter(Boolean).join(" ");
 }
 
+function allotmentWatchlistSourceNote(item, payload) {
+  const oneLotShares = item.shares_for_one_lot ?? item.shares_for_10_bonds;
+  const oneLotNumeric = Number(oneLotShares);
+  const oneLotText = Number.isFinite(oneLotNumeric) && oneLotNumeric > 0
+    ? `${Math.round(oneLotNumeric)}股`
+    : "待计算";
+  const rightsValueText = fmtPct(item.rights_value_pct);
+  const sourceText = [
+    `配债股${item.status ? ` · ${item.status}` : ""}`,
+    `一手股数 ${oneLotText}`,
+    `含权量 ${rightsValueText === "-" ? "待计算" : rightsValueText}`,
+  ].join(" · ");
+  return watchlistSourceNote(
+    item.stock_price_date || item.announce_date || payload?.asof,
+    sourceText,
+  );
+}
+
 function xueqiuStockUrl(symbol) {
   const normalized = String(symbol || "").trim().toUpperCase();
   const match = normalized.match(/^(\d{6})(?:\.(SH|SZ|BJ))?$/);
@@ -2730,7 +2748,7 @@ function renderConvertibleBondAllotments() {
     return;
   }
   rows.innerHTML = records.map((item) => `
-    <tr data-watchlist-symbol="${item.stock_code || ""}" data-watchlist-name="${item.stock_name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(item.stock_price_date || item.announce_date || payload.asof, `配债股${item.status ? ` · ${item.status}` : ""}`))}" tabindex="0">
+    <tr data-watchlist-symbol="${item.stock_code || ""}" data-watchlist-name="${item.stock_name || ""}" data-watchlist-note="${escapeHtml(allotmentWatchlistSourceNote(item, payload))}" tabindex="0">
       <td><span class="allotment-status ${allotmentStatusClass(item.stage)}">${item.status || "-"}</span></td>
       <td>${allotmentStockCell(item)}</td>
       <td><strong>${fmtPrice(item.stock_price)}</strong><em>${item.stock_price_date || "--"}</em></td>

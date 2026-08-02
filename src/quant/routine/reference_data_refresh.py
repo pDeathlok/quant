@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 
 from quant.data.tushare_fetcher import TushareDataFetcher
+from quant.data.tradability import build_daily_tradability
 from quant.routine.paths import PROJECT_ROOT
 
 
@@ -139,6 +140,79 @@ def refresh_index_daily(fetcher: TushareDataFetcher, raw_dir: Path, end_date: st
     }
 
 
+def _request_frame_with_retries(
+    operation,
+    *,
+    retries: int,
+    sleep_seconds: float,
+) -> pd.DataFrame:
+    last_error: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            frame = operation()
+            return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < max(1, retries) and sleep_seconds > 0:
+                time.sleep(sleep_seconds * (attempt + 1))
+    assert last_error is not None
+    raise last_error
+
+
+def refresh_daily_tradability(
+    fetcher: TushareDataFetcher,
+    raw_dir: Path,
+    trade_date: str,
+    *,
+    stock_basic: pd.DataFrame | None = None,
+    minimum_coverage_rate: float | None = None,
+    retries: int | None = None,
+) -> dict[str, Any]:
+    """Refresh one idempotent Tushare A-share tradability partition."""
+
+    basic = (
+        stock_basic.copy()
+        if stock_basic is not None
+        else pd.read_parquet(raw_dir / "stock_basic.parquet")
+    )
+    retry_count = retries or int(os.getenv("ROUTINE_TRADABILITY_RETRIES", "3"))
+    retry_sleep = float(os.getenv("ROUTINE_TRADABILITY_RETRY_SLEEP", "0.5"))
+    limits = _request_frame_with_retries(
+        lambda: fetcher.pro.stk_limit(trade_date=trade_date),
+        retries=retry_count,
+        sleep_seconds=retry_sleep,
+    )
+    suspensions = _request_frame_with_retries(
+        lambda: fetcher.pro.suspend_d(suspend_type="S", trade_date=trade_date),
+        retries=retry_count,
+        sleep_seconds=retry_sleep,
+    )
+    st_stocks = _request_frame_with_retries(
+        lambda: fetcher.pro.stock_st(trade_date=trade_date),
+        retries=retry_count,
+        sleep_seconds=retry_sleep,
+    )
+    frame, audit = build_daily_tradability(
+        trade_date=trade_date,
+        stock_basic=basic,
+        limits=limits,
+        suspensions=suspensions,
+        st_stocks=st_stocks,
+        minimum_coverage_rate=(
+            minimum_coverage_rate
+            if minimum_coverage_rate is not None
+            else float(os.getenv("ROUTINE_TRADABILITY_MIN_COVERAGE_RATE", "0.98"))
+        ),
+    )
+    path = raw_dir / "tradability" / f"{trade_date}.parquet"
+    _atomic_write_parquet(frame, path)
+    return {
+        "status": "success",
+        **audit,
+        "path": str(path),
+    }
+
+
 def refresh_financial_periods(
     fetcher: TushareDataFetcher,
     raw_dir: Path,
@@ -201,15 +275,35 @@ def refresh_reference_data(
     fetcher = fetcher or TushareDataFetcher(cache_dir=PROJECT_ROOT / "data/cache/source_merge/tushare")
     steps: dict[str, Any] = {}
     critical_errors: list[str] = []
+    stock_basic_frame: pd.DataFrame | None = None
     for name, operation in [
         ("stock_basic", lambda: refresh_stock_basic(fetcher, raw_dir)),
         ("index_000300", lambda: refresh_index_daily(fetcher, raw_dir, end_date)),
     ]:
         try:
             steps[name] = operation()
+            if name == "stock_basic":
+                stock_basic_frame = pd.read_parquet(raw_dir / "stock_basic.parquet")
         except Exception as exc:
             steps[name] = {"status": "failed", "error": str(exc)}
             critical_errors.append(f"{name}: {exc}")
+    if stock_basic_frame is None:
+        steps["tradability"] = {
+            "status": "failed",
+            "error": "stock_basic is unavailable",
+        }
+        critical_errors.append("tradability: stock_basic is unavailable")
+    else:
+        try:
+            steps["tradability"] = refresh_daily_tradability(
+                fetcher,
+                raw_dir,
+                end_date,
+                stock_basic=stock_basic_frame,
+            )
+        except Exception as exc:
+            steps["tradability"] = {"status": "failed", "error": str(exc)}
+            critical_errors.append(f"tradability: {exc}")
     effective_state_path = state_path or raw_dir / REFERENCE_STATE_PATH.name
     financial_checkpoint_hit = (
         include_financials

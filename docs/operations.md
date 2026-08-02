@@ -103,6 +103,20 @@ find data/routine -name manifest.json -type f -print | sort | tail -1
 
 打开该 JSON，确认关键步骤 `status` 为 `success`；主动跳过的数据刷新或回测会显示 `skipped`。
 
+参考数据步骤还必须包含：
+
+- `tradability`：`data/raw/tradability/YYYYMMDD.parquet`，覆盖率不得低于配置门槛；
+- `market_regime`：`data/features/market_regime/YYYYMMDD.json` 与 `latest.json`，`as_of` 必须等于本次正式行情日期。
+
+首次启用或需要重建历史回测输入时，按本地正式日线中实际存在的交易日回填。该命令只使用 Tushare；上市、退市和暂停上市证券会合并后再按每个日期过滤，已有分区默认跳过：
+
+```bash
+PYTHONPATH=src python -m quant.routine.tradability_refresh \
+  --start 20200101 --end 20260731
+```
+
+需要覆盖重拉时显式增加 `--force`。每次回填会写入 `data/raw/source_audit/*_tradability/manifest.json`；任一日期失败时进程返回非零。大范围回填受 Tushare 权限和限频影响，先用一个月验证权限，再逐年执行。
+
 ## B1 正式模型兼容与发布
 
 正式回测使用 `models/production/b1/` 下的五个统一模型：`up5_es`、`up8_es`、`up10_es`、`down2_es`、`down3_es`。模型必须使用与 `data/features/b1/training_xgb_project_vars.parquet` 一致的统一特征定义；生产目录只保留当前发布，旧模型不再作为运行时回退。
@@ -263,11 +277,15 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔；限频时提高 |
 | `ROUTINE_DAILY_BASIC_RETRIES` | `3` | `daily_basic` 单日失败重试次数 |
 | `ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE` | `0.98` | `daily_basic` 相对当日正式行情股票数的最低覆盖率 |
+| `ROUTINE_TRADABILITY_MIN_COVERAGE_RATE` | `0.98` | `stk_limit` 对当日有效证券范围的覆盖率门禁；低于门槛不发布 |
+| `ROUTINE_TRADABILITY_RETRIES` | `3` | 可交易性三个 Tushare 接口的单日重试次数 |
+| `ROUTINE_TRADABILITY_RETRY_SLEEP` | `0.5` | 单接口线性退避的基础秒数 |
+| `ROUTINE_TRADABILITY_BACKFILL_SLEEP` | `0.5` | 历史回填不同交易日之间的等待秒数 |
+| `ROUTINE_MARKET_REGIME_LOOKBACK_DAYS` | `252` | 市场状态读取正式行情的自然日窗口；必须至少 90 |
 | `TUSHARE_STOCK_BASIC_TTL_HOURS` | `24` | `stock_basic` 请求缓存最长有效时间；同一流水线内复用，避免重复请求 |
 | `ROUTINE_FINANCIAL_PERIODS` | `4` | 每日通过 Tushare VIP 重拉的最近报告期数 |
 | `ROUTINE_FINANCIAL_SLEEP` | `0.15` | 财务 VIP 请求之间的最小间隔秒数 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 内存或 CPU 紧张时降低 |
-| `ROUTINE_MODEL_SCORE_WORKERS` | `4` | 策略模型评分 worker；Web 每日更新并行阶段上限为 4 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | CPU 密集的特征计算默认使用多进程；调试时可改为 `threads` |
 | `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量候选与 `daily_basic` 匹配率门禁；不建议调低 |
 | `B1_FEATURE_MAX_SYMBOL_ERROR_RATE` | `0.001` | B1 特征构建允许的单股异常比例；超过即失败 |
@@ -282,7 +300,7 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 
 B1-family 与 z-skill 的生产信号刷新一次读取统一行情分区，再按股票分组交给多进程计算。每日流程不自动物化逐股票因子缓存，避免数千个小文件和额外 I/O。
 
-日线和 `daily_basic` 完成后，流水线还会刷新因子参考数据：`stock_basic` 每日缓存复用并同步，沪深300按最新日期回看 10 天增量合并，`fina_indicator` / `income` / `cashflow` 通过 VIP 接口重拉最近 4 个报告期，并更新 `v44` 使用的全市场分析师一致预期快照。同一交易日重试会复用已成功的财务和分析师快照检查点。所有写入都使用业务唯一键去重和临时文件原子替换；审计位于 `data/raw/source_audit/*_reference_data/manifest.json`。
+日线和 `daily_basic` 完成后，流水线还会刷新因子参考数据：`stock_basic` 每日缓存复用并同步，沪深300按最新日期回看 10 天增量合并，`stk_limit` / `suspend_d` / `stock_st` 组成当日可交易快照，`fina_indicator` / `income` / `cashflow` 通过 VIP 接口重拉最近 4 个报告期，并更新 `v44` 使用的全市场分析师一致预期快照。随后只读本地正式行情和沪深300生成市场状态，不再访问其他行情源。同一交易日重试会复用已成功的财务和分析师快照检查点。所有写入都使用业务唯一键去重和临时文件原子替换；审计位于 `data/raw/source_audit/*_reference_data/manifest.json`。
 
 若任务在共享数据刷新之后失败，当天重试会直接复用已通过门禁的日线、`daily_basic` 和参考数据，从特征计算阶段续跑；复用前必须同时满足源清单预期交易日、本地统一行情日期和 `daily_basic` 日期一致。若核心与扩展股票池已经完成，则从下游工作区或快照阶段续跑。缺少源检查点或日期不一致时会重新执行源刷新，不从下游产物反推“源已成功”。跨日任务不会复用旧检查点。
 

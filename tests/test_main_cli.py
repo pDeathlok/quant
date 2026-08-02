@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -58,3 +59,54 @@ def test_default_backtest_loader_prefers_canonical_partitioned_store(
     assert loaded["trade_date"].tolist() == ["20260728", "20260729"]
     assert loaded["symbol"].unique().tolist() == ["920826.BJ"]
     assert source == "canonical:daily/920826.BJ"
+
+
+def test_main_uses_default_a_share_execution_policy(monkeypatch, capsys) -> None:
+    from quant.backtest import AShareExecutionConfig
+
+    captured: dict[str, object] = {}
+    data = pd.DataFrame(
+        {
+            "date": pd.date_range("2026-07-27", periods=2, freq="D"),
+            "symbol": ["000001.SZ", "000001.SZ"],
+            "close": [10.0, 10.1],
+        }
+    )
+
+    class FakeEngine:
+        def __init__(self, **kwargs: object) -> None:
+            captured["init"] = kwargs
+
+        def run(self, **kwargs: object) -> None:
+            captured["run"] = kwargs
+
+    monkeypatch.setattr(
+        main,
+        "_load_symbol_backtest_data",
+        lambda *args: (data, "test-source"),
+    )
+    monkeypatch.setattr(main, "BacktestEngine", FakeEngine)
+    monkeypatch.setattr(
+        main,
+        "STRATEGIES",
+        {"momentum": lambda: SimpleNamespace(name="MomentumStrategy")},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "backtest",
+            "--strategy",
+            "momentum",
+            "--output",
+            "report.html",
+        ],
+    )
+
+    main.main()
+
+    init_kwargs = captured["init"]
+    assert isinstance(init_kwargs, dict)
+    assert init_kwargs["execution_config"] == AShareExecutionConfig()
+    assert captured["run"] == {"report_filename": "report.html"}
+    assert "回测报告已生成" in capsys.readouterr().out

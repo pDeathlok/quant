@@ -1,23 +1,35 @@
 from typing import Dict, List, Optional, Callable
 from .broker import Broker, Order, OrderSide
 from quant.risk.manager import RiskManager
+from quant.backtest.tradability import AShareTradabilityPolicy
 
 
 class OrderManager:
-    def __init__(self, broker: Broker, risk_manager: RiskManager = None):
+    def __init__(
+        self,
+        broker: Broker,
+        risk_manager: RiskManager = None,
+        tradability_policy: AShareTradabilityPolicy | None = None,
+    ):
         self.broker = broker
         self.risk_manager = risk_manager
+        self.tradability_policy = tradability_policy
         self.pending_orders: Dict[str, Order] = {}
         self.filled_orders: Dict[str, Order] = {}
         self._order_callbacks: List[Callable] = []
+        self.last_rejection_reason: str | None = None
 
     def place_order(
         self,
         symbol: str,
         side: OrderSide,
         quantity: int,
-        price: Optional[float] = None
+        price: Optional[float] = None,
+        *,
+        trade_date: str | None = None,
+        average_daily_volume: float | None = None,
     ) -> Optional[str]:
+        self.last_rejection_reason = None
         account = self.broker.get_account()
 
         order = Order(
@@ -27,6 +39,20 @@ class OrderManager:
             price=price
         )
 
+        if self.tradability_policy is not None:
+            if trade_date is None or price is None:
+                self.last_rejection_reason = "trade_date and price are required for tradability checks"
+                return None
+            decision = self.tradability_policy.check_order(
+                trade_date=trade_date,
+                symbol=symbol,
+                side=side.value,
+                price=price,
+            )
+            if not decision.allowed:
+                self.last_rejection_reason = decision.reason
+                return None
+
         if self.risk_manager:
             positions = self.broker.get_positions()
             order_dict = {
@@ -35,8 +61,15 @@ class OrderManager:
                 "quantity": quantity,
                 "price": price or 0
             }
-            passed, msg = self.risk_manager.pre_order_check(order_dict, account["total_value"], positions)
+            passed, msg = self.risk_manager.pre_order_check(
+                order_dict,
+                account["total_value"],
+                positions,
+                total_exposure=account.get("positions_value"),
+                average_daily_volume=average_daily_volume,
+            )
             if not passed:
+                self.last_rejection_reason = msg
                 return None
 
         order_id = self.broker.send_order(order)

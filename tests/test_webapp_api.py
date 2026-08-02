@@ -1621,13 +1621,15 @@ def test_similar_pattern_refresh_updates_vector_caches(monkeypatch, tmp_path) ->
     monkeypatch.setattr(services, "build_vector_caches_parallel", fake_build)
     monkeypatch.setattr(services, "analyze_targets_by_threshold", lambda *args, **kwargs: {})
 
-    payload = services.refresh_similar_pattern_analysis()
+    payload = services.refresh_similar_pattern_analysis(force_vector_cache=True)
 
     assert calls["cache"] == 1
     assert payload["cache"]["rebuilt"] == 1
     assert payload["cache"]["reused"] == 1
     assert payload["cache"]["reference_library_policy"] == "weekly"
     assert payload["cache"]["reference_library_refreshed"] is True
+    assert payload["cache"]["reference_library_reason"] == "forced"
+    assert payload["cache"]["reference_library_minimum_refresh_age_days"] == 5
     assert payload["cache"]["target_vectors"] == "live_from_latest_daily_data"
 
 
@@ -1684,6 +1686,7 @@ def test_similar_pattern_refresh_reuses_current_weekly_library_but_analyzes_live
         "waiting_for_friday_close",
         "waiting_for_friday_trade_close",
         "friday_close_window_already_refreshed",
+        "minimum_refresh_age_not_reached",
     }
     assert payload["cache"]["reused"] == 1
 
@@ -1798,7 +1801,7 @@ def test_similar_pattern_weekly_library_becomes_due_on_friday_after_close(
     state_dir.mkdir(parents=True)
     (state_dir / "000001_SZ.npz").write_bytes(b"cache")
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
-        json.dumps({"refreshed_at": "2026-07-20T20:25:57", "cached_files": 1}),
+        json.dumps({"refreshed_at": "2026-07-19T15:01:00", "cached_files": 1}),
         encoding="utf-8",
     )
 
@@ -1809,6 +1812,31 @@ def test_similar_pattern_weekly_library_becomes_due_on_friday_after_close(
 
     assert decision["due"] is True
     assert decision["reason"] == "friday_close_window"
+    assert decision["refresh_age_days"] == 5
+    assert decision["minimum_refresh_age_days"] == 5
+
+
+def test_similar_pattern_weekly_library_waits_until_minimum_age_on_friday(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps({"refreshed_at": "2026-07-20T20:25:57", "cached_files": 1}),
+        encoding="utf-8",
+    )
+
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 24, 15, 1, 0),
+        source_trade_date="2026-07-24",
+    )
+
+    assert decision["due"] is False
+    assert decision["reason"] == "minimum_refresh_age_not_reached"
+    assert decision["refresh_age_days"] < 5
 
 
 def test_similar_pattern_weekly_library_waits_when_friday_is_not_trade_date(
@@ -1820,7 +1848,7 @@ def test_similar_pattern_weekly_library_waits_when_friday_is_not_trade_date(
     state_dir.mkdir(parents=True)
     (state_dir / "000001_SZ.npz").write_bytes(b"cache")
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
-        json.dumps({"refreshed_at": "2026-07-20T20:25:57", "cached_files": 1}),
+        json.dumps({"refreshed_at": "2026-07-18T15:01:00", "cached_files": 1}),
         encoding="utf-8",
     )
 
@@ -1847,7 +1875,8 @@ def test_similar_pattern_weekly_library_does_not_rebuild_twice_in_friday_window(
     )
 
     decision = services._similar_pattern_vector_cache_refresh_decision(
-        now=datetime(2026, 7, 24, 16, 0, 0)
+        now=datetime(2026, 7, 24, 16, 0, 0),
+        source_trade_date="2026-07-24",
     )
 
     assert decision["due"] is False
@@ -1863,7 +1892,7 @@ def test_similar_pattern_weekly_library_rebuilds_when_cache_count_changes(monkey
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps(
             {
-                "refreshed_at": datetime.now().isoformat(timespec="seconds"),
+                "refreshed_at": "2026-07-17T15:01:00",
                 "cached_files": 2,
                 "errors": 0,
             }
@@ -1871,10 +1900,41 @@ def test_similar_pattern_weekly_library_rebuilds_when_cache_count_changes(monkey
         encoding="utf-8",
     )
 
-    decision = services._similar_pattern_vector_cache_refresh_decision()
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 24, 15, 1, 0),
+        source_trade_date="2026-07-24",
+    )
 
     assert decision["due"] is True
     assert decision["reason"] == "cache_file_count_changed"
+
+
+def test_similar_pattern_cache_repair_waits_for_minimum_refresh_age(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps(
+            {
+                "refreshed_at": "2026-07-23T15:01:00",
+                "cached_files": 2,
+                "errors": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 24, 15, 1, 0),
+        source_trade_date="2026-07-24",
+    )
+
+    assert decision["due"] is False
+    assert decision["reason"] == "minimum_refresh_age_not_reached"
 
 
 def test_similar_pattern_weekly_library_does_not_advance_watermark_on_build_errors(
@@ -1898,7 +1958,7 @@ def test_similar_pattern_weekly_library_does_not_advance_watermark_on_build_erro
     )
 
     with pytest.raises(RuntimeError, match="errors=1.*000002.SZ: bad source"):
-        services.refresh_similar_pattern_analysis()
+        services.refresh_similar_pattern_analysis(force_vector_cache=True)
 
     metadata_path = (
         services._similar_pattern_vector_cache_state_dir()
@@ -2079,12 +2139,13 @@ def test_watchlist_notes_are_saved_without_recalculating_scores(monkeypatch, tmp
     assert "回踩 20 日线" in persisted
 
 
-def test_strategy_add_appends_source_note_without_overwriting_or_duplication(monkeypatch, tmp_path) -> None:
+def test_strategy_add_duplicate_preserves_existing_note(monkeypatch, tmp_path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
-    watchlist_path.write_text(
-        '{"symbols":["002594.SZ"],"notes":{"002594.SZ":{"content":"手工计划：回踩观察","updated_at":"2026-07-16T20:00:00"}}}',
-        encoding="utf-8",
+    original = (
+        '{"symbols":["002594.SZ"],"notes":{"002594.SZ":'
+        '{"content":"手工计划：回踩观察","updated_at":"2026-07-16T20:00:00"}}}'
     )
+    watchlist_path.write_text(original, encoding="utf-8")
     monkeypatch.setattr(services, "SIMILAR_PATTERN_WATCHLIST_PATH", watchlist_path)
     monkeypatch.setattr(services, "_normalize_watch_symbol", lambda symbol: str(symbol).upper())
     monkeypatch.setattr(
@@ -2095,12 +2156,16 @@ def test_strategy_add_appends_source_note_without_overwriting_or_duplication(mon
         ),
     )
 
-    services.add_similar_pattern_watch_symbol("002594.SZ", note="7.17 触发 B1 策略")
     payload = services.add_similar_pattern_watch_symbol("002594.SZ", note="7.17 触发 B1 策略")
 
     note = payload["stocks"][0]["note"]
-    assert note == "手工计划：回踩观察\n7.17 触发 B1 策略"
-    assert note.count("7.17 触发 B1 策略") == 1
+    persisted = json.loads(watchlist_path.read_text(encoding="utf-8"))
+    assert note == "手工计划：回踩观察"
+    assert watchlist_path.read_text(encoding="utf-8") == original
+    assert persisted["notes"]["002594.SZ"] == {
+        "content": "手工计划：回踩观察",
+        "updated_at": "2026-07-16T20:00:00",
+    }
 
 
 def test_watchlist_add_returns_without_calculating_scores(monkeypatch, tmp_path) -> None:

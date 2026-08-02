@@ -10,6 +10,10 @@
 flowchart LR
     TS[Tushare] --> DR[日线与基础数据刷新]
     DR --> STORE[(MySQL / Parquet)]
+    TS --> TRAD[每日可交易快照]
+    STORE --> REGIME[市场状态]
+    TRAD --> GATE[订单门禁]
+    REGIME --> FEAT
     STORE --> FEAT[特征与规则信号]
     FEAT --> SCORE[模型评分与短线候选]
     SCORE --> WS[7 个策略工作区]
@@ -21,7 +25,8 @@ flowchart LR
 | 层 | 主要目录 | 责任 |
 | --- | --- | --- |
 | 数据 | `src/quant/data/` | Tushare 接入、字段标准化、MySQL/Parquet 读写 |
-| 特征 | `src/quant/features/` | 市场情绪、项目变量和特征合并 |
+| 特征 | `src/quant/features/` | 市场情绪、市场状态、项目变量和特征合并 |
+| 组合与风险 | `src/quant/portfolio/`、`src/quant/risk/` | 目标权重、订单、集中度、尾部风险、压力与容量 |
 | 策略 | `src/quant/strategies/` | 可复用的选股、交易和可转债规则 |
 | 例行任务 | `src/quant/routine/` | 增量刷新、模型评分、工作区编排和 manifest |
 | 应用 | `src/quant/application/`、`src/quant/webapp/`、`web/` | 应用用例、API、刷新状态和页面交互 |
@@ -84,7 +89,9 @@ python scripts/run_daily_web_refresh.py
 
 ```mermaid
 flowchart TD
-    A[刷新共享日线与参考数据] --> B1[构建 B1 特征缓存]
+    A[刷新共享日线与参考数据] --> T[可交易快照]
+    T --> R[市场状态快照]
+    R --> B1[构建 B1 特征缓存]
     B1 --> B2[重建全市场规则信号]
     A --> W3[提前刷新可转债]
     A --> W4[提前刷新配债股]
@@ -132,6 +139,33 @@ flowchart TD
 
 页面上的“更新全部”走后台刷新任务；单页按钮使用对应作用域或专用刷新接口。配债股和相似走势还会检查缓存日期，缓存不是当天时首次打开自动补刷。
 
+## 回测输出边界
+
+本地事件驱动回测保留两层输出：
+
+- `BacktestEngine.run()` 返回 akquant 原始结果，用于兼容底层报告和已有策略代码。
+- `BacktestEngine.artifacts` 返回项目自有 `BacktestArtifacts`，供研究脚本、绩效分析、组合构建和后续 Web 展示使用。
+
+稳定契约包含日频净值、收益、持仓、订单、成交、交易、成本和可选基准收益。成本台账不从成交价差推测滑点；底层没有提供的成本分项显式记为 0。绩效层将收益期数与交易笔数分开：期间正收益比例不等同于逐笔交易胜率。
+
+后续接入组合优化或其他回测引擎时，应新增适配器产出同一契约，不在上层代码中判断底层结果类型。
+
+### A 股执行策略边界
+
+- `AShareExecutionConfig` 是项目自有、经过校验的执行口径；佣金、税费、最低佣金、整手、T+1 和成交量参与率不由外部回测库的默认值决定。
+- `BacktestEngine` 只在调用 akquant 的边界把项目配置翻译为底层参数，并把原始结果适配成 `BacktestArtifacts`；策略、绩效分析和后续组合层不得依赖 akquant 字段。
+- CLI 默认启用 A 股执行配置；保留未传 `execution_config` 的兼容路径，供既有测试和非 A 股研究使用。
+- `reference_data_refresh` 每日生成 Tushare point-in-time 可交易分区，覆盖涨跌停价、停牌、ST、上市和退市日期；覆盖率不足会阻断下游。
+- `AShareTradabilityPolicy` 是项目订单门禁，由 `OrderManager` 和 `SimulatedBroker` 强制执行。原始 akquant 当前只暴露未稳定的自定义 matcher 协议，因此 `BacktestEngine.check_order()` 提供显式门禁，不能声称底层撮合已自动执行。
+- `SimulatedBroker` 执行相同税费、整手、T+1 和容量限制，并持久化账户状态；`reconcile_account` 负责日终现金与持仓差异。
+
+## 系统化研究与组合边界
+
+- `portfolio` 提供等权、评分、逆波动和最小方差目标权重，以及行业、单股、换手、现金和整手订单约束。
+- `research.validation` 提供 purge/embargo Walk-Forward，训练和测试时间边界不可重叠；`research.manifest` 固化输入哈希、参数、样本、随机种子、代码和环境。
+- `analysis` 提供统一绩效、因子 IC/RankIC/分组收益/换手、行业和 Brinson 归因；`write_backtest_report` 发布完整报告包。
+- `risk` 提供集中度、行业暴露、历史 VaR/CVaR、压力损失和按 ADV 估算的变现天数；研究指标与送单前硬限制分层实现。
+
 ## 存储与缓存
 
 ### 行情存储
@@ -165,7 +199,9 @@ flowchart TD
 
 ## 关键设计约束
 
-- 生产行情口径以 Tushare 为准；适配层只转换字段，不混用数据源。
+- 业务层优先复用 `MarketDataStore`、`TushareDataFetcher` 和既有标准化函数，不重复创建 Token、缓存、存储或代码映射体系。
+- 生产行情口径以 Tushare 为准；适配层只转换字段，不混用数据源。Tushare 没有等价字段时，其他来源必须通过独立适配器接入，并显式记录来源、口径、时点和降级原因。
+- 外部回测库和外部数据源都是可替换适配器；项目自有契约、执行规则和领域逻辑不得以外部库默认行为作为事实来源。
 - 每日任务应可重复执行；同日期产物采用覆盖、替换或稳定快照键，不做无界追加。
 - Web 请求不应承担完整历史训练；训练和大规模回测留在研究脚本中。
 - 策略配置、实现、测试和策略档案必须同步变更。

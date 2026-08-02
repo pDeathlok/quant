@@ -7,8 +7,10 @@ Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、
 ## 能力概览
 
 - 增量刷新 Tushare 日线数据；MySQL 使用统一 `market_daily` 表，Parquet 使用年月分区镜像。
-- 每日同步 `daily_basic`、`stock_basic`、沪深300及最近报告期财务数据，保证短线和长线因子的原始输入新鲜度。
+- 每日同步 `daily_basic`、`stock_basic`、沪深300、最近报告期财务数据，以及涨跌停、停牌、ST 的当日可交易快照。
+- 复用正式日线生成每日 `risk_on/neutral/risk_off` 市场状态；无需接入第二套行情源。
 - 构建 B1/B2/B3 与扩展策略特征、模型评分和每日候选池。
+- 提供组合构建、防泄漏 Walk-Forward、因子诊断、绩效归因、风险容量、标准报告和可持久化模拟交易能力。
 - 在一个 FastAPI + 静态前端工作台中查看 7 类策略结果。
 - 按日期保存选股器和工作区快照，支持历史复盘。
 - 每日流水线采用有依赖的并行编排，单个非核心工作区失败不会阻断其他工作区。
@@ -58,10 +60,11 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 
 1. 获取跨进程单实例锁，并用交易日历确认当天是否执行。
 2. 复用健康的 Web 服务，通过 API 启动与页面“更新全部”一致的任务。
-3. 按保留策略清理缓存，再串行刷新共享 Tushare 行情与参考数据。
-4. 串行构建特征缓存和规则信号缓存，避免两套进程池争抢 CPU、内存与磁盘带宽。
-5. 共享数据就绪后先并行启动可转债、配债股和 BYD 做T；特征与规则信号完成后，并行生成每日计划、Dashboard、模型评分与缠论评分，再计算短线股票池和剩余工作区。
-6. 原子发布正式文件，并将步骤状态、起止时间、耗时和结果写入 `data/routine/<运行时间>_<run_id>/manifest.json`。
+3. 按保留策略清理缓存，再串行刷新共享 Tushare 行情、`daily_basic`、参考数据和当日可交易快照。
+4. 使用截至当日的沪深300、全市场宽度、波动率和成交额生成市场状态日期快照与 `latest.json`。
+5. 串行构建特征缓存和规则信号缓存，避免两套进程池争抢 CPU、内存与磁盘带宽。
+6. 共享数据就绪后先并行启动可转债、配债股和 BYD 做T；特征与规则信号完成后，并行生成每日计划、Dashboard、模型评分与缠论评分，再计算短线股票池和剩余工作区。
+7. 原子发布正式文件，并将步骤状态、起止时间、耗时和结果写入 `data/routine/<运行时间>_<run_id>/manifest.json`。
 
 短线策略由主流水线生成，因此这套流程覆盖全部 7 个 Tab。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述统一入口。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
 
@@ -86,6 +89,9 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日刷新的并发数 |
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔，单位秒 |
 | `ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE` | `0.98` | `daily_basic` 相对当日正式行情股票数的最低覆盖率 |
+| `ROUTINE_TRADABILITY_MIN_COVERAGE_RATE` | `0.98` | `stk_limit` 相对当日有效证券范围的最低覆盖率；低于阈值阻断下游 |
+| `ROUTINE_TRADABILITY_RETRIES` | `3` | 涨跌停、停牌和 ST 接口的单日重试次数 |
+| `ROUTINE_MARKET_REGIME_LOOKBACK_DAYS` | `252` | 每日市场状态读取正式行情的自然日回看窗口，最小 90 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
 | `ROUTINE_MODEL_SCORE_WORKERS` | `4` | Web 每日更新中策略模型评分的 worker 数；与缠论评分并行时上限为 4 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | 特征计算执行器；CPU 密集计算默认使用多进程 |
@@ -108,6 +114,10 @@ PYTHONPATH=src python -m quant.routine.cli daily --skip-backtest
 PYTHONPATH=src python -m quant.routine.cli plan
 PYTHONPATH=src python -m quant.routine.cli dashboard
 
+# 首次启用时按正式日线中的交易日回填历史可交易快照；已有日期默认跳过
+PYTHONPATH=src python -m quant.routine.tradability_refresh \
+  --start 20200101 --end 20260731
+
 # 本地事件驱动回测
 PYTHONPATH=src python main.py backtest --strategy momentum --symbol 600000 \
   --start-date 20200101 --end-date 20231231
@@ -117,6 +127,29 @@ PYTHONPATH=src pytest -q
 PYTHONPATH=src python -m compileall -q src tests scripts
 ruff check src tests
 ```
+
+## 回测结果契约
+
+`BacktestEngine.run()` 继续返回 akquant 原始结果，兼容已有策略和报告生成；新的应用、研究脚本与组合层应优先读取 `engine.artifacts`。`BacktestArtifacts` 固定提供：
+
+- 日频净值与收益序列；
+- 持仓、订单、成交和已平仓交易表；
+- 佣金、印花税、过户费、滑点成本和总成本台账；
+- 可选的基准收益与初始资金元数据。
+
+`engine.get_metrics()` 从稳定契约计算统一指标。`period_count` 和 `positive_period_rate` 描述收益期数；`trade_count` 只统计交易表中的真实交易笔数，两种口径不能混用。底层引擎升级时，应只调整 `quant.backtest.artifacts` 的适配逻辑，不让工作区直接依赖 akquant 的具体字段。
+
+`write_backtest_report()` 可将上述契约一次写成净值、收益、持仓、订单、成交、交易、成本、指标 JSON、自包含 HTML 和 `research_manifest.json`。研究清单记录数据/代码 SHA-256、参数、样本期、随机种子、Git 状态与依赖版本。
+
+## A 股执行口径
+
+CLI 本地回测默认使用项目自有 `AShareExecutionConfig`：佣金率 `0.03%`、卖出印花税 `0.05%`、双向过户费 `0.001%`、最低佣金 5 元、100 股整手、T+1，以及单根行情最多成交 10% 成交量。佣金和最低佣金是研究假设，可按真实账户覆盖；完整配置会写入 `engine.artifacts.metadata["execution_policy"]`，便于复现。
+
+执行规则由本项目定义和校验，akquant 仅作为当前底层成交适配器。每日流程用 Tushare `stk_limit`、`suspend_d`、`stock_st` 和 `stock_basic` 生成 `data/raw/tradability/YYYYMMDD.parquet`；`AShareTradabilityPolicy` 在项目订单门禁和模拟券商中拒绝缺失数据、停牌、涨停买入、跌停卖出及上市前订单。由于 akquant 当前没有稳定的自定义撮合返回协议，原始 akquant 撮合仍只负责兼容回测，不能被当作这套门禁已经自动执行。
+
+`SimulatedBroker` 复用相同执行配置和门禁，执行最低佣金、双向过户费、卖出印花税、整手、T+1 与成交量参与率，并用注入的最新价估值；持仓、订单、成交和当日可卖数量可以原子持久化，日终通过 `reconcile_account()` 对账。
+
+数据接入遵循“项目能力优先、Tushare-first、显式降级”：业务层先读 `MarketDataStore` 的统一正式数据；缺失时由现有 `TushareDataFetcher` 和刷新流程补齐。仅当 Tushare 确实不提供所需字段时，才允许新增其他来源的独立适配器，并记录来源、字段口径、更新时间和降级原因，禁止静默拼接不同来源的同名字段。
 
 ## 项目结构
 
