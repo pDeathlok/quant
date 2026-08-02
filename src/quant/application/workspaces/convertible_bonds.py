@@ -81,7 +81,7 @@ def build_convertible_bond_grid_workspace(
         payload["data_refresh"] = refresh_result
     dependencies.write_snapshot(
         "convertible_bond_grid_plan",
-        payload.get("trade_date") or trade_date,
+        trade_date or payload.get("trade_date"),
         payload,
         params=params,
         write_sql=refresh,

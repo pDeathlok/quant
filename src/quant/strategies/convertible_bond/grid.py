@@ -510,17 +510,20 @@ def add_low_position_features(daily: pd.DataFrame, window: int = 252) -> pd.Data
     if "bond_over_rate" in frame.columns and "premium_rate" not in frame.columns:
         frame["premium_rate"] = pd.to_numeric(frame["bond_over_rate"], errors="coerce")
     if "premium_rate" in frame.columns:
-        frame["double_low"] = frame["close"] + pd.to_numeric(frame["premium_rate"], errors="coerce").fillna(0.0)
+        premium = pd.to_numeric(frame["premium_rate"], errors="coerce")
+        frame["premium_rate"] = premium
+        frame["premium_rate_available"] = premium.notna()
+        frame["double_low"] = frame["close"] + premium
     return frame
 
 
 def add_market_state_features(daily: pd.DataFrame, window: int = 252) -> pd.DataFrame:
     frame = daily.copy()
     if "double_low" not in frame.columns:
-        premium = pd.to_numeric(
-            frame.get("premium_rate", frame.get("bond_over_rate", 0.0)),
-            errors="coerce",
-        ).fillna(0.0)
+        premium_source = frame.get("premium_rate")
+        if premium_source is None:
+            premium_source = frame.get("bond_over_rate", pd.Series(np.nan, index=frame.index))
+        premium = pd.to_numeric(premium_source, errors="coerce")
         frame["double_low"] = frame["close"] + premium
     market = (
         frame.groupby("trade_date")

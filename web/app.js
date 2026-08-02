@@ -1022,11 +1022,19 @@ function similarProbabilitySourceLabel(source) {
     nonlinear: "非线性权重",
     regime_industry: "市场/行业状态权重",
     recency: "时间衰减",
-    full_weighting: "完整组合权重",
-    optimized: "完整组合权重",
+    full_weighting: "个股优化样本",
+    optimized: "个股优化样本",
     calibrated: "全池滚动校准",
   };
   return labels[source] || source || "统一策略";
+}
+
+function similarProbabilityPolicyLabel(row) {
+  const reason = row?.probability_policy_reason;
+  if (reason === "symbol_out_of_validation_scope") return "未跨股验证，已回退个股样本";
+  if (reason === "calibration_information_collapse") return "校准失真，已回退个股样本";
+  if (reason === "cached_variant_unavailable") return "缓存缺少模型分支，已回退个股样本";
+  return similarProbabilitySourceLabel(row?.probability_source);
 }
 
 function watchlistStrategyHits(item) {
@@ -1231,12 +1239,12 @@ function renderSimilarPatternsPage() {
         </td>
         <td class="similar-decision-cell">
           <strong class="similar-signal-${nextDayDecision.signal || "observe"}">${similarSignalLabel(nextDayDecision.signal)}</strong>
-          <span>上涨概率 ${fmtPct(nextDay.selected_up_probability ?? nextDay.calibrated_up_probability ?? nextDay.up_probability)}</span>
+          <span>上涨概率 ${fmtPct(nextDay.selected_up_probability ?? nextDay.calibrated_up_probability ?? nextDay.up_probability)} · ${similarProbabilityPolicyLabel(nextDay)}</span>
           <em>${result?.optimization_summary?.effective_sample_size ?? result?.scan_summary?.matched_cases ?? "-"} 个有效样本</em>
         </td>
         <td class="similar-medium-cell">
           <strong>${fmtPct(nextMonth.selected_up_probability ?? nextMonth.calibrated_up_probability ?? nextMonth.up_probability)}</strong>
-          <span>1月上涨概率</span>
+          <span>1月上涨概率 · ${similarProbabilityPolicyLabel(nextMonth)}</span>
           <em>收益中位 ${fmtPct(nextMonth.median)}</em>
         </td>
         <td class="similar-note-cell">
@@ -1299,7 +1307,7 @@ function renderSimilarPatternsPage() {
             const rowDecision = similarDecision(item, row.horizon);
             return `
             <div class="similar-forecast-row">
-              <span>${similarForecastLabel(row.horizon)} 选择上涨 ${fmtPct(row.selected_up_probability ?? row.calibrated_up_probability ?? row.up_probability)} · ${similarProbabilitySourceLabel(row.probability_source)}</span>
+              <span>${similarForecastLabel(row.horizon)} 选择上涨 ${fmtPct(row.selected_up_probability ?? row.calibrated_up_probability ?? row.up_probability)} · ${similarProbabilityPolicyLabel(row)}</span>
               <strong>${rowDecision.bearish_max ?? "-"}/${rowDecision.bullish_min ?? "-"} · 中位 ${fmtPct(row.median)}</strong>
             </div>
           `}).join("")}
@@ -1450,7 +1458,9 @@ async function loadConvertibleBondPlan(options = {}) {
   query.set("limit", "18");
   if (options.refresh) query.set("refresh", "true");
   try {
-    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`, workspaceRequestOptions(options));
+    const requestOptions = workspaceRequestOptions(options);
+    if (!options.refresh) requestOptions.timeoutMs = 60000;
+    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`, requestOptions);
     const plans = state.cbPayload.strategy_plans || [];
     if (!state.selectedCbStrategy && plans.length) {
       state.selectedCbStrategy = "all";
@@ -2012,13 +2022,13 @@ function renderStockRows() {
       <td>${fmtPrice(item.close)}</td>
       <td>${item.matched_count}</td>
       <td>${item.matched_families.map((family) => `<span class="tag">${family}</span>`).join("")}</td>
-      <td>
+      <td title="评分数据 ${item.score_date || item.date || "-"} · ${item.score_feature_source === "live_daily" ? "当日日线特征" : "历史模型特征"}">
         <span class="score-stack">
           <strong>${Number(item.opportunity_score ?? item.selector_score ?? 0).toFixed(1)}</strong>
           <em>${item.score_band || ""} ${item.score_percentile_label || ""}</em>
         </span>
       </td>
-      <td>
+      <td title="评分数据 ${item.score_date || item.date || "-"} · ${item.score_feature_source === "live_daily" ? "当日日线特征" : "历史模型特征"}">
         <span class="score-stack">
           <strong>${Number(item.holding_score ?? 0).toFixed(1)}</strong>
           <em>${item.score_risk_note || ""}</em>
@@ -2375,7 +2385,11 @@ function renderConvertibleBondPage() {
   const snapshotNote = rootPayload.cache?.stale
     ? ` · 最近可用快照 ${rootPayload.cache.snapshot_date || payload.trade_date || rootPayload.trade_date}`
     : "";
-  meta.textContent = `${strategyName} · 信号日 ${payload.trade_date || rootPayload.trade_date} · ${market.entry_permission || "-"}${snapshotNote}`;
+  const quality = rootPayload.data_quality || {};
+  const qualityNote = quality.stale
+    ? ` · 最新溢价缺失，已回退 ${quality.resolved_trade_date || payload.trade_date || rootPayload.trade_date}`
+    : "";
+  meta.textContent = `${strategyName} · 信号日 ${payload.trade_date || rootPayload.trade_date} · ${market.entry_permission || "-"}${snapshotNote}${qualityNote}`;
   metrics.innerHTML = `
     <div><span>去重候选</span><strong>${candidates.length} 只</strong></div>
     <div><span>当前策略</span><strong>${activeStrategyKey === "all" ? `${plans.length} 套` : (payload.strategy?.name || "-")}</strong></div>

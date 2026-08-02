@@ -29,6 +29,7 @@ CB_BASIC_PATH = CB_DATA_DIR / "cb_basic_all.parquet"
 CB_CALL_PATH = CB_DATA_DIR / "cb_call_20180101_20260616.parquet"
 ITERATION_SUMMARY_PATH = PROJECT_ROOT / "reports/convertible_bond/ladder_grid_iteration/iteration_summary.csv"
 GRID_TREND_OVERLAY_SUMMARY_PATH = PROJECT_ROOT / "reports/convertible_bond/grid_trend_overlay/iteration_summary.csv"
+CB_PREMIUM_MIN_COVERAGE = 0.90
 
 
 def default_convertible_bond_grid_config() -> HoldingGridConfig:
@@ -314,7 +315,7 @@ def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     ]
 
 
-def _resolve_trade_date(daily: pd.DataFrame, trade_date: str | None) -> str:
+def _requested_trade_date(daily: pd.DataFrame, trade_date: str | None) -> str:
     dates = daily["trade_date"].dropna().astype(str).sort_values().unique().tolist()
     if not dates:
         raise ValueError("No convertible-bond daily data available")
@@ -325,6 +326,33 @@ def _resolve_trade_date(daily: pd.DataFrame, trade_date: str | None) -> str:
     if not eligible:
         raise ValueError(f"No convertible-bond data before {trade_date}")
     return eligible[-1]
+
+
+def _premium_coverage_for_date(daily: pd.DataFrame, trade_date: str) -> float:
+    premium_column = "premium_rate" if "premium_rate" in daily.columns else "bond_over_rate"
+    if premium_column not in daily.columns:
+        return 0.0
+    day = daily[daily["trade_date"].astype(str).eq(str(trade_date))]
+    close = pd.to_numeric(day.get("close"), errors="coerce")
+    premium = pd.to_numeric(day[premium_column], errors="coerce")
+    eligible = close.notna()
+    total = int(eligible.sum())
+    return 0.0 if total == 0 else float((premium.notna() & eligible).sum() / total)
+
+
+def _resolve_trade_date(daily: pd.DataFrame, trade_date: str | None) -> str:
+    requested = _requested_trade_date(daily, trade_date)
+    dates = daily["trade_date"].dropna().astype(str).sort_values().unique().tolist()
+    usable = [
+        item
+        for item in dates
+        if item <= requested and _premium_coverage_for_date(daily, item) >= CB_PREMIUM_MIN_COVERAGE
+    ]
+    if not usable:
+        raise ValueError(
+            f"No convertible-bond data with at least {CB_PREMIUM_MIN_COVERAGE:.0%} premium coverage before {requested}"
+        )
+    return usable[-1]
 
 
 def _normalize_trade_date(value: str | int | pd.Timestamp) -> str:
@@ -686,7 +714,9 @@ def build_convertible_bond_grid_plan(
     daily = pd.read_parquet(CB_DAILY_PATH)
     basic = pd.read_parquet(CB_BASIC_PATH)
     call = pd.read_parquet(CB_CALL_PATH) if CB_CALL_PATH.exists() else pd.DataFrame()
+    requested_trade_date = _requested_trade_date(daily, trade_date)
     resolved_trade_date = _resolve_trade_date(daily, trade_date)
+    premium_coverage = _premium_coverage_for_date(daily, resolved_trade_date)
 
     daily = daily[daily["trade_date"].astype(str) <= resolved_trade_date].copy()
     featured = add_trend_enhanced_features(add_market_state_features(add_low_position_features(daily)))
@@ -717,6 +747,19 @@ def build_convertible_bond_grid_plan(
     payload = dict(primary)
     payload["generated_at"] = datetime.now().isoformat(timespec="seconds")
     payload["trade_date"] = resolved_trade_date
+    payload["data_quality"] = {
+        "status": "success",
+        "requested_trade_date": requested_trade_date,
+        "resolved_trade_date": resolved_trade_date,
+        "premium_coverage": round(premium_coverage, 6),
+        "minimum_premium_coverage": CB_PREMIUM_MIN_COVERAGE,
+        "stale": requested_trade_date != resolved_trade_date,
+        "reason": (
+            "latest_trade_date_missing_premium_data"
+            if requested_trade_date != resolved_trade_date
+            else "complete"
+        ),
+    }
     payload["strategy_plans"] = plans
     payload["strategy_pool"] = [
         {

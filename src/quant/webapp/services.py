@@ -300,6 +300,7 @@ SIMILAR_PATTERN_WATCHLIST_PATH = SIMILAR_PATTERN_STATE_DIR / "watchlist.json"
 SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analysis.json"
 SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
 SIMILAR_PATTERN_VALIDATION_PATH = PROJECT_ROOT / "reports/similar_patterns/validation_2025/calibration.json"
+SIMILAR_PATTERN_CALIBRATION_MAX_FLAT_SPAN = 15.0
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS = 7
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY = 4  # Friday
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR = 15
@@ -2971,6 +2972,143 @@ def _read_similar_pattern_validation() -> dict[str, Any]:
         return {}
 
 
+def _similar_pattern_validated_symbols(validation: dict[str, Any]) -> set[str]:
+    targets = {
+        str(symbol).upper()
+        for symbol in validation.get("targets") or []
+        if str(symbol).strip()
+    }
+    if targets:
+        return targets
+    targets.update(
+        str(item.get("symbol") or "").upper()
+        for item in validation.get("summary") or []
+        if isinstance(item, dict) and item.get("symbol")
+    )
+    model_selection = validation.get("model_selection") or {}
+    for horizon_policy in model_selection.values():
+        selected = (horizon_policy or {}).get("selected") or {}
+        targets.update(str(symbol).upper() for symbol in (selected.get("by_symbol") or {}))
+    return targets
+
+
+def _calibration_max_flat_span(calibration: dict[str, Any] | None) -> float:
+    if not calibration:
+        return 0.0
+    x_values = np.asarray(calibration.get("x") or [], dtype=float)
+    y_values = np.asarray(calibration.get("y") or [], dtype=float)
+    if len(x_values) != len(y_values) or len(x_values) < 2:
+        return 0.0
+    max_span = 0.0
+    start = 0
+    for index in range(1, len(y_values) + 1):
+        if index < len(y_values) and np.isclose(y_values[index], y_values[index - 1], atol=1e-6):
+            continue
+        if index - start >= 2:
+            max_span = max(max_span, float(x_values[index - 1] - x_values[start]))
+        start = index
+    return round(max_span, 4)
+
+
+def _similar_pattern_probability_policy(
+    validation: dict[str, Any],
+    symbol: str,
+    horizon: str,
+) -> dict[str, Any]:
+    model_selection = validation.get("model_selection") or {}
+    selected = dict(((model_selection.get(horizon) or {}).get("selected") or {}))
+    source = str(selected.get("source") or "optimized")
+    validated_symbols = _similar_pattern_validated_symbols(validation)
+    normalized_symbol = str(symbol).upper()
+    reason = "validated_policy"
+    applicable = not validated_symbols or normalized_symbol in validated_symbols
+    if not applicable:
+        source = "optimized"
+        reason = "symbol_out_of_validation_scope"
+    elif source == "calibrated":
+        calibration = (validation.get("calibrations") or {}).get(horizon)
+        flat_span = _calibration_max_flat_span(calibration)
+        if flat_span > SIMILAR_PATTERN_CALIBRATION_MAX_FLAT_SPAN:
+            source = "optimized"
+            reason = "calibration_information_collapse"
+        selected["calibration_max_flat_span"] = flat_span
+    selected.update(
+        {
+            "source": source,
+            "applicable": applicable,
+            "reason": reason,
+            "validated_symbols": sorted(validated_symbols),
+        }
+    )
+    selected.setdefault("bearish_max", SIMILAR_PATTERN_CONFIG.signal_bearish_max)
+    selected.setdefault("bullish_min", SIMILAR_PATTERN_CONFIG.signal_bullish_min)
+    selected.setdefault("enable_risk_gate", SIMILAR_PATTERN_CONFIG.enable_risk_gate)
+    if reason != "validated_policy":
+        selected.update(
+            {
+                "bearish_max": SIMILAR_PATTERN_CONFIG.signal_bearish_max,
+                "bullish_min": SIMILAR_PATTERN_CONFIG.signal_bullish_min,
+                "enable_risk_gate": SIMILAR_PATTERN_CONFIG.enable_risk_gate,
+            }
+        )
+    return selected
+
+
+def _upgrade_cached_similar_pattern_probability_policy(payload: dict[str, Any]) -> dict[str, Any]:
+    validation = _read_similar_pattern_validation()
+    for result in payload.get("results") or []:
+        symbol = str((result.get("target") or {}).get("symbol") or "").upper()
+        raw_by_horizon = {
+            str(row.get("horizon")): row.get("up_probability")
+            for row in result.get("forecast") or []
+        }
+        decisions_by_horizon = {
+            str(row.get("horizon")): row
+            for row in result.get("decisions") or []
+        }
+        for row in result.get("optimized_forecast") or []:
+            horizon = str(row.get("horizon") or "")
+            policy = _similar_pattern_probability_policy(validation, symbol, horizon)
+            source = str(policy.get("source") or "optimized")
+            if source in {"optimized", "full_weighting"}:
+                selected_probability = row.get("up_probability")
+            elif source == "raw_baseline":
+                selected_probability = raw_by_horizon.get(horizon)
+            elif source == "calibrated":
+                selected_probability = row.get("calibrated_up_probability")
+            elif row.get("probability_source") == source:
+                selected_probability = row.get("selected_up_probability")
+            else:
+                source = "optimized"
+                selected_probability = row.get("up_probability")
+                policy["reason"] = "cached_variant_unavailable"
+            row["selected_up_probability"] = selected_probability
+            row["probability_source"] = source
+            row["probability_policy_reason"] = policy.get("reason")
+            decision_config = replace(
+                SIMILAR_PATTERN_CONFIG,
+                signal_bearish_max=float(policy["bearish_max"]),
+                signal_bullish_min=float(policy["bullish_min"]),
+                enable_risk_gate=bool(policy["enable_risk_gate"]),
+            )
+            decision = classify_forecast_signal(
+                selected_probability,
+                result.get("latest_snapshot") or {},
+                str(result.get("market_regime") or "neutral"),
+                decision_config,
+            )
+            decision.update(
+                {
+                    "horizon": horizon,
+                    "probability_source": source,
+                    "probability_policy_reason": policy.get("reason"),
+                }
+            )
+            decisions_by_horizon[horizon] = decision
+        result["decisions"] = list(decisions_by_horizon.values())
+    return payload
+
+
 def _similar_pattern_result_payload(
     result: SimilarPatternResult,
     *,
@@ -3041,7 +3179,11 @@ def _similar_pattern_result_payload(
         horizon = str(row["horizon"])
         calibrated = apply_probability_calibration(row.get("up_probability"), calibration_map.get(horizon))
         optimized_forecast.at[row_index, "calibrated_up_probability"] = calibrated
-        selected_policy = model_selection.get(horizon, {}).get("selected") or {}
+        selected_policy = _similar_pattern_probability_policy(
+            validation,
+            result.target.symbol,
+            horizon,
+        )
         selected_source = str(selected_policy.get("source") or "raw_baseline")
         if selected_source == "raw_baseline" and horizon in raw_forecast_map.index:
             selected_probability = raw_forecast_map.loc[horizon, "up_probability"]
@@ -3055,6 +3197,7 @@ def _similar_pattern_result_payload(
             selected_probability = row.get("up_probability")
         optimized_forecast.at[row_index, "selected_up_probability"] = selected_probability
         optimized_forecast.at[row_index, "probability_source"] = selected_source
+        optimized_forecast.at[row_index, "probability_policy_reason"] = selected_policy.get("reason")
         decision_config = replace(
             SIMILAR_PATTERN_CONFIG,
             signal_bearish_max=float(selected_policy.get("bearish_max", SIMILAR_PATTERN_CONFIG.signal_bearish_max)),
@@ -3069,6 +3212,7 @@ def _similar_pattern_result_payload(
         )
         decision["horizon"] = horizon
         decision["probability_source"] = selected_source
+        decision["probability_policy_reason"] = selected_policy.get("reason")
         decisions.append(decision)
 
     top_cases = optimized_cases.copy()
@@ -3495,6 +3639,7 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
         ]
         watchlist_symbols = _read_similar_pattern_watchlist_symbols()
         if cached is not None:
+            cached = _upgrade_cached_similar_pattern_probability_policy(cached)
             cached_watchlist = {
                 str(item.get("symbol") or "").upper(): item
                 for item in cached.get("watchlist") or []
@@ -3954,9 +4099,31 @@ def _run_post_snapshot_cache_cleanup(results: dict[str, Any]) -> dict[str, Any]:
 
 
 def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELECTOR_LIMIT) -> dict[str, Any]:
-    rows = payload.get("stocks") or []
+    rows = [dict(row) for row in payload.get("stocks") or []]
     complete_total = int(payload.get("total_stock_count") or len(rows))
     display_rows = [row for row in rows if _row_display_quality_gate(row)]
+    if any(
+        row.get("buy_score_source") != "historical_return_model"
+        or row.get("hold_score_source") != "historical_return_model"
+        for row in display_rows
+    ):
+        rescored_rows = _apply_historical_score_normalization(
+            [dict(row) for row in display_rows]
+        )
+        display_rows = [
+            rescored
+            if rescored.get("buy_score_source") == "historical_return_model"
+            and rescored.get("hold_score_source") == "historical_return_model"
+            else original
+            for original, rescored in zip(display_rows, rescored_rows)
+        ]
+        display_rows = sorted(
+            display_rows,
+            key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
+            reverse=True,
+        )
+        if not (payload.get("snapshot_scope") or {}).get("strategies"):
+            display_rows = _diversify_default_rows(display_rows, len(display_rows))
     total = len(display_rows)
     display = display_rows[:limit] if limit > 0 else display_rows
     out = dict(payload)
@@ -4058,11 +4225,37 @@ def get_dashboard() -> dict[str, Any]:
         }
 
 
+def _convertible_bond_grid_payload_is_usable(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    quality = payload.get("data_quality") or {}
+    if quality:
+        coverage = _safe_float(quality.get("premium_coverage"), 0.0) or 0.0
+        minimum = _safe_float(quality.get("minimum_premium_coverage"), 0.90) or 0.90
+        if quality.get("status") != "success" or coverage < minimum:
+            return False
+    candidates = [item for item in payload.get("candidates") or [] if isinstance(item, dict)]
+    if len(candidates) < 3:
+        return True
+    premiums = [
+        value
+        for item in candidates
+        if (value := _safe_float(item.get("premium_rate"), None)) is not None
+    ]
+    if len(premiums) / len(candidates) < 0.80:
+        return False
+    return not (max(premiums) - min(premiums) < 1e-6 and abs(premiums[0]) < 1e-6)
+
+
 def get_convertible_bond_grid_plan(
     trade_date: str | None = None,
     limit: int = 18,
     refresh: bool = False,
 ) -> dict[str, Any]:
+    def read_snapshot(*args, **kwargs) -> dict[str, Any] | None:
+        payload = _read_workspace_snapshot(*args, **kwargs)
+        return payload if _convertible_bond_grid_payload_is_usable(payload) else None
+
     def read_legacy_snapshot() -> dict[str, Any] | None:
         try:
             payload = json.loads(
@@ -4070,11 +4263,11 @@ def get_convertible_bond_grid_plan(
             )
         except Exception:
             return None
-        return payload if isinstance(payload, dict) else None
+        return payload if _convertible_bond_grid_payload_is_usable(payload) else None
 
     params = {"limit": int(limit)}
     dependencies = ConvertibleBondGridDependencies(
-        read_snapshot=_read_workspace_snapshot,
+        read_snapshot=read_snapshot,
         read_legacy_snapshot=read_legacy_snapshot,
         promote_legacy_snapshot=lambda snapshot_date, payload: (
             _write_filesystem_workspace_snapshot(
@@ -5307,6 +5500,60 @@ def _matched_group_values(value: Any) -> list[str]:
     return [str(item) for item in items if item is not None and str(item)]
 
 
+def _selector_feature_rows_for_score_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    symbols_by_date: dict[str, set[str]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "")
+        signal_date = str(row.get("date") or "")
+        if symbol and signal_date:
+            symbols_by_date.setdefault(signal_date, set()).add(symbol)
+    feature_rows: dict[str, dict[str, Any]] = {}
+    store: MarketDataStore | None = None
+    for signal_date, symbols in symbols_by_date.items():
+        historical = _selector_model_feature_rows(signal_date)
+        for symbol in symbols:
+            if symbol in historical:
+                feature_rows[symbol] = {
+                    **historical[symbol],
+                    "_score_feature_source": "model_history",
+                }
+        missing_symbols = sorted(symbol for symbol in symbols if symbol not in feature_rows)
+        if not missing_symbols:
+            continue
+        try:
+            store = store or MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+            start_date = (pd.Timestamp(signal_date) - pd.Timedelta(days=130)).strftime("%Y-%m-%d")
+            daily = store.read_market_range(
+                DAILY_DIR.name,
+                start_date=start_date,
+                end_date=signal_date,
+                symbols=missing_symbols,
+                columns=[
+                    "symbol",
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "pre_close",
+                    "pct_chg",
+                    "volume",
+                    "turnover",
+                ],
+            )
+        except Exception:
+            daily = pd.DataFrame()
+        if daily.empty:
+            continue
+        symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
+        for symbol, frame in daily.groupby(symbol_column, sort=False):
+            feature = _selector_watchlist_feature_row_from_daily(str(symbol), signal_date, frame.copy())
+            if feature:
+                feature["_score_feature_source"] = "live_daily"
+                feature_rows[str(symbol)] = feature
+    return feature_rows
+
+
 def _apply_return_model_scores(
     rows: list[dict[str, Any]],
     feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
@@ -5314,6 +5561,8 @@ def _apply_return_model_scores(
     artifacts = _selector_buy_hold_models()
     if not artifacts:
         return
+    if feature_rows_by_symbol is None:
+        feature_rows_by_symbol = _selector_feature_rows_for_score_rows(rows)
     for mode, artifact in artifacts.items():
         features = [str(column) for column in artifact.get("features") or []]
         if not features:
@@ -5323,11 +5572,7 @@ def _apply_return_model_scores(
         for index, row in enumerate(rows):
             signal_date = str(row.get("date") or "")
             symbol = str(row.get("symbol") or "")
-            source = (
-                feature_rows_by_symbol.get(symbol)
-                if feature_rows_by_symbol is not None
-                else _selector_model_feature_rows(signal_date).get(symbol)
-            )
+            source = feature_rows_by_symbol.get(symbol)
             if source is None:
                 continue
             groups = set(_matched_group_values(row.get("matched_groups")))
@@ -5369,6 +5614,14 @@ def _apply_return_model_scores(
         for index, score in zip(indexes, scores):
             rows[index][historical_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
             rows[index][f"{mode}_score_source"] = "historical_return_model"
+            source = feature_rows_by_symbol.get(str(rows[index].get("symbol") or ""), {})
+            score_date = pd.to_datetime(source.get("date"), errors="coerce")
+            rows[index]["score_date"] = (
+                score_date.strftime("%Y-%m-%d")
+                if pd.notna(score_date)
+                else str(rows[index].get("date") or "") or None
+            )
+            rows[index]["score_feature_source"] = source.get("_score_feature_source") or "model_history"
 
 
 def _apply_historical_score_normalization(

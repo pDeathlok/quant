@@ -250,10 +250,10 @@ def add_trend_enhanced_features(daily: pd.DataFrame) -> pd.DataFrame:
         ["买", "卖"],
         default="观望",
     )
-    premium = pd.to_numeric(
-        frame.get("premium_rate", frame.get("bond_over_rate", 0.0)),
-        errors="coerce",
-    ).fillna(0.0)
+    premium_source = frame.get("premium_rate")
+    if premium_source is None:
+        premium_source = frame.get("bond_over_rate", pd.Series(np.nan, index=frame.index))
+    premium = pd.to_numeric(premium_source, errors="coerce")
     frame["double_low"] = frame["close"] + premium
     market = (
         frame.groupby("trade_date")
