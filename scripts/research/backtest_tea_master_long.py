@@ -374,18 +374,24 @@ def _rolling_last_percentile(
     min_periods: int = 24,
 ) -> pd.Series:
     numeric = pd.to_numeric(series, errors="coerce")
+    # The current observation is the right edge of every rolling window, so
+    # its rolling rank is exactly its trailing historical percentile. The
+    # vectorized implementation is materially faster than a Python callback
+    # for thousands of stocks while preserving the prior <= tie convention.
+    return (
+        numeric.rolling(window, min_periods=min_periods)
+        .rank(method="max", pct=True)
+        .mul(100.0)
+    )
 
-    def percentile(values: np.ndarray) -> float:
-        valid = values[np.isfinite(values)]
-        if len(valid) < min_periods or not np.isfinite(values[-1]):
-            return np.nan
-        return float((valid <= values[-1]).mean() * 100.0)
 
-    return numeric.rolling(window, min_periods=min_periods).apply(percentile, raw=True)
-
-
-def add_historical_valuation_features(features: pd.DataFrame) -> pd.DataFrame:
-    """Add point-in-time PE/PB/PR percentiles using only trailing observations."""
+def add_historical_valuation_features(
+    features: pd.DataFrame,
+    *,
+    window_months: int = 84,
+    minimum_months: int = 24,
+) -> pd.DataFrame:
+    """Add point-in-time PE/PB/PR percentiles using monthly trailing observations."""
 
     out = features.sort_values(["ts_code", "date"]).copy()
     roe_percent = pd.to_numeric(out["roe"], errors="coerce")
@@ -402,26 +408,62 @@ def add_historical_valuation_features(features: pd.DataFrame) -> pd.DataFrame:
     out["pr_pb"] = pb / valid_roe.pow(2) / 100.0
     denominator = pd.concat([out["pr_pe"].abs(), out["pr_pb"].abs()], axis=1).max(axis=1)
     out["pr_formula_gap"] = (out["pr_pe"] - out["pr_pb"]).abs() / denominator.replace(0, np.nan)
-    out["pr"] = out["pr_pe"]
+    industry = out["industry"].astype(str)
+    asset_based = industry.str.contains(
+        "银行|证券|保险|多元金融|金融服务|房地产|煤炭|石油|石化|钢铁|有色|建筑|建材|电力|公用事业|交通运输|港口|机场|高速|航运",
+        regex=True,
+        na=False,
+    )
+    earnings_based = industry.str.contains(
+        "软件|互联网|传媒|医药|医疗|食品|饮料|家电|电子|计算机|通信|教育|旅游|酒店|商贸|零售|美容|服务",
+        regex=True,
+        na=False,
+    ) & ~asset_based
+    out["valuation_profile"] = "balanced"
+    out.loc[asset_based, "valuation_profile"] = "asset_based"
+    out.loc[earnings_based, "valuation_profile"] = "earnings_based"
+    out["pr_pe_weight"] = 0.50
+    out["pr_pb_weight"] = 0.50
+    out.loc[asset_based, ["pr_pe_weight", "pr_pb_weight"]] = [0.30, 0.70]
+    out.loc[earnings_based, ["pr_pe_weight", "pr_pb_weight"]] = [0.70, 0.30]
 
-    grouped = out.groupby("ts_code", sort=False)
     for source, target in [
+        ("roe", "roe_hist_percentile"),
         ("pe_ttm", "pe_hist_percentile"),
         ("pb", "pb_hist_percentile"),
-        ("pr", "pr_hist_percentile"),
+        ("pr_pe", "pr_pe_hist_percentile"),
+        ("pr_pb", "pr_pb_hist_percentile"),
     ]:
         clean = pd.to_numeric(out[source], errors="coerce")
-        if source in {"pe_ttm", "pb"}:
+        if source in {"pe_ttm", "pb", "pr_pe", "pr_pb"}:
             clean = clean.where(clean > 0)
-        out[target] = (
-            clean.groupby(out["ts_code"], sort=False, group_keys=False)
-            .apply(_rolling_last_percentile)
-            .reset_index(level=0, drop=True)
-            .reindex(out.index)
+        out[target] = clean.groupby(out["ts_code"], sort=False).transform(
+            lambda values: _rolling_last_percentile(
+                values,
+                window=window_months,
+                min_periods=minimum_months,
+            )
         )
-    out["valuation_history_points"] = grouped["pe_ttm"].transform(
-        lambda values: pd.to_numeric(values, errors="coerce").where(lambda item: item > 0).rolling(60).count()
+    out["pr_hist_percentile"] = (
+        out["pr_pe_hist_percentile"] * out["pr_pe_weight"]
+        + out["pr_pb_hist_percentile"] * out["pr_pb_weight"]
     )
+    out["pr"] = (
+        out["pr_pe"] * out["pr_pe_weight"]
+        + out["pr_pb"] * out["pr_pb_weight"]
+    )
+    history_counts = []
+    for source in ["pe_ttm", "pb", "pr_pe", "pr_pb"]:
+        clean = pd.to_numeric(out[source], errors="coerce").where(lambda item: item > 0)
+        history_counts.append(
+            clean.groupby(out["ts_code"], sort=False).transform(
+                lambda values: values.rolling(window_months, min_periods=1).count()
+            )
+        )
+    out["valuation_history_points"] = pd.concat(history_counts, axis=1).min(axis=1)
+    out["roe_history_points"] = pd.to_numeric(out["roe"], errors="coerce").groupby(
+        out["ts_code"], sort=False
+    ).transform(lambda values: values.rolling(window_months, min_periods=1).count())
     out["historical_value_score"] = (
         100.0
         - out[["pe_hist_percentile", "pb_hist_percentile", "pr_hist_percentile"]]
@@ -431,10 +473,31 @@ def add_historical_valuation_features(features: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["date", "ts_code"]).reset_index(drop=True)
 
 
-def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
+def build_tea_scores(
+    features: pd.DataFrame,
+    *,
+    valuation_window_months: int = 84,
+    valuation_minimum_months: int = 24,
+) -> pd.DataFrame:
     out = features.copy()
     if "pr_hist_percentile" not in out.columns:
-        out = add_historical_valuation_features(out)
+        out = add_historical_valuation_features(
+            out,
+            window_months=valuation_window_months,
+            minimum_months=valuation_minimum_months,
+        )
+    out = out.sort_values(["ts_code", "date"]).copy()
+    for source, target in [
+        ("roe", "roe_volatility_36m"),
+        ("netprofit_margin", "margin_volatility_36m"),
+        ("or_yoy", "revenue_growth_volatility_36m"),
+    ]:
+        out[target] = out.groupby("ts_code", sort=False)[source].transform(
+            lambda values: pd.to_numeric(values, errors="coerce")
+            .rolling(36, min_periods=18)
+            .std()
+        )
+    out = out.sort_values(["date", "ts_code"]).reset_index(drop=True)
     out["listing_years"] = (out["date"] - out["list_date"]).dt.days / 365.25
     out["target_price"] = pd.concat(
         [out["ma_60"] * 1.02, out["ma_120"] * 1.05, out["median_close_60"]],
@@ -471,8 +534,9 @@ def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
         # financials until capital-adequacy data is available.
         group.loc[financial_mask, "balance_sheet_score"] = 50.0
         group["business_stability_score"] = (
-            percentile_score(group["dv_ttm_stability_36m"], True) * 0.50
-            + percentile_score(group["downside_volatility_60d"], False) * 0.50
+            percentile_score(group["roe_volatility_36m"], False) * 0.45
+            + percentile_score(group["margin_volatility_36m"], False) * 0.30
+            + percentile_score(group["revenue_growth_volatility_36m"], False) * 0.25
         ).clip(0, 100)
         group["good_stock_data_coverage"] = (
             group[
@@ -489,15 +553,10 @@ def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
             / 5.0
         )
         group["good_stock_score"] = (
-            group["profitability_score"] * 0.35
-            + group["fundamental_growth_score"] * 0.20
+            group["profitability_score"] * 0.40
+            + group["fundamental_growth_score"] * 0.25
             + group["balance_sheet_score"] * 0.20
             + group["business_stability_score"] * 0.15
-            + (
-                percentile_score(group["volatility_60d"], False) * 0.45
-                + percentile_score(group["downside_volatility_60d"], False) * 0.55
-            )
-            * 0.10
         ).clip(0, 100)
         group["quality_score"] = (
             percentile_score(group["roe"], True) * 0.35
@@ -534,7 +593,7 @@ def build_tea_scores(features: pd.DataFrame) -> pd.DataFrame:
         group["is_good_stock"] = (
             (group["good_stock_score"] >= 60)
             & (group["profitability_score"] >= 50)
-            & (group["risk_score"] >= 25)
+            & (group["business_stability_score"] >= 30)
             & (group["good_stock_data_coverage"] >= 0.60)
             & (group["listing_years"] >= 2)
             & ~group["name"].astype(str).str.contains("ST|退", regex=True, na=False)

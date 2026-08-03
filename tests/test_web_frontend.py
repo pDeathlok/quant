@@ -154,14 +154,20 @@ def test_watchlist_mutations_keep_previous_analysis_during_background_refresh() 
     assert "state.similarPayload = null;" not in APP_JS
 
 
-def test_watchlist_add_does_not_start_an_expensive_analysis() -> None:
+def test_watchlist_add_starts_debounced_background_analysis_and_score_refresh() -> None:
     assert 'await fetchJson("/similar-patterns/watchlist?include_scores=false")' in APP_JS
     add_function = APP_JS.split("async function addSimilarWatchSymbol(symbol, options = {}) {", 1)[1].split(
         "async function removeSimilarWatchSymbol",
         1,
     )[0]
     assert "loadSimilarPatterns" not in add_function
-    assert "可点击“刷新分析”更新结果" in APP_JS
+    assert "scheduleSimilarAnalysisRefresh();" in add_function
+    assert 'fetchJson("/similar-patterns/watchlist?include_scores=true")' in APP_JS
+    assert 'startLatestDataRefresh("similar")' in APP_JS
+    assert "similarAutoRefreshPending" in APP_JS
+    assert "评分与分析正在后台更新" in APP_JS
+    assert "正在后台更新分析，当前结果继续保留" in APP_JS
+    assert 'previousStatus !== status.status || previousScope !== status.scope' in APP_JS
     assert "if (addButton) addButton.disabled = state.similarLoading;" not in APP_JS
 
 
@@ -333,23 +339,53 @@ def test_long_analyst_coverage_uses_honest_labels_and_missing_state() -> None:
     assert '`${dataPoints}项预测数据`' in APP_JS
     assert '`覆盖未来${forwardYears}年`' in APP_JS
     assert '"成长评分 暂无"' in APP_JS
-    assert "前瞻EPS增长35% + 营收增长30% + 净利润增长25% + 预测覆盖10%" in APP_JS
     assert 'Number(item.analyst_forward_growth_score || 0).toFixed(1)' not in APP_JS
+    assert "function analystForecastRows(item)" in APP_JS
+    assert "function analystForecastCell(item, horizon)" in APP_JS
+    assert 'EPS均值 ${numberText(forecast.eps_mean, 3, "元")}' in APP_JS
+    assert 'EPS标准差 ${numberText(forecast.eps_std, 3, "元")}' in APP_JS
+    assert '股价均值 ${numberText(forecast.price_mean, 2, "元")}' in APP_JS
+    assert '股价标准差 ${numberText(forecast.price_std, 2, "元")}' in APP_JS
+    assert "EPS×预测PE隐含股价" in APP_JS
 
 
-def test_long_recommendation_and_price_status_are_separate() -> None:
-    assert "function recommendationBadge(item, includeDays = true)" in APP_JS
-    assert 'aria-label="连续推荐 ${days} 天"' in APP_JS
+def test_long_page_focuses_on_good_stocks_and_good_prices() -> None:
+    assert "function recommendationBadge(item, includeDays = false)" in APP_JS
     assert 'RECOMMENDED: "推荐"' in APP_JS
-    assert 'CAUTION: "谨慎"' in APP_JS
-    assert 'AVOID: "回避"' in APP_JS
-    assert "function priceStateText(item)" in APP_JS
-    assert "function longPricePlan(item)" in APP_JS
-    assert "不提供建仓或清仓指令" in APP_JS
+    assert 'WATCH: "观察"' in APP_JS
+    assert "function priceScoreDetail(item)" in APP_JS
+    assert 'item.price_state === "WAIT_HISTORY"' in APP_JS
+    assert 'item.price_state === "WAIT_STABILITY"' in APP_JS
+    assert "metric(item.pr_from_pe, 3)" in APP_JS
+    assert "metric(item.pr_from_pb, 3)" in APP_JS
+    assert "percentile(item.roe_hist_percentile, item.roe_history_points)" in APP_JS
     assert 'item.display_reason || item.reason || "-"' in APP_JS
     assert "<th>推荐程度</th>" in INDEX_HTML
-    assert "<th>价格状态</th>" in INDEX_HTML
-    assert ".recommendation-days" in STYLES_CSS
+    assert "<th>好股票</th>" in INDEX_HTML
+    assert "<th>价格分</th>" in INDEX_HTML
+    assert "metric(item.price_score)" in APP_JS
+    assert "个月样本" in APP_JS
+    assert "个股自身历史归一化（最多7年）· 跨日可比" not in APP_JS
+    assert "非单日横截面排名" not in APP_JS
+    assert "好股票 + 价格分 ≥ 60 + 长期价格结构通过" in INDEX_HTML
+    for header in [
+        "ROE",
+        "PE",
+        "PB",
+        "PR-PE",
+        "PR-PB",
+        "当年E EPS / 股价",
+        "次年E EPS / 股价",
+        "后年E EPS / 股价",
+    ]:
+        assert f"<th>{header}</th>" in INDEX_HTML
+    assert 'data-long-xueqiu' in APP_JS
+    assert "xueqiuStockUrl(item.ts_code)" in APP_JS
+    assert "雪球 ↗" in APP_JS
+    assert 'target="_blank" rel="noopener noreferrer"' in APP_JS
+    assert "卖出、减仓与持仓管理移至自选池" in INDEX_HTML
+    assert "PR-PE 与 PR-PB 同时保留" in INDEX_HTML
+    assert "最多 7 年月末历史归一化" in INDEX_HTML
 
 
 def test_byd_holding_inputs_are_restored_and_persisted() -> None:

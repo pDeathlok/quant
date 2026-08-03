@@ -23,33 +23,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import glob
 import argparse
 
-from quant.data.factors import (
-    MA, EMA, MACD, RSI, ATR, BollingerBands, KDJ, WilliamsR, BIAS,
-    Momentum, OBV, CCI,
-    Volatility, DownsideVolatility,
-    Factor,
-    LogMarketCap, Amplitude,
-)
-from quant.data.factors.technical import (
-    PSY, VR, MassIndex, ParabolicSAR, VortexIndicator,
-    ChaikinMoneyFlow, EaseOfMovement, KeltnerChannel,
-)
-from quant.data.factors.alpha101 import (
-    Alpha001Factor, Alpha002Factor, Alpha003Factor, Alpha004Factor, Alpha005Factor,
-    Alpha006Factor, Alpha007Factor, Alpha008Factor, Alpha009Factor, Alpha010Factor
-)
-from quant.data.factors.alpha191 import (
-    Alpha191_01Factor, Alpha191_02Factor, Alpha191_03Factor, 
-    Alpha191_04Factor, Alpha191_05Factor, Alpha191_06Factor,
-    Alpha191_07Factor, Alpha191_08Factor, Alpha191_09Factor,
-    Alpha191_10Factor, Alpha191_11Factor, Alpha191_12Factor,
-    Alpha191_13Factor, Alpha191_14Factor, Alpha191_15Factor
-)
-from quant.data.factors.momentum import (
-    ReturnFactor, MomentumSkip5Factor, RiskAdjustedMomentumFactor, ReversalFactor
-)
+from quant.data.factors import KDJ
 from quant.ml.label_maker import create_b1_labels
 from quant.features.variable_library import build_continuous_ohlc
+from quant.features.project_factor_layer import calculate_legacy_market_factors
 
 
 def _continuous_price_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -94,137 +71,9 @@ def calculate_factors_single_stock(df: pd.DataFrame) -> pd.DataFrame:
     2. 使用rolling计算时，确保只使用当前股票的历史数据
     3. 数据必须按日期排序
     """
-    # 确保数据按日期排序
-    if 'date' in df.columns:
-        df = df.sort_values('date').reset_index(drop=True)
-    elif 'trade_date' in df.columns:
-        df = df.sort_values('trade_date').reset_index(drop=True)
-    df = _continuous_price_frame(df)
-    
-    factors = pd.DataFrame(index=df.index)
-    
-    # 基础技术指标
-    factors["ma_5"] = MA(5).compute(df)
-    factors["ma_10"] = MA(10).compute(df)
-    factors["ma_20"] = MA(20).compute(df)
-    factors["ma_60"] = MA(60).compute(df)
-    factors["ma_120"] = MA(120).compute(df)
-    
-    factors["ema_5"] = EMA(5).compute(df)
-    factors["ema_10"] = EMA(10).compute(df)
-    factors["ema_20"] = EMA(20).compute(df)
-    
-    factors["macd"] = MACD().compute(df)
-    
-    factors["rsi_6"] = RSI(6).compute(df)
-    factors["rsi_12"] = RSI(12).compute(df)
-    factors["rsi_24"] = RSI(24).compute(df)
-    
-    kdj = KDJ().compute(df)
-    factors["kdj_k"] = kdj["K"]
-    factors["kdj_d"] = kdj["D"]
-    factors["kdj_j"] = kdj["J"]
-    
-    bb = BollingerBands().compute(df)
-    if isinstance(bb, pd.DataFrame):
-        factors["bb_upper"] = bb.iloc[:, 0]
-        factors["bb_middle"] = bb.iloc[:, 1]
-        factors["bb_lower"] = bb.iloc[:, 2]
-    else:
-        factors["bb_middle"] = bb
-    
-    factors["atr_14"] = ATR(14).compute(df)
-    factors["williams_r_14"] = WilliamsR(14).compute(df)
-    factors["cci"] = CCI().compute(df)
-    factors["bias_6"] = BIAS(6).compute(df)
-    factors["bias_12"] = BIAS(12).compute(df)
-    factors["bias_24"] = BIAS(24).compute(df)
-    
-    factors["obv"] = OBV().compute(df)
-    
-    # 更多技术指标
-    factors["psy_12"] = PSY(12).compute(df)
-    factors["psy_24"] = PSY(24).compute(df)
-    factors["vr_6"] = VR(6).compute(df)
-    factors["vr_12"] = VR(12).compute(df)
-    factors["vr_24"] = VR(24).compute(df)
-    factors["mass_index"] = MassIndex().compute(df)
-    factors["parabolic_sar"] = ParabolicSAR().compute(df)
-    
-    vortex = VortexIndicator().compute(df)
-    if isinstance(vortex, pd.DataFrame):
-        factors["vortex_plus"] = vortex.iloc[:, 0]
-        factors["vortex_minus"] = vortex.iloc[:, 1]
-    
-    factors["cmf"] = ChaikinMoneyFlow().compute(df)
-    factors["eom"] = EaseOfMovement().compute(df)
-    
-    kc = KeltnerChannel().compute(df)
-    if isinstance(kc, pd.DataFrame):
-        factors["keltner_upper"] = kc.iloc[:, 0]
-        factors["keltner_lower"] = kc.iloc[:, 1]
-        factors["keltner_width"] = (kc.iloc[:, 0] - kc.iloc[:, 1]) / kc.iloc[:, 2]
-    
-    factors["amplitude_1"] = Amplitude(1).compute(df)
-    factors["amplitude_20"] = Amplitude(20).compute(df)
-    
-    # Alpha因子
-    factors["alpha001"] = Alpha001Factor().compute(df)
-    factors["alpha002"] = Alpha002Factor().compute(df)
-    factors["alpha003"] = Alpha003Factor().compute(df)
-    factors["alpha004"] = Alpha004Factor().compute(df)
-    factors["alpha005"] = Alpha005Factor().compute(df)
-    factors["alpha006"] = Alpha006Factor().compute(df)
-    factors["alpha007"] = Alpha007Factor().compute(df)
-    factors["alpha008"] = Alpha008Factor().compute(df)
-    factors["alpha009"] = Alpha009Factor().compute(df)
-    factors["alpha010"] = Alpha010Factor().compute(df)
-    
-    factors["alpha191_01"] = Alpha191_01Factor().compute(df)
-    factors["alpha191_02"] = Alpha191_02Factor().compute(df)
-    factors["alpha191_03"] = Alpha191_03Factor().compute(df)
-    factors["alpha191_04"] = Alpha191_04Factor().compute(df)
-    factors["alpha191_05"] = Alpha191_05Factor().compute(df)
-    factors["alpha191_06"] = Alpha191_06Factor().compute(df)
-    factors["alpha191_07"] = Alpha191_07Factor().compute(df)
-    factors["alpha191_08"] = Alpha191_08Factor().compute(df)
-    factors["alpha191_09"] = Alpha191_09Factor().compute(df)
-    factors["alpha191_10"] = Alpha191_10Factor().compute(df)
-    factors["alpha191_11"] = Alpha191_11Factor().compute(df)
-    factors["alpha191_12"] = Alpha191_12Factor().compute(df)
-    factors["alpha191_13"] = Alpha191_13Factor().compute(df)
-    factors["alpha191_14"] = Alpha191_14Factor().compute(df)
-    factors["alpha191_15"] = Alpha191_15Factor().compute(df)
-    
-    # 动量因子
-    factors["return_1d"] = ReturnFactor(1).compute(df)
-    factors["return_5d"] = ReturnFactor(5).compute(df)
-    factors["return_10d"] = ReturnFactor(10).compute(df)
-    factors["return_20d"] = ReturnFactor(20).compute(df)
-    factors["return_60d"] = ReturnFactor(60).compute(df)
-    factors["return_120d"] = ReturnFactor(120).compute(df)
-    
-    factors["momentum_5d"] = MomentumSkip5Factor(5).compute(df)
-    factors["momentum_20d"] = MomentumSkip5Factor(20).compute(df)
-    factors["momentum_60d"] = MomentumSkip5Factor(60).compute(df)
-    
-    factors["risk_adjusted_momentum"] = RiskAdjustedMomentumFactor().compute(df)
-    factors["reversal_5d"] = ReversalFactor(5).compute(df)
-    factors["reversal_20d"] = ReversalFactor(20).compute(df)
-    
-    # 波动率因子
-    factors["volatility_20d"] = Volatility(20).compute(df)
-    factors["volatility_60d"] = Volatility(60).compute(df)
-    factors["downside_volatility_20d"] = DownsideVolatility(20).compute(df)
-    factors["downside_volatility_60d"] = DownsideVolatility(60).compute(df)
-    
-    # 市值相关因子
-    factors["price_level"] = df["close"]
-    factors["price_log"] = np.log(df["close"] + 1)
-    factors["price_volume_ratio"] = df["close"] / (df["volume"] + 1)
-    factors["volume_relative_60d"] = df["volume"] / df["volume"].rolling(60).mean().replace(0, np.nan)
-    
-    return factors
+    # Compatibility wrapper. Complete factor calculation is owned by the
+    # project factor layer; research scripts must not maintain another path.
+    return calculate_legacy_market_factors(df)
 
 
 def calculate_labels_single_stock(df: pd.DataFrame) -> pd.DataFrame:

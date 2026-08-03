@@ -9,6 +9,9 @@ from quant.routine.reference_data_refresh import refresh_reference_data
 
 
 class FakePro:
+    def trade_cal(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame({"cal_date": [kwargs["start_date"]], "is_open": ["1"]})
+
     def index_daily(self, **kwargs) -> pd.DataFrame:
         return pd.DataFrame(
             {
@@ -66,6 +69,47 @@ class FakePro:
             columns=["trade_date", "ts_code", "name", "type", "type_name"]
         )
 
+    def margin_detail(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "trade_date": [kwargs["trade_date"]],
+                "ts_code": ["000001.SZ"],
+                "rzye": [10.0],
+                "rqye": [1.0],
+                "rzrqye": [11.0],
+            }
+        )
+
+    def moneyflow(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "trade_date": [kwargs["trade_date"]],
+                "ts_code": ["000001.SZ"],
+                "net_mf_amount": [2.0],
+            }
+        )
+
+    def top_list(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "trade_date": [kwargs["trade_date"]],
+                "ts_code": ["000001.SZ"],
+                "reason": ["test"],
+            }
+        )
+
+    def stk_holdertrade(self, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "ann_date": [kwargs["end_date"]],
+                "holder_name": ["holder"],
+                "in_de": ["IN"],
+                "change_vol": [1.0],
+                "avg_price": [10.0],
+            }
+        )
+
 
 class FakeFetcher:
     def __init__(self) -> None:
@@ -116,6 +160,9 @@ def test_reference_refresh_is_idempotent_and_updates_every_dataset(tmp_path: Pat
     assert tradability["ts_code"].tolist() == ["000001.SZ"]
     assert first["steps"]["tradability"]["coverage_rate"] == 1.0
     assert second["steps"]["tradability"]["status"] == "success"
+    assert second["steps"]["long_factor_sources"]["status"] == "success"
+    assert len(list((raw_dir / "moneyflow").glob("*.parquet"))) == 1
+    assert len(pd.read_parquet(raw_dir / "holder_trade.parquet")) == 1
     assert not pd.read_parquet(raw_dir / "fina_indicator.parquet").duplicated(["ts_code", "ann_date", "end_date"]).any()
     assert second["steps"]["financials"]["status"] == "skipped"
     assert "already completed today" in second["steps"]["financials"]["reason"]

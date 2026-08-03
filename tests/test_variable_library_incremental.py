@@ -27,21 +27,22 @@ def _reference_continuous_ohlc(frame: pd.DataFrame) -> pd.DataFrame:
         sorted_frame["pre_close"],
         errors="coerce",
     )
-    for position in range(len(sorted_frame) - 1, 0, -1):
+    for position in range(1, len(sorted_frame)):
         index = sorted_frame.index[position]
         previous_index = sorted_frame.index[position - 1]
         previous_close = close.loc[previous_index]
         current_pre_close = pre_close.loc[index]
         ratio = (
-            current_pre_close / previous_close
+            previous_close / current_pre_close
             if pd.notna(current_pre_close)
             and pd.notna(previous_close)
+            and current_pre_close
             and previous_close
             else 1.0
         )
         if not np.isfinite(ratio) or ratio <= 0:
             ratio = 1.0
-        factor.loc[previous_index] = factor.loc[index] * ratio
+        factor.loc[index] = factor.loc[previous_index] * ratio
     for column in ("open", "high", "low", "close"):
         out[column] = (
             pd.to_numeric(out[column], errors="coerce")

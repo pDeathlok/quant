@@ -26,6 +26,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_parquet
+from quant.features.project_factor_layer import (
+    LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+    resolve_project_factor_schema,
+)
 from quant.features.variable_library import merge_daily_basic_features
 from train_b1_tushare_models import assign_symbol_splits, build_dataset
 
@@ -61,6 +65,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     started = perf_counter()
     args = parse_args()
+    factor_schema_version = resolve_project_factor_schema()
     start_ts = _parse_date(args.incremental_start_date)
     start_str = start_ts.strftime("%Y%m%d")
 
@@ -165,6 +170,21 @@ def main() -> None:
     if args.dataset_out.exists():
         existing = pd.read_parquet(args.dataset_out)
         existing["date"] = pd.to_datetime(existing["date"])
+        if "factor_schema_version" not in existing.columns:
+            if factor_schema_version != LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Existing B1 feature cache has no factor schema metadata. "
+                    "Rebuild it before using the current causal schema."
+                )
+            existing["factor_schema_version"] = factor_schema_version
+        existing_schemas = set(
+            existing["factor_schema_version"].dropna().astype(str).unique()
+        )
+        if existing_schemas - {factor_schema_version}:
+            raise RuntimeError(
+                "Existing B1 feature cache schema mismatch: "
+                f"expected={factor_schema_version} actual={sorted(existing_schemas)}"
+            )
         kept = existing[existing["date"] < start_ts].copy()
         combined = pd.concat([kept, incremental], ignore_index=True, sort=False)
     else:
@@ -177,6 +197,19 @@ def main() -> None:
         )
 
     combined["date"] = pd.to_datetime(combined["date"])
+    if "factor_schema_version" not in combined.columns:
+        combined["factor_schema_version"] = factor_schema_version
+    combined["factor_schema_version"] = combined["factor_schema_version"].fillna(
+        factor_schema_version
+    )
+    combined_schemas = set(
+        combined["factor_schema_version"].dropna().astype(str).unique()
+    )
+    if combined_schemas != {factor_schema_version}:
+        raise RuntimeError(
+            "B1 feature cache would mix factor schemas: "
+            f"expected={factor_schema_version} actual={sorted(combined_schemas)}"
+        )
     combined = (
         combined.sort_values(["date", "symbol"])
         .drop_duplicates(["symbol", "date"], keep="last")
@@ -191,6 +224,7 @@ def main() -> None:
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "incremental_start_date": start_ts.strftime("%Y-%m-%d"),
         "incremental_rows": int(len(incremental)),
+        "factor_schema_version": factor_schema_version,
         "gate_mode": gate_mode,
         "gate_fallback_reason": gate_reason,
         "gate_candidate_symbols": int(

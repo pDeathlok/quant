@@ -52,3 +52,45 @@ def test_live_feature_mode_does_not_build_or_persist_daily_returns(monkeypatch, 
     assert not features.empty
     assert daily_returns.empty
     assert not cache_dir.exists()
+
+
+def test_weekly_feature_sampling_uses_more_rebalance_dates_than_monthly(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    module = services._long_research_module()
+    daily_dir = tmp_path / "daily"
+    cache_dir = tmp_path / "cache"
+    daily_dir.mkdir()
+    _write_daily_history(daily_dir / "000001.SZ.parquet")
+    monkeypatch.setattr(module, "DAILY_DIR", daily_dir)
+    monkeypatch.setattr(module, "RESEARCH_CACHE_DIR", cache_dir)
+    stock_basic = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ"],
+            "name": ["测试股票"],
+            "industry": ["测试行业"],
+            "list_date": pd.to_datetime(["2010-01-01"]),
+        }
+    )
+    args = (
+        pd.Timestamp("2024-01-01"),
+        pd.Timestamp("2024-12-31"),
+        stock_basic,
+    )
+
+    monthly, _ = module.load_daily_monthly_features(
+        *args,
+        use_cache=False,
+        include_daily_returns=False,
+        sampling="monthly",
+    )
+    weekly, _ = module.load_daily_monthly_features(
+        *args,
+        use_cache=False,
+        include_daily_returns=False,
+        sampling="weekly",
+    )
+
+    assert weekly["date"].nunique() > monthly["date"].nunique()
+    assert weekly["date"].dt.to_period("W-FRI").nunique() == weekly["date"].nunique()

@@ -627,6 +627,11 @@ def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, 
         "refresh_reference_inputs",
         lambda dry_run, include_financials: call_order.append("reference") or {"status": "success"},
     )
+    monkeypatch.setattr(
+        pipeline,
+        "refresh_factor_registry_snapshot",
+        lambda: {"status": "success"},
+    )
     monkeypatch.setattr(pipeline, "build_features", parallel_step)
     monkeypatch.setattr(pipeline, "refresh_strategy_signal_cache", parallel_step)
     monkeypatch.setattr(pipeline, "score_latest_models", lambda: {"status": "success"})

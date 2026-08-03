@@ -27,12 +27,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
-import build_training_data_parallel as btd
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR
 from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
 from quant.data.source_merge import normalize_tushare_daily
-from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
-from quant.features.variable_library import build_continuous_ohlc
+from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.project_factor_layer import (
+    LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+    calculate_project_market_factors,
+    resolve_project_factor_schema,
+)
+from quant.features.variable_library import (
+    PROJECT_FACTOR_COLUMNS,
+    build_continuous_ohlc,
+    build_latest_scale_ohlc,
+)
 from train_z_skill_models_and_backtest import (
     AucGapEarlyStopping,
     LABELS,
@@ -97,10 +105,27 @@ def _process_symbol(
             compute_if_missing=True,
             persist_missing=False,
         )
-        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
-        factors = pd.concat([btd.calculate_factors_single_stock(daily), shared[shared_cols]], axis=1)
-        factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
-        price = build_continuous_ohlc(daily)
+        factor_frame = calculate_project_market_factors(
+            daily,
+            symbol=path.stem,
+            shared_factors=shared,
+        )
+        factors = factor_frame[
+            [
+                *[
+                    column
+                    for column in PROJECT_FACTOR_COLUMNS
+                    if column in factor_frame.columns
+                ],
+                "factor_schema_version",
+            ]
+        ]
+        factor_schema_version = resolve_project_factor_schema()
+        price = (
+            build_latest_scale_ohlc(daily)
+            if factor_schema_version == LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+            else build_continuous_ohlc(daily)
+        )
         close_pos = ((price["close"] - price["low"]) / (price["high"] - price["low"]).replace(0, np.nan)).rename("close_pos")
         result = pd.concat([daily, factors, close_pos], axis=1)
         result = result.loc[:, ~result.columns.duplicated(keep="last")]
@@ -278,6 +303,7 @@ def main() -> None:
         "executor_type": executor_type,
         "batch_size": batch_size,
         "workers": args.workers,
+        "factor_schema_version": resolve_project_factor_schema(),
         "feature_elapsed_seconds": round(feature_elapsed_seconds, 3),
         "elapsed_seconds": round(perf_counter() - started, 3),
         "scored_rows": int(len(scored)),

@@ -35,15 +35,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
-import build_training_data_parallel as btd
 from analyze_b1_entry_exit_grid import ExitRule, add_future_prices, simulate_exit, summarize_returns
 from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR, drop_overlapping_trades
 from analyze_z_skill_entry_exit_backtest import OpenFilter, apply_open_filter, build_open_filters
 from quant.data.source_merge import normalize_tushare_daily
 from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
 from quant.data.atomic_io import atomic_link_or_copy
-from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
-from quant.features.variable_library import PROJECT_FACTOR_COLUMNS, build_continuous_ohlc
+from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.project_factor_layer import (
+    LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+    PROJECT_FACTOR_SCHEMA_VERSION,
+    calculate_project_market_factors,
+    resolve_project_factor_schema,
+)
+from quant.features.variable_library import (
+    PROJECT_FACTOR_COLUMNS,
+    build_continuous_ohlc,
+    build_latest_scale_ohlc,
+)
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
 
@@ -278,11 +287,28 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
             return None
 
         shared = attach_daily_base_factors(daily, symbol=path.stem, compute_if_missing=True)
-        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
-        factors = pd.concat([btd.calculate_factors_single_stock(daily), shared[shared_cols]], axis=1)
-        factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
+        factor_frame = calculate_project_market_factors(
+            daily,
+            symbol=path.stem,
+            shared_factors=shared,
+        )
+        factors = factor_frame[
+            [
+                *[
+                    column
+                    for column in PROJECT_FACTOR_COLUMNS
+                    if column in factor_frame.columns
+                ],
+                "factor_schema_version",
+            ]
+        ]
         labels = create_b1_labels(daily, forward_days=5, exit_aware=True, use_new_labels=True)
-        price = build_continuous_ohlc(daily)
+        factor_schema_version = resolve_project_factor_schema()
+        price = (
+            build_latest_scale_ohlc(daily)
+            if factor_schema_version == LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+            else build_continuous_ohlc(daily)
+        )
         close_pos = ((price["close"] - price["low"]) / (price["high"] - price["low"]).replace(0, np.nan)).rename("close_pos")
         result = pd.concat([daily, factors, labels, close_pos], axis=1)
         result = result.loc[:, ~result.columns.duplicated(keep="last")]
@@ -304,6 +330,7 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
             "close",
             "pct_chg",
             "close_pos",
+            "factor_schema_version",
             *signals,
             *PROJECT_FACTOR_COLUMNS,
             *LABELS.values(),
@@ -328,9 +355,19 @@ def build_model_dataset(
         data = pd.read_parquet(DATASET_PATH)
         data["date"] = pd.to_datetime(data["date"])
         expected = set(signals) | set(LABELS.values())
-        if expected <= set(data.columns):
+        schemas = (
+            set(data["factor_schema_version"].dropna().astype(str).unique())
+            if "factor_schema_version" in data.columns
+            else set()
+        )
+        expected_schema = resolve_project_factor_schema()
+        if expected <= set(data.columns) and schemas == {expected_schema}:
             return data[(data["date"] >= pd.Timestamp(start_date)) & data[signals].any(axis=1)].copy()
-        print("z-skill model dataset missing expected columns; rebuilding", flush=True)
+        print(
+            "z-skill model dataset columns/schema mismatch; rebuilding "
+            f"expected_schema={expected_schema} actual={sorted(schemas) or ['missing']}",
+            flush=True,
+        )
 
     signal_df = _load_signal_cache(signals, start_date)
     by_symbol = {symbol: group[["symbol", "date", *signals]].copy() for symbol, group in signal_df.groupby("symbol")}
@@ -444,7 +481,15 @@ def train_one_model(data: pd.DataFrame, signal: str, label_name: str, feature_co
     )
     classifier.fit(X_train, train[label_col], eval_set=[(X_train, train[label_col]), (X_test, test[label_col])], verbose=False)
     selected_features = [feature_cols[i] for i, keep in enumerate(selector.get_support()) if keep]
-    wrapper = XGBResearchModel(feature_cols, selected_features, imputer, selector, classifier, early_stop.best_iteration)
+    wrapper = XGBResearchModel(
+        feature_cols,
+        selected_features,
+        imputer,
+        selector,
+        classifier,
+        early_stop.best_iteration,
+        PROJECT_FACTOR_SCHEMA_VERSION,
+    )
 
     for split, frame, X in [("train", train, X_train), ("test", test, X_test), ("oot", oot, X_oot)]:
         if len(frame) == 0:
@@ -457,6 +502,7 @@ def train_one_model(data: pd.DataFrame, signal: str, label_name: str, feature_co
         rows[f"{split}_auc"] = _safe_auc(frame[label_col], proba)
         rows[f"{split}_ap"] = _safe_ap(frame[label_col], proba)
     rows["status"] = "ok"
+    rows["factor_schema_version"] = PROJECT_FACTOR_SCHEMA_VERSION
     rows["best_iteration"] = int(early_stop.best_iteration)
     rows["early_stop_best_score"] = float(early_stop.best_score)
     rows["selected_feature_count"] = int(len(selected_features))
@@ -467,6 +513,16 @@ def train_one_model(data: pd.DataFrame, signal: str, label_name: str, feature_co
 
 
 def train_models(data: pd.DataFrame, signals: list[str], model_dir: Path) -> tuple[dict[tuple[str, str], XGBResearchModel], pd.DataFrame]:
+    schemas = (
+        set(data["factor_schema_version"].dropna().astype(str).unique())
+        if "factor_schema_version" in data.columns
+        else set()
+    )
+    if schemas != {PROJECT_FACTOR_SCHEMA_VERSION}:
+        raise RuntimeError(
+            "Z-skill research training requires the current causal factor schema: "
+            f"expected={PROJECT_FACTOR_SCHEMA_VERSION} actual={sorted(schemas) or ['missing']}"
+        )
     feature_cols = _feature_columns(data)
     models: dict[tuple[str, str], XGBResearchModel] = {}
     reports: list[dict] = []
@@ -491,17 +547,40 @@ def load_models(signals: list[str], model_dir: Path, output_dir: Path) -> tuple[
     report_path = output_dir / "latest_z_skill_model_training_report.csv"
     if report_path.exists():
         rows = pd.read_csv(report_path).to_dict("records")
+    expected_schema = resolve_project_factor_schema()
     for signal in signals:
         for label_name in LABELS:
             path = model_dir / f"{signal}_{label_name}.joblib"
             if not path.exists():
                 raise FileNotFoundError(f"Missing trained model: {path}")
-            models[(signal, label_name)] = joblib.load(path)
+            model = joblib.load(path)
+            model_schema = (
+                getattr(model, "factor_schema_version_", None)
+                or LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+            )
+            if model_schema != expected_schema:
+                raise RuntimeError(
+                    f"Incompatible factor schema for {path}: "
+                    f"model={model_schema} expected={expected_schema}; "
+                    "retrain before scoring"
+                )
+            models[(signal, label_name)] = model
     return models, pd.DataFrame(rows)
 
 
 def add_predictions(data: pd.DataFrame, models: dict[tuple[str, str], XGBResearchModel], signals: list[str]) -> pd.DataFrame:
     out = data.copy()
+    data_schemas = (
+        set(out["factor_schema_version"].dropna().astype(str).unique())
+        if "factor_schema_version" in out.columns
+        else set()
+    )
+    expected_schema = resolve_project_factor_schema()
+    if data_schemas != {expected_schema}:
+        raise RuntimeError(
+            "Scoring data factor schema mismatch: "
+            f"expected={expected_schema} actual={sorted(data_schemas) or ['missing']}"
+        )
     for signal in signals:
         mask = out[signal].fillna(False).astype(bool)
         for label_name in LABELS:

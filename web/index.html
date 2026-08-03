@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -35,19 +35,11 @@
         </div>
         <button id="clearFilters" class="secondary-button" type="button">清空筛选</button>
         <div id="longStrategySection" class="side-section hidden">
-          <span>长线组合</span>
+          <span>长线筛选</span>
           <div class="long-variant-control" aria-label="长线策略版本">
             <button class="long-variant-button active" type="button" data-long-variant="tea">
-              <strong>茶大长线趋势网格</strong>
-              <span>core14_soft_plus · 当前主推</span>
-            </button>
-            <button class="long-variant-button" type="button" data-long-variant="tea_safe">
-              <strong>茶大长线稳健网格</strong>
-              <span>core14_soft_spread · 保守备选</span>
-            </button>
-            <button class="long-variant-button" type="button" data-long-variant="v44">
-              <strong>旧防守中性长期组合</strong>
-              <span>v44 · 旧策略对照</span>
+              <strong>好股票 · 好价格</strong>
+              <span>基本面入池 · 历史估值推荐</span>
             </button>
           </div>
           <button id="longPoolRefresh" class="secondary-button" type="button">刷新股票池</button>
@@ -275,7 +267,7 @@
           </button>
           <button class="page-tab active" type="button" data-page="long">
             <strong>长线策略</strong>
-            <span>组合候选 / 仓位择时</span>
+            <span>好股票 / 好价格</span>
           </button>
           <button class="page-tab" type="button" data-page="cb">
             <strong>可转债策略</strong>
@@ -298,15 +290,15 @@
         <section class="toolbar long-toolbar">
           <div>
             <p class="eyebrow">Long Horizon Strategy</p>
-            <h2>长线策略候选</h2>
-            <p class="subline">2013-01-04 至 2026-06-12 回测 · 使用茶大独立长线策略与前复权数据</p>
+            <h2>长线好股票与好价格</h2>
+            <p class="subline">只回答两件事：公司是否值得长期观察，当前估值是否进入好价格区</p>
           </div>
           <div class="long-toolbar-actions">
             <div id="longDateSlot" class="long-date-slot"></div>
             <button id="longRefreshLatestButton" type="button" data-refresh-scope="long">更新本页</button>
             <div class="long-summary">
-              <span id="longSummaryLabel">主推荐</span>
-              <strong id="longSummaryName">茶大长线趋势网格</strong>
+              <span id="longSummaryLabel">筛选模型</span>
+              <strong id="longSummaryName">好股票 · 价格分</strong>
             </div>
           </div>
           <div class="refresh-status"></div>
@@ -315,32 +307,33 @@
 
         <section class="long-overview-grid" aria-label="长线策略概览">
           <article class="long-hero-panel">
-            <span id="longHeroTag" class="tag strong">当前推荐</span>
-            <h3 id="longHeroTitle">茶大长线趋势网格</h3>
-            <p id="longHeroDescription">独立于旧长线策略，使用茶大体系的年线趋势、核心底仓、行业上限、软刹车和日线做T。</p>
-            <p id="longHeroNote" class="long-execution-note">当前主推 core14_soft_plus：不使用成长卫星仓，保留约 14 个核心候选。</p>
+            <span id="longHeroTag" class="tag strong">筛选原则</span>
+            <h3 id="longHeroTitle">好股票进入观察，好股票 + 价格分达标才推荐</h3>
+            <p id="longHeroDescription">卖出、减仓与持仓管理移至自选池；本页不再输出仓位和卖点。</p>
+            <p id="longHeroNote" class="long-execution-note">券商预测仅用于补充阅读，不参与好股票或价格评分。</p>
             <div class="long-metrics compact">
-              <div><span>年化收益</span><strong id="longMetricAnnual">5.62%</strong></div>
-              <div><span>最大回撤</span><strong id="longMetricDrawdown">-21.80%</strong></div>
-              <div><span>Sharpe</span><strong id="longMetricSharpe">0.616</strong></div>
-              <div><span>平均仓位</span><strong id="longMetricWeight">51.00%</strong></div>
+              <div><span>好股票</span><strong id="longMetricAnnual">-</strong></div>
+              <div><span>好价推荐</span><strong id="longMetricDrawdown">-</strong></div>
+              <div><span>价格观察</span><strong id="longMetricSharpe">-</strong></div>
+              <div><span>预测覆盖</span><strong id="longMetricWeight">-</strong></div>
             </div>
           </article>
           <aside class="long-rule-panel">
-            <h3>阅读顺序</h3>
+            <h3>判断标准</h3>
             <ol>
-              <li>先看三套候选策略的定位差异</li>
-              <li>再看年度表现，判断收益来自哪些年份</li>
-              <li>最后看回撤来源和下一轮风控优化</li>
+              <li><strong>入池：</strong>基本面综合分 ≥ 60，并通过盈利、数据覆盖、上市年限和风险硬门槛</li>
+              <li><strong>观察：</strong>通过好股票标准即进入观察池，等待合适价格</li>
+              <li><strong>推荐：</strong>好股票 + 价格分 ≥ 60 + 长期价格结构通过</li>
             </ol>
+            <p class="long-rule-caveat">PR-PE 与 PR-PB 同时保留；价格分按个股最多 7 年月末历史归一化，至少需要 24 个样本，可跨日比较。</p>
           </aside>
         </section>
 
         <section class="panel long-pool-panel">
           <div class="panel-head">
             <div>
-              <h3>当前长线股票池</h3>
-              <span id="longPoolMeta">等待加载</span>
+              <h3>好股票观察池</h3>
+              <span id="longPoolMeta" aria-live="polite">等待加载</span>
             </div>
             <div id="longStateCounts" class="state-counts"></div>
           </div>
@@ -351,47 +344,23 @@
                   <th>推荐程度</th>
                   <th>股票</th>
                   <th>行业</th>
-                  <th>价格状态</th>
-                  <th>策略计划</th>
-                  <th>评分</th>
-                  <th>关键价格</th>
-                  <th>预测覆盖</th>
+                  <th>好股票</th>
+                  <th>价格分</th>
+                  <th>ROE</th>
+                  <th>PE</th>
+                  <th>PB</th>
+                  <th>PR-PE</th>
+                  <th>PR-PB</th>
+                  <th>当年E EPS / 股价</th>
+                  <th>次年E EPS / 股价</th>
+                  <th>后年E EPS / 股价</th>
                   <th>入选 / 观察原因</th>
                 </tr>
               </thead>
               <tbody id="longStockRows">
-                <tr><td colspan="9" class="empty-cell">切到长线策略后加载股票池</td></tr>
+                <tr><td colspan="14" class="empty-cell">切到长线策略后加载股票池</td></tr>
               </tbody>
             </table>
-          </div>
-        </section>
-
-        <section class="panel long-year-panel">
-          <div class="panel-head">
-            <h3>年度表现</h3>
-            <span>收益 / 年内最大回撤 / 平均仓位</span>
-          </div>
-          <div class="table-wrap long-table-wrap">
-            <table class="long-table">
-              <thead>
-                <tr>
-                  <th>年份</th>
-                  <th>策略年度表现</th>
-                </tr>
-              </thead>
-              <tbody id="longStrategyRows"></tbody>
-            </table>
-          </div>
-        </section>
-
-        <section class="long-notes">
-          <div class="note-block">
-            <span>组合定位</span>
-            <p>长线策略用于跨周期持仓、分批建仓和仓位管理，不替代每日短线选股。左侧切换后，本页概览、年度表现和股票池都会同步到当前策略。</p>
-          </div>
-          <div class="note-block">
-            <span>下一步优化</span>
-            <p>最大回撤主要来自 2015 股灾，后续可加入日级指数刹车和 pullback 禁止买回规则。</p>
           </div>
         </section>
 
@@ -937,6 +906,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2"></script>
   </body>
 </html>

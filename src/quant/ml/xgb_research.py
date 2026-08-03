@@ -23,6 +23,7 @@ class XGBResearchModel:
     selector: object | None
     classifier: object
     best_iteration: int | None = None
+    factor_schema_version_: str | None = None
 
     def transform(self, X: pd.DataFrame) -> np.ndarray:
         raw = X[self.feature_names_in_].replace([np.inf, -np.inf], np.nan)

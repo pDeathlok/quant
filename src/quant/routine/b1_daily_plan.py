@@ -13,6 +13,10 @@ import pandas as pd
 
 from quant.data.atomic_io import atomic_write_json
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.features.project_factor_layer import (
+    LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+    PROJECT_FACTOR_SCHEMA_VERSION,
+)
 from quant.routine.paths import CONFIG_PATH, PROJECT_ROOT, ROUTINE_DIR, WEB_DATA_DIR
 from quant.routine.strategies import ExitConfig, StrategyConfig, StrategyRelease, load_strategy_release
 
@@ -107,9 +111,36 @@ def predict_models(
     model_names: tuple[str, ...],
 ) -> pd.DataFrame:
     out = candidates.copy()
+    if "factor_schema_version" in out.columns:
+        candidate_schemas = set(
+            out["factor_schema_version"].dropna().astype(str).unique()
+        )
+        if len(candidate_schemas) > 1:
+            raise RuntimeError(
+                f"B1 candidate cache mixes factor schemas: {sorted(candidate_schemas)}"
+            )
+        candidate_schema = (
+            next(iter(candidate_schemas))
+            if candidate_schemas
+            else LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+        )
+    else:
+        # Released pre-v4 caches did not carry schema metadata. Their only
+        # valid interpretation is the legacy latest-scale/global-rank schema.
+        candidate_schema = LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
     for model_name in model_names:
         model_path = model_dir / f"{model_name}.joblib"
         model = joblib.load(model_path)
+        model_schema = (
+            getattr(model, "factor_schema_version_", None)
+            or LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+        )
+        if model_schema != candidate_schema:
+            raise RuntimeError(
+                "B1 model factor schema is incompatible: "
+                f"{model_path} model={model_schema} candidates={candidate_schema}; "
+                f"current_research={PROJECT_FACTOR_SCHEMA_VERSION}"
+            )
         feature_cols = list(model.feature_names_in_)
         missing = [col for col in feature_cols if col not in out.columns]
         if missing:

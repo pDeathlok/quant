@@ -20,6 +20,12 @@ from quant.application.workspace_refresh import (
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_json as publish_json
 from quant.features.market_regime import classify_market_regime
+from quant.features.factor_registry import registry_frame, validate_registry
+from quant.features.project_factor_layer import (
+    LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+    PROJECT_FACTOR_SCHEMA_VERSION,
+    resolve_project_factor_schema,
+)
 from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.dashboard import write_dashboard_json
 from quant.routine.b1_daily_plan import write_daily_plan
@@ -544,6 +550,11 @@ def _refresh_analyst_forecast_snapshot() -> dict:
 def build_features(progress_callback=None) -> dict:
     started = time.monotonic()
     start_date = _incremental_feature_start()
+    production_factor_mode = os.getenv(
+        "ROUTINE_PRODUCTION_FACTOR_SCHEMA",
+        LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+    )
+    production_factor_schema = resolve_project_factor_schema(production_factor_mode)
     command = [
         sys.executable,
         "scripts/research/refresh_b1_feature_cache.py",
@@ -559,7 +570,11 @@ def build_features(progress_callback=None) -> dict:
         "--gate-manifest",
         "data/features/b1/b1_gate_manifest.json",
     ]
-    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}",
+        "PROJECT_FACTOR_COMPATIBILITY_MODE": production_factor_schema,
+    }
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
@@ -597,6 +612,8 @@ def build_features(progress_callback=None) -> dict:
     )
     return {
         **manifest,
+        "factor_schema_version": production_factor_schema,
+        "factor_calculator": "quant.features.project_factor_layer",
         "status": "success" if complete else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
@@ -607,6 +624,56 @@ def build_features(progress_callback=None) -> dict:
         "source_latest_trade_date": source_latest_trade_date or None,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
+
+
+def refresh_factor_registry_snapshot() -> dict:
+    """Publish the factor contract consumed by every daily/weekly application."""
+
+    started = time.monotonic()
+    output_path = PROJECT_ROOT / "data/features/factor_registry/latest.json"
+    try:
+        validate_registry()
+        registry = registry_frame()
+        family_counts = {
+            str(key): int(value)
+            for key, value in registry["family"].value_counts().sort_index().items()
+        }
+        frequency_counts = {
+            str(key): int(value)
+            for key, value in registry["frequency"].value_counts().sort_index().items()
+        }
+        payload = {
+            "status": "success",
+            "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "factor_count": int(len(registry)),
+            "family_counts": family_counts,
+            "frequency_counts": frequency_counts,
+            "point_in_time_factor_count": int(registry["point_in_time"].sum()),
+            "calculation_entrypoint": "quant.features.project_factor_layer.calculate_project_factor_frame",
+            "applications": {
+                "short_daily_current": "gate first, then complete current causal project factors",
+                "short_daily_released": (
+                    "pinned pre-v4 models use the explicit legacy compatibility schema "
+                    "until independently retrained and promoted"
+                ),
+                "long_weekly": "weekly last trading day with financial ann_date as-of",
+            },
+            "factors": registry.to_dict(orient="records"),
+        }
+        publish_json(payload, output_path)
+        return {
+            **{key: value for key, value in payload.items() if key != "factors"},
+            "path": str(output_path),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "path": str(output_path),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
 
 
 def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> dict:
@@ -620,7 +687,17 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
         "--incremental-start-date",
         start_date,
     ]
-    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    production_factor_schema = resolve_project_factor_schema(
+        os.getenv(
+            "ROUTINE_PRODUCTION_FACTOR_SCHEMA",
+            LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+        )
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}",
+        "PROJECT_FACTOR_COMPATIBILITY_MODE": production_factor_schema,
+    }
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
@@ -669,6 +746,7 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
     )
     return {
         **manifest,
+        "factor_schema_version": production_factor_schema,
         "status": "success" if complete else "failed",
         "returncode": returncode,
         "stdout_tail": stdout[-4000:],
@@ -698,7 +776,17 @@ def score_latest_models(workers: int = 8) -> dict:
         "--batch-size",
         batch_size,
     ]
-    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    production_factor_schema = resolve_project_factor_schema(
+        os.getenv(
+            "ROUTINE_PRODUCTION_FACTOR_SCHEMA",
+            LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+        )
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}",
+        "PROJECT_FACTOR_COMPATIBILITY_MODE": production_factor_schema,
+    }
     result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
     manifest = _extract_last_json_object(result.stdout)
     return {
@@ -708,6 +796,7 @@ def score_latest_models(workers: int = 8) -> dict:
         "stdout_tail": result.stdout[-4000:],
         "stderr_tail": result.stderr[-4000:],
         "command": " ".join(command),
+        "factor_schema_version": production_factor_schema,
         "script_elapsed_seconds": manifest.get("elapsed_seconds"),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
@@ -896,6 +985,8 @@ def run_daily_pipeline(
             include_financials=True,
         )
         require_complete("refresh_reference_inputs", allow_skipped=skip_data)
+        results["refresh_factor_registry"] = refresh_factor_registry_snapshot()
+        require_complete("refresh_factor_registry")
         # Both jobs fan out into their own CPU-bound process pools. Running the
         # pools at the same time oversubscribes the machine and is materially
         # slower than letting each pool use the worker budget in turn.

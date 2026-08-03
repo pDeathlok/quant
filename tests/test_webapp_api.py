@@ -64,6 +64,7 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(pipeline, "refresh_data", source_success)
     monkeypatch.setattr(pipeline, "refresh_daily_basic_data", daily_basic_success)
     monkeypatch.setattr(pipeline, "refresh_reference_inputs", success)
+    monkeypatch.setattr(pipeline, "refresh_factor_registry_snapshot", success)
     monkeypatch.setattr(pipeline, "build_features", build_features or success)
     monkeypatch.setattr(pipeline, "refresh_strategy_signal_cache", success)
     monkeypatch.setattr(pipeline, "generate_daily_plan", generate_daily_plan or success)
@@ -1217,6 +1218,67 @@ def test_long_stock_pool_worker_does_not_redirect_process_stdout(monkeypatch) ->
     }
 
 
+def test_long_factor_snapshot_publishes_dated_latest_and_manifest(monkeypatch, tmp_path) -> None:
+    rows = []
+    for symbol, close in [("000001.SZ", 10.0), ("600000.SH", 12.0)]:
+        row = {column: 1.0 for column in services.LONG_FACTOR_REQUIRED_COLUMNS}
+        row.update(
+            {
+                "date": pd.Timestamp("2026-07-30"),
+                "ts_code": symbol,
+                "name": symbol,
+                "industry": "电子",
+                "close": close,
+            }
+        )
+        rows.append(row)
+    monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path / "long")
+
+    result = services._publish_long_factor_snapshot(
+        pd.DataFrame(rows),
+        pd.Timestamp("2026-07-30"),
+    )
+
+    latest = pd.read_parquet(tmp_path / "long/latest.parquet")
+    manifest = json.loads((tmp_path / "long/latest.json").read_text(encoding="utf-8"))
+    assert result["signal_date"] == "2026-07-30"
+    assert result["rows"] == 2
+    assert result["factor_count"] > 0
+    assert (tmp_path / "long/20260730.parquet").is_file()
+    assert latest["ts_code"].tolist() == ["000001.SZ", "600000.SH"]
+    assert latest["factor_schema_version"].eq(services.LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION).all()
+    assert manifest["latest_path"] == str(tmp_path / "long/latest.parquet")
+
+
+def test_long_refresh_publishes_factor_result_before_page_snapshot(monkeypatch) -> None:
+    order = []
+    factor_snapshot = {
+        "status": "success",
+        "signal_date": "2026-07-30",
+        "latest_path": "data/features/long/latest.parquet",
+    }
+
+    def build(variant, signal_date):
+        order.append("factor_snapshot")
+        return {
+            "signal_date": signal_date,
+            "stocks": [],
+            "factor_snapshot": factor_snapshot,
+        }
+
+    monkeypatch.setattr(services, "_build_tea_master_stock_pool_cached", build)
+    monkeypatch.setattr(
+        services,
+        "_write_long_stock_pool_snapshot",
+        lambda *args, **kwargs: order.append("page_snapshot"),
+    )
+
+    result = services._refresh_long_stock_pool_variant("tea", "2026-07-30")
+
+    assert order == ["factor_snapshot", "page_snapshot"]
+    assert result["factor_snapshot"] == factor_snapshot
+
+
 def test_live_long_base_skips_persistent_backtest_cache_and_reuses_memory(monkeypatch) -> None:
     calls = []
     features = pd.DataFrame({"date": pd.to_datetime(["2026-07-20"]), "ts_code": ["000001.SZ"]})
@@ -1248,12 +1310,12 @@ def test_live_long_base_skips_persistent_backtest_cache_and_reuses_memory(monkey
     second = services._load_live_long_base("2026-07-20")
 
     assert len(calls) == 1
-    assert calls[0] == {"use_cache": False, "include_daily_returns": False}
+    assert calls[0] == {"use_cache": True, "include_daily_returns": False}
     assert first[0] is second[0]
     services._load_live_long_base_cached.cache_clear()
 
 
-def test_live_long_base_keeps_two_sections_and_bounded_history(monkeypatch) -> None:
+def test_live_long_base_keeps_valuation_history_sections(monkeypatch) -> None:
     observed = {}
     dates = pd.to_datetime(["2026-05-29", "2026-06-30", "2026-07-21"])
     daily_basic = pd.DataFrame(
@@ -1287,12 +1349,211 @@ def test_live_long_base_keeps_two_sections_and_bounded_history(monkeypatch) -> N
 
     loaded_features, loaded_basic, _, coverage = services._load_live_long_base("2026-07-21")
 
-    assert observed["basic_start"] == pd.Timestamp("2023-03-21")
-    assert observed["price_start"] == pd.Timestamp("2026-06-30")
+    assert observed["basic_start"] == pd.Timestamp("2018-07-21")
+    assert observed["price_start"] == pd.Timestamp("2026-05-29")
     assert loaded_features["date"].tolist() == list(dates[-2:])
-    assert loaded_basic["date"].tolist() == list(dates[-2:])
-    assert coverage["live_rebalance_dates"] == ["2026-06-30", "2026-07-21"]
+    assert loaded_basic["date"].tolist() == list(dates)
+    assert coverage["live_rebalance_dates"] == ["2026-05-29", "2026-06-30", "2026-07-21"]
     services._load_live_long_base_cached.cache_clear()
+
+
+def test_long_good_price_keeps_both_pr_formulas_and_uses_history_rule() -> None:
+    row = pd.Series(
+        {
+            "close": 10.0,
+            "pe_ttm": 12.0,
+            "pb": 1.5,
+            "pr": 0.92,
+            "pr_pe": 0.80,
+            "pr_pb": 1.20,
+            "pr_formula_gap": 1 / 3,
+            "pe_hist_percentile": 35.0,
+            "pb_hist_percentile": 30.0,
+            "pr_hist_percentile": 32.0,
+            "pr_pe_hist_percentile": 28.0,
+            "pr_pb_hist_percentile": 40.0,
+            "valuation_history_points": 36,
+            "historical_value_score": 68.0,
+            "valuation_profile": "earnings_based",
+            "pr_pe_weight": 0.70,
+            "pr_pb_weight": 0.30,
+            "ma_120": 9.5,
+            "ma_120_slope_20d": 0.01,
+        }
+    )
+
+    result = services._long_good_price_assessment(row)
+
+    assert result["is_good_price"] is True
+    assert result["good_price_rule"] == "composite_60_guard"
+    assert result["price_score"] == 68.0
+    assert result["price_score_normalization"] == "per_stock_trailing_history_percentile"
+    assert result["price_score_cross_date_comparable"] is True
+    assert result["price_score_history_frequency"] == "month_end"
+    assert result["price_score_history_window_months"] == 84
+    assert result["price_score_min_history_points"] == 24
+    assert result["pr_from_pe"] == 0.8
+    assert result["pr_from_pb"] == 1.2
+    assert result["pr_pe_hist_percentile"] == 28.0
+    assert result["pr_pb_hist_percentile"] == 40.0
+    assert result["valuation_profile"] == "earnings_based"
+    assert result["pr_pe_weight"] == 0.7
+    assert result["pr_pb_weight"] == 0.3
+
+
+def test_long_good_stock_excludes_special_treatment_names() -> None:
+    base = {
+        "industry": "电子",
+        "good_stock_score": 80.0,
+        "profitability_score": 80.0,
+        "fundamental_growth_score": 70.0,
+        "balance_sheet_score": 70.0,
+        "business_stability_score": 70.0,
+        "good_stock_data_coverage": 1.0,
+        "listing_years": 5.0,
+        "roe": 15.0,
+        "netprofit_margin": 12.0,
+        "or_yoy": 10.0,
+        "basic_eps_yoy": 12.0,
+        "debt_to_assets": 35.0,
+    }
+
+    assert services._long_good_stock_assessment(pd.Series({**base, "name": "优质股份"}))["is_good_stock"] is True
+    assert services._long_good_stock_assessment(pd.Series({**base, "name": "ST风险"}))["is_good_stock"] is False
+    assert services._long_good_stock_assessment(pd.Series({**base, "name": "退市风险"}))["is_good_stock"] is False
+
+
+def test_long_good_price_requires_24_months_of_complete_history() -> None:
+    result = services._long_good_price_assessment(
+        pd.Series(
+            {
+                "close": 10.0,
+                "historical_value_score": 80.0,
+                "valuation_history_points": 23,
+                "pe_hist_percentile": 10.0,
+                "pb_hist_percentile": 10.0,
+                "pr_hist_percentile": 10.0,
+                "ma_120": 9.5,
+                "ma_120_slope_20d": 0.01,
+            }
+        )
+    )
+
+    assert result["is_good_price"] is False
+    assert result["price_state"] == "WAIT_HISTORY"
+
+
+def test_long_pool_row_exposes_metric_percentiles_and_three_year_forecast() -> None:
+    row = pd.Series(
+        {
+            "ts_code": "000001.SZ",
+            "name": "优质股份",
+            "industry": "电子",
+            "close": 10.0,
+            "good_stock_score": 80.0,
+            "profitability_score": 80.0,
+            "fundamental_growth_score": 70.0,
+            "balance_sheet_score": 70.0,
+            "business_stability_score": 70.0,
+            "good_stock_data_coverage": 1.0,
+            "listing_years": 5.0,
+            "roe": 15.0,
+            "roe_hist_percentile": 72.0,
+            "roe_history_points": 84,
+            "netprofit_margin": 12.0,
+            "or_yoy": 10.0,
+            "basic_eps_yoy": 12.0,
+            "debt_to_assets": 35.0,
+            "pe_ttm": 12.0,
+            "pb": 1.5,
+            "pr": 0.92,
+            "pr_pe": 0.8,
+            "pr_pb": 1.2,
+            "pe_hist_percentile": 35.0,
+            "pb_hist_percentile": 30.0,
+            "pr_hist_percentile": 32.0,
+            "pr_pe_hist_percentile": 28.0,
+            "pr_pb_hist_percentile": 40.0,
+            "valuation_history_points": 84,
+            "historical_value_score": 68.0,
+            "ma_120": 9.5,
+            "ma_120_slope_20d": 0.01,
+            "analyst_forward_eps_3y_mean_180d": 1.6,
+            "analyst_forward_eps_3y_variance_180d": 0.113333,
+            "analyst_forward_eps_3y_years_180d": 3,
+            "analyst_forward_eps_3y_estimate_count_180d": 4,
+            "analyst_forward_y0_year": 2026,
+            "analyst_forward_y0_eps_mean_180d": 1.2,
+            "analyst_forward_y0_eps_std_180d": None,
+            "analyst_forward_y0_eps_estimate_count_180d": 1,
+            "analyst_forward_y0_price_mean_180d": 12.0,
+            "analyst_forward_y0_price_std_180d": None,
+            "analyst_forward_y0_price_estimate_count_180d": 1,
+            "analyst_forward_y1_year": 2027,
+            "analyst_forward_y1_eps_mean_180d": 1.6,
+            "analyst_forward_y1_eps_std_180d": 0.141421,
+            "analyst_forward_y1_eps_estimate_count_180d": 2,
+            "analyst_forward_y1_price_mean_180d": 17.7,
+            "analyst_forward_y1_price_std_180d": 3.818377,
+            "analyst_forward_y1_price_estimate_count_180d": 2,
+            "analyst_forward_y2_year": 2028,
+            "analyst_forward_y2_eps_mean_180d": 2.0,
+            "analyst_forward_y2_eps_std_180d": None,
+            "analyst_forward_y2_eps_estimate_count_180d": 1,
+            "analyst_forward_y2_price_mean_180d": 20.0,
+            "analyst_forward_y2_price_std_180d": None,
+            "analyst_forward_y2_price_estimate_count_180d": 1,
+        }
+    )
+
+    result = services._tea_good_stock_price_row(row, variant="tea")
+
+    assert result["roe_hist_percentile"] == 72.0
+    assert result["roe_history_points"] == 84
+    assert result["pe_hist_percentile"] == 35.0
+    assert result["pr_from_pe"] == 0.8
+    assert result["pr_from_pb"] == 1.2
+    assert result["analyst_forward_eps_3y_mean_180d"] == 1.6
+    assert result["analyst_forward_eps_3y_variance_180d"] == 0.113333
+    assert result["analyst_forward_eps_3y_years_180d"] == 3
+    assert result["analyst_forward_eps_3y_estimate_count_180d"] == 4
+    assert result["price_score"] == 68.0
+    assert result["display_reason"] == "盈利能力较强、成长质量较好、财务安全性较好、经营稳定性较好；价格分达标"
+    assert result["analyst_forecast_3y"] == [
+        {
+            "horizon": 0,
+            "forecast_year": 2026,
+            "eps_mean": 1.2,
+            "eps_std": None,
+            "eps_estimate_count": 1,
+            "price_mean": 12.0,
+            "price_std": None,
+            "price_estimate_count": 1,
+            "price_basis": "eps_x_forecast_pe",
+        },
+        {
+            "horizon": 1,
+            "forecast_year": 2027,
+            "eps_mean": 1.6,
+            "eps_std": 0.1414,
+            "eps_estimate_count": 2,
+            "price_mean": 17.7,
+            "price_std": 3.82,
+            "price_estimate_count": 2,
+            "price_basis": "eps_x_forecast_pe",
+        },
+        {
+            "horizon": 2,
+            "forecast_year": 2028,
+            "eps_mean": 2.0,
+            "eps_std": None,
+            "eps_estimate_count": 1,
+            "price_mean": 20.0,
+            "price_std": None,
+            "price_estimate_count": 1,
+            "price_basis": "eps_x_forecast_pe",
+        },
+    ]
 
 
 def test_tea_checkpoint_recovers_previous_month_targets(monkeypatch) -> None:
@@ -2046,7 +2307,33 @@ def test_watchlist_strategy_hits_merge_only_strategy_workspaces(monkeypatch) -> 
         "_read_selector_snapshot",
         lambda *args, **kwargs: {
             "signal_date": "2026-07-15",
-            "stocks": [{"symbol": "002594.SZ", "matched_families": ["B1", "强K"], "matched_count": 2}],
+            "stocks": [
+                {
+                    "symbol": "002594.SZ",
+                    "matched_families": ["B1", "强K"],
+                    "matched_count": 2,
+                    "selector_score": 80.0,
+                    "opportunity_score": 80.0,
+                    "holding_score": 70.0,
+                    "best_profit_factor": 2.0,
+                    "buy_score_source": "historical_return_model",
+                    "hold_score_source": "historical_return_model",
+                    "signals": [{"strategy_family": "B1"}],
+                },
+                {
+                    "symbol": "002920.SZ",
+                    "matched_families": ["强K/突破"],
+                    "matched_count": 1,
+                    "selector_score": 35.2,
+                    "best_profit_factor": 1.0,
+                    "signals": [
+                        {
+                            "strategy_family": "KEY_K",
+                            "action_level": "谨慎观察",
+                        }
+                    ],
+                },
+            ],
         },
     )
     monkeypatch.setattr(
@@ -2074,10 +2361,11 @@ def test_watchlist_strategy_hits_merge_only_strategy_workspaces(monkeypatch) -> 
         },
     )
 
-    hits = services._collect_watchlist_strategy_hits(["002594.SZ", "002788.SZ"])
+    hits = services._collect_watchlist_strategy_hits(["002594.SZ", "002788.SZ", "002920.SZ"])
 
     assert [item["strategy_key"] for item in hits["002594.SZ"]] == ["short", "chan"]
     assert [item["strategy_key"] for item in hits["002788.SZ"]] == ["long"]
+    assert hits["002920.SZ"] == []
     assert hits["002594.SZ"][0]["detail"] == "B1 / 强K"
 
 

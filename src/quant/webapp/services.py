@@ -190,9 +190,32 @@ DEFAULT_FAMILY_CAP = 12
 SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v8_robust_return_models"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
-LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v7_good_stock_good_price"
+LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v11_history_price_score_forecast_years"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
+LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION = "long-page-v1"
+LONG_FACTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/features/long"
+LONG_FACTOR_REQUIRED_COLUMNS = (
+    "date",
+    "ts_code",
+    "good_stock_score",
+    "profitability_score",
+    "fundamental_growth_score",
+    "balance_sheet_score",
+    "business_stability_score",
+    "historical_value_score",
+    "roe",
+    "pe_ttm",
+    "pb",
+    "pr_pe",
+    "pr_pb",
+    "roe_hist_percentile",
+    "pe_hist_percentile",
+    "pb_hist_percentile",
+    "pr_pe_hist_percentile",
+    "pr_pb_hist_percentile",
+    "valuation_history_points",
+)
 WEB_WORKSPACE_SNAPSHOT_SCHEMA_VERSION = "workspace_payload_v1"
 WEB_WORKSPACE_SNAPSHOT_TABLE = "web_workspace_snapshots"
 WEB_WORKSPACE_SNAPSHOT_DIR = PROJECT_ROOT / "data/workspace_snapshots"
@@ -214,7 +237,7 @@ LONG_VARIANTS = {
     "v31": "v31_bull_bear_exposure_sleeve",
 }
 LONG_VARIANT_LABELS = {
-    "tea": "茶大长线趋势网格",
+    "tea": "长线好股票 · 好价格",
     "tea_safe": "茶大长线稳健网格",
     "v44": "防守中性长期组合",
     "v43": "核心质量长期组合",
@@ -266,7 +289,9 @@ def _reload_production_strategy_configs() -> None:
     add_triple_volume_strategy_pool_signals = (
         module.add_triple_volume_strategy_pool_signals
     )
-LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 40
+LONG_VALUATION_WINDOW_MONTHS = 84
+LONG_VALUATION_MINIMUM_MONTHS = 24
+LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 96
 _REFRESH_LOCK = threading.Lock()
 _REFRESH_CONTEXT = threading.local()
 _REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
@@ -1017,7 +1042,7 @@ def _load_live_long_base_full_cached(
 def _load_live_long_base_cached(
     signal_date: str | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Build live inputs from bounded price history and the latest two rebalance sections."""
+    """Build live inputs with enough monthly history for valuation percentiles."""
 
     module = _long_research_module()
     requested_end = pd.to_datetime(signal_date) if signal_date else pd.Timestamp.now().normalize()
@@ -1026,17 +1051,80 @@ def _load_live_long_base_cached(
     daily_basic, coverage = module.load_daily_basic_monthly(basic_start, requested_end)
     if daily_basic.empty:
         raise RuntimeError("缺少 daily_basic，无法生成长线股票池")
-    rebalance_dates = sorted(pd.to_datetime(daily_basic["date"].dropna().unique()))[-2:]
+    rebalance_dates = sorted(pd.to_datetime(daily_basic["date"].dropna().unique()))
     if not rebalance_dates:
         raise RuntimeError("daily_basic 没有可用调仓截面")
     price_start = pd.Timestamp(rebalance_dates[0])
-    features, _ = module.load_daily_monthly_features(
-        price_start,
-        requested_end,
-        stock_basic,
-        candidate_symbols=None,
-        use_cache=False,
-        include_daily_returns=False,
+    latest_rebalance = pd.Timestamp(rebalance_dates[-1])
+    candidate_symbols: set[str] | None = None
+    if hasattr(module, "filter_daily_basic_point_in_time"):
+        live_universe_config = type(
+            "LiveLongUniverseConfig",
+            (),
+            {
+                "variant": "tea",
+                "prefilter_min_dv_ttm": 0.0,
+                "prefilter_min_total_mv": 800000.0,
+                "prefilter_min_circ_mv": 500000.0,
+            },
+        )()
+        latest_basic = daily_basic[daily_basic["date"] == latest_rebalance].copy()
+        latest_basic = module.filter_daily_basic_point_in_time(
+            latest_basic,
+            live_universe_config,
+        )
+        candidate_symbols = set(latest_basic["ts_code"].dropna().astype(str))
+    history_features = pd.DataFrame()
+    module_root = getattr(module, "PROJECT_ROOT", None)
+    if module_root is not None:
+        full_cache_key = hashlib.sha1(
+            "20130101|none|qfq_ohlc_price_v1|".encode("utf-8")
+        ).hexdigest()[:16]
+        full_cache_path = (
+            Path(module_root)
+            / "data/research/long_dividend_quality"
+            / f"daily_monthly_features_{full_cache_key}.parquet"
+        )
+        if full_cache_path.exists():
+            history_features = pd.read_parquet(full_cache_path)
+            history_features["date"] = pd.to_datetime(history_features["date"])
+            history_features = history_features[
+                (history_features["date"] >= price_start)
+                & (history_features["date"] <= requested_end)
+            ].copy()
+            if candidate_symbols is not None:
+                history_features = history_features[
+                    history_features["ts_code"].astype(str).isin(candidate_symbols)
+                ].copy()
+
+    cached_last_date = (
+        pd.to_datetime(history_features["date"].max())
+        if not history_features.empty
+        else pd.NaT
+    )
+    if pd.isna(cached_last_date) or cached_last_date < latest_rebalance:
+        # Historical percentiles come from the reusable month-end cache. Only
+        # compute the missing latest section from daily bars (the loader keeps
+        # its own 450-day technical warm-up), instead of rescanning six years.
+        recent_start = latest_rebalance if not history_features.empty else price_start
+        recent_features, _ = module.load_daily_monthly_features(
+            recent_start,
+            requested_end,
+            stock_basic,
+            candidate_symbols=candidate_symbols,
+            use_cache=True,
+            include_daily_returns=False,
+        )
+        features = pd.concat([history_features, recent_features], ignore_index=True, sort=False)
+    else:
+        features = history_features
+    feature_sort_columns = [
+        column for column in ["date", "ts_code", "trade_date"] if column in features.columns
+    ]
+    features = (
+        features.sort_values(feature_sort_columns)
+        .drop_duplicates(["date", "ts_code"], keep="last")
+        .reset_index(drop=True)
     )
     daily_basic = daily_basic[daily_basic["date"].isin(rebalance_dates)].copy()
     coverage = dict(coverage)
@@ -1048,6 +1136,19 @@ def _load_live_long_base_cached(
             "live_rebalance_dates": [pd.Timestamp(item).date().isoformat() for item in rebalance_dates],
             "live_feature_rows": int(len(features)),
             "live_daily_basic_rows": int(len(daily_basic)),
+            "live_candidate_symbols": (
+                len(candidate_symbols) if candidate_symbols is not None else None
+            ),
+            "live_history_cache_last_date": (
+                pd.Timestamp(cached_last_date).date().isoformat()
+                if not pd.isna(cached_last_date)
+                else None
+            ),
+            "live_recent_feature_start": (
+                recent_start.date().isoformat()
+                if "recent_start" in locals()
+                else None
+            ),
         }
     )
     return features, daily_basic, stock_basic, coverage
@@ -1771,20 +1872,72 @@ def _attach_analyst_forecast_for_display(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(scored, ignore_index=True) if scored else enriched
 
 
+def _publish_long_factor_snapshot(frame: pd.DataFrame, signal_ts: pd.Timestamp) -> dict[str, Any]:
+    """Publish the exact point-in-time factor cross-section used by the long page."""
+
+    # Keep the complete factor calculator out of Web application startup. The
+    # registry is only needed when the daily long snapshot is materialized.
+    from quant.features.factor_registry import LONG_FACTOR_COLUMNS
+
+    if frame.empty:
+        raise RuntimeError("长线因子截面为空，拒绝发布页面股票池")
+    missing = [column for column in LONG_FACTOR_REQUIRED_COLUMNS if column not in frame.columns]
+    if missing:
+        raise RuntimeError(f"长线因子截面缺少必需字段: {', '.join(missing)}")
+
+    signal_date = pd.to_datetime(signal_ts).date().isoformat()
+    snapshot = frame.copy()
+    snapshot["date"] = pd.to_datetime(snapshot["date"], errors="coerce")
+    snapshot = snapshot[snapshot["date"].dt.date.astype(str) == signal_date].copy()
+    if snapshot.empty:
+        raise RuntimeError(f"长线因子截面未覆盖目标日期: {signal_date}")
+    if snapshot["ts_code"].astype(str).duplicated().any():
+        raise RuntimeError(f"长线因子截面存在重复股票: {signal_date}")
+
+    identity_columns = ["date", "ts_code", "name", "industry", "close"]
+    factor_columns = [column for column in LONG_FACTOR_COLUMNS if column in snapshot.columns]
+    columns = list(dict.fromkeys([*identity_columns, *factor_columns]))
+    snapshot = snapshot[[column for column in columns if column in snapshot.columns]].copy()
+    snapshot["factor_schema_version"] = LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION
+    snapshot = snapshot.sort_values("ts_code").reset_index(drop=True)
+
+    dated_path = LONG_FACTOR_SNAPSHOT_DIR / f"{signal_date.replace('-', '')}.parquet"
+    latest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.parquet"
+    manifest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.json"
+    atomic_write_parquet(snapshot, dated_path, index=False)
+    atomic_write_parquet(snapshot, latest_path, index=False)
+    manifest = {
+        "status": "success",
+        "factor_schema_version": LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION,
+        "signal_date": signal_date,
+        "rows": int(len(snapshot)),
+        "factor_count": int(len(factor_columns)),
+        "source": "long_page_point_in_time_cross_section",
+        "dated_path": str(dated_path),
+        "latest_path": str(latest_path),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    atomic_write_json(manifest, manifest_path)
+    return {**manifest, "manifest_path": str(manifest_path)}
+
+
 def _long_good_stock_assessment(row: pd.Series) -> dict[str, Any]:
     """Evaluate business quality without using valuation or price trend."""
 
+    name = str(row.get("name") or "").strip()
     industry = str(row.get("industry") or "")
+    eligible_name = not bool(re.search(r"ST|退", name, re.IGNORECASE))
     is_financial = bool(re.search(r"银行|证券|保险|多元金融|金融服务", industry))
     score = _safe_float(row.get("good_stock_score"), 0.0) or 0.0
     profitability = _safe_float(row.get("profitability_score"), 0.0) or 0.0
     growth = _safe_float(row.get("fundamental_growth_score"), 0.0) or 0.0
     balance = _safe_float(row.get("balance_sheet_score"), 0.0) or 0.0
     stability = _safe_float(row.get("business_stability_score"), 0.0) or 0.0
-    risk = _safe_float(row.get("risk_score"), 0.0) or 0.0
     coverage = _safe_float(row.get("good_stock_data_coverage"), 0.0) or 0.0
     listing_years = _safe_float(row.get("listing_years"), 0.0) or 0.0
     roe = _safe_float(row.get("roe"))
+    roe_percentile = _safe_float(row.get("roe_hist_percentile"))
+    roe_history_points = int(_safe_float(row.get("roe_history_points"), 0.0) or 0)
     margin = _safe_float(row.get("netprofit_margin"))
     revenue_growth = _safe_float(row.get("or_yoy"))
     eps_growth = _safe_float(row.get("basic_eps_yoy"))
@@ -1803,12 +1956,13 @@ def _long_good_stock_assessment(row: pd.Series) -> dict[str, Any]:
     is_good_stock = bool(
         score >= 60
         and profitability >= 50
-        and risk >= 25
+        and stability >= 30
         and coverage >= 0.60
         and listing_years >= 2
         and profitable
         and balance_ok
         and not severe_deterioration
+        and eligible_name
     )
 
     strengths: list[str] = []
@@ -1835,33 +1989,38 @@ def _long_good_stock_assessment(row: pd.Series) -> dict[str, Any]:
         "good_stock_data_coverage": round(coverage, 2),
         "good_stock_reason": "、".join(strengths),
         "is_financial_industry": is_financial,
+        "roe_hist_percentile": round(roe_percentile, 2) if roe_percentile is not None else None,
+        "roe_history_points": roe_history_points,
     }
 
 
 def _long_good_price_assessment(row: pd.Series) -> dict[str, Any]:
-    """Evaluate price only after a stock has passed the quality gate."""
+    """Evaluate the validation-selected, cross-date historical price score."""
 
     close = _safe_float(row.get("close"))
-    reference = _safe_float(row.get("target_price"))
-    value_score = _safe_float(row.get("value_score"), 0.0) or 0.0
+    pe = _safe_float(row.get("pe_ttm"))
+    pb = _safe_float(row.get("pb"))
+    pr = _safe_float(row.get("pr"))
+    pr_from_pe = _safe_float(row.get("pr_pe"))
+    pr_from_pb = _safe_float(row.get("pr_pb"))
+    pr_formula_gap = _safe_float(row.get("pr_formula_gap"))
+    pe_percentile = _safe_float(row.get("pe_hist_percentile"))
+    pb_percentile = _safe_float(row.get("pb_hist_percentile"))
+    pr_percentile = _safe_float(row.get("pr_hist_percentile"))
+    pr_pe_percentile = _safe_float(row.get("pr_pe_hist_percentile"))
+    pr_pb_percentile = _safe_float(row.get("pr_pb_hist_percentile"))
+    valuation_profile = str(row.get("valuation_profile") or "balanced")
+    pr_pe_weight = _safe_float(row.get("pr_pe_weight"), 0.50) or 0.50
+    pr_pb_weight = _safe_float(row.get("pr_pb_weight"), 0.50) or 0.50
+    history_points = int(_safe_float(row.get("valuation_history_points"), 0.0) or 0)
+    historical_value_score = _safe_float(row.get("historical_value_score"))
     ma120 = _safe_float(row.get("ma_120"))
     ma120_slope = _safe_float(row.get("ma_120_slope_20d"))
-    ratio = close / reference if close and reference and reference > 0 else None
-
-    if ratio is None:
-        price_position_score = 0.0
-    elif ratio <= 0.98:
-        price_position_score = 100.0
-    elif ratio <= 1.00:
-        price_position_score = 100.0 - (ratio - 0.98) / 0.02 * 10.0
-    elif ratio <= 1.08:
-        price_position_score = 90.0 - (ratio - 1.00) / 0.08 * 30.0
-    elif ratio <= 1.20:
-        price_position_score = 60.0 - (ratio - 1.08) / 0.12 * 40.0
-    else:
-        price_position_score = max(0.0, 20.0 - (ratio - 1.20) * 50.0)
-
-    good_price_score = float(np.clip(value_score * 0.60 + price_position_score * 0.40, 0, 100))
+    complete_percentiles = bool(
+        historical_value_score is not None
+        and all(value is not None for value in [pe_percentile, pb_percentile, pr_percentile])
+    )
+    has_history = bool(history_points >= 24 and complete_percentiles)
     trend_guard = bool(
         close is not None
         and ma120 is not None
@@ -1870,48 +2029,107 @@ def _long_good_price_assessment(row: pd.Series) -> dict[str, Any]:
         and ma120_slope >= -0.06
     )
     is_good_price = bool(
-        ratio is not None
-        and ratio <= 1.08
-        and value_score >= 55
-        and good_price_score >= 60
+        has_history
+        and historical_value_score >= 60
         and trend_guard
     )
     near_good_price = bool(
         not is_good_price
-        and ratio is not None
-        and ratio <= 1.15
-        and value_score >= 50
+        and has_history
+        and historical_value_score >= 55
         and trend_guard
     )
 
     if is_good_price:
         price_state = "GOOD_PRICE"
-        price_reason = f"估值分 {value_score:.1f}，当前价位进入好价格区"
+        price_reason = f"历史归一化价格分 {historical_value_score:.1f}，通过研究规则"
+    elif history_points < 24:
+        price_state = "WAIT_HISTORY"
+        price_reason = f"估值历史仅 {history_points} 个月，未达到 24 个月最低要求"
+    elif not complete_percentiles:
+        price_state = "WAIT_HISTORY"
+        price_reason = "当前 PE、PB 或双 PR 口径不完整，暂不判定好价格"
     elif not trend_guard:
         price_state = "WAIT_STABILITY"
-        price_reason = "价格结构偏弱，先等待长期趋势企稳"
+        price_reason = "估值可能较低，但长期价格结构保护尚未通过"
     elif near_good_price:
         price_state = "NEAR_GOOD_PRICE"
-        price_reason = "已接近好价格区，继续等待安全边际"
+        price_reason = f"历史归一化价格分 {historical_value_score:.1f}，接近推荐标准"
     else:
         price_state = "WAIT_PRICE"
-        price_reason = "公司质量达标，当前价格仍需等待"
+        price_reason = f"历史归一化价格分 {historical_value_score:.1f}，当前估值分位仍需等待"
 
     return {
         "is_good_price": is_good_price,
-        "good_price_score": round(good_price_score, 2),
-        "price_position_score": round(price_position_score, 2),
+        "price_score": round(historical_value_score, 2) if historical_value_score is not None else None,
+        # Compatibility alias for older snapshots and downstream research.
+        "good_price_score": round(historical_value_score, 2) if historical_value_score is not None else None,
+        "price_score_normalization": "per_stock_trailing_history_percentile",
+        "price_score_cross_date_comparable": True,
+        "price_score_history_frequency": "month_end",
+        "price_score_history_window_months": LONG_VALUATION_WINDOW_MONTHS,
+        "price_score_min_history_points": LONG_VALUATION_MINIMUM_MONTHS,
         "price_state": price_state,
         "price_state_reason": price_reason,
-        "price_to_reference": round(ratio, 4) if ratio is not None else None,
+        "good_price_rule": "composite_60_guard",
+        "good_price_evidence": "RESEARCH_PENDING_OOS_CONFIRMATION",
+        "valuation_history_points": history_points,
+        "pe_hist_percentile": round(pe_percentile, 2) if pe_percentile is not None else None,
+        "pb_hist_percentile": round(pb_percentile, 2) if pb_percentile is not None else None,
+        "pr_hist_percentile": round(pr_percentile, 2) if pr_percentile is not None else None,
+        "pr": round(pr, 4) if pr is not None else None,
+        "pr_from_pe": round(pr_from_pe, 4) if pr_from_pe is not None else None,
+        "pr_from_pb": round(pr_from_pb, 4) if pr_from_pb is not None else None,
+        "pr_formula_gap": round(pr_formula_gap, 4) if pr_formula_gap is not None else None,
+        "pr_pe_hist_percentile": round(pr_pe_percentile, 2) if pr_pe_percentile is not None else None,
+        "pr_pb_hist_percentile": round(pr_pb_percentile, 2) if pr_pb_percentile is not None else None,
+        "valuation_profile": valuation_profile,
+        "pr_pe_weight": round(pr_pe_weight, 2),
+        "pr_pb_weight": round(pr_pb_weight, 2),
+        "pe_ttm": round(pe, 2) if pe is not None else None,
+        "pb": round(pb, 2) if pb is not None else None,
         "price_levels": {
             "current_price": round(close, 2) if close is not None else None,
-            "patient_price": round(reference * 0.98, 2) if reference is not None else None,
-            "reference_price": round(reference, 2) if reference is not None else None,
-            "good_price_upper": round(reference * 1.08, 2) if reference is not None else None,
             "trend_reference_price": round(ma120, 2) if ma120 is not None else None,
         },
     }
+
+
+def _analyst_forecast_years(row: pd.Series) -> list[dict[str, Any]]:
+    forecasts: list[dict[str, Any]] = []
+    signal_date = pd.to_datetime(row.get("date"), errors="coerce")
+    signal_year = None if pd.isna(signal_date) else int(signal_date.year)
+    for horizon in range(3):
+        prefix = f"analyst_forward_y{horizon}"
+        year = _safe_float(row.get(f"{prefix}_year"))
+        eps_mean = _safe_float(row.get(f"{prefix}_eps_mean_180d"))
+        eps_std = _safe_float(row.get(f"{prefix}_eps_std_180d"))
+        price_mean = _safe_float(row.get(f"{prefix}_price_mean_180d"))
+        price_std = _safe_float(row.get(f"{prefix}_price_std_180d"))
+        forecasts.append(
+            {
+                "horizon": horizon,
+                "forecast_year": (
+                    int(year)
+                    if year is not None
+                    else signal_year + horizon
+                    if signal_year is not None
+                    else None
+                ),
+                "eps_mean": round(eps_mean, 4) if eps_mean is not None else None,
+                "eps_std": round(eps_std, 4) if eps_std is not None else None,
+                "eps_estimate_count": int(
+                    _safe_float(row.get(f"{prefix}_eps_estimate_count_180d"), 0.0) or 0
+                ),
+                "price_mean": round(price_mean, 2) if price_mean is not None else None,
+                "price_std": round(price_std, 2) if price_std is not None else None,
+                "price_estimate_count": int(
+                    _safe_float(row.get(f"{prefix}_price_estimate_count_180d"), 0.0) or 0
+                ),
+                "price_basis": "eps_x_forecast_pe",
+            }
+        )
+    return forecasts
 
 
 def _tea_good_stock_price_row(
@@ -1924,14 +2142,19 @@ def _tea_good_stock_price_row(
     price = _long_good_price_assessment(row)
     recommended = bool(stock["is_good_stock"] and price["is_good_price"])
     level = "RECOMMENDED" if recommended else "WATCH"
-    display_reason = (
-        f"好股票：{stock['good_stock_reason']}；好价格：{price['price_state_reason']}"
-        if recommended
-        else f"好股票：{stock['good_stock_reason']}；观察价格：{price['price_state_reason']}"
-    )
+    price_summary = {
+        "GOOD_PRICE": "价格分达标",
+        "NEAR_GOOD_PRICE": "价格分接近推荐线",
+        "WAIT_PRICE": "价格分未达推荐线",
+        "WAIT_HISTORY": "估值历史不足",
+        "WAIT_STABILITY": "长期价格结构待确认",
+    }.get(str(price["price_state"]), "价格条件待确认")
+    display_reason = f"{stock['good_stock_reason']}；{price_summary}"
     close = _safe_float(row.get("close"))
     analyst_growth = _safe_float(row.get("analyst_forward_growth_score"))
     analyst_upside = _safe_float(row.get("analyst_target_upside_180d"))
+    analyst_eps_3y_mean = _safe_float(row.get("analyst_forward_eps_3y_mean_180d"))
+    analyst_eps_3y_variance = _safe_float(row.get("analyst_forward_eps_3y_variance_180d"))
     return {
         "ts_code": str(row.get("ts_code")),
         "name": row.get("name"),
@@ -1969,6 +2192,21 @@ def _tea_good_stock_price_row(
         "analyst_forward_years_180d": int(_safe_float(row.get("analyst_forward_years_180d"), 0.0) or 0),
         "analyst_forward_growth_score": round(analyst_growth, 2) if analyst_growth is not None else None,
         "analyst_target_upside_180d": round(analyst_upside, 4) if analyst_upside is not None else None,
+        "analyst_forward_eps_3y_mean_180d": (
+            round(analyst_eps_3y_mean, 4) if analyst_eps_3y_mean is not None else None
+        ),
+        "analyst_forward_eps_3y_variance_180d": (
+            round(analyst_eps_3y_variance, 6)
+            if analyst_eps_3y_variance is not None
+            else None
+        ),
+        "analyst_forward_eps_3y_years_180d": int(
+            _safe_float(row.get("analyst_forward_eps_3y_years_180d"), 0.0) or 0
+        ),
+        "analyst_forward_eps_3y_estimate_count_180d": int(
+            _safe_float(row.get("analyst_forward_eps_3y_estimate_count_180d"), 0.0) or 0
+        ),
+        "analyst_forecast_3y": _analyst_forecast_years(row),
         **stock,
         **price,
     }
@@ -1977,7 +2215,11 @@ def _tea_good_stock_price_row(
 def _upgrade_cached_tea_analyst_display(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     stocks = payload.get("stocks") or []
     if payload.get("schema_version") == LONG_STOCK_POOL_SCHEMA_VERSION and all(
-        item.get("recommendation_level") and item.get("display_reason") for item in stocks
+        item.get("recommendation_level")
+        and item.get("display_reason")
+        and "price_score" in item
+        and len(item.get("analyst_forecast_3y") or []) == 3
+        for item in stocks
     ):
         return payload, False
     signal_date = payload.get("signal_date")
@@ -2001,7 +2243,24 @@ def _upgrade_cached_tea_analyst_display(payload: dict[str, Any]) -> tuple[dict[s
         "analyst_forward_years_180d",
         "analyst_forward_growth_score",
         "analyst_target_upside_180d",
+        "analyst_forward_eps_3y_mean_180d",
+        "analyst_forward_eps_3y_variance_180d",
+        "analyst_forward_eps_3y_years_180d",
+        "analyst_forward_eps_3y_estimate_count_180d",
     ]
+    for horizon in range(3):
+        prefix = f"analyst_forward_y{horizon}"
+        analyst_columns.extend(
+            [
+                f"{prefix}_year",
+                f"{prefix}_eps_mean_180d",
+                f"{prefix}_eps_std_180d",
+                f"{prefix}_eps_estimate_count_180d",
+                f"{prefix}_price_mean_180d",
+                f"{prefix}_price_std_180d",
+                f"{prefix}_price_estimate_count_180d",
+            ]
+        )
     upgraded = dict(payload)
     upgraded_stocks: list[dict[str, Any]] = []
     for item in stocks:
@@ -2020,11 +2279,42 @@ def _upgrade_cached_tea_analyst_display(payload: dict[str, Any]) -> tuple[dict[s
                     "analyst_research_report_count_180d",
                     "analyst_consensus_report_count_180d",
                     "analyst_forward_years_180d",
+                    "analyst_forward_eps_3y_years_180d",
+                    "analyst_forward_eps_3y_estimate_count_180d",
+                    *{
+                        f"analyst_forward_y{horizon}_{metric}_estimate_count_180d"
+                        for horizon in range(3)
+                        for metric in ("eps", "price")
+                    },
+                    *{f"analyst_forward_y{horizon}_year" for horizon in range(3)},
                 }:
                     upgraded_item[column] = int(value or 0)
                 else:
-                    precision = 4 if column == "analyst_target_upside_180d" else 2
+                    precision = (
+                        6
+                        if column == "analyst_forward_eps_3y_variance_180d"
+                        else 4
+                        if column in {
+                            "analyst_target_upside_180d",
+                            "analyst_forward_eps_3y_mean_180d",
+                        }
+                        else 2
+                    )
                     upgraded_item[column] = round(value, precision) if value is not None else None
+            upgraded_item["analyst_forecast_3y"] = _analyst_forecast_years(row)
+        if upgraded_item.get("price_score") is None:
+            upgraded_item["price_score"] = upgraded_item.get("good_price_score")
+        upgraded_item.setdefault(
+            "price_score_normalization", "per_stock_trailing_history_percentile"
+        )
+        upgraded_item.setdefault("price_score_cross_date_comparable", True)
+        upgraded_item.setdefault("price_score_history_frequency", "month_end")
+        upgraded_item.setdefault(
+            "price_score_history_window_months", LONG_VALUATION_WINDOW_MONTHS
+        )
+        upgraded_item.setdefault(
+            "price_score_min_history_points", LONG_VALUATION_MINIMUM_MONTHS
+        )
         existing_since = pd.to_datetime(upgraded_item.get("recommendation_since"), errors="coerce")
         _decorate_long_recommendation_display(
             upgraded_item,
@@ -2386,7 +2676,11 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     if config is None:
         raise ValueError(f"未知茶大长线策略版本: {variant_key}")
     merged, _, coverage = _prepare_tea_master_live_data(module, signal_date)
-    scored = module.build_tea_scores(merged)
+    scored = module.build_tea_scores(
+        merged,
+        valuation_window_months=LONG_VALUATION_WINDOW_MONTHS,
+        valuation_minimum_months=LONG_VALUATION_MINIMUM_MONTHS,
+    )
     eligible_scored = scored.copy()
     if signal_date:
         eligible_scored = eligible_scored[eligible_scored["date"] <= pd.to_datetime(signal_date)].copy()
@@ -2397,27 +2691,40 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     if scored_date.empty:
         scored_date = eligible_scored.sort_values("date").drop_duplicates("ts_code", keep="last").copy()
     scored_date = _attach_analyst_forecast_for_display(scored_date)
+    factor_snapshot = (
+        _publish_long_factor_snapshot(scored_date, signal_ts)
+        if variant_key == "tea"
+        else None
+    )
 
     rows = [
         _tea_good_stock_price_row(row, variant=variant_key)
         for _, row in scored_date.iterrows()
     ]
-    rows = [row for row in rows if row["is_good_stock"]]
-    rows = sorted(
-        rows,
-        key=lambda item: (
-            0 if item["recommendation_level"] == "RECOMMENDED" else 1,
-            -(item.get("good_price_score") or 0),
-            -(item.get("good_stock_score") or 0),
-        ),
-    )[:40]
+    all_good_stock_rows = [row for row in rows if row["is_good_stock"]]
+    recommended_rows = sorted(
+        [row for row in all_good_stock_rows if row["recommendation_level"] == "RECOMMENDED"],
+        key=lambda item: (-(item.get("price_score") or 0), -(item.get("good_stock_score") or 0)),
+    )
+    watch_rows = sorted(
+        [row for row in all_good_stock_rows if row["recommendation_level"] == "WATCH"],
+        key=lambda item: (-(item.get("good_stock_score") or 0), -(item.get("price_score") or 0)),
+    )
+    # Keep both decision states visible without turning the page into a full
+    # universe dump. Counts below always describe the complete good-stock pool.
+    rows = recommended_rows[:40] + watch_rows[:40]
     for index, item in enumerate(rows, start=1):
         item["rank"] = index
 
     regime_values = scored_date["market_regime"].dropna().astype(str)
     regime = str(regime_values.iloc[0]) if not regime_values.empty else "neutral"
-    state_counts = pd.Series([row["recommendation_level"] for row in rows]).value_counts().to_dict()
-    analyst_covered = sum(1 for row in rows if row.get("analyst_report_count_180d", 0) > 0)
+    state_counts = {
+        "RECOMMENDED": len(recommended_rows),
+        "WATCH": len(watch_rows),
+    }
+    analyst_covered = sum(
+        1 for row in all_good_stock_rows if row.get("analyst_report_count_180d", 0) > 0
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": signal_ts.date().isoformat(),
@@ -2426,19 +2733,24 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
         "variant_name": LONG_VARIANT_LABELS.get(variant_key, variant_key),
         "market_regime": regime,
         "coverage": coverage,
+        "factor_snapshot": factor_snapshot,
         "state_counts": {str(k): int(v) for k, v in state_counts.items()},
         "quality_price_summary": {
-            "good_stock_count": len(rows),
-            "recommended_count": int(state_counts.get("RECOMMENDED", 0)),
-            "watch_count": int(state_counts.get("WATCH", 0)),
+            "good_stock_count": len(all_good_stock_rows),
+            "recommended_count": len(recommended_rows),
+            "watch_count": len(watch_rows),
             "analyst_covered_count": analyst_covered,
+            "displayed_count": len(rows),
         },
         "stocks": rows,
         "notes": [
-            "长线页面只回答好股票与好价格，不承担卖出、降仓或持仓管理。",
+            "长线页面只负责选好股票与合适的建仓价格，持仓管理由自选池承担。",
             "好股票由盈利能力、成长质量、财务安全和经营稳定性决定，价格与趋势不参与好股票资格。",
-            "好股票统一进入观察池；同时满足估值、价格位置和长期趋势保护时升级为推荐。",
+            "好股票统一进入观察池；价格分达到60且通过长期价格结构保护时升级为推荐。",
+            "PR-PE和PR-PB同时保留，并按利润驱动、资本驱动或均衡型行业调整权重。",
+            "价格分为0—100分，使用每只股票最近7年月末历史的PE/PB/双PR分位归一化，不使用单日横截面排名，因此跨日含义一致；至少24个有效点。",
             "券商预测严格按 report_date <= signal_date 展示，目前不参与好股票或好价格评分。",
+            "未来三年研报统计按当年E、次年E、后年E分别展示EPS及EPS×预测PE隐含股价的均值、样本标准差；严格按信号日可见数据计算。",
         ],
     }
 
@@ -3407,6 +3719,10 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
                 include_extended=True,
                 use_cache=True,
             )
+        # Keep cross-workspace badges aligned with the short-strategy surface:
+        # raw snapshot rows that fail the OOT quality gate or fall outside the
+        # displayed shortlist must not be presented as visible strategy hits.
+        short_payload = _display_selector_payload(short_payload)
         for item in short_payload.get("stocks") or []:
             families = " / ".join(str(value) for value in (item.get("matched_families") or [])[:4])
             append_hit(
@@ -6580,11 +6896,14 @@ def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> d
     else:
         payload = _build_long_stock_pool_cached(variant_key, signal_date, True)
     _write_long_stock_pool_snapshot(payload, variant_key, signal_date)
-    return {
+    result = {
         "variant": variant_key,
         "signal_date": payload.get("signal_date"),
         "stocks": len(payload.get("stocks") or []),
     }
+    if payload.get("factor_snapshot"):
+        result["factor_snapshot"] = payload["factor_snapshot"]
+    return result
 
 
 def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | None) -> list[dict[str, Any]]:
@@ -6764,6 +7083,7 @@ def _run_latest_refresh_job(
         refresh_chan_model_scores,
         refresh_data,
         refresh_daily_basic_data,
+        refresh_factor_registry_snapshot,
         refresh_reference_inputs,
         refresh_strategy_signal_cache,
         score_latest_models,
@@ -6970,6 +7290,13 @@ def _run_latest_refresh_job(
             if results["refresh_reference_inputs"].get("status") not in {"success", "skipped"}:
                 details = results["refresh_reference_inputs"].get("critical_errors") or []
                 raise RuntimeError(f"参考数据刷新失败: {details}")
+
+        results["factor_registry"] = refresh_factor_registry_snapshot()
+        if results["factor_registry"].get("status") != "success":
+            raise RuntimeError(
+                "统一因子注册表刷新失败: "
+                + str(results["factor_registry"].get("error") or "unknown error")
+            )
 
         _set_refresh_progress(
             step_key="refresh_data",

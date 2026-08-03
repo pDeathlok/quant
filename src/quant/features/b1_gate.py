@@ -6,7 +6,15 @@ import numpy as np
 import pandas as pd
 
 from quant.data.factors import KDJ
-from quant.features.variable_library import build_continuous_ohlc, calc_bbi
+from quant.features.project_factor_layer import (
+    LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+    resolve_project_factor_schema,
+)
+from quant.features.variable_library import (
+    build_continuous_ohlc,
+    build_latest_scale_ohlc,
+    calc_bbi,
+)
 
 
 B1_GATE_METRIC_COLUMNS = [
@@ -41,17 +49,27 @@ def calculate_b1_gate(
     daily: pd.DataFrame,
     *,
     shared_factors: pd.DataFrame | None = None,
+    factor_schema_version: str | None = None,
 ) -> pd.DataFrame:
     """Return the production B1 mask and its exact gate inputs."""
 
-    price = build_continuous_ohlc(daily)
+    schema = resolve_project_factor_schema(factor_schema_version)
+    legacy = schema == LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+    price = build_latest_scale_ohlc(daily) if legacy else build_continuous_ohlc(daily)
     close = pd.to_numeric(price["close"], errors="coerce")
     low = pd.to_numeric(price["low"], errors="coerce")
     high = pd.to_numeric(price["high"], errors="coerce")
     pct_change = close.pct_change() * 100
     amplitude = (high - low) / low.replace(0, np.nan) * 100
 
-    shared = shared_factors if shared_factors is not None else pd.DataFrame()
+    # The shared layer is materialized under the current causal schema.  A
+    # pinned legacy release therefore recomputes its two price-dependent gate
+    # inputs instead of silently mixing schemas.
+    shared = (
+        shared_factors
+        if shared_factors is not None and not legacy
+        else pd.DataFrame()
+    )
     bbi = _aligned_shared_column(shared, "bbi", daily.index)
     if bbi is None:
         bbi = calc_bbi(close)

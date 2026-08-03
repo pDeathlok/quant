@@ -35,11 +35,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
-import build_training_data_parallel as btd
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import normalize_tushare_daily
 from quant.features.b1_gate import calculate_b1_gate
-from quant.features.daily_factor_layer import BASE_FACTOR_COLUMNS, attach_daily_base_factors
+from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.project_factor_layer import (
+    PROJECT_FACTOR_SCHEMA_VERSION,
+    calculate_project_market_factors,
+)
 from quant.features.variable_library import (
     PROJECT_FACTOR_COLUMNS,
     merge_daily_basic_features,
@@ -115,9 +118,21 @@ def process_daily_frame(
         if not bool((b1_signal & (df["date"] >= start_ts)).any()):
             return None
 
-        shared_cols = [col for col in BASE_FACTOR_COLUMNS if col in shared.columns]
-        factors = pd.concat([btd.calculate_factors_single_stock(df), shared[shared_cols]], axis=1)
-        factors = factors.loc[:, ~factors.columns.duplicated(keep="last")]
+        factor_frame = calculate_project_market_factors(
+            df,
+            symbol=symbol,
+            shared_factors=shared,
+        )
+        factors = factor_frame[
+            [
+                *[
+                    column
+                    for column in PROJECT_FACTOR_COLUMNS
+                    if column in factor_frame.columns
+                ],
+                "factor_schema_version",
+            ]
+        ]
         labels = create_b1_labels(df, forward_days=5, exit_aware=True, use_new_labels=True)
         result = pd.concat([df, factors, labels], axis=1)
 
@@ -129,6 +144,7 @@ def process_daily_frame(
             "name",
             "industry",
             "market",
+            "factor_schema_version",
             *B1_FEATURE_COLUMNS,
             *LABELS.values(),
         ]
@@ -400,6 +416,18 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
     output_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     reports: dict[str, dict] = {}
+    factor_schemas = (
+        set(data["factor_schema_version"].dropna().astype(str).unique())
+        if "factor_schema_version" in data.columns
+        else set()
+    )
+    if factor_schemas != {PROJECT_FACTOR_SCHEMA_VERSION}:
+        raise RuntimeError(
+            "B1 research training requires one current factor schema: "
+            f"expected={PROJECT_FACTOR_SCHEMA_VERSION} "
+            f"actual={sorted(factor_schemas) or ['missing']}"
+        )
+    factor_schema_version = next(iter(factor_schemas))
 
     for model_name, label_col in LABELS.items():
         cols = [col for col in B1_FEATURE_COLUMNS if col in data.columns]
@@ -453,6 +481,7 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
             selector=selector,
             classifier=classifier,
             best_iteration=early_stop.best_iteration,
+            factor_schema_version_=factor_schema_version,
         )
 
         split_reports = {}
@@ -477,6 +506,7 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
         joblib.dump(model, model_path)
         reports[model_name] = {
             "label": label_col,
+            "factor_schema_version": factor_schema_version,
             "model_path": str(model_path),
             "features": len(cols),
             "feature_selection_k": "all" if model_select_k is None else model_select_k,

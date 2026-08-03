@@ -38,6 +38,7 @@ const state = {
   longPayload: null,
   longVariant: "tea",
   longLoading: false,
+  longError: "",
   chanPayload: null,
   chanLoading: false,
   chanSelectedSymbol: null,
@@ -58,6 +59,10 @@ const state = {
   similarError: "",
   similarSelectedSymbol: null,
   similarRefreshPromise: null,
+  similarScoreRefreshPromise: null,
+  similarScoreRefreshPending: false,
+  similarAutoRefreshTimer: null,
+  similarAutoRefreshPending: false,
   similarPendingRemovals: new Set(),
   similarOrderSaving: false,
   selectorRequestId: 0,
@@ -110,7 +115,7 @@ const REFRESH_BUTTON_LABELS = {
 const WORKSPACE_TABS = [
   { key: "short", label: "短线策略", description: "每日选股 / 交易计划", panelId: "shortPage" },
   { key: "chan", label: "缠论策略", description: "三买模型 / T+1 计划", panelId: "chanPage" },
-  { key: "long", label: "长线策略", description: "组合候选 / 仓位择时", panelId: "longPage" },
+  { key: "long", label: "长线策略", description: "好股票 / 好价格", panelId: "longPage" },
   { key: "cb", label: "可转债策略", description: "低位候选 / 分批计划", panelId: "cbPage" },
   { key: "cbAllotment", label: "配债股", description: "发行流程 / 关键日期", panelId: "cbAllotmentPage" },
   { key: "byd", label: "BYD 做T", description: "盘前计划 / 正T优先", panelId: "bydPage" },
@@ -506,7 +511,7 @@ function recommendationLevel(item) {
   return { level, label: labels[level] || "观察" };
 }
 
-function recommendationBadge(item, includeDays = true) {
+function recommendationBadge(item, includeDays = false) {
   const recommendation = recommendationLevel(item);
   const days = Number(item.recommendation_days || 0);
   const dayBadge = includeDays && recommendation.level === "RECOMMENDED" && days > 0
@@ -515,17 +520,13 @@ function recommendationBadge(item, includeDays = true) {
   return `<span class="state-pill recommendation-pill ${recommendation.level}">${recommendation.label}${dayBadge}</span>`;
 }
 
-function priceStateText(item) {
-  const labels = {
-    AGGRESSIVE: "积极区",
-    BUY_ZONE: "建仓区",
-    SCALE_IN: "分批区",
-    WAIT_PULLBACK: "等待回落",
-    WAIT_SIGNAL: "等待信号",
-    RISK_RISING: "风险升高",
-    TREND_INVALID: "趋势失效",
-  };
-  return labels[item.price_state] || "等待信号";
+function priceScoreDetail(item) {
+  const points = Number(item.valuation_history_points || 0);
+  if (item.price_state === "WAIT_HISTORY") {
+    return points > 0 ? `${points}个月样本，未达门槛` : "历史样本不足";
+  }
+  const structure = item.price_state === "WAIT_STABILITY" ? "结构待确认" : "结构已通过";
+  return points > 0 ? `${points}个月样本 · ${structure}` : structure;
 }
 
 function longPricePlan(item) {
@@ -553,7 +554,11 @@ function analystCoverageText(item) {
   const consensusReports = Number(item.analyst_consensus_report_count_180d || 0);
   const forwardYears = Number(item.analyst_forward_years_180d || 0);
   if (!dataPoints) {
-    return { main: "近180日无结构化预测", sub: "使用财务/估值/趋势因子" };
+    return {
+      main: "近180日无结构化预测",
+      sub: "仅展示，不参与评分",
+      title: "仅使用信号日可见的近180日预测；隐含股价由同一条估计的EPS×预测PE计算。",
+    };
   }
   const coverageText = institutions && researchReports
     ? `${institutions}家机构 · ${researchReports}份研报`
@@ -567,9 +572,55 @@ function analystCoverageText(item) {
     : `成长评分 ${Number(growth).toFixed(1)}`;
   return {
     main: coverageText,
-    sub: `${yearText} · ${growthText}`,
-    title: "成长评分为0–100相对分位：前瞻EPS增长35% + 营收增长30% + 净利润增长25% + 预测覆盖10%；越高表示相对成长预期越强，不代表预期收益率。",
+    sub: `${yearText} · ${growthText} · 仅展示`,
+    title: "当年E至后两年E分别统计；按来源、机构、作者和年度保留最新估计。EPS与EPS×预测PE隐含股价均展示样本均值和样本标准差，仅供补充阅读。",
   };
+}
+
+function analystForecastRows(item) {
+  if (Array.isArray(item.analyst_forecast_3y) && item.analyst_forecast_3y.length === 3) {
+    return item.analyst_forecast_3y;
+  }
+  return Array.from({ length: 3 }, (_, horizon) => {
+    const prefix = `analyst_forward_y${horizon}`;
+    return {
+      horizon,
+      forecast_year: item[`${prefix}_year`],
+      eps_mean: item[`${prefix}_eps_mean_180d`],
+      eps_std: item[`${prefix}_eps_std_180d`],
+      eps_estimate_count: item[`${prefix}_eps_estimate_count_180d`],
+      price_mean: item[`${prefix}_price_mean_180d`],
+      price_std: item[`${prefix}_price_std_180d`],
+      price_estimate_count: item[`${prefix}_price_estimate_count_180d`],
+    };
+  });
+}
+
+function analystForecastCell(item, horizon) {
+  const coverage = analystCoverageText(item);
+  const forecast = analystForecastRows(item)[horizon] || {};
+  const year = Number(forecast.forecast_year);
+  const yearText = Number.isFinite(year) ? `${year}E` : ["当年E", "次年E", "后年E"][horizon];
+  const numberText = (value, digits, suffix = "") => (
+    value == null || !Number.isFinite(Number(value))
+      ? "暂无"
+      : `${Number(value).toFixed(digits)}${suffix}`
+  );
+  const epsCount = Number(forecast.eps_estimate_count || 0);
+  const priceCount = Number(forecast.price_estimate_count || 0);
+  return `
+    <td>
+      <span class="score-stack forecast-year-stack" title="${escapeHtml(coverage.title)}">
+        <strong>${escapeHtml(yearText)}</strong>
+        <em>EPS均值 ${numberText(forecast.eps_mean, 3, "元")}</em>
+        <em>EPS标准差 ${numberText(forecast.eps_std, 3, "元")}</em>
+        <em>股价均值 ${numberText(forecast.price_mean, 2, "元")}</em>
+        <em>股价标准差 ${numberText(forecast.price_std, 2, "元")}</em>
+        <em>样本 EPS ${epsCount} · 股价 ${priceCount}</em>
+        ${horizon === 0 ? `<em>${escapeHtml(coverage.main)} · ${escapeHtml(coverage.sub)}</em>` : ""}
+      </span>
+    </td>
+  `;
 }
 
 function selectedStrategyParam() {
@@ -779,12 +830,64 @@ function loadSimilarPatterns() {
   return sharedRequest;
 }
 
+async function refreshSimilarWatchlistScores() {
+  if (state.similarScoreRefreshPromise) {
+    state.similarScoreRefreshPending = true;
+    return state.similarScoreRefreshPromise;
+  }
+  state.similarScoreRefreshPending = false;
+  const request = fetchJson("/similar-patterns/watchlist?include_scores=true")
+    .then((payload) => {
+      const scoredWatchlist = enrichWatchlistProfiles(
+        state.similarPayload?.watchlist || [],
+        payload.stocks || [],
+      );
+      state.similarPayload = mergeSimilarPayloadWithWatchlist({
+        ...(state.similarPayload || {}),
+        generated_at: state.similarPayload?.generated_at || payload.updated_at,
+      }, scoredWatchlist);
+      renderSimilarPatternsPage();
+    })
+    .catch((error) => {
+      showWatchlistToast(`评分暂未更新：${error.message || "请稍后重试"}`, "error");
+    });
+  const sharedRequest = request.finally(() => {
+    if (state.similarScoreRefreshPromise === sharedRequest) {
+      state.similarScoreRefreshPromise = null;
+    }
+    if (state.similarScoreRefreshPending) {
+      state.similarScoreRefreshPending = false;
+      refreshSimilarWatchlistScores();
+    }
+  });
+  state.similarScoreRefreshPromise = sharedRequest;
+  return sharedRequest;
+}
+
+function runScheduledSimilarAnalysisRefresh() {
+  state.similarAutoRefreshTimer = null;
+  refreshSimilarWatchlistScores();
+  const refreshRunning = ["running", "queued"].includes(state.latestRefreshStatus?.status);
+  if (refreshRunning) {
+    state.similarAutoRefreshPending = true;
+    return;
+  }
+  state.similarAutoRefreshPending = false;
+  startLatestDataRefresh("similar");
+}
+
+function scheduleSimilarAnalysisRefresh() {
+  if (state.similarAutoRefreshTimer) window.clearTimeout(state.similarAutoRefreshTimer);
+  state.similarAutoRefreshTimer = window.setTimeout(runScheduledSimilarAnalysisRefresh, 500);
+}
+
 async function addSimilarWatchSymbol(symbol, options = {}) {
   const payload = await fetchJson("/similar-patterns/watchlist", {
     method: "POST",
     body: JSON.stringify({ symbol, note: options.note || "" }),
   });
   applySimilarWatchlistPayload(payload, { analysisChanged: true });
+  scheduleSimilarAnalysisRefresh();
   return payload;
 }
 
@@ -1172,12 +1275,16 @@ function renderSimilarPatternsPage() {
     (total, { alertState }) => total + alertState.triggeredReminders.length,
     0,
   );
+  const similarAnalysisRefreshing = ["running", "queued"].includes(state.latestRefreshStatus?.status)
+    && ["all", "similar"].includes(state.latestRefreshStatus?.scope);
   meta.textContent = state.similarError
     ? `分析加载失败，笔记仍可编辑 · 自选 ${watch.length} 只`
     : state.similarLoading
       ? results.length
         ? `自选 ${watch.length} 只 · 正在后台刷新，当前显示上次结果`
         : `自选 ${watch.length} 只 · 正在加载分析，笔记可先编辑`
+      : similarAnalysisRefreshing
+        ? `自选 ${watch.length} 只 · 正在后台更新分析，当前结果继续保留`
       : payload.cache?.missing
         ? `自选 ${watch.length} 只 · 尚未生成分析，点击“刷新分析”开始后台计算`
         : payload.cache?.watchlist_changed
@@ -1426,22 +1533,30 @@ function hideSimilarNoteTooltip(row = null) {
 async function loadLongStockPool(options = {}) {
   const requestedVariant = state.longVariant;
   state.longLoading = true;
+  state.longError = "";
   renderLongStockPool();
   const query = new URLSearchParams();
   query.set("variant", requestedVariant);
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
   try {
-    const payload = await fetchJson(`/long/stock-pool?${query.toString()}`, workspaceRequestOptions(options));
+    const requestOptions = workspaceRequestOptions(options);
+    if (!options.refresh) requestOptions.timeoutMs = 120000;
+    const payload = await fetchJson(`/long/stock-pool?${query.toString()}`, requestOptions);
     if (state.longVariant === requestedVariant) {
       state.longPayload = payload;
+      state.longError = "";
     }
   } catch (error) {
+    if (state.longVariant === requestedVariant) {
+      state.longError = error?.message || "长线股票池加载失败";
+    }
     showError(error);
     throw error;
   } finally {
     if (state.longVariant === requestedVariant) {
       state.longLoading = false;
+      renderLongOverview();
       renderLongStockPool();
     }
   }
@@ -2186,23 +2301,30 @@ function renderPageShell() {
 }
 
 function renderLongOverview() {
-  const strategy = currentLongStrategy();
+  const summary = state.longPayload?.quality_price_summary || {};
   const title = document.querySelector("#longHeroTitle");
   const description = document.querySelector("#longHeroDescription");
   const tag = document.querySelector("#longHeroTag");
   const note = document.querySelector("#longHeroNote");
   const summaryLabel = document.querySelector("#longSummaryLabel");
   const summaryName = document.querySelector("#longSummaryName");
-  if (tag) tag.textContent = strategy.tag;
-  if (title) title.textContent = `${strategy.version} ${strategy.name}`;
-  if (description) description.textContent = strategy.description;
-  if (note) note.textContent = strategy.note;
-  if (summaryLabel) summaryLabel.textContent = strategy.summaryLabel;
-  if (summaryName) summaryName.textContent = strategy.name;
-  document.querySelector("#longMetricAnnual").textContent = strategy.metrics.annual;
-  document.querySelector("#longMetricDrawdown").textContent = strategy.metrics.drawdown;
-  document.querySelector("#longMetricSharpe").textContent = strategy.metrics.sharpe;
-  document.querySelector("#longMetricWeight").textContent = strategy.metrics.weight;
+  if (tag) tag.textContent = "筛选原则";
+  if (title) title.textContent = "好股票进入观察，好股票 + 价格分达标才推荐";
+  if (description) description.textContent = "卖出、减仓与持仓管理移至自选池；本页不再输出仓位和卖点。";
+  if (note) note.textContent = "券商预测仅用于补充阅读，不参与好股票或价格评分。";
+  if (summaryLabel) summaryLabel.textContent = "筛选模型";
+  if (summaryName) summaryName.textContent = "好股票 · 价格分";
+  const metricValues = [
+    summary.good_stock_count,
+    summary.recommended_count,
+    summary.watch_count,
+    summary.analyst_covered_count,
+  ];
+  ["#longMetricAnnual", "#longMetricDrawdown", "#longMetricSharpe", "#longMetricWeight"]
+    .forEach((selector, index) => {
+      const node = document.querySelector(selector);
+      if (node) node.textContent = metricValues[index] == null ? "-" : String(metricValues[index]);
+    });
 }
 
 function renderLongStrategies() {
@@ -2261,75 +2383,114 @@ function renderLongStockPool() {
     button.setAttribute("aria-pressed", String(active));
   });
   if (state.longLoading) {
-    meta.textContent = "正在生成长线股票池...";
+    meta.textContent = "正在计算好股票与历史归一化价格分...";
     counts.innerHTML = "";
-    body.innerHTML = `<tr><td colspan="9" class="empty-cell">正在按策略状态机生成股票池...</td></tr>`;
+    body.innerHTML = `<tr><td colspan="14" class="empty-cell">正在加载最近 7 年月末估值历史并计算双 PR...</td></tr>`;
+    return;
+  }
+  if (state.longError) {
+    meta.textContent = "加载失败";
+    counts.innerHTML = "";
+    body.innerHTML = `<tr><td colspan="14" class="empty-cell error-cell">${escapeHtml(state.longError)}；请点击“更新本页”重试。</td></tr>`;
     return;
   }
   const payload = state.longPayload;
   if (!payload) {
     meta.textContent = "等待加载";
     counts.innerHTML = "";
-    body.innerHTML = `<tr><td colspan="9" class="empty-cell">切到长线策略后加载股票池</td></tr>`;
+    body.innerHTML = `<tr><td colspan="14" class="empty-cell">切到长线策略后加载股票池</td></tr>`;
     return;
   }
-  meta.textContent = `${payload.variant_name} · 信号日 ${payload.signal_date} · 市场 ${payload.market_regime} · ${payload.stocks.length} 只`;
-  const recommendationCounts = (payload.stocks || []).reduce((result, item) => {
-    const { level } = recommendationLevel(item);
-    result[level] = (result[level] || 0) + 1;
-    return result;
-  }, {});
+  const totalGoodStocks = payload.quality_price_summary?.good_stock_count ?? payload.stocks.length;
+  meta.textContent = `信号日 ${payload.signal_date} · 展示 ${payload.stocks.length}/${totalGoodStocks} 只好股票 · 预测仅展示`;
+  const recommendationCounts = payload.state_counts || {};
   counts.innerHTML = Object.entries(recommendationCounts).map(([key, value]) => (
     `<span class="state-pill ${key}">${stateLabel(key)} ${value}</span>`
   )).join("");
   if (!payload.stocks.length) {
-    body.innerHTML = `<tr><td colspan="9" class="empty-cell">当前没有长线候选股票</td></tr>`;
+    body.innerHTML = `<tr><td colspan="14" class="empty-cell">当前没有公司同时通过好股票标准与数据完整性门槛</td></tr>`;
     return;
   }
-  body.innerHTML = payload.stocks.map((item) => `
+  const metric = (value, digits = 1) => value == null || !Number.isFinite(Number(value))
+    ? "-"
+    : Number(value).toFixed(digits);
+  const valueWithUnit = (value, digits, unit) => value == null || !Number.isFinite(Number(value))
+    ? "-"
+    : `${Number(value).toFixed(digits)}${unit}`;
+  const percentile = (value, points) => {
+    const percentileText = value == null || !Number.isFinite(Number(value))
+      ? "历史 -"
+      : `历史 ${Number(value).toFixed(0)}%`;
+    const pointCount = Number(points || 0);
+    return pointCount > 0 ? `${percentileText} · ${pointCount}点` : percentileText;
+  };
+  body.innerHTML = payload.stocks.map((item) => {
+    const xueqiuUrl = xueqiuStockUrl(item.ts_code);
+    return `
     <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload.signal_date, `${payload.variant_name} · ${recommendationLevel(item).label}`))}" tabindex="0">
-      <td>${recommendationBadge(item)}</td>
+      <td>${recommendationBadge(item, false)}</td>
       <td>
-        <strong>${item.ts_code}</strong>
-        <span>${item.name || ""}</span>
+        <strong>${escapeHtml(item.ts_code)}</strong>
+        <span>${escapeHtml(item.name || "")}</span>
+        <span>现价 ${fmtPrice(item.close)}</span>
+        ${xueqiuUrl ? `
+          <a class="xueqiu-stock-link long-xueqiu-link" data-long-xueqiu href="${escapeHtml(xueqiuUrl)}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(item.name || item.ts_code)}">
+            雪球 ↗
+          </a>
+        ` : `<span class="xueqiu-stock-unavailable">—</span>`}
       </td>
-      <td>${item.industry || "-"}</td>
+      <td>${escapeHtml(item.industry || "-")}</td>
+      <td>
+        <span class="score-stack">
+          <strong>${metric(item.good_stock_score)} 分</strong>
+          <em>盈利 ${metric(item.profitability_score)} · 成长 ${metric(item.fundamental_growth_score)}</em>
+          <em>安全 ${metric(item.balance_sheet_score)} · 稳定 ${metric(item.business_stability_score)}</em>
+        </span>
+      </td>
       <td>
         <span class="score-stack left">
-          <strong>${priceStateText(item)}</strong>
-          <em>${item.price_state_reason || "等待价格与趋势确认"}</em>
+          <strong>${metric(item.price_score)} 分</strong>
+          <em>${escapeHtml(priceScoreDetail(item))}</em>
         </span>
       </td>
       <td>
-        <span class="score-stack">
-          ${longPositionPlan(item)}
+        <span class="score-stack metric-stack">
+          <strong>${valueWithUnit(item.roe, 2, "%")}</strong>
+          <em>${percentile(item.roe_hist_percentile, item.roe_history_points)}</em>
         </span>
       </td>
       <td>
-        <span class="score-stack">
-          <strong>${Number(item.long_score || 0).toFixed(1)}</strong>
-          <em>成长 ${Number(item.growth_score || 0).toFixed(1)} · 趋势 ${Number(item.trend_score || 0).toFixed(1)}</em>
+        <span class="score-stack metric-stack">
+          <strong>${metric(item.pe_ttm, 2)}</strong>
+          <em>${percentile(item.pe_hist_percentile, item.valuation_history_points)}</em>
         </span>
       </td>
       <td>
-        <span class="score-stack price-plan">
-          ${longPricePlan(item)}
+        <span class="score-stack metric-stack">
+          <strong>${metric(item.pb, 2)}</strong>
+          <em>${percentile(item.pb_hist_percentile, item.valuation_history_points)}</em>
         </span>
       </td>
       <td>
-        ${(() => {
-          const coverage = analystCoverageText(item);
-          return `
-        <span class="score-stack" title="${coverage.title || ""}">
-          <strong>${coverage.main}</strong>
-          <em>${coverage.sub}</em>
+        <span class="score-stack metric-stack">
+          <strong>${metric(item.pr_from_pe, 3)}</strong>
+          <em>${percentile(item.pr_pe_hist_percentile, item.valuation_history_points)}</em>
+          <em>权重 ${Math.round(Number(item.pr_pe_weight || 0) * 100)}%</em>
         </span>
-          `;
-        })()}
       </td>
-      <td class="reason-cell">${item.display_reason || item.reason || "-"}</td>
-    </tr>
-  `).join("");
+      <td>
+        <span class="score-stack metric-stack">
+          <strong>${metric(item.pr_from_pb, 3)}</strong>
+          <em>${percentile(item.pr_pb_hist_percentile, item.valuation_history_points)}</em>
+          <em>权重 ${Math.round(Number(item.pr_pb_weight || 0) * 100)}%</em>
+        </span>
+      </td>
+      ${analystForecastCell(item, 0)}
+      ${analystForecastCell(item, 1)}
+      ${analystForecastCell(item, 2)}
+      <td class="reason-cell">${escapeHtml(item.display_reason || item.reason || "-")}</td>
+    </tr>`;
+  }).join("");
 }
 
 function renderConvertibleBondPage() {
@@ -3033,6 +3194,8 @@ function setRefreshStatus(status) {
     localStorage.removeItem(REFRESH_STATUS_STORAGE_KEY);
     return;
   }
+  const previousStatus = state.latestRefreshStatus?.status;
+  const previousScope = state.latestRefreshStatus?.scope;
   state.latestRefreshStatus = status;
   const time = status.finished_at || status.started_at || "";
   const percent = Number(status.percent || 0);
@@ -3052,6 +3215,12 @@ function setRefreshStatus(status) {
   `).join("");
   statusEls.forEach((el) => { el.innerHTML = statusHtml; });
   stepsEls.forEach((el) => { el.innerHTML = stepsHtml; });
+  if (
+    state.activePage === "similar"
+    && (previousStatus !== status.status || previousScope !== status.scope)
+  ) {
+    renderSimilarPatternsPage();
+  }
 }
 
 function setRefreshButtonRunning(isRunning) {
@@ -3118,10 +3287,18 @@ async function pollLatestRefresh() {
     stopRefreshPolling();
     await reloadAfterRefresh(status);
     setRefreshButtonRunning(false);
+    if (state.similarAutoRefreshPending) {
+      state.similarAutoRefreshPending = false;
+      scheduleSimilarAnalysisRefresh();
+    }
   } else if (status.status === "failed") {
     stopRefreshPolling();
     setRefreshButtonRunning(false);
     showError(new Error(status.error || "刷新任务失败"));
+    if (state.similarAutoRefreshPending) {
+      state.similarAutoRefreshPending = false;
+      scheduleSimilarAnalysisRefresh();
+    }
   }
 }
 
@@ -3432,7 +3609,7 @@ document.querySelector("[data-watchlist-context-add]")?.addEventListener("click"
   button.disabled = true;
   try {
     await addSimilarWatchSymbol(target.symbol, { note: target.note });
-    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}，可点击“刷新分析”更新结果`);
+    showWatchlistToast(`${target.name} 已加入自选池${target.note ? "并记录来源" : ""}，评分与分析正在后台更新`);
   } catch (error) {
     showWatchlistToast(error.message || "加入自选池失败", "error");
   } finally {
@@ -3803,7 +3980,7 @@ document.querySelector("#similarAddForm")?.addEventListener("submit", async (eve
   try {
     await addSimilarWatchSymbol(symbol);
     if (input) input.value = "";
-    showWatchlistToast(`${symbol} 已加入自选池，可点击“刷新分析”更新结果`);
+    showWatchlistToast(`${symbol} 已加入自选池，评分与分析正在后台更新`);
   } catch (error) {
     showError(error);
   } finally {

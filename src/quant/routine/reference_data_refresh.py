@@ -12,6 +12,11 @@ from typing import Any
 import pandas as pd
 
 from quant.data.tushare_fetcher import TushareDataFetcher
+from quant.data.long_factor_backfill import (
+    RequestPolicy,
+    backfill_trade_date_partitions,
+    refresh_holder_trade_recent,
+)
 from quant.data.tradability import build_daily_tradability
 from quant.routine.paths import PROJECT_ROOT
 
@@ -259,6 +264,64 @@ def refresh_financial_periods(
     }
 
 
+def refresh_long_factor_daily_sources(
+    fetcher: TushareDataFetcher,
+    raw_dir: Path,
+    audit_dir: Path,
+    trade_date: str,
+) -> dict[str, Any]:
+    """Refresh cheap daily/event sources while leaving full pledge scans low-frequency."""
+
+    required_methods = [
+        "trade_cal",
+        "margin_detail",
+        "moneyflow",
+        "top_list",
+        "stk_holdertrade",
+    ]
+    missing_methods = [
+        method for method in required_methods if not callable(getattr(fetcher.pro, method, None))
+    ]
+    if missing_methods:
+        return {
+            "status": "skipped",
+            "reason": f"provider does not expose: {','.join(missing_methods)}",
+        }
+    policy = RequestPolicy(
+        retries=max(1, int(os.getenv("ROUTINE_LONG_FACTOR_RETRIES", "3"))),
+        sleep_seconds=max(0.0, float(os.getenv("ROUTINE_LONG_FACTOR_SLEEP", "0.15"))),
+        max_retry_wait_seconds=max(
+            0.0, float(os.getenv("ROUTINE_LONG_FACTOR_MAX_RETRY_WAIT", "60"))
+        ),
+    )
+    datasets: dict[str, Any] = {}
+    for dataset in ("margin_detail", "moneyflow", "top_list"):
+        datasets[dataset] = backfill_trade_date_partitions(
+            fetcher.pro,
+            dataset,
+            trade_date,
+            trade_date,
+            raw_dir,
+            audit_dir,
+            policy=policy,
+        )
+    datasets["holder_trade_recent"] = refresh_holder_trade_recent(
+        fetcher.pro,
+        trade_date,
+        raw_dir,
+        audit_dir,
+        lookback_days=max(1, int(os.getenv("ROUTINE_HOLDER_TRADE_LOOKBACK_DAYS", "45"))),
+        policy=policy,
+    )
+    statuses = {item.get("status") for item in datasets.values()}
+    status = (
+        "failed"
+        if "failed" in statuses
+        else ("partial" if statuses & {"partial", "deferred"} else "success")
+    )
+    return {"status": status, "datasets": datasets}
+
+
 def refresh_reference_data(
     end_date: str,
     *,
@@ -268,6 +331,7 @@ def refresh_reference_data(
     audit_root: Path = AUDIT_ROOT,
     financial_periods: int | None = None,
     force_financials: bool = False,
+    include_long_factor_sources: bool = True,
     state_path: Path | None = None,
 ) -> dict[str, Any]:
     """Refresh all non-daily inputs with bounded, idempotent requests."""
@@ -275,6 +339,8 @@ def refresh_reference_data(
     fetcher = fetcher or TushareDataFetcher(cache_dir=PROJECT_ROOT / "data/cache/source_merge/tushare")
     steps: dict[str, Any] = {}
     critical_errors: list[str] = []
+    audit_dir = audit_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_reference_data"
+    audit_dir.mkdir(parents=True, exist_ok=True)
     stock_basic_frame: pd.DataFrame | None = None
     for name, operation in [
         ("stock_basic", lambda: refresh_stock_basic(fetcher, raw_dir)),
@@ -304,6 +370,21 @@ def refresh_reference_data(
         except Exception as exc:
             steps["tradability"] = {"status": "failed", "error": str(exc)}
             critical_errors.append(f"tradability: {exc}")
+    if include_long_factor_sources:
+        try:
+            steps["long_factor_sources"] = refresh_long_factor_daily_sources(
+                fetcher,
+                raw_dir,
+                audit_dir,
+                end_date,
+            )
+        except Exception as exc:
+            steps["long_factor_sources"] = {"status": "failed", "error": str(exc)}
+    else:
+        steps["long_factor_sources"] = {
+            "status": "skipped",
+            "reason": "not required for this refresh scope",
+        }
     effective_state_path = state_path or raw_dir / REFERENCE_STATE_PATH.name
     financial_checkpoint_hit = (
         include_financials
@@ -328,7 +409,17 @@ def refresh_reference_data(
     else:
         steps["financials"] = {"status": "skipped", "reason": "not required for this refresh scope"}
     financial_status = steps["financials"].get("status")
-    status = "failed" if critical_errors else ("partial" if financial_status == "partial" else "success")
+    long_factor_status = steps["long_factor_sources"].get("status")
+    status = (
+        "failed"
+        if critical_errors
+        else (
+            "partial"
+            if financial_status == "partial"
+            or long_factor_status in {"failed", "partial", "deferred"}
+            else "success"
+        )
+    )
     manifest = {
         "status": status,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -336,8 +427,6 @@ def refresh_reference_data(
         "steps": steps,
         "critical_errors": critical_errors,
     }
-    audit_dir = audit_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_reference_data"
-    audit_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = audit_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest["manifest_path"] = str(manifest_path)

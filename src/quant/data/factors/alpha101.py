@@ -14,6 +14,28 @@ from typing import Union, Optional
 from .base import Factor, RollingFactor
 
 
+def _causal_rank(
+    values: pd.Series,
+    *,
+    window: int = 252,
+    min_periods: int = 20,
+) -> pd.Series:
+    """Trailing time-series percentile; never ranks against future rows.
+
+    The original single-symbol implementation used ``Series.rank`` over the
+    entire history even though WorldQuant ``rank`` is cross-sectional. That
+    made historical values change whenever future rows were appended. In a
+    per-symbol calculator the stable substitute is a trailing one-year
+    time-series rank.
+    """
+
+    numeric = pd.to_numeric(values, errors="coerce")
+    return numeric.rolling(window, min_periods=min_periods).rank(
+        method="average",
+        pct=True,
+    )
+
+
 class Alpha001Factor(RollingFactor):
     """Alpha001: 基于标准差和价格的非线性变换"""
     
@@ -36,7 +58,7 @@ class Alpha001Factor(RollingFactor):
         argmax_5 = pd.Series(value_sq, index=df.index).rolling(5).apply(np.argmax)
         
         # 排名并减0.5
-        result = argmax_5.rank(pct=True) - 0.5
+        result = _causal_rank(argmax_5) - 0.5
         
         return result
 
@@ -61,8 +83,8 @@ class Alpha002Factor(RollingFactor):
         open_ret = (df['close'] - df['open']) / df['open']
         
         # 排名
-        rank_vol = delta_log_vol.rank(pct=True)
-        rank_ret = open_ret.rank(pct=True)
+        rank_vol = _causal_rank(delta_log_vol)
+        rank_ret = _causal_rank(open_ret)
         
         # 计算滚动相关性
         result = rank_vol.rolling(self.window).corr(rank_ret)
@@ -82,8 +104,8 @@ class Alpha003Factor(RollingFactor):
             df['open'] = df['close'].shift(1)
         
         # 排名（使用标准字段 volume）
-        rank_open = df['open'].rank(pct=True)
-        rank_vol = df['volume'].rank(pct=True)
+        rank_open = _causal_rank(df['open'])
+        rank_vol = _causal_rank(df['volume'])
         
         # 计算滚动协方差
         cov = pd.DataFrame({'open': rank_open, 'vol': rank_vol}).rolling(self.window).cov()
@@ -92,7 +114,7 @@ class Alpha003Factor(RollingFactor):
         cov_values = cov.loc[(slice(None), 'open'), 'vol']
         cov_values.index = cov_values.index.droplevel(1)
         
-        return -cov_values.rank(pct=True)
+        return -_causal_rank(cov_values)
 
 
 class Alpha004Factor(Factor):
@@ -111,7 +133,7 @@ class Alpha004Factor(Factor):
         ts_rank_ret = neg_ret.rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
         
         # 乘积并排名
-        return (ts_rank_vol * ts_rank_ret).rank(pct=True)
+        return _causal_rank(ts_rank_vol * ts_rank_ret)
 
 
 class Alpha005Factor(RollingFactor):
@@ -126,18 +148,18 @@ class Alpha005Factor(RollingFactor):
             df['open'] = df['close'].shift(1)
         
         # 计算VWAP（简化版）
-        df['vwap'] = (df['high'] + df['low'] + df['close']) / 3
+        vwap = (df['high'] + df['low'] + df['close']) / 3
         
         # 10天VWAP均值
-        vwap_mean = df['vwap'].rolling(self.window).mean()
+        vwap_mean = vwap.rolling(self.window).mean()
         
         # 开盘价与VWAP均值的差
         open_diff = df['open'] - vwap_mean
         
         # 收盘价与VWAP的差
-        close_diff = df['close'] - df['vwap']
+        close_diff = df['close'] - vwap
         
-        return open_diff.rank(pct=True) * (-1 * close_diff.abs().rank(pct=True))
+        return _causal_rank(open_diff) * (-1 * _causal_rank(close_diff.abs()))
 
 
 class Alpha006Factor(RollingFactor):
@@ -151,7 +173,7 @@ class Alpha006Factor(RollingFactor):
         if 'open' not in df.columns:
             df['open'] = df['close'].shift(1)
         
-        return -((df['open'] - df['close']).rolling(self.window).mean()).rank(pct=True)
+        return -_causal_rank((df['open'] - df['close']).rolling(self.window).mean())
 
 
 class Alpha007Factor(RollingFactor):
@@ -165,7 +187,7 @@ class Alpha007Factor(RollingFactor):
         # 使用 pandas 的 corr 方法计算滚动相关性
         corr = df['high'].rolling(self.window).corr(df['volume'])
         
-        return corr.rank(pct=True)
+        return _causal_rank(corr)
 
 
 class Alpha008Factor(RollingFactor):
@@ -188,7 +210,7 @@ class Alpha008Factor(RollingFactor):
         vol_mean = df['volume'].rolling(self.window).mean()
         vol_ratio = vol_std / vol_mean.replace(0, np.nan)
         
-        return (open_ret_sum.rank(pct=True) * vol_ratio.rank(pct=True)).rank(pct=True)
+        return _causal_rank(_causal_rank(open_ret_sum) * _causal_rank(vol_ratio))
 
 
 class Alpha009Factor(Factor):
@@ -203,7 +225,7 @@ class Alpha009Factor(Factor):
         vol_delta = df['volume'].diff(1)
         close_delta = -df['close'].diff(1)
         
-        return -(vol_delta.rank(pct=True) * close_delta.rank(pct=True)).rank(pct=True)
+        return -_causal_rank(_causal_rank(vol_delta) * _causal_rank(close_delta))
 
 
 class Alpha010Factor(Factor):
@@ -215,7 +237,7 @@ class Alpha010Factor(Factor):
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """((-1) * Ts_Rank(rank(volume), 3))"""
         # 使用标准字段 volume
-        rank_vol = df['volume'].rank(pct=True)
+        rank_vol = _causal_rank(df['volume'])
         ts_rank = rank_vol.rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
         return -ts_rank
 

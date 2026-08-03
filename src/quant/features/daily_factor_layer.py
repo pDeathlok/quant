@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.atomic_io import atomic_write_json
 from quant.data.source_merge import normalize_tushare_daily
 from quant.data.factors.technical import KDJ
 from quant.features.variable_library import (
@@ -31,8 +32,8 @@ from quant.features.variable_library import (
 )
 
 
-FACTOR_LAYER_VERSION = "v1"
-SIGNAL_FACTOR_LAYER_VERSION = "signal-v1"
+FACTOR_LAYER_VERSION = "v2-causal-price"
+SIGNAL_FACTOR_LAYER_VERSION = "signal-v2-causal-price"
 SIGNAL_STATE_SCHEMA_VERSION = 1
 DEFAULT_FACTOR_ROOT = Path("data/features/daily_factor_layer")
 KEY_COLUMNS = ["ts_code", "symbol", "trade_date", "date"]
@@ -1245,6 +1246,6 @@ def refresh_daily_factor_layer(
     }
     manifest_path = Path(factor_root) / FACTOR_LAYER_VERSION / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(manifest, manifest_path)
     manifest["manifest_path"] = str(manifest_path)
     return manifest

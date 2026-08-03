@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from quant.application.refresh_contracts import (
+    REFRESH_SCOPE_STEPS,
+    REFRESH_STEP_DEFINITIONS,
     build_progress_steps,
     normalize_refresh_scope,
 )
@@ -40,3 +42,12 @@ def test_build_progress_steps_returns_fresh_mutable_records() -> None:
     assert all(step["status"] == "pending" for step in first)
     first[0]["status"] = "success"
     assert second[0]["status"] == "pending"
+
+
+def test_daily_refresh_orders_factor_layer_before_long_page_outputs() -> None:
+    steps = REFRESH_SCOPE_STEPS["all"]
+
+    assert steps.index("feature_cache") < steps.index("long_stock_pool")
+    assert "统一日频因子层" in REFRESH_STEP_DEFINITIONS["feature_cache"]["label"]
+    assert "长线因子截面" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]
+    assert "页面股票池" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]

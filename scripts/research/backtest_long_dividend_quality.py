@@ -24,6 +24,7 @@ DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
 DAILY_BASIC_DIR = PROJECT_ROOT / "data/raw/daily_basic"
 DAILY_BASIC_CACHE_DIR = PROJECT_ROOT / "data/cache/source_merge/tushare"
 STOCK_BASIC_PATH = PROJECT_ROOT / "data/raw/stock_basic.parquet"
+STOCK_BASIC_HISTORY_PATH = PROJECT_ROOT / "data/raw/stock_basic_history.parquet"
 FINA_INDICATOR_PATH = PROJECT_ROOT / "data/raw/fina_indicator.parquet"
 ANALYST_FORECAST_PATH = PROJECT_ROOT / "data/raw/analyst_forecasts.parquet"
 INDEX_300_PATH = PROJECT_ROOT / "data/raw/index_000300.SH.parquet"
@@ -297,9 +298,10 @@ def normalize_ts_code(path: Path) -> str:
 
 
 def load_stock_basic() -> pd.DataFrame:
-    if not STOCK_BASIC_PATH.exists():
+    path = STOCK_BASIC_HISTORY_PATH if STOCK_BASIC_HISTORY_PATH.exists() else STOCK_BASIC_PATH
+    if not path.exists():
         return pd.DataFrame(columns=["ts_code", "name", "industry", "list_date"])
-    frame = pd.read_parquet(STOCK_BASIC_PATH)
+    frame = pd.read_parquet(path)
     frame["list_date"] = pd.to_datetime(frame["list_date"].astype(str), format="%Y%m%d", errors="coerce")
     return frame[["ts_code", "name", "industry", "list_date"]].copy()
 
@@ -312,17 +314,24 @@ def load_daily_monthly_features(
     *,
     use_cache: bool = True,
     include_daily_returns: bool = True,
+    sampling: str = "monthly",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if sampling not in {"monthly", "weekly"}:
+        raise ValueError("sampling must be 'monthly' or 'weekly'")
+    cache_parts = [
+        start.strftime("%Y%m%d"),
+        end.strftime("%Y%m%d") if end is not None else "none",
+        "qfq_ohlc_price_v1",
+        ",".join(sorted(candidate_symbols or [])),
+    ]
+    if sampling != "monthly":
+        cache_parts.append(f"sampling={sampling}")
     cache_key_source = "|".join(
-        [
-            start.strftime("%Y%m%d"),
-            end.strftime("%Y%m%d") if end is not None else "none",
-            "qfq_ohlc_price_v1",
-            ",".join(sorted(candidate_symbols or [])),
-        ]
+        cache_parts
     )
     cache_key = hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()[:16]
-    feature_cache = RESEARCH_CACHE_DIR / f"daily_monthly_features_{cache_key}.parquet"
+    feature_prefix = "daily_monthly_features" if sampling == "monthly" else "daily_weekly_features"
+    feature_cache = RESEARCH_CACHE_DIR / f"{feature_prefix}_{cache_key}.parquet"
     returns_cache = RESEARCH_CACHE_DIR / f"daily_returns_{cache_key}.parquet"
     cache_ready = feature_cache.exists() and (
         returns_cache.exists() or not include_daily_returns
@@ -402,9 +411,10 @@ def load_daily_monthly_features(
             ].copy()
             returns.append(daily_return)
 
-        monthly_idx = df.groupby(df["date"].dt.to_period("M"))["date"].idxmax()
-        monthly = df.loc[
-            monthly_idx,
+        period_frequency = "M" if sampling == "monthly" else "W-FRI"
+        sample_idx = df.groupby(df["date"].dt.to_period(period_frequency))["date"].idxmax()
+        sampled = df.loc[
+            sample_idx,
             [
                 "date",
                 "trade_date",
@@ -420,13 +430,13 @@ def load_daily_monthly_features(
                 "ma_120_slope_20d",
             ],
         ].copy()
-        monthly = monthly[monthly["date"] >= start]
+        sampled = sampled[sampled["date"] >= start]
         if stock_meta is not None and not stock_meta.empty and ts_code in stock_meta.index:
             meta = stock_meta.loc[ts_code]
-            monthly["name"] = meta.get("name")
-            monthly["industry"] = meta.get("industry")
-            monthly["list_date"] = meta.get("list_date")
-        frames.append(monthly)
+            sampled["name"] = meta.get("name")
+            sampled["industry"] = meta.get("industry")
+            sampled["list_date"] = meta.get("list_date")
+        frames.append(sampled)
 
         if processed % 100 == 0:
             print(f"processed candidate daily files: {processed} usable_symbols={len(frames)}", flush=True)
@@ -483,7 +493,14 @@ def filter_daily_basic_point_in_time(daily_basic: pd.DataFrame, config: Backtest
     return frame[mask].copy()
 
 
-def load_daily_basic_monthly(start: pd.Timestamp, end: pd.Timestamp | None) -> tuple[pd.DataFrame, dict]:
+def load_daily_basic_monthly(
+    start: pd.Timestamp,
+    end: pd.Timestamp | None,
+    *,
+    sampling: str = "monthly",
+) -> tuple[pd.DataFrame, dict]:
+    if sampling not in {"monthly", "weekly"}:
+        raise ValueError("sampling must be 'monthly' or 'weekly'")
     source_dir = DAILY_BASIC_DIR if any(DAILY_BASIC_DIR.glob("*.parquet")) else DAILY_BASIC_CACHE_DIR
     files = sorted(source_dir.glob("*.parquet"))
     if source_dir == DAILY_BASIC_CACHE_DIR:
@@ -532,14 +549,26 @@ def load_daily_basic_monthly(start: pd.Timestamp, end: pd.Timestamp | None) -> t
 
     basic = pd.concat(frames, ignore_index=True)
     basic["date"] = pd.to_datetime(basic["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-    monthly_dates = basic.groupby(basic["date"].dt.to_period("M"))["date"].max().rename("date").reset_index(drop=True)
-    monthly = basic[basic["date"].isin(set(monthly_dates))].copy()
-    monthly = monthly.sort_values(["ts_code", "date"]).reset_index(drop=True)
-    dv = pd.to_numeric(monthly["dv_ttm"], errors="coerce")
-    monthly["dv_ttm_mean_36m"] = dv.groupby(monthly["ts_code"]).transform(lambda s: s.rolling(36, min_periods=12).mean())
-    monthly["dv_ttm_std_36m"] = dv.groupby(monthly["ts_code"]).transform(lambda s: s.rolling(36, min_periods=12).std())
-    monthly["dv_ttm_stability_36m"] = (
-        monthly["dv_ttm_mean_36m"] / monthly["dv_ttm_std_36m"].replace(0, np.nan)
+    period_frequency = "M" if sampling == "monthly" else "W-FRI"
+    sampled_dates = (
+        basic.groupby(basic["date"].dt.to_period(period_frequency))["date"]
+        .max()
+        .rename("date")
+        .reset_index(drop=True)
+    )
+    sampled = basic[basic["date"].isin(set(sampled_dates))].copy()
+    sampled = sampled.sort_values(["ts_code", "date"]).reset_index(drop=True)
+    dv = pd.to_numeric(sampled["dv_ttm"], errors="coerce")
+    stability_window = 36 if sampling == "monthly" else 156
+    stability_minimum = 12 if sampling == "monthly" else 52
+    sampled["dv_ttm_mean_36m"] = dv.groupby(sampled["ts_code"]).transform(
+        lambda s: s.rolling(stability_window, min_periods=stability_minimum).mean()
+    )
+    sampled["dv_ttm_std_36m"] = dv.groupby(sampled["ts_code"]).transform(
+        lambda s: s.rolling(stability_window, min_periods=stability_minimum).std()
+    )
+    sampled["dv_ttm_stability_36m"] = (
+        sampled["dv_ttm_mean_36m"] / sampled["dv_ttm_std_36m"].replace(0, np.nan)
     ).clip(0, 10)
     coverage = {
         "source_dir": str(source_dir),
@@ -547,9 +576,12 @@ def load_daily_basic_monthly(start: pd.Timestamp, end: pd.Timestamp | None) -> t
         "loaded_trade_dates": len(set(dates)),
         "first_trade_date": min(dates) if dates else None,
         "last_trade_date": max(dates) if dates else None,
-        "monthly_rebalance_dates": int(monthly["date"].nunique()),
+        "monthly_rebalance_dates": int(sampled["date"].nunique()) if sampling == "monthly" else 0,
+        "weekly_rebalance_dates": int(sampled["date"].nunique()) if sampling == "weekly" else 0,
+        "sampled_rebalance_dates": int(sampled["date"].nunique()),
+        "sample_frequency": sampling,
     }
-    return monthly, coverage
+    return sampled, coverage
 
 
 def load_market_regime(start: pd.Timestamp, end: pd.Timestamp | None) -> pd.DataFrame:
@@ -610,9 +642,13 @@ def load_financial_asof(features: pd.DataFrame) -> pd.DataFrame:
 
     out = features.sort_values(["date", "ts_code"]).copy()
     merged_parts: list[pd.DataFrame] = []
+    finance_by_symbol = {
+        str(ts_code): group.sort_values("ann_date").drop(columns=["ts_code"])
+        for ts_code, group in fina.groupby("ts_code", sort=False)
+    }
     for ts_code, group in out.groupby("ts_code", sort=False):
-        finance = fina[fina["ts_code"] == ts_code].sort_values("ann_date")
-        if finance.empty:
+        finance = finance_by_symbol.get(str(ts_code))
+        if finance is None or finance.empty:
             group = group.copy()
             group["roe"] = np.nan
             group["debt_to_assets"] = np.nan
@@ -623,7 +659,7 @@ def load_financial_asof(features: pd.DataFrame) -> pd.DataFrame:
             continue
         merged = pd.merge_asof(
             group.sort_values("date"),
-            finance.drop(columns=["ts_code"]).sort_values("ann_date"),
+            finance,
             left_on="date",
             right_on="ann_date",
             direction="backward",
@@ -653,7 +689,28 @@ def add_empty_analyst_forecast_columns(features: pd.DataFrame) -> pd.DataFrame:
         "analyst_forward_revenue_growth_180d": np.nan,
         "analyst_forward_net_profit_growth_180d": np.nan,
         "analyst_forward_pe_180d": np.nan,
+        "analyst_forward_eps_3y_mean_180d": np.nan,
+        "analyst_forward_eps_3y_variance_180d": np.nan,
+        "analyst_forward_eps_3y_years_180d": 0.0,
+        "analyst_forward_eps_3y_estimate_count_180d": 0.0,
+        "analyst_forward_revenue_3y_mean_180d": np.nan,
+        "analyst_forward_revenue_3y_variance_180d": np.nan,
+        "analyst_forward_net_profit_3y_mean_180d": np.nan,
+        "analyst_forward_net_profit_3y_variance_180d": np.nan,
     }
+    for horizon in range(3):
+        prefix = f"analyst_forward_y{horizon}"
+        defaults.update(
+            {
+                f"{prefix}_year": np.nan,
+                f"{prefix}_eps_mean_180d": np.nan,
+                f"{prefix}_eps_std_180d": np.nan,
+                f"{prefix}_eps_estimate_count_180d": 0.0,
+                f"{prefix}_price_mean_180d": np.nan,
+                f"{prefix}_price_std_180d": np.nan,
+                f"{prefix}_price_estimate_count_180d": 0.0,
+            }
+        )
     for column, value in defaults.items():
         if column not in out.columns:
             out[column] = value
@@ -686,6 +743,7 @@ def load_raw_analyst_reports() -> pd.DataFrame:
         "revenue",
         "report_count",
         "snapshot_only",
+        "is_predict",
     ]
     for column in keep_columns:
         if column not in reports.columns:
@@ -798,12 +856,39 @@ def load_analyst_forecast_asof(features: pd.DataFrame) -> pd.DataFrame:
             )
             consensus_report_counts = pd.to_numeric(visible["report_count"], errors="coerce").dropna()
             consensus_report_count = float(consensus_report_counts.max()) if not consensus_report_counts.empty else 0.0
-            forward = visible[visible["forecast_year"] >= date.year].copy()
+            prediction_mask = (
+                visible["is_predict"].fillna(True).astype(bool)
+                if "is_predict" in visible.columns
+                else pd.Series(True, index=visible.index)
+            )
+            forward = visible[
+                (visible["forecast_year"] >= date.year) & prediction_mask
+            ].copy()
             forward_years = forward["forecast_year"].dropna().nunique()
             forward_eps_growth = np.nan
             forward_revenue_growth = np.nan
             forward_net_profit_growth = np.nan
             forward_pe = np.nan
+            forward_eps_3y_mean = np.nan
+            forward_eps_3y_variance = np.nan
+            forward_eps_3y_years = 0
+            forward_eps_3y_estimate_count = 0
+            forward_revenue_3y_mean = np.nan
+            forward_revenue_3y_variance = np.nan
+            forward_net_profit_3y_mean = np.nan
+            forward_net_profit_3y_variance = np.nan
+            yearly_forecasts = {
+                horizon: {
+                    "year": float(date.year + horizon),
+                    "eps_mean": np.nan,
+                    "eps_std": np.nan,
+                    "eps_count": 0.0,
+                    "price_mean": np.nan,
+                    "price_std": np.nan,
+                    "price_count": 0.0,
+                }
+                for horizon in range(3)
+            }
             if not forward.empty:
                 by_year = forward.groupby("forecast_year", dropna=True)[["eps", "revenue", "net_profit", "pe"]].mean()
                 current_year = float(date.year)
@@ -820,8 +905,113 @@ def load_analyst_forecast_asof(features: pd.DataFrame) -> pd.DataFrame:
                 pe_window = by_year.loc[by_year.index.isin([current_year, next_year]), "pe"].replace([np.inf, -np.inf], np.nan).dropna()
                 if not pe_window.empty:
                     forward_pe = float(pe_window.mean())
-            rows.append(
-                {
+
+                # Current-year E plus the next two fiscal years. Repeated daily
+                # consensus snapshots must not outweigh an individual research
+                # source, so retain only the latest estimate for each
+                # source/institution/author/year identity before aggregation.
+                target_years = {date.year, date.year + 1, date.year + 2}
+                three_year_estimates = forward[
+                    forward["forecast_year"].isin(target_years)
+                ].copy()
+                if not three_year_estimates.empty:
+                    identity_columns = ["source", "org_name", "author_name"]
+                    three_year_estimates["_forecast_identity"] = (
+                        three_year_estimates[identity_columns]
+                        .fillna("")
+                        .astype(str)
+                        .agg("|".join, axis=1)
+                    )
+                    three_year_estimates = (
+                        three_year_estimates.sort_values("report_date")
+                        .drop_duplicates(
+                            ["_forecast_identity", "forecast_year"], keep="last"
+                        )
+                    )
+                    three_year_estimates["eps"] = pd.to_numeric(
+                        three_year_estimates["eps"], errors="coerce"
+                    )
+                    three_year_estimates["pe"] = pd.to_numeric(
+                        three_year_estimates["pe"], errors="coerce"
+                    )
+                    three_year_estimates["implied_price"] = (
+                        three_year_estimates["eps"] * three_year_estimates["pe"]
+                    ).where(
+                        (three_year_estimates["eps"] > 0)
+                        & (three_year_estimates["pe"] > 0)
+                    )
+
+                    eps_three_year = three_year_estimates.dropna(
+                        subset=["eps", "forecast_year"]
+                    )
+                    eps_values = eps_three_year["eps"].astype(float)
+                    if not eps_values.empty:
+                        forward_eps_3y_mean = float(eps_values.mean())
+                        if len(eps_values) >= 2:
+                            forward_eps_3y_variance = float(eps_values.var(ddof=1))
+                        forward_eps_3y_years = int(
+                            eps_three_year["forecast_year"].nunique(dropna=True)
+                        )
+                        forward_eps_3y_estimate_count = int(len(eps_values))
+
+                    for horizon in range(3):
+                        forecast_year = date.year + horizon
+                        year_estimates = three_year_estimates[
+                            three_year_estimates["forecast_year"] == forecast_year
+                        ]
+                        year_eps = year_estimates["eps"].dropna().astype(float)
+                        year_prices = year_estimates["implied_price"].dropna().astype(float)
+                        yearly_forecasts[horizon] = {
+                            "year": float(forecast_year),
+                            "eps_mean": float(year_eps.mean()) if not year_eps.empty else np.nan,
+                            "eps_std": (
+                                float(year_eps.std(ddof=1)) if len(year_eps) >= 2 else np.nan
+                            ),
+                            "eps_count": float(len(year_eps)),
+                            "price_mean": (
+                                float(year_prices.mean()) if not year_prices.empty else np.nan
+                            ),
+                            "price_std": (
+                                float(year_prices.std(ddof=1))
+                                if len(year_prices) >= 2
+                                else np.nan
+                            ),
+                            "price_count": float(len(year_prices)),
+                        }
+
+                def three_year_summary(metric: str) -> tuple[float, float]:
+                    estimates = forward[
+                        forward["forecast_year"].isin(target_years)
+                    ].copy()
+                    estimates[metric] = pd.to_numeric(estimates[metric], errors="coerce")
+                    estimates = estimates.dropna(subset=[metric, "forecast_year"])
+                    if estimates.empty:
+                        return np.nan, np.nan
+                    estimates["_forecast_identity"] = (
+                        estimates[["source", "org_name", "author_name"]]
+                        .fillna("")
+                        .astype(str)
+                        .agg("|".join, axis=1)
+                    )
+                    estimates = (
+                        estimates.sort_values("report_date")
+                        .drop_duplicates(
+                            ["_forecast_identity", "forecast_year"], keep="last"
+                        )
+                    )
+                    values = estimates[metric].astype(float)
+                    variance = float(values.var(ddof=1)) if len(values) >= 2 else np.nan
+                    return float(values.mean()), variance
+
+                (
+                    forward_revenue_3y_mean,
+                    forward_revenue_3y_variance,
+                ) = three_year_summary("revenue")
+                (
+                    forward_net_profit_3y_mean,
+                    forward_net_profit_3y_variance,
+                ) = three_year_summary("net_profit")
+            forecast_row = {
                     "ts_code": ts_code,
                     "date": date,
                     "analyst_report_count_180d": float(max(0, hi - lo_180)),
@@ -841,8 +1031,31 @@ def load_analyst_forecast_asof(features: pd.DataFrame) -> pd.DataFrame:
                     "analyst_forward_revenue_growth_180d": forward_revenue_growth,
                     "analyst_forward_net_profit_growth_180d": forward_net_profit_growth,
                     "analyst_forward_pe_180d": forward_pe,
-                }
-            )
+                    "analyst_forward_eps_3y_mean_180d": forward_eps_3y_mean,
+                    "analyst_forward_eps_3y_variance_180d": forward_eps_3y_variance,
+                    "analyst_forward_eps_3y_years_180d": float(forward_eps_3y_years),
+                    "analyst_forward_eps_3y_estimate_count_180d": float(
+                        forward_eps_3y_estimate_count
+                    ),
+                    "analyst_forward_revenue_3y_mean_180d": forward_revenue_3y_mean,
+                    "analyst_forward_revenue_3y_variance_180d": forward_revenue_3y_variance,
+                    "analyst_forward_net_profit_3y_mean_180d": forward_net_profit_3y_mean,
+                    "analyst_forward_net_profit_3y_variance_180d": forward_net_profit_3y_variance,
+            }
+            for horizon, summary in yearly_forecasts.items():
+                prefix = f"analyst_forward_y{horizon}"
+                forecast_row.update(
+                    {
+                        f"{prefix}_year": summary["year"],
+                        f"{prefix}_eps_mean_180d": summary["eps_mean"],
+                        f"{prefix}_eps_std_180d": summary["eps_std"],
+                        f"{prefix}_eps_estimate_count_180d": summary["eps_count"],
+                        f"{prefix}_price_mean_180d": summary["price_mean"],
+                        f"{prefix}_price_std_180d": summary["price_std"],
+                        f"{prefix}_price_estimate_count_180d": summary["price_count"],
+                    }
+                )
+            rows.append(forecast_row)
 
     forecast = pd.DataFrame(rows)
     out = features.merge(forecast, on=["date", "ts_code"], how="left")

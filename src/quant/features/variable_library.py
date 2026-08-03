@@ -168,11 +168,14 @@ PROJECT_FACTOR_COLUMNS = [
 
 
 def build_continuous_ohlc(df: pd.DataFrame) -> pd.DataFrame:
-    """Return OHLC adjusted to a continuous current-price scale for indicators.
+    """Return causal continuous OHLC using actions known by each row.
 
     Tushare daily OHLC can contain ex-right price jumps while pct_chg/pre_close
-    remain continuous. Rolling technical indicators should use a continuous
-    price series; display and trade simulation can still use raw prices.
+    remain continuous. The historical implementation adjusted every past row
+    to the latest row's scale, so a future split changed already-materialized
+    absolute factors. This forward-scale series compounds the adjustment only
+    from the ex-right row onward. It is continuous but never rewrites the past;
+    display and trade simulation can still use raw prices.
     """
     out = df.copy()
     if not {"open", "high", "low", "close"} <= set(out.columns):
@@ -201,14 +204,14 @@ def build_continuous_ohlc(df: pd.DataFrame) -> pd.DataFrame:
         errors="coerce",
     ).to_numpy(dtype=float)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        ratios = pre_close[1:] / close[:-1]
+        ratios = close[:-1] / pre_close[1:]
     ratios = np.where(
         np.isfinite(ratios) & (ratios > 0),
         ratios,
         1.0,
     )
     factor_values = np.ones(len(sorted_frame), dtype=float)
-    factor_values[:-1] = np.cumprod(ratios[::-1])[::-1]
+    factor_values[1:] = np.cumprod(ratios)
     factor = pd.Series(
         factor_values,
         index=sorted_frame.index,
@@ -217,6 +220,40 @@ def build_continuous_ohlc(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in ["open", "high", "low", "close"]:
         out[col] = pd.to_numeric(out[col], errors="coerce") * factor.reindex(out.index).fillna(1.0)
+    return out
+
+
+def build_latest_scale_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """Legacy latest-scale adjustment used only by pinned pre-v4 models.
+
+    New calculations must use :func:`build_continuous_ohlc`. This compatibility
+    function keeps already-released model inputs reproducible until those
+    models are retrained and audited under the causal schema.
+    """
+
+    out = df.copy()
+    if not {"open", "high", "low", "close"} <= set(out.columns) or "pre_close" not in out.columns:
+        return out
+    if "date" in out.columns:
+        order = out.assign(_order_date=pd.to_datetime(out["date"], errors="coerce")).sort_values("_order_date").index
+    elif "trade_date" in out.columns:
+        trade_date = pd.to_datetime(out["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+        order = out.assign(_order_date=trade_date).sort_values("_order_date").index
+    else:
+        order = out.index
+    sorted_frame = out.loc[order].copy()
+    if len(sorted_frame) < 2:
+        return out
+    close = pd.to_numeric(sorted_frame["close"], errors="coerce").to_numpy(dtype=float)
+    pre_close = pd.to_numeric(sorted_frame["pre_close"], errors="coerce").to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ratios = pre_close[1:] / close[:-1]
+    ratios = np.where(np.isfinite(ratios) & (ratios > 0), ratios, 1.0)
+    factor_values = np.ones(len(sorted_frame), dtype=float)
+    factor_values[:-1] = np.cumprod(ratios[::-1])[::-1]
+    factor = pd.Series(factor_values, index=sorted_frame.index, dtype=float)
+    for column in ("open", "high", "low", "close"):
+        out[column] = pd.to_numeric(out[column], errors="coerce") * factor.reindex(out.index).fillna(1.0)
     return out
 
 EXTRA_FEATURE_COLUMNS = [
@@ -396,10 +433,14 @@ def _align_weekly_ma(df: pd.DataFrame) -> pd.DataFrame:
     return aligned.reindex(df.index)[keep[1:]]
 
 
-def calculate_project_extra_features(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_project_extra_features(
+    df: pd.DataFrame,
+    *,
+    price_builder=build_continuous_ohlc,
+) -> pd.DataFrame:
     """Calculate reusable project-level variables not covered by legacy factors."""
     out = pd.DataFrame(index=df.index)
-    price_df = build_continuous_ohlc(df)
+    price_df = price_builder(df)
     close = price_df["close"]
     volume = df["volume"]
 
