@@ -5014,6 +5014,80 @@ tbody tr.selected-row:hover td {
 #longPage .long-pool-table th:nth-child(14),
 #longPage .long-pool-table td:nth-child(14) { width: 260px; }
 
+.long-sort-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-weight: 800;
+  gap: 5px;
+  padding: 0;
+}
+
+.long-sort-button:hover,
+.long-sort-button:focus-visible {
+  color: var(--accent);
+}
+
+.long-sort-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+[data-long-sort-indicator] {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.long-price-band-panel {
+  align-self: start;
+}
+
+.long-price-band-table-wrap {
+  max-height: none;
+}
+
+.long-price-band-table {
+  min-width: 1180px;
+  table-layout: fixed;
+}
+
+.long-price-band-table th,
+.long-price-band-table td {
+  line-height: 1.4;
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+}
+
+.long-price-band-table th:nth-child(1) { width: 120px; }
+.long-price-band-table th:nth-child(2) { width: 310px; }
+.long-price-band-table th:nth-child(n+3):nth-child(-n+8) { width: 112px; }
+.long-price-band-table th:nth-child(9) { width: 130px; }
+
+.long-price-band-table td strong,
+.long-price-band-table td span {
+  display: block;
+}
+
+.long-price-band-table td span {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.long-price-band-conclusion {
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0;
+  padding: 12px 14px 14px;
+}
+
 .metric-stack {
   min-width: 104px;
 }

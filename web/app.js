@@ -39,6 +39,7 @@ const state = {
   longVariant: "tea",
   longLoading: false,
   longError: "",
+  longSort: { key: null, direction: "desc" },
   chanPayload: null,
   chanLoading: false,
   chanSelectedSymbol: null,
@@ -525,8 +526,98 @@ function priceScoreDetail(item) {
   if (item.price_state === "WAIT_HISTORY") {
     return points > 0 ? `${points}个月样本，未达门槛` : "历史样本不足";
   }
-  const structure = item.price_state === "WAIT_STABILITY" ? "结构待确认" : "结构已通过";
+  const structure = item.price_state === "WAIT_STABILITY" ? "结构未通过" : "结构已通过";
   return points > 0 ? `${points}个月样本 · ${structure}` : structure;
+}
+
+function sortedLongStocks(stocks) {
+  const rows = [...(stocks || [])];
+  const { key, direction } = state.longSort;
+  if (!key) return rows;
+  const numeric = (item, field) => {
+    if (item?.[field] == null || item[field] === "") return null;
+    const value = Number(item[field]);
+    return Number.isFinite(value) ? value : null;
+  };
+  const multiplier = direction === "asc" ? 1 : -1;
+  const secondaryKey = key === "good_stock_score" ? "price_score" : "good_stock_score";
+  return rows.sort((left, right) => {
+    const leftValue = numeric(left, key);
+    const rightValue = numeric(right, key);
+    if (leftValue == null && rightValue != null) return 1;
+    if (leftValue != null && rightValue == null) return -1;
+    if (leftValue != null && rightValue != null && leftValue !== rightValue) {
+      return (leftValue - rightValue) * multiplier;
+    }
+    const leftSecondary = numeric(left, secondaryKey) ?? Number.NEGATIVE_INFINITY;
+    const rightSecondary = numeric(right, secondaryKey) ?? Number.NEGATIVE_INFINITY;
+    if (leftSecondary !== rightSecondary) return rightSecondary - leftSecondary;
+    return String(left.ts_code || "").localeCompare(String(right.ts_code || ""));
+  });
+}
+
+function toggleLongSort(key) {
+  if (state.longSort.key !== key) {
+    state.longSort = { key, direction: "desc" };
+  } else if (state.longSort.direction === "desc") {
+    state.longSort = { key, direction: "asc" };
+  } else {
+    state.longSort = { key: null, direction: "desc" };
+  }
+  renderLongStockPool();
+}
+
+function syncLongSortHeaders() {
+  document.querySelectorAll("[data-long-sort-header]").forEach((header) => {
+    const key = header.dataset.longSortHeader;
+    const active = state.longSort.key === key;
+    const direction = active ? state.longSort.direction : null;
+    header.setAttribute("aria-sort", direction === "asc" ? "ascending" : direction === "desc" ? "descending" : "none");
+    const indicator = header.querySelector("[data-long-sort-indicator]");
+    if (indicator) indicator.textContent = direction === "asc" ? "↑" : direction === "desc" ? "↓" : "↕";
+    const button = header.querySelector("[data-long-sort]");
+    if (button) {
+      const next = !active ? "从高到低" : direction === "desc" ? "从低到高" : "恢复默认顺序";
+      button.title = `点击${next}排列`;
+    }
+  });
+}
+
+function renderLongPriceScoreBacktest() {
+  const body = document.querySelector("#longPriceBandRows");
+  const meta = document.querySelector("#longPriceBandMeta");
+  const conclusion = document.querySelector("#longPriceBandConclusion");
+  if (!body || !meta || !conclusion) return;
+  if (state.longLoading) {
+    meta.textContent = "正在读取严格历史回测";
+    conclusion.textContent = "";
+    body.innerHTML = `<tr><td colspan="9" class="empty-cell">正在加载价格分分档证据...</td></tr>`;
+    return;
+  }
+  const backtest = state.longPayload?.price_score_backtest;
+  if (!backtest?.available || !Array.isArray(backtest.bands) || !backtest.bands.length) {
+    meta.textContent = state.longError ? "回测证据加载失败" : "等待加载";
+    conclusion.textContent = "";
+    body.innerHTML = `<tr><td colspan="9" class="empty-cell">暂无价格分分档回测</td></tr>`;
+    return;
+  }
+  meta.textContent = `月末信号 · 最近${Number(backtest.history_window_months || 0) / 12}年 · 最少${backtest.minimum_history_months}个月 · 次日收盘执行`;
+  body.innerHTML = backtest.bands.map((band) => {
+    const validation = band.validation || {};
+    const test = band.test || {};
+    return `<tr>
+      <td><strong>${escapeHtml(band.label || "-")}</strong><span>${escapeHtml(band.name || "")}</span></td>
+      <td><strong>${escapeHtml(band.meaning || "-")}</strong><span>${escapeHtml(band.decision || "-")}</span></td>
+      <td>${fmtRate(validation.mean_return)}</td>
+      <td>${fmtRate(validation.positive_rate)}</td>
+      <td>${fmtRate(test.mean_return)}</td>
+      <td>${fmtRate(test.positive_rate)}</td>
+      <td>${fmtRate(test.mean_excess)}</td>
+      <td>${fmtRate(test.mean_mae)}</td>
+      <td>${Number(test.signals || 0).toLocaleString("zh-CN")} / ${Number(test.periods || 0)}月</td>
+    </tr>`;
+  }).join("");
+  conclusion.textContent = `${backtest.conclusion || ""} 验证期 ${backtest.validation_period || "-"}；样本外 ${backtest.test_period || "-"}。收益按信号月内好股票等权，持有期存在重叠。`;
 }
 
 function longPricePlan(item) {
@@ -2377,6 +2468,8 @@ function renderLongStockPool() {
   const meta = document.querySelector("#longPoolMeta");
   const counts = document.querySelector("#longStateCounts");
   if (!body || !meta || !counts) return;
+  syncLongSortHeaders();
+  renderLongPriceScoreBacktest();
   document.querySelectorAll(".long-variant-button").forEach((button) => {
     const active = button.dataset.longVariant === state.longVariant;
     button.classList.toggle("active", active);
@@ -2402,7 +2495,12 @@ function renderLongStockPool() {
     return;
   }
   const totalGoodStocks = payload.quality_price_summary?.good_stock_count ?? payload.stocks.length;
-  meta.textContent = `信号日 ${payload.signal_date} · 展示 ${payload.stocks.length}/${totalGoodStocks} 只好股票 · 预测仅展示`;
+  const sortLabel = state.longSort.key === "good_stock_score"
+    ? ` · 股票分${state.longSort.direction === "asc" ? "升序" : "降序"}`
+    : state.longSort.key === "price_score"
+      ? ` · 价格分${state.longSort.direction === "asc" ? "升序" : "降序"}`
+      : "";
+  meta.textContent = `信号日 ${payload.signal_date} · 展示 ${payload.stocks.length}/${totalGoodStocks} 只好股票 · 预测仅展示${sortLabel}`;
   const recommendationCounts = payload.state_counts || {};
   counts.innerHTML = Object.entries(recommendationCounts).map(([key, value]) => (
     `<span class="state-pill ${key}">${stateLabel(key)} ${value}</span>`
@@ -2424,7 +2522,7 @@ function renderLongStockPool() {
     const pointCount = Number(points || 0);
     return pointCount > 0 ? `${percentileText} · ${pointCount}点` : percentileText;
   };
-  body.innerHTML = payload.stocks.map((item) => {
+  body.innerHTML = sortedLongStocks(payload.stocks).map((item) => {
     const xueqiuUrl = xueqiuStockUrl(item.ts_code);
     return `
     <tr data-watchlist-symbol="${item.ts_code}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload.signal_date, `${payload.variant_name} · ${recommendationLevel(item).label}`))}" tabindex="0">
@@ -3484,6 +3582,10 @@ document.querySelectorAll(".long-variant-button").forEach((button) => {
     renderLongStockPool();
     loadLongStockPool().catch(showError);
   });
+});
+
+document.querySelectorAll("[data-long-sort]").forEach((button) => {
+  button.addEventListener("click", () => toggleLongSort(button.dataset.longSort));
 });
 
 document.querySelector("#longPoolRefresh").addEventListener("click", async () => {

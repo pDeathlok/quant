@@ -29,9 +29,57 @@ from backtest_tea_master_long import (
 
 
 REPORT_DIR = PROJECT_ROOT / "reports/long_good_stock_price"
+PRICE_SCORE_BAND_CONFIG_PATH = PROJECT_ROOT / "config/long_price_score_bands.json"
 HORIZONS = {"6m": 126, "12m": 252, "24m": 504}
 HISTORY_WINDOWS = [36, 60, 84]
 MINIMUM_HISTORY_MONTHS = 24
+PRICE_SCORE_BANDS = [
+    {
+        "key": "80_100",
+        "label": "80–100",
+        "name": "深度相对低估",
+        "minimum": 80.0,
+        "maximum": 100.0,
+        "meaning": "估值处于自身历史低位，但需警惕预期下修和价值陷阱",
+        "decision": "结构通过后才可推荐",
+    },
+    {
+        "key": "60_80",
+        "label": "60–<80",
+        "name": "好价候选",
+        "minimum": 60.0,
+        "maximum": 80.0,
+        "meaning": "相对历史偏便宜，达到当前价格分推荐线",
+        "decision": "结构通过后可推荐",
+    },
+    {
+        "key": "40_60",
+        "label": "40–<60",
+        "name": "中性价格",
+        "minimum": 40.0,
+        "maximum": 60.0,
+        "meaning": "相对自身历史不便宜也不极端昂贵",
+        "decision": "继续观察价格",
+    },
+    {
+        "key": "20_40",
+        "label": "20–<40",
+        "name": "相对偏贵",
+        "minimum": 20.0,
+        "maximum": 40.0,
+        "meaning": "估值处于自身历史偏高区域",
+        "decision": "不建议新建仓",
+    },
+    {
+        "key": "0_20",
+        "label": "0–<20",
+        "name": "显著相对高估",
+        "minimum": 0.0,
+        "maximum": 20.0,
+        "meaning": "估值接近自身历史高位",
+        "decision": "等待估值消化",
+    },
+]
 
 
 @dataclass(frozen=True)
@@ -231,6 +279,96 @@ def summarize(signals: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
+def summarize_price_score_bands(signals: pd.DataFrame) -> pd.DataFrame:
+    """Summarize disjoint production-score bands without selecting on outcomes."""
+
+    frame = signals[
+        (signals["history_window_months"] == 84)
+        & (signals["rule"] == "all_good_stocks")
+    ].drop_duplicates(["date", "ts_code"]).copy()
+    frame["historical_value_score"] = pd.to_numeric(
+        frame["historical_value_score"], errors="coerce"
+    )
+    frame = frame.dropna(subset=["historical_value_score"])
+    rows: list[dict[str, float | int | str]] = []
+    periods = {
+        "validation": frame["date"].dt.year.between(2020, 2023),
+        "test": frame["date"].dt.year.ge(2024),
+    }
+    for band in PRICE_SCORE_BANDS:
+        score_mask = frame["historical_value_score"].ge(band["minimum"])
+        if band["maximum"] >= 100:
+            score_mask &= frame["historical_value_score"].le(band["maximum"])
+        else:
+            score_mask &= frame["historical_value_score"].lt(band["maximum"])
+        for period, period_mask in periods.items():
+            observations = frame.loc[
+                score_mask & period_mask,
+                ["date", "ts_code", "return_12m", "excess_return_12m", "mae_12m"],
+            ].copy()
+            for column in ["return_12m", "excess_return_12m", "mae_12m"]:
+                observations[column] = pd.to_numeric(observations[column], errors="coerce")
+            observations = observations.dropna(subset=["return_12m"])
+            monthly = observations.groupby("date").agg(
+                portfolio_return=("return_12m", "mean"),
+                portfolio_excess=("excess_return_12m", "mean"),
+                portfolio_mae=("mae_12m", "mean"),
+            )
+            if monthly.empty:
+                continue
+            rows.append(
+                {
+                    "key": str(band["key"]),
+                    "period": period,
+                    "signals": int(len(observations)),
+                    "periods": int(len(monthly)),
+                    "mean_return": float(monthly["portfolio_return"].mean()),
+                    "positive_rate": float((monthly["portfolio_return"] > 0).mean()),
+                    "mean_excess": float(monthly["portfolio_excess"].mean()),
+                    "mean_mae": float(monthly["portfolio_mae"].mean()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def price_score_band_payload(summary: pd.DataFrame) -> dict[str, object]:
+    results = {
+        (str(row.key), str(row.period)): {
+            "signals": int(row.signals),
+            "periods": int(row.periods),
+            "mean_return": round(float(row.mean_return), 10),
+            "positive_rate": round(float(row.positive_rate), 10),
+            "mean_excess": round(float(row.mean_excess), 10),
+            "mean_mae": round(float(row.mean_mae), 10),
+        }
+        for row in summary.itertuples(index=False)
+    }
+    bands = []
+    for definition in PRICE_SCORE_BANDS:
+        item = {
+            key: value
+            for key, value in definition.items()
+            if key not in {"minimum", "maximum"}
+        }
+        item["validation"] = results.get((str(definition["key"]), "validation"), {})
+        item["test"] = results.get((str(definition["key"]), "test"), {})
+        bands.append(item)
+    return {
+        "schema_version": "long_price_score_bands_v1",
+        "score_definition": "100 - (PE历史分位×30% + PB历史分位×25% + 类型自适应PR历史分位×45%)",
+        "sampling": "monthly_last_trading_day",
+        "history_window_months": 84,
+        "minimum_history_months": 24,
+        "execution": "next_trading_day_close",
+        "horizon": "12m",
+        "portfolio_aggregation": "每个信号月内好股票等权，再跨月统计",
+        "validation_period": "2020-01-01/2023-12-31",
+        "test_period": "2024-01-01/2025-06-30",
+        "conclusion": "价格分只衡量相对自身历史的便宜程度，回测未呈现分数越高、未来收益越高的单调关系；60分仅是好价候选线，推荐仍需长期价格结构通过。",
+        "bands": bands,
+    }
+
+
 def choose_validation_candidate(summary: pd.DataFrame) -> tuple[int, str]:
     # PE/PB-only and PR-only rules are diagnostic baselines. Production
     # candidates must jointly consider all three historical percentiles.
@@ -388,11 +526,17 @@ def run(start: str, end: str | None) -> dict[str, object]:
     signals = attach_forward_returns(signals, daily_returns, benchmark)
     signals["period"] = signals["date"].map(period_label)
     summary = summarize(signals)
+    price_score_bands = summarize_price_score_bands(signals)
     selected_window_months, selected_rule = choose_validation_candidate(summary)
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     summary.to_csv(REPORT_DIR / "summary.csv", index=False)
+    price_score_bands.to_csv(REPORT_DIR / "price_score_bands.csv", index=False)
     signals.to_parquet(REPORT_DIR / "signals.parquet", index=False)
+    PRICE_SCORE_BAND_CONFIG_PATH.write_text(
+        json.dumps(price_score_band_payload(price_score_bands), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     selected_scored = scored_by_window[selected_window_months]
     report = markdown_report(
         summary,

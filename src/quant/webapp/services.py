@@ -190,9 +190,10 @@ DEFAULT_FAMILY_CAP = 12
 SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v8_robust_return_models"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
-LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v11_history_price_score_forecast_years"
+LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v12_price_bands_structure_evidence"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
+LONG_PRICE_SCORE_BAND_CONFIG_PATH = PROJECT_ROOT / "config/long_price_score_bands.json"
 LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION = "long-page-v1"
 LONG_FACTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/features/long"
 LONG_FACTOR_REQUIRED_COLUMNS = (
@@ -2021,13 +2022,16 @@ def _long_good_price_assessment(row: pd.Series) -> dict[str, Any]:
         and all(value is not None for value in [pe_percentile, pb_percentile, pr_percentile])
     )
     has_history = bool(history_points >= 24 and complete_percentiles)
-    trend_guard = bool(
+    trend_floor_price = ma120 * 0.90 if ma120 is not None else None
+    trend_price_guard_passed = bool(
         close is not None
-        and ma120 is not None
-        and ma120_slope is not None
-        and close >= ma120 * 0.90
-        and ma120_slope >= -0.06
+        and trend_floor_price is not None
+        and close >= trend_floor_price
     )
+    trend_slope_guard_passed = bool(
+        ma120_slope is not None and ma120_slope >= -0.06
+    )
+    trend_guard = bool(trend_price_guard_passed and trend_slope_guard_passed)
     is_good_price = bool(
         has_history
         and historical_value_score >= 60
@@ -2051,7 +2055,22 @@ def _long_good_price_assessment(row: pd.Series) -> dict[str, Any]:
         price_reason = "当前 PE、PB 或双 PR 口径不完整，暂不判定好价格"
     elif not trend_guard:
         price_state = "WAIT_STABILITY"
-        price_reason = "估值可能较低，但长期价格结构保护尚未通过"
+        structure_issues: list[str] = []
+        if close is None:
+            structure_issues.append("缺少当前价格")
+        elif trend_floor_price is None:
+            structure_issues.append("缺少MA120，无法计算90%价格门槛")
+        elif not trend_price_guard_passed:
+            structure_issues.append(
+                f"收盘 {close:.2f} 低于MA120的90%门槛 {trend_floor_price:.2f}"
+            )
+        if ma120_slope is None:
+            structure_issues.append("缺少MA120近20日斜率")
+        elif not trend_slope_guard_passed:
+            structure_issues.append(
+                f"MA120近20日斜率 {ma120_slope:.2%}，低于 -6.00% 门槛"
+            )
+        price_reason = "；".join(structure_issues) or "长期价格结构保护尚未通过"
     elif near_good_price:
         price_state = "NEAR_GOOD_PRICE"
         price_reason = f"历史归一化价格分 {historical_value_score:.1f}，接近推荐标准"
@@ -2088,11 +2107,40 @@ def _long_good_price_assessment(row: pd.Series) -> dict[str, Any]:
         "pr_pb_weight": round(pr_pb_weight, 2),
         "pe_ttm": round(pe, 2) if pe is not None else None,
         "pb": round(pb, 2) if pb is not None else None,
+        "trend_guard_passed": trend_guard,
+        "trend_price_guard_passed": trend_price_guard_passed,
+        "trend_slope_guard_passed": trend_slope_guard_passed,
+        "ma120_slope_20d": round(ma120_slope, 6) if ma120_slope is not None else None,
         "price_levels": {
             "current_price": round(close, 2) if close is not None else None,
             "trend_reference_price": round(ma120, 2) if ma120 is not None else None,
+            "trend_floor_price": (
+                round(trend_floor_price, 2) if trend_floor_price is not None else None
+            ),
         },
     }
+
+
+@lru_cache(maxsize=1)
+def _long_price_score_backtest_payload() -> dict[str, Any]:
+    """Load the versioned, reproducible price-score band calibration."""
+
+    try:
+        payload = json.loads(LONG_PRICE_SCORE_BAND_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {
+            "available": False,
+            "bands": [],
+            "conclusion": "价格分分档回测暂不可用",
+        }
+    bands = payload.get("bands") if isinstance(payload, dict) else None
+    if not isinstance(bands, list) or not bands:
+        return {
+            "available": False,
+            "bands": [],
+            "conclusion": "价格分分档回测暂不可用",
+        }
+    return {**payload, "available": True}
 
 
 def _analyst_forecast_years(row: pd.Series) -> list[dict[str, Any]]:
@@ -2147,7 +2195,7 @@ def _tea_good_stock_price_row(
         "NEAR_GOOD_PRICE": "价格分接近推荐线",
         "WAIT_PRICE": "价格分未达推荐线",
         "WAIT_HISTORY": "估值历史不足",
-        "WAIT_STABILITY": "长期价格结构待确认",
+        "WAIT_STABILITY": price["price_state_reason"],
     }.get(str(price["price_state"]), "价格条件待确认")
     display_reason = f"{stock['good_stock_reason']}；{price_summary}"
     close = _safe_float(row.get("close"))
@@ -2742,6 +2790,7 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
             "analyst_covered_count": analyst_covered,
             "displayed_count": len(rows),
         },
+        "price_score_backtest": _long_price_score_backtest_payload(),
         "stocks": rows,
         "notes": [
             "长线页面只负责选好股票与合适的建仓价格，持仓管理由自选池承担。",

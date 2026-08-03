@@ -1,0 +1,130 @@
+{
+  "schema_version": "long_price_score_bands_v1",
+  "score_definition": "100 - (PE历史分位×30% + PB历史分位×25% + 类型自适应PR历史分位×45%)",
+  "sampling": "monthly_last_trading_day",
+  "history_window_months": 84,
+  "minimum_history_months": 24,
+  "execution": "next_trading_day_close",
+  "horizon": "12m",
+  "portfolio_aggregation": "每个信号月内好股票等权，再跨月统计",
+  "validation_period": "2020-01-01/2023-12-31",
+  "test_period": "2024-01-01/2025-06-30",
+  "conclusion": "价格分只衡量相对自身历史的便宜程度，回测未呈现分数越高、未来收益越高的单调关系；60分仅是好价候选线，推荐仍需长期价格结构通过。",
+  "bands": [
+    {
+      "key": "80_100",
+      "label": "80–100",
+      "name": "深度相对低估",
+      "meaning": "估值处于自身历史低位，但需警惕预期下修和价值陷阱",
+      "decision": "结构通过后才可推荐",
+      "validation": {
+        "signals": 3174,
+        "periods": 48,
+        "mean_return": -0.0331739385,
+        "positive_rate": 0.4166666667,
+        "mean_excess": 0.0070716001,
+        "mean_mae": -0.2557565488
+      },
+      "test": {
+        "signals": 1848,
+        "periods": 18,
+        "mean_return": 0.1587899257,
+        "positive_rate": 0.7777777778,
+        "mean_excess": -0.0295236478,
+        "mean_mae": -0.1929360236
+      }
+    },
+    {
+      "key": "60_80",
+      "label": "60–<80",
+      "name": "好价候选",
+      "meaning": "相对历史偏便宜，达到当前价格分推荐线",
+      "decision": "结构通过后可推荐",
+      "validation": {
+        "signals": 3182,
+        "periods": 48,
+        "mean_return": -0.0442760521,
+        "positive_rate": 0.2708333333,
+        "mean_excess": -0.0040305135,
+        "mean_mae": -0.2654161455
+      },
+      "test": {
+        "signals": 2068,
+        "periods": 18,
+        "mean_return": 0.1492056592,
+        "positive_rate": 0.8333333333,
+        "mean_excess": -0.0391359416,
+        "mean_mae": -0.1704393556
+      }
+    },
+    {
+      "key": "40_60",
+      "label": "40–<60",
+      "name": "中性价格",
+      "meaning": "相对自身历史不便宜也不极端昂贵",
+      "decision": "继续观察价格",
+      "validation": {
+        "signals": 2322,
+        "periods": 48,
+        "mean_return": -0.0576123300,
+        "positive_rate": 0.2708333333,
+        "mean_excess": -0.0173944603,
+        "mean_mae": -0.2770090700
+      },
+      "test": {
+        "signals": 1501,
+        "periods": 18,
+        "mean_return": 0.2006264942,
+        "positive_rate": 0.9444444444,
+        "mean_excess": 0.0122848934,
+        "mean_mae": -0.1557642304
+      }
+    },
+    {
+      "key": "20_40",
+      "label": "20–<40",
+      "name": "相对偏贵",
+      "meaning": "估值处于自身历史偏高区域",
+      "decision": "不建议新建仓",
+      "validation": {
+        "signals": 1385,
+        "periods": 48,
+        "mean_return": -0.0350022553,
+        "positive_rate": 0.3125,
+        "mean_excess": 0.0052432834,
+        "mean_mae": -0.2802686602
+      },
+      "test": {
+        "signals": 723,
+        "periods": 18,
+        "mean_return": 0.2175890077,
+        "positive_rate": 0.9444444444,
+        "mean_excess": 0.0292523622,
+        "mean_mae": -0.1571870098
+      }
+    },
+    {
+      "key": "0_20",
+      "label": "0–<20",
+      "name": "显著相对高估",
+      "meaning": "估值接近自身历史高位",
+      "decision": "等待估值消化",
+      "validation": {
+        "signals": 624,
+        "periods": 36,
+        "mean_return": -0.1222993874,
+        "positive_rate": 0.25,
+        "mean_excess": -0.0697300881,
+        "mean_mae": -0.3032255872
+      },
+      "test": {
+        "signals": 228,
+        "periods": 16,
+        "mean_return": 0.1275324911,
+        "positive_rate": 0.4375,
+        "mean_excess": -0.0587417861,
+        "mean_mae": -0.2348867293
+      }
+    }
+  ]
+}

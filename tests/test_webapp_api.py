@@ -1443,6 +1443,50 @@ def test_long_good_price_requires_24_months_of_complete_history() -> None:
     assert result["price_state"] == "WAIT_HISTORY"
 
 
+def test_long_good_price_explains_the_failed_structure_gate() -> None:
+    result = services._long_good_price_assessment(
+        pd.Series(
+            {
+                "close": 269.58,
+                "historical_value_score": 94.42,
+                "valuation_history_points": 81,
+                "pe_hist_percentile": 4.94,
+                "pb_hist_percentile": 6.17,
+                "pr_hist_percentile": 5.68,
+                "ma_120": 251.57,
+                "ma_120_slope_20d": -0.068084431,
+            }
+        )
+    )
+
+    assert result["is_good_price"] is False
+    assert result["price_state"] == "WAIT_STABILITY"
+    assert result["trend_price_guard_passed"] is True
+    assert result["trend_slope_guard_passed"] is False
+    assert result["trend_guard_passed"] is False
+    assert result["price_levels"]["trend_floor_price"] == pytest.approx(226.41)
+    assert result["price_state_reason"] == "MA120近20日斜率 -6.81%，低于 -6.00% 门槛"
+
+
+def test_long_price_score_backtest_payload_is_versioned_and_complete() -> None:
+    services._long_price_score_backtest_payload.cache_clear()
+    payload = services._long_price_score_backtest_payload()
+
+    assert payload["available"] is True
+    assert payload["schema_version"] == "long_price_score_bands_v1"
+    assert payload["history_window_months"] == 84
+    assert payload["minimum_history_months"] == 24
+    assert [item["key"] for item in payload["bands"]] == [
+        "80_100",
+        "60_80",
+        "40_60",
+        "20_40",
+        "0_20",
+    ]
+    assert all(item["validation"]["signals"] > 0 for item in payload["bands"])
+    assert all(item["test"]["signals"] > 0 for item in payload["bands"])
+
+
 def test_long_pool_row_exposes_metric_percentiles_and_three_year_forecast() -> None:
     row = pd.Series(
         {

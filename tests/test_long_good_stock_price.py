@@ -13,6 +13,10 @@ if str(RESEARCH_DIR) not in sys.path:
 
 from backtest_tea_master_long import add_historical_valuation_features  # noqa: E402
 import backtest_long_dividend_quality as dividend_module  # noqa: E402
+from backtest_long_good_stock_price import (  # noqa: E402
+    price_score_band_payload,
+    summarize_price_score_bands,
+)
 from backtest_long_good_price_weekly_absolute import (  # noqa: E402
     absolute_rule_masks,
     historical_rule_masks,
@@ -355,3 +359,39 @@ def test_weekly_historical_rule_requires_minimum_observation_years() -> None:
     assert masks["hist_composite60"].tolist() == [False, True, False]
     assert masks["hybrid_hist60_abs1"].tolist() == [False, True, False]
     assert masks["hybrid_hist60_or_abs1"].tolist() == [True, True, True]
+
+
+def test_price_score_band_backtest_uses_disjoint_production_ranges() -> None:
+    rows = []
+    for date, score, stock_return in [
+        ("2021-01-31", 80.0, 0.10),
+        ("2021-01-31", 79.999, -0.10),
+        ("2024-01-31", 60.0, 0.20),
+        ("2024-01-31", 59.999, 0.30),
+        ("2024-02-29", 20.0, -0.20),
+        ("2024-02-29", 19.999, -0.30),
+    ]:
+        rows.append(
+            {
+                "date": pd.Timestamp(date),
+                "ts_code": f"S{len(rows)}",
+                "history_window_months": 84,
+                "rule": "all_good_stocks",
+                "historical_value_score": score,
+                "return_12m": stock_return,
+                "excess_return_12m": stock_return - 0.05,
+                "mae_12m": min(stock_return, -0.10),
+            }
+        )
+
+    summary = summarize_price_score_bands(pd.DataFrame(rows))
+    payload = price_score_band_payload(summary)
+    bands = {item["key"]: item for item in payload["bands"]}
+
+    assert bands["80_100"]["validation"]["signals"] == 1
+    assert bands["60_80"]["validation"]["signals"] == 1
+    assert bands["60_80"]["test"]["signals"] == 1
+    assert bands["40_60"]["test"]["signals"] == 1
+    assert bands["20_40"]["test"]["signals"] == 1
+    assert bands["0_20"]["test"]["signals"] == 1
+    assert payload["execution"] == "next_trading_day_close"

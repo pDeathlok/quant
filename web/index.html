@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -344,8 +344,16 @@
                   <th>推荐程度</th>
                   <th>股票</th>
                   <th>行业</th>
-                  <th>好股票</th>
-                  <th>价格分</th>
+                  <th data-long-sort-header="good_stock_score" aria-sort="none">
+                    <button class="long-sort-button" type="button" data-long-sort="good_stock_score">
+                      股票分 <span data-long-sort-indicator aria-hidden="true">↕</span>
+                    </button>
+                  </th>
+                  <th data-long-sort-header="price_score" aria-sort="none">
+                    <button class="long-sort-button" type="button" data-long-sort="price_score">
+                      价格分 <span data-long-sort-indicator aria-hidden="true">↕</span>
+                    </button>
+                  </th>
                   <th>ROE</th>
                   <th>PE</th>
                   <th>PB</th>
@@ -362,6 +370,36 @@
               </tbody>
             </table>
           </div>
+        </section>
+
+        <section class="panel long-price-band-panel" aria-labelledby="longPriceBandTitle">
+          <div class="panel-head">
+            <div>
+              <h3 id="longPriceBandTitle">价格分分档与历史回测</h3>
+              <span id="longPriceBandMeta">等待加载</span>
+            </div>
+          </div>
+          <div class="table-wrap long-price-band-table-wrap">
+            <table class="long-price-band-table">
+              <thead>
+                <tr>
+                  <th>价格分</th>
+                  <th>含义 / 使用</th>
+                  <th>验证期12月收益</th>
+                  <th>验证期胜率</th>
+                  <th>样本外12月收益</th>
+                  <th>样本外胜率</th>
+                  <th>样本外超额</th>
+                  <th>样本外平均回撤</th>
+                  <th>样本外信号</th>
+                </tr>
+              </thead>
+              <tbody id="longPriceBandRows">
+                <tr><td colspan="9" class="empty-cell">切到长线策略后加载回测证据</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p id="longPriceBandConclusion" class="long-price-band-conclusion"></p>
         </section>
 
       </main>
@@ -906,6 +944,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1"></script>
   </body>
 </html>

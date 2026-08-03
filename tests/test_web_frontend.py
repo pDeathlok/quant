@@ -361,8 +361,11 @@ def test_long_page_focuses_on_good_stocks_and_good_prices() -> None:
     assert "percentile(item.roe_hist_percentile, item.roe_history_points)" in APP_JS
     assert 'item.display_reason || item.reason || "-"' in APP_JS
     assert "<th>推荐程度</th>" in INDEX_HTML
-    assert "<th>好股票</th>" in INDEX_HTML
-    assert "<th>价格分</th>" in INDEX_HTML
+    assert 'data-long-sort="good_stock_score"' in INDEX_HTML
+    assert 'data-long-sort="price_score"' in INDEX_HTML
+    assert "function sortedLongStocks(stocks)" in APP_JS
+    assert "function toggleLongSort(key)" in APP_JS
+    assert 'header.setAttribute("aria-sort"' in APP_JS
     assert "metric(item.price_score)" in APP_JS
     assert "个月样本" in APP_JS
     assert "个股自身历史归一化（最多7年）· 跨日可比" not in APP_JS
@@ -383,6 +386,17 @@ def test_long_page_focuses_on_good_stocks_and_good_prices() -> None:
     assert "xueqiuStockUrl(item.ts_code)" in APP_JS
     assert "雪球 ↗" in APP_JS
     assert 'target="_blank" rel="noopener noreferrer"' in APP_JS
+
+
+def test_long_page_explains_price_score_bands_with_backtest_evidence() -> None:
+    assert "价格分分档与历史回测" in INDEX_HTML
+    assert 'id="longPriceBandRows"' in INDEX_HTML
+    assert "验证期12月收益" in INDEX_HTML
+    assert "样本外12月收益" in INDEX_HTML
+    assert "样本外平均回撤" in INDEX_HTML
+    assert "function renderLongPriceScoreBacktest()" in APP_JS
+    assert "backtest.conclusion" in APP_JS
+    assert "持有期存在重叠" in APP_JS
     assert "卖出、减仓与持仓管理移至自选池" in INDEX_HTML
     assert "PR-PE 与 PR-PB 同时保留" in INDEX_HTML
     assert "最多 7 年月末历史归一化" in INDEX_HTML
