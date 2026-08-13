@@ -1,9 +1,9 @@
 """Daily, pre-market BYD T plan selected from sideways-era history.
 
-The live plan never needs intraday updates. Completed five-minute bars are
-used only to validate whether an entry happened before its target and to fit a
-small, deliberately constrained decision tree. The selected positive-T rule
-is trained from 2022 onward so the 2020-2021 BYD bull run cannot dominate it.
+Completed five-minute bars are historical training and validation samples, not
+same-day live features. The workspace records their maximum date and enforces a
+configurable freshness SLA. The selected positive-T rule is trained from 2022
+onward so the 2020-2021 BYD bull run cannot dominate it.
 """
 
 from __future__ import annotations
@@ -340,7 +340,10 @@ def build_daily_t_plan(
     return {
         "signal_date": signal_date.strftime("%Y-%m-%d"),
         "reference_close": round(close, 2),
-        "basis": "盘前固定日线计划；历史5分钟线只用于验证成交先后，盘中不刷新计划",
+        "basis": (
+            "盘前固定日线计划；历史5分钟线用于模型训练与成交先后验证，"
+            "不是当日特征，盘中不刷新计划"
+        ),
         "priority": "positive",
         "positive": {
             "execution_enabled": positive_enabled,

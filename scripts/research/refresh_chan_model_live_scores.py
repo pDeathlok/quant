@@ -44,6 +44,7 @@ from quant.features.market_sentiment import (
     normalize_ts_code,
     read_top_list_features,
 )
+from quant.ml.feature_coverage import validate_required_feature_coverage
 from quant.strategies.custom.chan_model import (
     add_chan_model_strategy_columns,
     select_chan_model_candidates,
@@ -88,7 +89,16 @@ def _load_models(model_dir: Path) -> dict[str, dict[str, Any]]:
         path = model_dir / f"{target}.joblib"
         if not path.exists():
             raise FileNotFoundError(f"缺少缠论模型文件: {path}")
-        models[target] = joblib.load(path)
+        bundle = joblib.load(path)
+        non_live = sorted(
+            set(bundle.get("features") or [])
+            & {"entry_gap_pct", "chan_stroke_amplitude"}
+        )
+        if non_live:
+            raise RuntimeError(
+                f"缠论模型 {path} 仍依赖信号日收盘后不可得特征 {non_live}；请先按实时特征合同重训"
+            )
+        models[target] = bundle
     return models
 
 
@@ -113,6 +123,42 @@ def _resolve_daily_path(daily_dir: Path, symbol: str) -> Path | None:
     )
 
 
+def _read_daily_basic_turnover_history(
+    daily_basic_dir: Path,
+    start: str,
+    end: str,
+) -> pd.DataFrame:
+    """Read the point-in-time turnover history needed by rolling features."""
+
+    start_key = pd.Timestamp(start).strftime("%Y%m%d")
+    end_key = pd.Timestamp(end).strftime("%Y%m%d")
+    frames: list[pd.DataFrame] = []
+    for path in sorted(daily_basic_dir.glob("*.parquet")):
+        if not (path.stem.isdigit() and start_key <= path.stem <= end_key):
+            continue
+        try:
+            frame = pd.read_parquet(
+                path,
+                columns=["ts_code", "trade_date", "turnover_rate"],
+            )
+        except Exception:
+            continue
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=["ts_code", "date", "turnover_rate"])
+    out = pd.concat(frames, ignore_index=True)
+    out["ts_code"] = out["ts_code"].map(normalize_ts_code)
+    out["date"] = pd.to_datetime(
+        out["trade_date"].astype(str),
+        format="%Y%m%d",
+        errors="coerce",
+    )
+    out["turnover_rate"] = pd.to_numeric(out["turnover_rate"], errors="coerce")
+    return out[["ts_code", "date", "turnover_rate"]].drop_duplicates(
+        ["ts_code", "date"], keep="last"
+    )
+
+
 def _build_recent_feature_dataset(
     candidates: pd.DataFrame,
     daily_dir: Path,
@@ -128,12 +174,36 @@ def _build_recent_feature_dataset(
     if signal.empty:
         return pd.DataFrame()
 
+    turnover_history = _read_daily_basic_turnover_history(
+        daily_basic_dir,
+        (pd.Timestamp(start) - pd.Timedelta(days=120)).strftime("%Y-%m-%d"),
+        end,
+    )
+
     frames: list[pd.DataFrame] = []
     for symbol, group in signal.groupby("symbol"):
         path = _resolve_daily_path(daily_dir, str(symbol))
         if path is None:
             continue
-        daily = add_stock_features(read_daily_file(path))
+        daily = read_daily_file(path)
+        daily["ts_code"] = daily["symbol"].map(normalize_ts_code)
+        symbol_turnover = turnover_history[
+            turnover_history["ts_code"].eq(normalize_ts_code(symbol))
+        ]
+        if not symbol_turnover.empty:
+            existing_turnover = pd.to_numeric(
+                daily.get("turnover_rate", pd.Series(np.nan, index=daily.index)),
+                errors="coerce",
+            )
+            daily = daily.drop(columns=["turnover_rate"], errors="ignore").merge(
+                symbol_turnover,
+                on=["ts_code", "date"],
+                how="left",
+            )
+            daily["turnover_rate"] = daily["turnover_rate"].combine_first(
+                existing_turnover.reset_index(drop=True)
+            )
+        daily = add_stock_features(daily)
         daily["symbol"] = daily["symbol"].map(normalize_ts_code)
         daily["entry_open"] = daily["open"].shift(-1)
         daily["entry_gap_pct"] = (daily["entry_open"] / daily["close"] - 1) * 100
@@ -169,7 +239,10 @@ def _build_recent_feature_dataset(
         return pd.DataFrame()
 
     data = pd.concat(frames, ignore_index=True)
-    market = build_limit_proxy_features(daily_dir, start=start)
+    market_history_start = (
+        pd.Timestamp(start) - pd.Timedelta(days=40)
+    ).strftime("%Y-%m-%d")
+    market = build_limit_proxy_features(daily_dir, start=market_history_start)
     if not market.empty:
         data = data.merge(market, on="date", how="left")
 
@@ -185,8 +258,8 @@ def _build_recent_feature_dataset(
 
     for col in ["top_list_count", "top_net_amount_ratio", "top_net_rate"]:
         if col not in data.columns:
-            data[col] = np.nan
-    data["top_list_count"] = data["top_list_count"].fillna(0)
+            data[col] = 0.0
+        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0.0)
     data = add_candidate_cross_section_ranks(data)
     data["split"] = "live"
     for col in ["hold_5d_close", "hold_10d_close", "hold_20d_close", "target_win10", "target_big10", "target_good"]:
@@ -197,15 +270,24 @@ def _build_recent_feature_dataset(
 
 def _add_predictions(data: pd.DataFrame, models: dict[str, dict[str, Any]]) -> pd.DataFrame:
     out = data.copy()
-    all_features = set()
+    all_features: set[str] = set()
     for bundle in models.values():
         all_features.update(bundle["features"])
-    for feature in sorted(all_features):
-        if feature not in out.columns:
-            out[feature] = np.nan
+    target_date = (
+        pd.to_datetime(out["date"], errors="coerce").max()
+        if "date" in out.columns
+        else None
+    )
+    feature_coverage = validate_required_feature_coverage(
+        out,
+        sorted(all_features),
+        target_date=target_date,
+        context="Chan live model scoring",
+    )
     for target, bundle in models.items():
         x = bundle["imputer"].transform(out[bundle["features"]])
         out[f"pred_{target}"] = bundle["model"].predict_proba(x)[:, 1]
+    out.attrs["feature_coverage"] = feature_coverage
     return out
 
 
@@ -284,6 +366,31 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
     )
     models = _load_models(args.model_dir)
     live_scored = _add_predictions(live, models) if not live.empty else live
+    feature_coverage = dict(live_scored.attrs.get("feature_coverage") or {})
+    if live_scored.empty:
+        required_features = sorted(
+            {
+                str(feature)
+                for artifact in models.values()
+                for feature in artifact.get("features") or []
+            }
+        )
+        feature_coverage = {
+            "status": "valid",
+            "target_date": args.end,
+            "row_count": 0,
+            "required_feature_count": len(required_features),
+            "present_feature_count": 0,
+            "covered_feature_count": 0,
+            "missing_columns": [],
+            "all_null_features": [],
+            "partial_features": [],
+            "minimum_coverage": 1.0,
+            "mean_coverage": 1.0,
+            "coverage": {},
+            "non_null_counts": {},
+            "empty_candidate_set": True,
+        }
 
     historical = pd.read_parquet(args.scored_path) if args.scored_path.exists() else pd.DataFrame()
     if not historical.empty:
@@ -325,11 +432,13 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
         "strategy": strategy_meta,
         "snapshots": snapshot_results,
         "candidate_refresh": candidate_metrics,
+        "feature_coverage": feature_coverage,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
     manifest_path = args.scored_path.parent / DEFAULT_REFRESH_MANIFEST_PATH.name
     atomic_write_json(
         {
+            "status": "success",
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "processed_through": args.end,
             "daily_dir": str(args.daily_dir),
@@ -337,6 +446,7 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
             "live_rows": result["live_rows"],
             "combined_max_date": result["combined_max_date"],
             "candidate_refresh": candidate_metrics,
+            "feature_coverage": feature_coverage,
             "elapsed_seconds": result["elapsed_seconds"],
         },
         manifest_path,

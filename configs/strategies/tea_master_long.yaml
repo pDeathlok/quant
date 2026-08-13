@@ -6,6 +6,9 @@
 release:
   lifecycle: production
   consumer: quant.webapp.services
+  dependency_nodes:
+    - feature.long_snapshot
+    - product.long_pools
   selection_field: strategies[].backtest.variant
 
 strategies:

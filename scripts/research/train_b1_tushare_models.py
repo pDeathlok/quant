@@ -47,6 +47,7 @@ from quant.features.variable_library import (
     PROJECT_FACTOR_COLUMNS,
     merge_daily_basic_features,
 )
+from quant.ml.feature_coverage import model_feature_history_start
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
 
@@ -70,11 +71,24 @@ MODEL_PARAMS = {
 }
 
 
+def combine_training_frames(
+    daily: pd.DataFrame,
+    factors: pd.DataFrame,
+    labels: pd.DataFrame,
+) -> pd.DataFrame:
+    """Prefer factor-layer columns and keep the training schema unique."""
+
+    combined = pd.concat([daily, factors, labels], axis=1)
+    if combined.columns.has_duplicates:
+        combined = combined.loc[:, ~combined.columns.duplicated(keep="last")]
+    return combined
+
+
 def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
     path_str, start_date = args
     path = Path(path_str)
     start_ts = pd.to_datetime(start_date)
-    history_start = start_ts - pd.Timedelta(days=450)
+    history_start = model_feature_history_start(start_ts)
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=path.parent.parent))
     df = store.read_market_range(path.parent.name, start_date=history_start.strftime("%Y%m%d"), symbols=[path.stem])
     return process_daily_frame((path.stem, df, start_date))
@@ -87,7 +101,7 @@ def process_daily_frame(
     raise_errors = bool(options[0]) if options else False
     try:
         start_ts = pd.to_datetime(start_date)
-        history_start = start_ts - pd.Timedelta(days=450)
+        history_start = model_feature_history_start(start_ts)
         df = normalize_tushare_daily(df, symbol)
         if "vol" in df.columns and "volume" in df.columns:
             df = df.drop(columns=["vol"])
@@ -134,7 +148,7 @@ def process_daily_frame(
             ]
         ]
         labels = create_b1_labels(df, forward_days=5, exit_aware=True, use_new_labels=True)
-        result = pd.concat([df, factors, labels], axis=1)
+        result = combine_training_frames(df, factors, labels)
 
         keep_cols = [
             "ts_code",
@@ -148,8 +162,10 @@ def process_daily_frame(
             *B1_FEATURE_COLUMNS,
             *LABELS.values(),
         ]
-        present = [col for col in keep_cols if col in result.columns]
+        present = list(dict.fromkeys(col for col in keep_cols if col in result.columns))
         out = result.loc[(result["date"] >= start_ts) & b1_signal, present].copy()
+        if out.columns.has_duplicates:
+            raise RuntimeError("B1 training frame contains duplicate columns")
         return out if len(out) else None
     except Exception as exc:
         if raise_errors:
@@ -175,7 +191,7 @@ def build_dataset(
     symbols: list[str] | None = None,
 ) -> pd.DataFrame:
     start_ts = pd.to_datetime(start_date)
-    history_start = (start_ts - pd.Timedelta(days=450)).strftime("%Y%m%d")
+    history_start = model_feature_history_start(start_ts).strftime("%Y%m%d")
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     market = store.read_market_range(
         daily_dir.name,
@@ -446,7 +462,7 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
             raise RuntimeError(f"{model_name} train split has only one class for {label_col}")
 
         model_select_k = None if select_k is None else min(select_k, len(cols))
-        imputer = SimpleImputer(strategy="median")
+        imputer = SimpleImputer(strategy="median", keep_empty_features=True)
         X_train_imputed = imputer.fit_transform(X_train_raw.replace([np.inf, -np.inf], np.nan))
         X_test_imputed = imputer.transform(X_test_raw.replace([np.inf, -np.inf], np.nan))
         selector = None

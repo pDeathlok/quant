@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -17,6 +19,7 @@ from quant.application.workspace_refresh import (
     WorkspaceRefreshOperations,
     refresh_daily_workspaces,
 )
+from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_json as publish_json
 from quant.features.market_regime import classify_market_regime
@@ -69,7 +72,15 @@ def _incremental_daily_basic_start() -> str:
         for path in daily_basic_dir.glob("*.parquet")
         if path.stem.isdigit() and len(path.stem) == 8
     ]
-    return max(dates) if dates else _incremental_daily_start()
+    if not dates:
+        return _incremental_daily_start()
+    # Rolling model factors depend on the preceding 20 trading sessions.  A
+    # previously cached cross-section may have complete rows but incomplete
+    # feature columns, so revalidate a calendar window wide enough to cover
+    # that dependency on every routine run. Complete local dates are skipped
+    # without a network request by daily_basic_refresh.
+    latest = pd.to_datetime(max(dates), format="%Y%m%d")
+    return (latest - pd.Timedelta(days=45)).strftime("%Y%m%d")
 
 
 def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
@@ -103,6 +114,10 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         os.getenv("ROUTINE_DAILY_FINAL_RETRY_WORKERS", "4"),
         "--final-retry-sleep",
         os.getenv("ROUTINE_DAILY_FINAL_RETRY_SLEEP", "0.8"),
+        "--availability-retry-failures",
+        os.getenv("ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES", "12"),
+        "--availability-retry-interval",
+        os.getenv("ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL", "300"),
     ]
     if dry_run:
         return {
@@ -124,6 +139,12 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
     )
     stdout_lines: list[str] = []
     progress_pattern = re.compile(r"refresh progress: (\d+)/(\d+) done, success=(\d+), failed=(\d+)")
+    availability_pattern = re.compile(
+        r"market daily availability retry: "
+        r"trade_date=(\d{8}) "
+        r"failed_attempts=(\d+)/(\d+) "
+        r"retry_in_seconds=([0-9.]+)"
+    )
     assert process.stdout is not None
     for line in process.stdout:
         stdout_lines.append(line)
@@ -134,6 +155,20 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
             progress_callback(
                 percent=10 + int(ratio * 25),
                 message=f"正在拉取 Tushare 最新日线数据：{done}/{total}，成功 {ok}，失败 {failed}",
+            )
+            continue
+        availability_match = availability_pattern.search(line)
+        if availability_match and progress_callback is not None:
+            trade_date, failed_attempts, tolerated_failures, retry_seconds = (
+                availability_match.groups()
+            )
+            progress_callback(
+                percent=10,
+                message=(
+                    f"{trade_date} 日线尚未完整发布；"
+                    f"已失败 {failed_attempts}/{tolerated_failures} 次，"
+                    f"{retry_seconds} 秒后重试"
+                ),
             )
     returncode = process.wait()
     stdout = "".join(stdout_lines)
@@ -188,27 +223,56 @@ def refresh_daily_basic_data(dry_run: bool = True, progress_callback=None) -> di
     }
 
 
-def refresh_reference_inputs(dry_run: bool = True, include_financials: bool = True) -> dict:
+def refresh_reference_inputs(
+    dry_run: bool = True,
+    include_financials: bool = True,
+    *,
+    include_analyst: bool | None = None,
+    include_stock_basic: bool = True,
+    include_index: bool = True,
+    include_market_regime: bool = True,
+    include_tradability: bool = True,
+    long_factor_datasets: tuple[str, ...] | None = None,
+) -> dict:
+    """Refresh only reference inputs selected by the active dependency closure.
+
+    Defaults preserve the legacy all-input behavior for direct callers.  The
+    Web coordinator passes switches compiled from the current production
+    product and model contracts.
+    """
+
     started = time.monotonic()
     end_date = _incremental_daily_start()
+    effective_include_analyst = (
+        include_financials if include_analyst is None else include_analyst
+    )
     if dry_run:
         return {
             "status": "skipped",
-            "reason": "dry_run=true；未刷新 stock_basic、沪深300和财务报表。",
+            "reason": "dry_run=true；未刷新当前产品闭包所需的参考数据。",
             "end_date": end_date,
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
     from quant.routine.reference_data_refresh import refresh_reference_data
 
-    if include_financials:
+    reference_kwargs = {
+        "end_date": end_date,
+        "include_financials": include_financials,
+        "include_stock_basic": include_stock_basic,
+        "include_index": include_index,
+        "include_tradability": include_tradability,
+        "include_long_factor_sources": long_factor_datasets is None
+        or bool(long_factor_datasets),
+        "long_factor_datasets": long_factor_datasets,
+    }
+    if effective_include_analyst:
         # Eastmoney/AkShare and Tushare use independent upstreams and write to
         # different datasets. Run them concurrently, then merge only their
         # small status payloads after both have completed.
         with ThreadPoolExecutor(max_workers=2) as executor:
             reference_future = executor.submit(
                 refresh_reference_data,
-                end_date=end_date,
-                include_financials=True,
+                **reference_kwargs,
             )
             analyst_future = executor.submit(_refresh_analyst_forecast_snapshot)
             result = reference_future.result()
@@ -227,8 +291,16 @@ def refresh_reference_inputs(dry_run: bool = True, include_financials: bool = Tr
                 + str(analyst_result.get("error") or "using last-known-good data")
             )
     else:
-        result = refresh_reference_data(end_date=end_date, include_financials=False)
-    if result.get("end_date") and result.get("status") in {"success", "partial"}:
+        result = refresh_reference_data(**reference_kwargs)
+        result.setdefault("steps", {})["analyst_forecast_snapshot"] = {
+            "status": "skipped",
+            "reason": "not required for this refresh scope",
+        }
+    if (
+        include_market_regime
+        and result.get("end_date")
+        and result.get("status") in {"success", "partial"}
+    ):
         regime_result = refresh_market_regime_snapshot(str(result["end_date"]))
         result.setdefault("steps", {})["market_regime"] = regime_result
         if regime_result.get("status") == "failed":
@@ -236,6 +308,11 @@ def refresh_reference_inputs(dry_run: bool = True, include_financials: bool = Tr
             result.setdefault("critical_errors", []).append(
                 "market_regime: " + str(regime_result.get("error") or "refresh failed")
             )
+    elif not include_market_regime:
+        result.setdefault("steps", {})["market_regime"] = {
+            "status": "skipped",
+            "reason": "not required for this refresh scope",
+        }
     result["elapsed_seconds"] = round(time.monotonic() - started, 3)
     return result
 
@@ -395,7 +472,11 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             latest = None
 
     if latest == today:
-        steps["consensus_snapshot"] = {"status": "skipped", "reason": "today's snapshot already exists"}
+        steps["consensus_snapshot"] = {
+            "status": "skipped",
+            "reason": "today's snapshot already exists",
+            "polled_through": today.date().isoformat(),
+        }
     else:
         command = [
             sys.executable,
@@ -422,6 +503,9 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             "fallback_latest_report_date": (
                 latest.date().isoformat() if not consensus_success and latest is not None and pd.notna(latest) else None
             ),
+            "polled_through": (
+                today.date().isoformat() if consensus_success else None
+            ),
         }
 
     symbols = _latest_long_analyst_symbols()
@@ -446,7 +530,11 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             "symbols_requested": len(symbols),
         }
     elif marker_date == today.date().isoformat():
-        steps["candidate_research_reports"] = {"status": "skipped", "reason": "today's candidate reports already refreshed"}
+        steps["candidate_research_reports"] = {
+            "status": "skipped",
+            "reason": "today's candidate reports already refreshed",
+            "polled_through": today.date().isoformat(),
+        }
     else:
         research_command = [
             sys.executable,
@@ -528,15 +616,25 @@ def _refresh_analyst_forecast_snapshot() -> dict:
             "command": " ".join(research_command),
             "stdout_tail": research_result.stdout[-2000:],
             "stderr_tail": research_result.stderr[-2000:],
+            "polled_through": (
+                today.date().isoformat() if research_success else None
+            ),
         }
 
     failed = [name for name, item in steps.items() if item.get("status") == "failed"]
     degraded = [name for name, item in steps.items() if item.get("status") == "degraded"]
     ran = any(item.get("status") == "success" for item in steps.values())
+    consensus_polled_through = steps.get("consensus_snapshot", {}).get(
+        "polled_through"
+    )
     return {
         "status": "failed" if failed else ("degraded" if degraded else ("success" if ran else "skipped")),
         "latest_report_date": latest.date().isoformat() if latest is not None and pd.notna(latest) else None,
         "candidate_symbols": symbols,
+        # This node's required daily poll is the full-market consensus
+        # snapshot.  Candidate research has its own independent marker above;
+        # its disabled/fallback state must not fabricate a watermark.
+        "polled_through": consensus_polled_through,
         "steps": steps,
         "error": (
             f"failed analyst refresh steps: {', '.join(failed)}"
@@ -642,10 +740,37 @@ def refresh_factor_registry_snapshot() -> dict:
             str(key): int(value)
             for key, value in registry["frequency"].value_counts().sort_index().items()
         }
+        dependency_summary = {
+            "schema_version": DEFAULT_DAILY_DEPENDENCY_REGISTRY.schema_version,
+            "node_count": len(DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes),
+            "scope_roots": DEFAULT_DAILY_DEPENDENCY_REGISTRY.scope_roots,
+            "layer_counts": {
+                layer.value: sum(
+                    1
+                    for node in DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes.values()
+                    if node.layer == layer
+                )
+                for layer in type(next(iter(DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes.values())).layer)
+            },
+            "runtime_snapshot": "data/contracts/daily_dependencies/latest.json",
+        }
+        contract_body = {
+            "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+            "factors": registry.to_dict(orient="records"),
+            "daily_dependency_registry": dependency_summary,
+        }
+        contract_hash = hashlib.sha256(
+            json.dumps(contract_body, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        try:
+            existing = json.loads(output_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            existing = {}
         payload = {
             "status": "success",
             "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
+            "contract_hash": contract_hash,
             "factor_count": int(len(registry)),
             "family_counts": family_counts,
             "frequency_counts": frequency_counts,
@@ -659,11 +784,17 @@ def refresh_factor_registry_snapshot() -> dict:
                 ),
                 "long_weekly": "weekly last trading day with financial ann_date as-of",
             },
-            "factors": registry.to_dict(orient="records"),
+            "daily_dependency_registry": dependency_summary,
+            "factors": contract_body["factors"],
         }
-        publish_json(payload, output_path)
+        checkpoint_reused = existing.get("contract_hash") == contract_hash
+        if checkpoint_reused:
+            payload["created_at"] = existing.get("created_at") or payload["created_at"]
+        else:
+            publish_json(payload, output_path)
         return {
             **{key: value for key, value in payload.items() if key != "factors"},
+            "checkpoint_reused": checkpoint_reused,
             "path": str(output_path),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
@@ -674,6 +805,38 @@ def refresh_factor_registry_snapshot() -> dict:
             "path": str(output_path),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
+
+
+def resolve_daily_dependency_source_options(scope: str) -> dict[str, Any]:
+    """Compile active source switches from promoted product/model contracts."""
+
+    from quant.routine.daily_dependency_runtime import resolve_active_source_options
+
+    return resolve_active_source_options(PROJECT_ROOT, scope)
+
+
+def publish_daily_dependency_contract(
+    target_date: str,
+    scope: str,
+    results: dict[str, Any],
+    *,
+    phase: str,
+    strict_freshness: bool,
+) -> dict[str, Any]:
+    """Publish the four-layer daily plan and optionally enforce its final gate."""
+
+    from quant.routine.daily_dependency_runtime import publish_daily_dependency_snapshot
+
+    return publish_daily_dependency_snapshot(
+        PROJECT_ROOT,
+        target_date,
+        scope=scope,
+        results=results,
+        phase=phase,
+        strict_models=True,
+        strict_freshness=strict_freshness,
+        raise_on_failure=False,
+    )
 
 
 def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> dict:
@@ -761,6 +924,10 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
 
 def score_latest_models(workers: int = 8) -> dict:
     started = time.monotonic()
+    expected_trade_date = pd.to_datetime(
+        _incremental_daily_start(),
+        format="%Y%m%d",
+    ).strftime("%Y-%m-%d")
     executor_type = os.getenv(
         "ROUTINE_MODEL_SCORE_EXECUTOR",
         "processes",
@@ -769,6 +936,8 @@ def score_latest_models(workers: int = 8) -> dict:
     command = [
         sys.executable,
         "scripts/research/score_latest_strategy_models.py",
+        "--target-date",
+        expected_trade_date,
         "--workers",
         str(workers),
         "--executor",
@@ -789,14 +958,22 @@ def score_latest_models(workers: int = 8) -> dict:
     }
     result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
     manifest = _extract_last_json_object(result.stdout)
+    scored_trade_date = str(manifest.get("target_date") or "")
+    complete = (
+        result.returncode == 0
+        and manifest.get("status") == "success"
+        and scored_trade_date == expected_trade_date
+    )
     return {
         **manifest,
-        "status": "success" if result.returncode == 0 else "failed",
+        "status": "success" if complete else "failed",
         "returncode": result.returncode,
         "stdout_tail": result.stdout[-4000:],
         "stderr_tail": result.stderr[-4000:],
         "command": " ".join(command),
         "factor_schema_version": production_factor_schema,
+        "expected_trade_date": expected_trade_date,
+        "scored_trade_date": scored_trade_date or None,
         "script_elapsed_seconds": manifest.get("elapsed_seconds"),
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
@@ -976,29 +1153,35 @@ def run_daily_pipeline(
             raise RuntimeError(f"{step_name} incomplete: {detail}")
 
     try:
+        source_options = resolve_daily_dependency_source_options("short")
+        results["dependency_source_options"] = {
+            "status": "success",
+            **source_options,
+        }
         results["refresh_data"] = refresh_data(dry_run=skip_data)
         require_complete("refresh_data", allow_skipped=skip_data)
         results["refresh_daily_basic"] = refresh_daily_basic_data(dry_run=skip_data)
         require_complete("refresh_daily_basic", allow_skipped=skip_data)
         results["refresh_reference_inputs"] = refresh_reference_inputs(
             dry_run=skip_data,
-            include_financials=True,
+            include_financials=source_options["include_financials"],
+            include_analyst=source_options["include_analyst"],
+            include_stock_basic=source_options["include_stock_basic"],
+            include_index=source_options["include_index"],
+            include_market_regime=source_options["include_market_regime"],
+            include_tradability=source_options["include_tradability"],
+            long_factor_datasets=source_options["long_factor_datasets"],
         )
         require_complete("refresh_reference_inputs", allow_skipped=skip_data)
         results["refresh_factor_registry"] = refresh_factor_registry_snapshot()
         require_complete("refresh_factor_registry")
-        # Both jobs fan out into their own CPU-bound process pools. Running the
-        # pools at the same time oversubscribes the machine and is materially
-        # slower than letting each pool use the worker budget in turn.
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            upstream_futures = {
-                executor.submit(build_features): "build_features",
-                executor.submit(refresh_strategy_signal_cache): "refresh_strategy_signal_cache",
-            }
-            for future in as_completed(upstream_futures):
-                step_name = upstream_futures[future]
-                results[step_name] = future.result()
-                require_complete(step_name)
+        # The signal pass owns the target-date B1 gate.  Run it first so the
+        # expensive six-year feature pass is limited to the B1/Z candidate
+        # union instead of falling back to an all-market scan.
+        results["refresh_strategy_signal_cache"] = refresh_strategy_signal_cache()
+        require_complete("refresh_strategy_signal_cache")
+        results["build_features"] = build_features()
+        require_complete("build_features")
         results["score_latest_models"] = score_latest_models()
         require_complete("score_latest_models")
         results["refresh_chan_model_scores"] = refresh_chan_model_scores()

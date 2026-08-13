@@ -32,13 +32,30 @@ def classify_market_regime(
     market = _normalize(market_daily, name="market_daily")
     if "ts_code" not in market.columns:
         raise ValueError("market_daily missing required columns: ['ts_code']")
-    cutoff = pd.Timestamp(as_of) if as_of is not None else index["trade_date"].max()
-    index = index.loc[index["trade_date"] <= cutoff].copy()
-    market = market.loc[market["trade_date"] <= cutoff].copy()
+    requested_date = pd.Timestamp(as_of).normalize() if as_of is not None else None
+    if requested_date is not None:
+        index = index.loc[index["trade_date"] <= requested_date].copy()
+        market = market.loc[market["trade_date"] <= requested_date].copy()
     if index["trade_date"].nunique() < 60:
         raise ValueError("index_daily requires at least 60 observations through as_of")
+    if market.empty:
+        raise ValueError("market_daily has no observations through as_of")
 
     index = index.drop_duplicates("trade_date", keep="last")
+    latest_index_date = index["trade_date"].max()
+    latest_market_date = market["trade_date"].max()
+    if latest_index_date != latest_market_date:
+        raise ValueError(
+            "market regime terminal observation dates differ: "
+            f"index={latest_index_date.date().isoformat()} "
+            f"market={latest_market_date.date().isoformat()}"
+        )
+    if requested_date is not None and latest_index_date != requested_date:
+        raise ValueError(
+            "market regime inputs are stale for requested decision date: "
+            f"requested={requested_date.date().isoformat()} "
+            f"latest={latest_index_date.date().isoformat()}"
+        )
     index["ma20"] = index["close"].rolling(20).mean()
     index["ma60"] = index["close"].rolling(60).mean()
     index["return"] = index["close"].pct_change()
@@ -48,7 +65,6 @@ def classify_market_regime(
     market["symbol_ma20"] = market.groupby("ts_code", sort=False)["close"].transform(
         lambda values: values.rolling(20).mean()
     )
-    latest_market_date = market["trade_date"].max()
     cross_section = market.loc[market["trade_date"] == latest_market_date]
     breadth = float((cross_section["close"] > cross_section["symbol_ma20"]).mean())
 
@@ -71,7 +87,7 @@ def classify_market_regime(
 
     regime = "risk_on" if score >= 2 else ("risk_off" if score <= 0 else "neutral")
     return {
-        "as_of": min(cutoff, latest_market_date).strftime("%Y%m%d"),
+        "as_of": latest_index_date.strftime("%Y%m%d"),
         "regime": regime,
         "score": score,
         "signals": {
@@ -86,6 +102,7 @@ def classify_market_regime(
         },
         "coverage": {
             "index_observations": int(index["trade_date"].nunique()),
+            "index_observation_date": latest_index_date.strftime("%Y%m%d"),
             "market_symbols": int(cross_section["ts_code"].nunique()),
             "market_observation_date": latest_market_date.strftime("%Y%m%d"),
         },

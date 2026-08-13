@@ -10,9 +10,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_json
 from quant.data.tushare_fetcher import TushareDataFetcher
-from quant.routine.paths import PROJECT_ROOT
+from quant.routine.paths import DAILY_DIR, PROJECT_ROOT
 from quant.strategies.convertible_bond.backtest import _active_basic, _active_call, _prepare_basic, _prepare_call
 from quant.strategies.convertible_bond.grid import (
     HoldingGridConfig,
@@ -26,10 +27,12 @@ from quant.strategies.convertible_bond.trend_enhanced import add_trend_enhanced_
 CB_DATA_DIR = PROJECT_ROOT / "data/convertible_bond/tushare"
 CB_DAILY_PATH = CB_DATA_DIR / "cb_daily_20180101_20260616.parquet"
 CB_BASIC_PATH = CB_DATA_DIR / "cb_basic_all.parquet"
+CB_BASIC_FALLBACK_PATH = CB_DATA_DIR / "tushare_cache/tushare_cb_basic_all.parquet"
 CB_CALL_PATH = CB_DATA_DIR / "cb_call_20180101_20260616.parquet"
 ITERATION_SUMMARY_PATH = PROJECT_ROOT / "reports/convertible_bond/ladder_grid_iteration/iteration_summary.csv"
 GRID_TREND_OVERLAY_SUMMARY_PATH = PROJECT_ROOT / "reports/convertible_bond/grid_trend_overlay/iteration_summary.csv"
 CB_PREMIUM_MIN_COVERAGE = 0.90
+CB_PREMIUM_COVERAGE_WINDOW = 20
 
 
 def default_convertible_bond_grid_config() -> HoldingGridConfig:
@@ -340,6 +343,44 @@ def _premium_coverage_for_date(daily: pd.DataFrame, trade_date: str) -> float:
     return 0.0 if total == 0 else float((premium.notna() & eligible).sum() / total)
 
 
+def _premium_coverage_window(
+    daily: pd.DataFrame,
+    trade_date: str,
+    *,
+    window: int = CB_PREMIUM_COVERAGE_WINDOW,
+) -> dict[str, Any]:
+    dates = sorted(
+        item
+        for item in daily["trade_date"].dropna().astype(str).unique().tolist()
+        if item <= str(trade_date)
+    )[-window:]
+    coverage_values = [
+        (item, _premium_coverage_for_date(daily, item))
+        for item in dates
+    ]
+    daily_coverage = [
+        {"trade_date": item, "premium_coverage": round(coverage, 6)}
+        for item, coverage in coverage_values
+    ]
+    sessions_meeting_requirement = sum(
+        coverage >= CB_PREMIUM_MIN_COVERAGE
+        for _, coverage in coverage_values
+    )
+    return {
+        "required_sessions": window,
+        "observed_sessions": len(dates),
+        "window_start_trade_date": dates[0] if dates else None,
+        "window_end_trade_date": dates[-1] if dates else None,
+        "minimum_daily_premium_coverage": CB_PREMIUM_MIN_COVERAGE,
+        "sessions_meeting_requirement": sessions_meeting_requirement,
+        "complete": (
+            len(dates) == window
+            and sessions_meeting_requirement == window
+        ),
+        "daily_coverage": daily_coverage,
+    }
+
+
 def _resolve_trade_date(daily: pd.DataFrame, trade_date: str | None) -> str:
     requested = _requested_trade_date(daily, trade_date)
     dates = daily["trade_date"].dropna().astype(str).sort_values().unique().tolist()
@@ -353,6 +394,182 @@ def _resolve_trade_date(daily: pd.DataFrame, trade_date: str | None) -> str:
             f"No convertible-bond data with at least {CB_PREMIUM_MIN_COVERAGE:.0%} premium coverage before {requested}"
         )
     return usable[-1]
+
+
+def _basic_with_conversion_prices(basic: pd.DataFrame) -> pd.DataFrame:
+    """Fill conversion-price fields from the durable full cb_basic cache."""
+
+    out = basic.copy() if basic is not None else pd.DataFrame()
+    has_complete_conversion_prices = (
+        not out.empty
+        and "conv_price" in out.columns
+        and pd.to_numeric(out["conv_price"], errors="coerce").gt(0).all()
+    )
+    if has_complete_conversion_prices or not CB_BASIC_FALLBACK_PATH.exists():
+        return out
+    try:
+        fallback = pd.read_parquet(CB_BASIC_FALLBACK_PATH)
+    except Exception:
+        return out
+    required = [
+        column
+        for column in ["ts_code", "stk_code", "first_conv_price", "conv_price"]
+        if column in fallback.columns
+    ]
+    if "ts_code" not in required or "conv_price" not in required:
+        return out
+    fallback = fallback[required].drop_duplicates("ts_code", keep="last")
+    if out.empty or "ts_code" not in out.columns:
+        return fallback
+    merged = out.merge(fallback, on="ts_code", how="left", suffixes=("", "_fallback"))
+    for column in ["stk_code", "first_conv_price", "conv_price"]:
+        fallback_column = f"{column}_fallback"
+        if fallback_column not in merged.columns:
+            continue
+        if column not in merged.columns:
+            merged[column] = merged[fallback_column]
+        else:
+            current = merged[column]
+            if column in {"first_conv_price", "conv_price"}:
+                current = pd.to_numeric(current, errors="coerce").where(
+                    pd.to_numeric(current, errors="coerce").gt(0)
+                )
+            merged[column] = current.fillna(merged[fallback_column])
+        merged = merged.drop(columns=[fallback_column])
+    return merged
+
+
+def _underlying_stock_daily(
+    basic: pd.DataFrame,
+    trade_date: str,
+) -> pd.DataFrame:
+    if basic.empty or "stk_code" not in basic.columns:
+        return pd.DataFrame()
+    symbols = sorted({str(value) for value in basic["stk_code"].dropna() if str(value)})
+    if not symbols:
+        return pd.DataFrame()
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    try:
+        return store.read_market_range(
+            DAILY_DIR.name,
+            start_date=trade_date,
+            end_date=trade_date,
+            symbols=symbols,
+            columns=["ts_code", "trade_date", "close"],
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fill_missing_premium_fields(
+    daily: pd.DataFrame,
+    basic: pd.DataFrame,
+    stock_daily: pd.DataFrame,
+) -> tuple[pd.DataFrame, int]:
+    """Repair missing conversion value/premium from latest stock close and conversion price."""
+
+    if daily.empty:
+        return daily.copy(), 0
+    out = daily.copy()
+    out["_repair_row_order"] = np.arange(len(out))
+    out["trade_date"] = out["trade_date"].astype(str)
+
+    basic_columns = [
+        column
+        for column in ["ts_code", "stk_code", "conv_price"]
+        if column in basic.columns
+    ]
+    if {"ts_code", "stk_code", "conv_price"} <= set(basic_columns):
+        lookup = (
+            basic[basic_columns]
+            .drop_duplicates("ts_code", keep="last")
+            .rename(columns={"stk_code": "_underlying_code", "conv_price": "_conversion_price"})
+        )
+        out = out.merge(lookup, on="ts_code", how="left", sort=False)
+    else:
+        out["_underlying_code"] = pd.NA
+        out["_conversion_price"] = np.nan
+
+    if not stock_daily.empty and {"ts_code", "trade_date", "close"} <= set(stock_daily.columns):
+        stock_lookup = stock_daily[["ts_code", "trade_date", "close"]].copy()
+        stock_lookup["trade_date"] = stock_lookup["trade_date"].astype(str)
+        stock_lookup = stock_lookup.drop_duplicates(["ts_code", "trade_date"], keep="last").rename(
+            columns={"ts_code": "_underlying_code", "close": "_underlying_close"}
+        )
+        out = out.merge(
+            stock_lookup,
+            on=["_underlying_code", "trade_date"],
+            how="left",
+            sort=False,
+        )
+    else:
+        out["_underlying_close"] = np.nan
+
+    if "stock_price" not in out.columns:
+        out["stock_price"] = np.nan
+    out["stock_price"] = pd.to_numeric(out["stock_price"], errors="coerce").fillna(
+        pd.to_numeric(out["_underlying_close"], errors="coerce")
+    )
+    conversion_price = pd.to_numeric(out["_conversion_price"], errors="coerce")
+    stock_price = pd.to_numeric(out["stock_price"], errors="coerce")
+    computed_value = stock_price.div(conversion_price).mul(100).where(conversion_price.gt(0))
+
+    if "bond_value" not in out.columns:
+        out["bond_value"] = np.nan
+    bond_value = pd.to_numeric(out["bond_value"], errors="coerce").fillna(computed_value)
+    out["bond_value"] = bond_value
+
+    if "bond_over_rate" not in out.columns:
+        out["bond_over_rate"] = np.nan
+    premium_before = pd.to_numeric(out["bond_over_rate"], errors="coerce")
+    bond_close = pd.to_numeric(out["close"], errors="coerce")
+    computed_premium = bond_close.div(bond_value).sub(1).mul(100).where(bond_value.gt(0))
+    out["bond_over_rate"] = premium_before.fillna(computed_premium)
+    repaired_rows = int((premium_before.isna() & out["bond_over_rate"].notna()).sum())
+
+    out = out.sort_values("_repair_row_order").drop(
+        columns=["_repair_row_order", "_underlying_code", "_conversion_price", "_underlying_close"]
+    )
+    out.index = daily.index
+    return out, repaired_rows
+
+
+def _repair_latest_premium_data(
+    daily: pd.DataFrame,
+    basic: pd.DataFrame,
+    trade_date: str,
+) -> tuple[pd.DataFrame, int]:
+    day_mask = daily["trade_date"].astype(str).eq(str(trade_date))
+    if not day_mask.any():
+        return daily, 0
+    repair_basic = _basic_with_conversion_prices(basic)
+    stock_daily = _underlying_stock_daily(repair_basic, trade_date)
+    repaired_day, repaired_rows = _fill_missing_premium_fields(
+        daily.loc[day_mask],
+        repair_basic,
+        stock_daily,
+    )
+    if not repaired_rows:
+        return daily, 0
+    out = daily.copy()
+    for column in ["stock_price", "bond_value", "bond_over_rate"]:
+        if column not in out.columns:
+            out[column] = np.nan
+        out.loc[day_mask, column] = repaired_day[column].to_numpy()
+    return out, repaired_rows
+
+
+def _repair_premium_window(
+    daily: pd.DataFrame,
+    basic: pd.DataFrame,
+    trade_dates: list[str],
+) -> tuple[pd.DataFrame, int]:
+    out = daily.copy()
+    repaired_rows = 0
+    for trade_date in trade_dates:
+        out, repaired = _repair_latest_premium_data(out, basic, trade_date)
+        repaired_rows += repaired
+    return out, repaired_rows
 
 
 def _normalize_trade_date(value: str | int | pd.Timestamp) -> str:
@@ -418,13 +635,20 @@ def refresh_convertible_bond_daily(
             time.sleep(sleep_seconds)
 
     basic_rows = 0
+    basic = pd.DataFrame()
+    basic_poll_status = "failed"
     call_rows = 0
+    call_poll_status = "failed"
     try:
         basic = fetcher.pro.cb_basic(fields=(
             "ts_code,bond_short_name,stk_code,stk_short_name,list_date,delist_date,"
-            "remain_size,conv_start_date,conv_end_date,issue_rating,newest_rating"
+            "remain_size,conv_start_date,conv_end_date,first_conv_price,conv_price,"
+            "issue_rating,newest_rating"
         ))
-        if basic is not None and not basic.empty:
+        if basic is None:
+            basic = pd.DataFrame()
+        basic_poll_status = "success"
+        if not basic.empty:
             basic.to_parquet(CB_BASIC_PATH, index=False)
             basic_rows = int(len(basic))
     except Exception as exc:
@@ -432,6 +656,7 @@ def refresh_convertible_bond_daily(
 
     try:
         call = fetcher.pro.cb_call(ann_date=normalized)
+        call_poll_status = "success"
         if call is not None and not call.empty:
             call_rows = _merge_parquet(
                 CB_CALL_PATH,
@@ -441,6 +666,19 @@ def refresh_convertible_bond_daily(
     except Exception as exc:
         attempts.append({"attempt": "cb_call", "rows": 0, "error": str(exc)})
 
+    reference_poll_status = (
+        "success"
+        if basic_poll_status == "success" and call_poll_status == "success"
+        else "failed"
+    )
+    reference_polled_through = (
+        normalized if reference_poll_status == "success" else None
+    )
+    reference_poll = {
+        "status": reference_poll_status,
+        "polled_through": reference_polled_through,
+    }
+
     if daily.empty:
         return {
             "status": "no_data",
@@ -448,18 +686,40 @@ def refresh_convertible_bond_daily(
             "daily_rows": 0,
             "basic_rows": basic_rows,
             "call_rows": call_rows,
+            "basic_poll_status": basic_poll_status,
+            "call_poll_status": call_poll_status,
+            "reference_poll_status": reference_poll_status,
+            "reference_polled_through": reference_polled_through,
+            "reference_poll": reference_poll,
             "attempts": attempts,
             "error": last_error,
         }
 
     daily["trade_date"] = daily["trade_date"].astype(str)
+    repair_basic = basic
+    if repair_basic.empty and CB_BASIC_PATH.exists():
+        try:
+            repair_basic = pd.read_parquet(CB_BASIC_PATH)
+        except Exception:
+            repair_basic = pd.DataFrame()
+    daily, premium_repaired_rows = _repair_latest_premium_data(
+        daily,
+        repair_basic,
+        normalized,
+    )
     written_rows = _merge_parquet(CB_DAILY_PATH, daily, ["trade_date", "ts_code"])
     return {
         "status": "success",
         "trade_date": normalized,
         "daily_rows": written_rows,
+        "premium_repaired_rows": premium_repaired_rows,
         "basic_rows": basic_rows,
         "call_rows": call_rows,
+        "basic_poll_status": basic_poll_status,
+        "call_poll_status": call_poll_status,
+        "reference_poll_status": reference_poll_status,
+        "reference_polled_through": reference_polled_through,
+        "reference_poll": reference_poll,
         "attempts": attempts,
         "path": str(CB_DAILY_PATH),
     }
@@ -592,18 +852,16 @@ def _overlay_entry_permission(market: dict[str, Any], config: HoldingGridConfig)
         and median_double_low > config.max_entry_market_median_double_low
     ):
         reasons.append(f"市场双低中位 {median_double_low:.1f} > {config.max_entry_market_median_double_low:g}")
-    if (
-        config.min_entry_market_trend_20d is not None
-        and trend_20d is not None
-        and trend_20d < config.min_entry_market_trend_20d
-    ):
-        reasons.append(f"市场20日趋势 {trend_20d:.2%} < {config.min_entry_market_trend_20d:.2%}")
-    if (
-        config.min_entry_market_trend_breadth is not None
-        and trend_breadth is not None
-        and trend_breadth < config.min_entry_market_trend_breadth
-    ):
-        reasons.append(f"趋势广度 {trend_breadth:.1%} < {config.min_entry_market_trend_breadth:.0%}")
+    if config.min_entry_market_trend_20d is not None:
+        if trend_20d is None:
+            reasons.append("市场20日趋势缺失")
+        elif trend_20d < config.min_entry_market_trend_20d:
+            reasons.append(f"市场20日趋势 {trend_20d:.2%} < {config.min_entry_market_trend_20d:.2%}")
+    if config.min_entry_market_trend_breadth is not None:
+        if trend_breadth is None:
+            reasons.append("趋势广度缺失")
+        elif trend_breadth < config.min_entry_market_trend_breadth:
+            reasons.append(f"趋势广度 {trend_breadth:.1%} < {config.min_entry_market_trend_breadth:.0%}")
     if reasons:
         return False, "趋势闸门暂停新建仓：" + "；".join(reasons)
     return True, "允许新建仓"
@@ -715,6 +973,33 @@ def build_convertible_bond_grid_plan(
     basic = pd.read_parquet(CB_BASIC_PATH)
     call = pd.read_parquet(CB_CALL_PATH) if CB_CALL_PATH.exists() else pd.DataFrame()
     requested_trade_date = _requested_trade_date(daily, trade_date)
+    premium_repaired_rows = 0
+    premium_window = _premium_coverage_window(daily, requested_trade_date)
+    if not premium_window["complete"]:
+        window_dates = [
+            str(item["trade_date"])
+            for item in premium_window["daily_coverage"]
+        ]
+        daily, premium_repaired_rows = _repair_premium_window(
+            daily,
+            basic,
+            window_dates,
+        )
+        if premium_repaired_rows:
+            basic = _basic_with_conversion_prices(basic)
+        premium_window = _premium_coverage_window(daily, requested_trade_date)
+    if not premium_window["complete"]:
+        incomplete_dates = [
+            f"{item['trade_date']}={item['premium_coverage']:.1%}"
+            for item in premium_window["daily_coverage"]
+            if item["premium_coverage"] < CB_PREMIUM_MIN_COVERAGE
+        ]
+        preview = ", ".join(incomplete_dates[:5]) or "insufficient session history"
+        raise ValueError(
+            "20-session premium coverage incomplete after local repair: "
+            f"observed={premium_window['observed_sessions']}/"
+            f"{premium_window['required_sessions']}; {preview}"
+        )
     resolved_trade_date = _resolve_trade_date(daily, trade_date)
     premium_coverage = _premium_coverage_for_date(daily, resolved_trade_date)
 
@@ -753,6 +1038,13 @@ def build_convertible_bond_grid_plan(
         "resolved_trade_date": resolved_trade_date,
         "premium_coverage": round(premium_coverage, 6),
         "minimum_premium_coverage": CB_PREMIUM_MIN_COVERAGE,
+        "premium_coverage_window": premium_window,
+        "premium_repaired_rows": premium_repaired_rows,
+        "premium_repair_source": (
+            "local_stock_close_x_conversion_price"
+            if premium_repaired_rows
+            else None
+        ),
         "stale": requested_trade_date != resolved_trade_date,
         "reason": (
             "latest_trade_date_missing_premium_data"

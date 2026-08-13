@@ -29,25 +29,157 @@ def test_adjusted_incremental_refresh_restarts_from_first_stored_date():
     assert data_refresh._symbol_refresh_start(existing, "20240104", adjust=None) == "20240104"
 
 
-def test_completed_market_end_date_uses_previous_day_before_data_ready(monkeypatch):
+def test_completed_market_end_date_caps_at_latest_publishable_calendar_date(monkeypatch):
     monkeypatch.delenv("ROUTINE_MARKET_DATA_READY_TIME", raising=False)
 
-    before_close, adjusted = data_refresh._completed_market_end_date(
-        "20260730",
-        now=datetime(2026, 7, 30, 9, 38),
+    before_ready = data_refresh._completed_market_end_date(
+        "20260813",
+        now=datetime(2026, 8, 13, 13, 0),
     )
-    after_ready, after_ready_adjusted = data_refresh._completed_market_end_date(
-        "20260730",
-        now=datetime(2026, 7, 30, 16, 1),
+    after_ready = data_refresh._completed_market_end_date(
+        "20260813",
+        now=datetime(2026, 8, 13, 16, 0),
     )
-    historical, historical_adjusted = data_refresh._completed_market_end_date(
-        "20260729",
-        now=datetime(2026, 7, 30, 9, 38),
+    historical = data_refresh._completed_market_end_date(
+        "20260812",
+        now=datetime(2026, 8, 13, 13, 0),
+    )
+    future = data_refresh._completed_market_end_date(
+        "20260814",
+        now=datetime(2026, 8, 13, 16, 0),
     )
 
-    assert (before_close, adjusted) == ("20260729", True)
-    assert (after_ready, after_ready_adjusted) == ("20260730", False)
-    assert (historical, historical_adjusted) == ("20260729", False)
+    assert before_ready == ("20260812", True)
+    assert after_ready == ("20260813", False)
+    assert historical == ("20260812", False)
+    assert future == ("20260813", True)
+
+
+def test_refresh_daily_data_does_not_probe_unfinished_current_session(monkeypatch):
+    real_datetime = datetime
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = real_datetime(
+                2026,
+                8,
+                13,
+                13,
+                0,
+                tzinfo=data_refresh.MARKET_TIMEZONE,
+            )
+            return current if tz is None else current.astimezone(tz)
+
+    class DummyTushareFetcher:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class ProbeReached(RuntimeError):
+        pass
+
+    calendar_ranges: list[tuple[str, str]] = []
+    probed_dates: list[str] = []
+
+    def fake_open_trade_dates(fetcher, start_date, end_date):
+        calendar_ranges.append((start_date, end_date))
+        return {"20260812"}
+
+    def stop_at_availability_probe(fetcher, trade_date, symbols, **kwargs):
+        probed_dates.append(trade_date)
+        raise ProbeReached
+
+    monkeypatch.delenv("ROUTINE_MARKET_DATA_READY_TIME", raising=False)
+    monkeypatch.setattr(data_refresh, "datetime", FrozenDateTime)
+    monkeypatch.setattr(data_refresh, "TushareDataFetcher", DummyTushareFetcher)
+    monkeypatch.setattr(
+        data_refresh,
+        "load_tushare_symbols",
+        lambda *args, **kwargs: [("000001.SZ", "平安银行")],
+    )
+    monkeypatch.setattr(data_refresh, "_open_trade_dates", fake_open_trade_dates)
+    monkeypatch.setattr(
+        data_refresh,
+        "_wait_for_market_daily_availability",
+        stop_at_availability_probe,
+    )
+
+    with pytest.raises(ProbeReached):
+        data_refresh.refresh_daily_data(start_date="20260812", sleep_between=0)
+
+    assert calendar_ranges == [("20260812", "20260812")]
+    assert probed_dates == ["20260812"]
+
+
+def test_market_daily_availability_allows_twelve_failures_before_final_probe():
+    class DummyPro:
+        def __init__(self):
+            self.calls = 0
+
+        def daily(self, **kwargs):
+            self.calls += 1
+            if self.calls <= 12:
+                return pd.DataFrame()
+            return pd.DataFrame(
+                [
+                    {
+                        "ts_code": "000001.SZ",
+                        "trade_date": kwargs["trade_date"],
+                        "open": 10.0,
+                        "high": 10.5,
+                        "low": 9.8,
+                        "close": 10.2,
+                        "vol": 100.0,
+                    }
+                ]
+            )
+
+    class DummyFetcher:
+        pro = DummyPro()
+
+    sleep_calls: list[float] = []
+    frame, probe = data_refresh._wait_for_market_daily_availability(
+        DummyFetcher(),
+        "20260803",
+        [("000001.SZ", "平安银行")],
+        sleep_between=0,
+        retry_failures=12,
+        retry_interval_seconds=300,
+        sleep_fn=sleep_calls.append,
+    )
+
+    assert not frame.empty
+    assert probe["attempts"] == 13
+    assert probe["failed_attempts"] == 12
+    assert sleep_calls == [300] * 12
+
+
+def test_market_daily_availability_fails_only_after_thirteenth_failed_probe():
+    class DummyPro:
+        def __init__(self):
+            self.calls = 0
+
+        def daily(self, **kwargs):
+            self.calls += 1
+            return pd.DataFrame()
+
+    class DummyFetcher:
+        pro = DummyPro()
+
+    sleep_calls: list[float] = []
+    with pytest.raises(data_refresh.MarketDataNotReadyError, match="after 13 probes"):
+        data_refresh._wait_for_market_daily_availability(
+            DummyFetcher(),
+            "20260803",
+            [("000001.SZ", "平安银行")],
+            sleep_between=0,
+            retry_failures=12,
+            retry_interval_seconds=300,
+            sleep_fn=sleep_calls.append,
+        )
+
+    assert DummyFetcher.pro.calls == 13
+    assert sleep_calls == [300] * 12
 
 
 def test_refresh_one_symbol_retries_then_succeeds(monkeypatch, tmp_path):
@@ -186,10 +318,14 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
     )
 
     assert dummy_pro.daily_calls == [
-        {"trade_date": "20260605"},
         {"trade_date": "20260606"},
+        {"trade_date": "20260605"},
     ]
     assert manifest["refresh_mode"] == "batch_by_trade_date"
+    assert manifest["end_date_adjusted_before_market_ready"] is False
+    assert manifest["availability_policy"] == "probe_latest_completed_open_trade_date"
+    assert manifest["availability_probe"]["trade_date"] == "20260606"
+    assert manifest["availability_probe"]["attempts"] == 1
     assert manifest["market_daily_requests"] == 2
     assert manifest["failed"] == 0
     store = data_refresh.MarketDataStore(
@@ -215,6 +351,52 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
         },
     }
     assert sorted((tmp_path / "daily_partitioned").glob("year_month=*/data.parquet"))
+
+
+def test_refresh_daily_data_does_not_generate_previous_date_when_latest_is_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    class DummyPro:
+        def __init__(self):
+            self.daily_calls: list[dict[str, str]] = []
+
+        def trade_cal(self, **kwargs):
+            return pd.DataFrame({"cal_date": ["20260731", "20260803"]})
+
+        def daily(self, **kwargs):
+            self.daily_calls.append(kwargs)
+            return pd.DataFrame()
+
+    dummy_pro = DummyPro()
+
+    class DummyTushareFetcher:
+        def __init__(self, *args, **kwargs):
+            self.pro = dummy_pro
+
+    monkeypatch.setattr(data_refresh, "TushareDataFetcher", DummyTushareFetcher)
+    monkeypatch.setattr(
+        data_refresh,
+        "load_tushare_symbols",
+        lambda *args, **kwargs: [("000001.SZ", "平安银行")],
+    )
+    data_refresh._TRADE_CAL_CACHE.clear()
+
+    with pytest.raises(data_refresh.MarketDataNotReadyError, match="20260803"):
+        data_refresh.refresh_daily_data(
+            start_date="20260731",
+            end_date="20260803",
+            output_dir=tmp_path / "daily",
+            workers=1,
+            sleep_between=0,
+            retries=0,
+            final_retry_rounds=0,
+            availability_retry_failures=0,
+            availability_retry_interval=0,
+        )
+
+    assert dummy_pro.daily_calls == [{"trade_date": "20260803"}]
+    assert not (tmp_path / "daily_partitioned").exists()
 
 
 def test_market_daily_batch_rejects_possible_row_limit_truncation(monkeypatch):
@@ -263,9 +445,28 @@ def test_market_daily_batch_rejects_incomplete_symbol_coverage() -> None:
 
 
 def test_refresh_daily_data_writes_failed_symbols(monkeypatch, tmp_path):
+    class DummyPro:
+        def trade_cal(self, **kwargs):
+            return pd.DataFrame({"cal_date": ["20260606"]})
+
+        def daily(self, **kwargs):
+            return pd.DataFrame(
+                [
+                    {
+                        "ts_code": "000004.SZ",
+                        "trade_date": kwargs["trade_date"],
+                        "open": 10.0,
+                        "high": 10.5,
+                        "low": 9.8,
+                        "close": 10.2,
+                        "vol": 100.0,
+                    }
+                ]
+            )
+
     class DummyTushareFetcher:
         def __init__(self, *args, **kwargs):
-            pass
+            self.pro = DummyPro()
 
     def fake_load_symbols(fetcher, board="all", limit=None):
         return [("000004.SZ", "国华网安")]
@@ -285,6 +486,7 @@ def test_refresh_daily_data_writes_failed_symbols(monkeypatch, tmp_path):
     monkeypatch.setattr(data_refresh, "TushareDataFetcher", DummyTushareFetcher)
     monkeypatch.setattr(data_refresh, "load_tushare_symbols", fake_load_symbols)
     monkeypatch.setattr(data_refresh, "refresh_one_symbol", fake_refresh_one_symbol)
+    data_refresh._TRADE_CAL_CACHE.clear()
 
     manifest = data_refresh.refresh_daily_data(
         start_date="20260605",

@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -57,12 +57,18 @@ BATCH_NO_TRADE_STATUS = "no_trade_in_batch"
 TUSHARE_DAILY_ROW_LIMIT = 6000
 DEFAULT_BATCH_MAX_TRADE_DATES = 30
 DEFAULT_BATCH_MIN_COVERAGE_RATE = 0.995
+DEFAULT_AVAILABILITY_RETRIES = 12
+DEFAULT_AVAILABILITY_RETRY_INTERVAL_SECONDS = 300.0
 MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 DEFAULT_MARKET_DATA_READY_TIME = "16:00"
 
 
 class MarketBatchCoverageError(RuntimeError):
     """Raised before publication when a market-wide response is materially incomplete."""
+
+
+class MarketDataNotReadyError(RuntimeError):
+    """Raised when the latest open trade date is not yet available from Tushare."""
 
 
 def _validate_market_batch_coverage(
@@ -218,6 +224,12 @@ def _completed_market_end_date(
     *,
     now: datetime | None = None,
 ) -> tuple[str, bool]:
+    """Cap a request at the latest calendar date whose daily bar is publishable.
+
+    The trade calendar is applied afterwards, so weekends and exchange holidays
+    naturally resolve to the most recent completed open session.
+    """
+
     current = now or datetime.now(MARKET_TIMEZONE)
     if current.tzinfo is None:
         current = current.replace(tzinfo=MARKET_TIMEZONE)
@@ -226,13 +238,15 @@ def _completed_market_end_date(
     requested = _parse_trade_date(requested_end_date)
     if requested is None:
         raise ValueError(f"invalid end_date: {requested_end_date}")
+
     hour, minute = _market_data_ready_time()
     ready_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    today = pd.Timestamp(current.date())
-    if requested >= today and current < ready_at:
-        completed_end = today - pd.Timedelta(days=1)
-        return _format_trade_date(completed_end), True
-    return _format_trade_date(requested), False
+    latest_publishable = pd.Timestamp(current.date())
+    if current < ready_at:
+        latest_publishable -= pd.Timedelta(days=1)
+
+    completed_end = min(requested, latest_publishable)
+    return _format_trade_date(completed_end), completed_end != requested
 
 
 def _symbol_refresh_start(
@@ -381,17 +395,7 @@ def _fetch_market_daily_with_retries(
     attempts = max(1, retries + 1)
     for attempt in range(1, attempts + 1):
         try:
-            limiter.wait()
-            frame = tushare.pro.daily(trade_date=trade_date)
-            if frame is None or frame.empty:
-                raise RuntimeError(f"Tushare daily returned no market rows for {trade_date}")
-            if len(frame) >= TUSHARE_DAILY_ROW_LIMIT:
-                raise RuntimeError(
-                    f"Tushare daily returned {len(frame)} rows for {trade_date}; "
-                    f"the {TUSHARE_DAILY_ROW_LIMIT}-row limit may have truncated the market"
-                )
-            if "ts_code" not in frame.columns or "trade_date" not in frame.columns:
-                raise ValueError(f"Tushare daily market response missing required columns for {trade_date}")
+            frame = _fetch_market_daily_once(tushare, trade_date, limiter)
             return frame, attempt
         except Exception:
             if attempt >= attempts:
@@ -400,6 +404,109 @@ def _fetch_market_daily_with_retries(
             delay += random.uniform(0, retry_jitter) if retry_jitter > 0 else 0
             time.sleep(delay)
     raise RuntimeError(f"Tushare daily market request failed for {trade_date}")
+
+
+def _fetch_market_daily_once(
+    tushare: TushareDataFetcher,
+    trade_date: str,
+    limiter: RequestLimiter,
+) -> pd.DataFrame:
+    limiter.wait()
+    frame = tushare.pro.daily(trade_date=trade_date)
+    if frame is None or frame.empty:
+        raise MarketDataNotReadyError(
+            f"Tushare daily returned no market rows for {trade_date}"
+        )
+    if len(frame) >= TUSHARE_DAILY_ROW_LIMIT:
+        raise RuntimeError(
+            f"Tushare daily returned {len(frame)} rows for {trade_date}; "
+            f"the {TUSHARE_DAILY_ROW_LIMIT}-row limit may have truncated the market"
+        )
+    if "ts_code" not in frame.columns or "trade_date" not in frame.columns:
+        raise ValueError(
+            f"Tushare daily market response missing required columns for {trade_date}"
+        )
+    return frame
+
+
+def _wait_for_market_daily_availability(
+    tushare: TushareDataFetcher,
+    trade_date: str,
+    symbols: list[tuple[str, str]],
+    *,
+    sleep_between: float,
+    retry_failures: int,
+    retry_interval_seconds: float,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Probe the newest market date until it is complete enough to publish.
+
+    The first request is immediate. ``retry_failures`` controls how many failed
+    probes are tolerated before one final request is made, so the default of 12
+    permits failures 1-12 and reports failure only when probe 13 also fails.
+    """
+
+    if retry_failures < 0:
+        raise ValueError("availability retry failures must be >= 0")
+    if retry_interval_seconds < 0:
+        raise ValueError("availability retry interval must be >= 0")
+
+    name_by_symbol = {
+        normalize_ts_code(symbol): name for symbol, name in symbols
+    }
+    target_symbols = set(name_by_symbol)
+    minimum_coverage_rate = float(
+        os.getenv(
+            "ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE",
+            str(DEFAULT_BATCH_MIN_COVERAGE_RATE),
+        )
+    )
+    limiter = RequestLimiter(sleep_between)
+    total_attempts = retry_failures + 1
+    last_error = ""
+    for attempt in range(1, total_attempts + 1):
+        try:
+            frame = _fetch_market_daily_once(tushare, trade_date, limiter)
+            market = normalize_tushare_market_daily(
+                frame,
+                name_by_symbol=name_by_symbol,
+            )
+            market = market[market["ts_code"].isin(target_symbols)].copy()
+            coverage = _validate_market_batch_coverage(
+                market,
+                target_symbols,
+                [trade_date],
+                minimum_coverage_rate,
+            )
+            return frame, {
+                "status": "available",
+                "trade_date": trade_date,
+                "attempts": attempt,
+                "failed_attempts": attempt - 1,
+                "retry_failures_allowed": retry_failures,
+                "retry_interval_seconds": retry_interval_seconds,
+                "coverage": coverage,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            failed_attempts = attempt
+            if failed_attempts > retry_failures:
+                break
+            print(
+                "market daily availability retry: "
+                f"trade_date={trade_date} "
+                f"failed_attempts={failed_attempts}/{retry_failures} "
+                f"retry_in_seconds={retry_interval_seconds:g} "
+                f"error={last_error[:240]}",
+                flush=True,
+            )
+            sleep_fn(retry_interval_seconds)
+
+    raise MarketDataNotReadyError(
+        f"Tushare daily for {trade_date} remained unavailable or incomplete "
+        f"after {total_attempts} probes ({retry_failures} tolerated failures, "
+        f"interval={retry_interval_seconds:g}s): {last_error}"
+    )
 
 
 def _refresh_symbols_by_trade_date(
@@ -413,6 +520,8 @@ def _refresh_symbols_by_trade_date(
     retry_base_delay: float,
     retry_max_delay: float,
     retry_jitter: float,
+    prefetched_market_frames: dict[str, pd.DataFrame] | None = None,
+    prefetched_request_count: int = 0,
 ) -> tuple[list[DailyRefreshAudit], int, dict[str, Any]]:
     """Refresh raw daily bars with one Tushare request per open trade date."""
 
@@ -434,9 +543,14 @@ def _refresh_symbols_by_trade_date(
         return audits, 0, {"rows": 0, "sql_rows": 0, "parquet_partitions": 0, "table": "market_daily"}
 
     limiter = RequestLimiter(sleep_between)
-    market_frames: list[pd.DataFrame] = []
-    request_count = 0
-    for index, trade_date in enumerate(trade_dates, start=1):
+    market_frames_by_date = dict(prefetched_market_frames or {})
+    request_count = prefetched_request_count
+    remaining_trade_dates = [
+        trade_date
+        for trade_date in reversed(trade_dates)
+        if trade_date not in market_frames_by_date
+    ]
+    for index, trade_date in enumerate(remaining_trade_dates, start=1):
         frame, attempts = _fetch_market_daily_with_retries(
             tushare,
             trade_date,
@@ -447,11 +561,15 @@ def _refresh_symbols_by_trade_date(
             retry_jitter,
         )
         request_count += attempts
-        market_frames.append(frame)
+        market_frames_by_date[trade_date] = frame
         print(
-            f"market daily batch progress: {index}/{len(trade_dates)} trade dates",
+            "market daily batch progress: "
+            f"{index + len(trade_dates) - len(remaining_trade_dates)}/"
+            f"{len(trade_dates)} trade dates",
             flush=True,
         )
+
+    market_frames = [market_frames_by_date[trade_date] for trade_date in trade_dates]
 
     name_by_symbol = {normalize_ts_code(symbol): name for symbol, name in symbols}
     market = normalize_tushare_market_daily(
@@ -798,6 +916,8 @@ def refresh_daily_data(
     final_retry_rounds: int = 2,
     final_retry_workers: int = 4,
     final_retry_sleep: float = 0.8,
+    availability_retry_failures: int = DEFAULT_AVAILABILITY_RETRIES,
+    availability_retry_interval: float = DEFAULT_AVAILABILITY_RETRY_INTERVAL_SECONDS,
 ) -> dict:
     market_now = datetime.now(MARKET_TIMEZONE)
     requested_end_date = end_date or market_now.strftime("%Y%m%d")
@@ -813,9 +933,22 @@ def refresh_daily_data(
         raise RuntimeError("Tushare stock_basic returned no symbols")
     requested_open_dates = sorted(_open_trade_dates(tushare, start_date, end_date))
     expected_trade_date = requested_open_dates[-1] if requested_open_dates else None
+    if expected_trade_date is None:
+        raise RuntimeError(
+            f"Tushare trade calendar returned no open dates for {start_date}-{end_date}"
+        )
+
+    prefetched_market, availability_probe = _wait_for_market_daily_availability(
+        tushare,
+        expected_trade_date,
+        symbols,
+        sleep_between=sleep_between,
+        retry_failures=availability_retry_failures,
+        retry_interval_seconds=availability_retry_interval,
+    )
 
     refresh_mode = "per_symbol"
-    market_daily_requests = 0
+    market_daily_requests = int(availability_probe["attempts"])
     batch_storage: dict[str, Any] = {}
     batch_fallback_reason: str | None = None
     if adjust is None:
@@ -831,8 +964,12 @@ def refresh_daily_data(
                 retry_base_delay=retry_base_delay,
                 retry_max_delay=retry_max_delay,
                 retry_jitter=retry_jitter,
+                prefetched_market_frames={expected_trade_date: prefetched_market},
+                prefetched_request_count=market_daily_requests,
             )
             refresh_mode = "batch_by_trade_date"
+        except (MarketDataNotReadyError, MarketBatchCoverageError):
+            raise
         except Exception as exc:
             batch_fallback_reason = str(exc)
             print(
@@ -929,6 +1066,8 @@ def refresh_daily_data(
             "ROUTINE_MARKET_DATA_READY_TIME",
             DEFAULT_MARKET_DATA_READY_TIME,
         ),
+        "availability_policy": "probe_latest_completed_open_trade_date",
+        "availability_probe": availability_probe,
         "expected_trade_date": expected_trade_date,
         "dataset_trade_date": dataset_trade_date,
         "freshness_error": freshness_error,
@@ -996,6 +1135,28 @@ def main() -> None:
     parser.add_argument("--final-retry-rounds", type=int, default=2, help="Slow final retry rounds for symbols still failed after the main pass")
     parser.add_argument("--final-retry-workers", type=int, default=4, help="Workers for final failed-symbol retry rounds")
     parser.add_argument("--final-retry-sleep", type=float, default=0.8, help="Minimum request interval for final failed-symbol retry rounds")
+    parser.add_argument(
+        "--availability-retry-failures",
+        type=int,
+        default=int(
+            os.getenv(
+                "ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES",
+                str(DEFAULT_AVAILABILITY_RETRIES),
+            )
+        ),
+        help="Failed newest-date probes tolerated before the final probe",
+    )
+    parser.add_argument(
+        "--availability-retry-interval",
+        type=float,
+        default=float(
+            os.getenv(
+                "ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL",
+                str(DEFAULT_AVAILABILITY_RETRY_INTERVAL_SECONDS),
+            )
+        ),
+        help="Seconds between newest-date availability probes",
+    )
     args = parser.parse_args()
 
     adjust = None if args.adjust == "none" else args.adjust
@@ -1016,6 +1177,8 @@ def main() -> None:
         final_retry_rounds=args.final_retry_rounds,
         final_retry_workers=args.final_retry_workers,
         final_retry_sleep=args.final_retry_sleep,
+        availability_retry_failures=args.availability_retry_failures,
+        availability_retry_interval=args.availability_retry_interval,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     # A completed Python process is not the same thing as a complete market

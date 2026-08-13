@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Mapping, Optional, Union
 import pandas as pd
 from pathlib import Path
 import tushare as ts
@@ -25,6 +25,7 @@ def validate_daily_basic_frame(
     trade_date: str,
     *,
     minimum_rows: int = 1,
+    required_feature_coverage: Mapping[str, float] | None = None,
 ) -> pd.DataFrame:
     """Validate a daily_basic response before it is allowed into any cache."""
 
@@ -52,6 +53,33 @@ def validate_daily_basic_frame(
         raise ValueError(f"Tushare daily_basic contains blank ts_code for {trade_date}")
     if codes.duplicated().any():
         raise ValueError(f"Tushare daily_basic contains duplicate ts_code for {trade_date}")
+    if required_feature_coverage:
+        missing_feature_columns = sorted(
+            set(required_feature_coverage) - set(frame.columns)
+        )
+        if missing_feature_columns:
+            raise ValueError(
+                "Tushare daily_basic missing model feature columns for "
+                f"{trade_date}: {missing_feature_columns}"
+            )
+        feature_coverage = {
+            column: float(pd.to_numeric(frame[column], errors="coerce").notna().mean())
+            for column in required_feature_coverage
+        }
+        inadequate = {
+            column: {
+                "actual": round(feature_coverage[column], 6),
+                "required": float(minimum),
+            }
+            for column, minimum in required_feature_coverage.items()
+            if feature_coverage[column] < float(minimum)
+        }
+        if inadequate:
+            raise ValueError(
+                "Tushare daily_basic model feature coverage below threshold for "
+                f"{trade_date}: {inadequate}"
+            )
+        frame.attrs["feature_coverage"] = feature_coverage
     return frame
 
 

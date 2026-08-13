@@ -63,6 +63,7 @@ def test_chan_daily_detects_daily_third_buy_after_center_pullback():
     assert out.loc[signal_idx, "chan_signal_name"] == "三买确认"
     assert out.loc[signal_idx, "chan_center_low"] > 0
     assert out.loc[signal_idx, "chan_center_high"] > out.loc[signal_idx, "chan_center_low"]
+    assert pd.notna(out.loc[signal_idx, "chan_stroke_amplitude"])
     assert out.loc[signal_idx, "chan_score"] >= 90
     assert out.loc[signal_idx, "chan_buy_plan"]
     assert out.loc[signal_idx, "chan_sell_plan"]

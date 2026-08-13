@@ -7,6 +7,9 @@
 release:
   lifecycle: production
   consumer: quant.routine.convertible_bond_plan
+  dependency_nodes:
+    - feature.cb_grid
+    - product.cb_grid
 
 strategy:
   id: cb_double_low_rotation

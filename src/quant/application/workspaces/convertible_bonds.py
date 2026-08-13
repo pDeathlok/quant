@@ -15,6 +15,11 @@ SnapshotReader = Callable[..., WorkspacePayload | None]
 SnapshotWriter = Callable[..., None]
 PayloadBuilder = Callable[..., WorkspacePayload]
 
+DEFAULT_ALLOTMENT_LIMIT = 80
+DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS = 90
+DEFAULT_ALLOTMENT_STAGE_SCOPE = "pipeline"
+DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT = 18
+
 
 def _canonical_snapshot_date(value: Any) -> str:
     text_value = str(value or "latest").strip()
@@ -40,7 +45,7 @@ class ConvertibleBondGridDependencies:
 
 def build_convertible_bond_grid_workspace(
     trade_date: str | None = None,
-    limit: int = 18,
+    limit: int = DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
     refresh: bool = False,
     *,
     dependencies: ConvertibleBondGridDependencies,
@@ -58,7 +63,13 @@ def build_convertible_bond_grid_workspace(
         if cached is not None:
             return cached
         legacy = dependencies.read_legacy_snapshot()
-        if isinstance(legacy, dict) and legacy.get("trade_date"):
+        legacy_params = legacy.get("request_params") if isinstance(legacy, dict) else None
+        legacy_matches = (
+            legacy_params == params
+            if isinstance(legacy_params, dict)
+            else int(limit) == DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT
+        )
+        if legacy_matches and isinstance(legacy, dict) and legacy.get("trade_date"):
             cached_date = _canonical_snapshot_date(legacy.get("trade_date"))
             requested_date = _canonical_snapshot_date(trade_date) if trade_date else None
             if not requested_date or cached_date <= requested_date:
@@ -77,6 +88,7 @@ def build_convertible_bond_grid_workspace(
     if refresh and trade_date:
         refresh_result = dependencies.refresh_daily(trade_date=trade_date)
     payload = dependencies.build_plan(trade_date=trade_date, limit=limit)
+    payload["request_params"] = params
     if refresh_result is not None:
         payload["data_refresh"] = refresh_result
     dependencies.write_snapshot(
@@ -99,6 +111,48 @@ class ConvertibleBondAllotmentDependencies:
     write_snapshot: SnapshotWriter
     build_payload: PayloadBuilder
     is_daily_current: Callable[..., bool]
+
+
+def _allotment_cache_timestamp(payload: WorkspacePayload | None) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    generated_at = pd.to_datetime(payload.get("generated_at"), errors="coerce", utc=True)
+    if pd.isna(generated_at):
+        return None
+    return int(generated_at.value)
+
+
+def _daily_allotment_cache_matches(
+    payload: WorkspacePayload | None,
+    params: WorkspacePayload,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    cached_params = payload.get("request_params")
+    if isinstance(cached_params, dict):
+        return cached_params == params
+    return params == {
+        "limit": DEFAULT_ALLOTMENT_LIMIT,
+        "include_listed_days": DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
+        "stage_scope": DEFAULT_ALLOTMENT_STAGE_SCOPE,
+    }
+
+
+def _newest_allotment_cache(
+    snapshot: WorkspacePayload | None,
+    daily: WorkspacePayload | None,
+) -> tuple[WorkspacePayload | None, str | None]:
+    if snapshot is None:
+        return daily, "daily_cache" if daily is not None else None
+    if daily is None:
+        return snapshot, "workspace_snapshot"
+    snapshot_timestamp = _allotment_cache_timestamp(snapshot)
+    daily_timestamp = _allotment_cache_timestamp(daily)
+    if daily_timestamp is not None and (
+        snapshot_timestamp is None or daily_timestamp > snapshot_timestamp
+    ):
+        return daily, "daily_cache"
+    return snapshot, "workspace_snapshot"
 
 
 def evaluate_convertible_bond_allotment_quality(
@@ -207,10 +261,10 @@ def evaluate_convertible_bond_allotment_quality(
 
 
 def build_convertible_bond_allotment_workspace(
-    limit: int = 80,
-    include_listed_days: int = 90,
+    limit: int = DEFAULT_ALLOTMENT_LIMIT,
+    include_listed_days: int = DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
     refresh: bool = False,
-    stage_scope: str = "pipeline",
+    stage_scope: str = DEFAULT_ALLOTMENT_STAGE_SCOPE,
     expected_trade_date: str | None = None,
     validate_quality: bool = False,
     *,
@@ -225,17 +279,25 @@ def build_convertible_bond_allotment_workspace(
         "stage_scope": str(stage_scope),
     }
     if not refresh:
-        cached = dependencies.read_snapshot(
+        snapshot = dependencies.read_snapshot(
             "convertible_bond_allotments",
             params=params,
             allow_sql=False,
         )
-        if cached is None:
-            cached = dependencies.read_daily_cache()
+        daily = dependencies.read_daily_cache()
+        if not _daily_allotment_cache_matches(daily, params):
+            daily = None
+        cached, cache_source = _newest_allotment_cache(snapshot, daily)
         if cached is not None:
             cached.setdefault("cache", {})
             is_current = dependencies.is_daily_current(cached)
-            cached["cache"].update({"hit": True, "stale": not is_current})
+            cached["cache"].update(
+                {
+                    "hit": True,
+                    "stale": not is_current,
+                    "source": cache_source,
+                }
+            )
             cached_quality = cached.get("quality") or {}
             cached["quality"] = evaluate_convertible_bond_allotment_quality(
                 cached,
@@ -250,6 +312,7 @@ def build_convertible_bond_allotment_workspace(
         refresh=refresh,
         stage_scope=stage_scope,
     )
+    payload["request_params"] = params
     payload["quality"] = evaluate_convertible_bond_allotment_quality(
         payload,
         expected_trade_date=expected_trade_date,

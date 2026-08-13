@@ -60,9 +60,9 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 
 1. 获取跨进程单实例锁，并用交易日历确认当天是否执行。
 2. 复用健康的 Web 服务，通过 API 启动与页面“更新全部”一致的任务。
-3. 按保留策略清理缓存，再串行刷新共享 Tushare 行情、`daily_basic`、参考数据和当日可交易快照。
+3. 按活动依赖闭包清理缓存并刷新共享 Tushare 行情、当前策略实际需要的 `daily_basic` 与参考数据；`tradability` 只在研究/显式回填任务中刷新。
 4. 使用截至当日的沪深300、全市场宽度、波动率和成交额生成市场状态日期快照与 `latest.json`。
-5. 串行构建特征缓存和规则信号缓存，避免两套进程池争抢 CPU、内存与磁盘带宽。
+5. 先增量构建便宜的规则信号和 B1/Z 候选并集，再只为命中股票计算完整重因子，避免全市场重复计算和两套进程池争抢资源。
 6. 共享数据就绪后先并行启动可转债、配债股和 BYD 做T；特征与规则信号完成后，并行生成每日计划、Dashboard、模型评分与缠论评分，再计算短线股票池和剩余工作区。
 7. 原子发布正式文件，并将步骤状态、起止时间、耗时和结果写入 `data/routine/<运行时间>_<run_id>/manifest.json`。
 
@@ -85,6 +85,8 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 | `MARKET_DATA_SQL_WRITE_TIMEOUT` | `60` | MySQL 写入超时，单位秒 |
 | `ROUTINE_DAILY_WORKERS` | `4` | 日线刷新并发数 |
 | `ROUTINE_DAILY_SLEEP` | `0.08` | Tushare 请求间隔，单位秒 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES` | `12` | 当天日线为空或覆盖率不足时允许连续失败次数；第 13 次探测仍失败才终止 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL` | `300` | 当天日线可用性探测间隔，单位秒；默认每 5 分钟一次 |
 | `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.995` | 每个交易日全市场批量响应的最低股票覆盖率；低于阈值拒绝发布 |
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日刷新的并发数 |
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔，单位秒 |
@@ -182,6 +184,7 @@ tests/                     单元、集成和 API 测试
 - [系统架构与数据流](docs/architecture.md)
 - [API 参考](docs/api.md)
 - [每日运行与故障排查](docs/operations.md)
+- [每日依赖注册表](docs/daily_dependency_registry.md)
 - [项目结构与 MySQL 存储](docs/project_structure_and_storage.md)
 - [正式策略档案](docs/strategies/b1_selected_strategy_record.md)
 

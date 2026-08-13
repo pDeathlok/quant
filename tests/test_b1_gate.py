@@ -90,3 +90,20 @@ def test_signal_gate_uses_the_original_450_day_b1_window(
     assert result.empty
     assert captured["min"] >= rebuild_start - pd.Timedelta(days=450)
     assert captured["max"] == rebuild_start
+
+
+def test_signal_cache_merge_publishes_schema_for_legal_empty_scan() -> None:
+    rebuilt = signal_cache._merge_incremental_cache(
+        None,
+        [],
+        pd.Timestamp("2026-08-12"),
+        empty_columns={"signal_a", "signal_b"},
+    )
+
+    assert rebuilt.empty
+    assert rebuilt.columns.tolist() == [
+        "symbol",
+        "date",
+        "signal_a",
+        "signal_b",
+    ]

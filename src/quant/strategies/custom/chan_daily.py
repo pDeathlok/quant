@@ -305,6 +305,12 @@ def add_chan_daily_signals(
             center_width_arr[i] = center["width"]
 
         last_stroke = strokes[stroke_cursor - 1] if stroke_cursor else None
+        # A signal can occur after the latest stroke endpoint.  The model
+        # feature represents the latest completed stroke, so carry that
+        # point-in-time value forward instead of exposing it only on the
+        # endpoint bar and silently imputing every live signal row.
+        if last_stroke is not None:
+            stroke_amplitude[i] = last_stroke["amplitude"]
         last_down = strokes[last_down_at[stroke_cursor]] if last_down_at[stroke_cursor] >= 0 else None
         prev_down = strokes[prev_down_at[stroke_cursor]] if prev_down_at[stroke_cursor] >= 0 else None
         last_up = strokes[last_up_at[stroke_cursor]] if last_up_at[stroke_cursor] >= 0 else None

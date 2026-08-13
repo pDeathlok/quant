@@ -103,10 +103,18 @@ find data/routine -name manifest.json -type f -print | sort | tail -1
 
 打开该 JSON，确认关键步骤 `status` 为 `success`；主动跳过的数据刷新或回测会显示 `skipped`。
 
-参考数据步骤还必须包含：
+正式入口会先从当前生产产品和晋级模型反推活动依赖，只刷新该 scope 真正使用的数据。`tradability`、margin、moneyflow、holder-trade 等无当前生产消费者的研究输入不会被顺带日更。
 
-- `tradability`：`data/raw/tradability/YYYYMMDD.parquet`，覆盖率不得低于配置门槛；
-- `market_regime`：`data/features/market_regime/YYYYMMDD.json` 与 `latest.json`，`as_of` 必须等于本次正式行情日期。
+刷新前后分别发布 `data/contracts/daily_dependencies/*-preflight.json` 和 `*-postflight.json`。结束时检查 `latest.json`：
+
+- `target_trade_date` 等于行情源确认的目标交易日；
+- `freshness_audit.status` 为 `success`；
+- `refresh_node_ids` 为空，表示没有尚未执行的 dirty/poll 节点；
+- 行情、模型分和最终产物等 exact-date 节点均为目标日；
+- 财报、研报和维表等事件源证明已轮询到目标日，即使当天没有新记录；
+- 当前 scope 使用市场状态时，`data/features/market_regime/latest.json` 的 `as_of` 与沪深300、全市场日线日期一致。
+
+完整合同和新增策略/因子的维护流程见 [每日依赖注册表](daily_dependency_registry.md)。
 
 首次启用或需要重建历史回测输入时，按本地正式日线中实际存在的交易日回填。该命令只使用 Tushare；上市、退市和暂停上市证券会合并后再按每个日期过滤，已有分区默认跳过：
 
@@ -206,6 +214,8 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 9. 每次终态都会保存独立的 `data/routine/<运行时间>_<run_id>/manifest.json`，其中包含每一步的状态、起止时间、耗时、结果和错误；`latest_refresh_status.json` 只作为最新状态指针。
 10. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应正式文件存在且非空时才删除。已被合并可转债日线覆盖的逐日请求缓存会删除；B1 时间戳研究报告每类保留最近 2 版，可重建的超大 trade-samples 只保留最新 1 版，内容相同的 `latest` 文件使用硬链接去重。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
 11. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
+12. B1 与 Z 当日候选先取 symbol 并集，只计算一次 147 项目因子；B1 原缓存保留 B1 gate 语义，Z 优先复用 `active_candidate_project_features.parquet`，缺失 symbol 才补算。
+13. 模型 artifact 与策略/因子 `contract_sources` 都按内容哈希复用；只有版本变化才重新编译模型特征合同并把对应下游标为 dirty。
 
 清理逻辑也会在 `daily` CLI 开始前执行。需要单独维护或立即释放空间时可运行：
 
@@ -271,6 +281,8 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_DAILY_FINAL_RETRY_ROUNDS` | `2` | 最终失败较多时谨慎增加 |
 | `ROUTINE_DAILY_FINAL_RETRY_WORKERS` | `4` | 限频时降低 |
 | `ROUTINE_DAILY_FINAL_RETRY_SLEEP` | `0.8` | 最终重试仍限频时提高 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES` | `12` | 最新交易日日线为空或覆盖率不足时允许连续失败 12 次，第 13 次仍失败才终止 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL` | `300` | 最新交易日日线可用性探测间隔，单位秒 |
 | `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.995` | 单交易日全市场行情覆盖率门禁；低于阈值阻断发布 |
 | `MARKET_DATA_SQL_BATCH_SIZE` | `5000` | 统一行情表批量 upsert 行数；遇到 `max_allowed_packet` 限制时降低 |
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日拉取的并发数；限频时降低 |
@@ -300,7 +312,7 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 
 B1-family 与 z-skill 的生产信号刷新一次读取统一行情分区，再按股票分组交给多进程计算。每日流程不自动物化逐股票因子缓存，避免数千个小文件和额外 I/O。
 
-日线和 `daily_basic` 完成后，流水线还会刷新因子参考数据：`stock_basic` 每日缓存复用并同步，沪深300按最新日期回看 10 天增量合并，`stk_limit` / `suspend_d` / `stock_st` 组成当日可交易快照，`fina_indicator` / `income` / `cashflow` 通过 VIP 接口重拉最近 4 个报告期，并更新 `v44` 使用的全市场分析师一致预期快照。随后只读本地正式行情和沪深300生成市场状态，不再访问其他行情源。同一交易日重试会复用已成功的财务和分析师快照检查点。所有写入都使用业务唯一键去重和临时文件原子替换；审计位于 `data/raw/source_audit/*_reference_data/manifest.json`。
+日线和 `daily_basic` 完成后，流水线按活动依赖注册表刷新参考数据：`stock_basic` 每日轻量轮询，沪深300按最新日期回看 10 天增量合并，`fina_indicator` / `income` / `cashflow` 通过 VIP 接口重拉最近 4 个报告期，并更新 `v44` 使用的全市场分析师一致预期快照。`stk_limit` / `suspend_d` / `stock_st` 组成的 tradability 快照当前没有生产消费者，只在研究或显式回填任务中刷新。随后只读本地正式行情和沪深300生成市场状态。同一交易日重试只会复用合同哈希和日期都通过门禁的检查点。所有写入都使用业务唯一键去重和临时文件原子替换；审计位于 `data/raw/source_audit/*_reference_data/manifest.json`。
 
 若任务在共享数据刷新之后失败，当天重试会直接复用已通过门禁的日线、`daily_basic` 和参考数据，从特征计算阶段续跑；复用前必须同时满足源清单预期交易日、本地统一行情日期和 `daily_basic` 日期一致。若核心与扩展股票池已经完成，则从下游工作区或快照阶段续跑。缺少源检查点或日期不一致时会重新执行源刷新，不从下游产物反推“源已成功”。跨日任务不会复用旧检查点。
 

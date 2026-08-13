@@ -5,6 +5,7 @@
 release:
   lifecycle: research_only
   consumer: scripts.research.backtest_convertible_bond_trend_enhanced
+  dependency_nodes: []
 
 strategy:
   id: cb_trend_enhanced

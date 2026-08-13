@@ -16,6 +16,7 @@ from quant.features.project_factor_layer import (
     calculate_project_market_factors,
 )
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
+from quant.ml.feature_coverage import RequiredFeatureCoverageError
 from quant.routine import pipeline
 from quant.routine import b1_daily_plan
 
@@ -235,3 +236,31 @@ def test_legacy_model_accepts_only_legacy_factor_rows(monkeypatch, tmp_path) -> 
     )
 
     assert result["pred_up5"].iloc[0] == pytest.approx(0.75)
+    assert result.attrs["feature_coverage"]["status"] == "valid"
+
+
+def test_b1_prediction_rejects_an_all_null_required_feature(monkeypatch, tmp_path) -> None:
+    class LegacyModel:
+        feature_names_in_ = ["alpha003"]
+
+        def predict_proba(self, frame):
+            raise AssertionError("invalid feature batches must fail before prediction")
+
+    monkeypatch.setattr(b1_daily_plan.joblib, "load", lambda path: LegacyModel())
+
+    with pytest.raises(RequiredFeatureCoverageError) as exc_info:
+        b1_daily_plan.predict_models(
+            pd.DataFrame(
+                {
+                    "alpha003": [np.nan],
+                    "factor_schema_version": [
+                        LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+                    ],
+                }
+            ),
+            model_dir=tmp_path,
+            model_names=("up5",),
+        )
+
+    assert exc_info.value.report["missing_columns"] == []
+    assert exc_info.value.report["all_null_features"] == ["alpha003"]

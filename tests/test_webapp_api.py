@@ -1,6 +1,7 @@
 import json
 import queue
 import threading
+from types import SimpleNamespace
 from datetime import date, datetime
 from pathlib import Path
 
@@ -65,6 +66,40 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(pipeline, "refresh_daily_basic_data", daily_basic_success)
     monkeypatch.setattr(pipeline, "refresh_reference_inputs", success)
     monkeypatch.setattr(pipeline, "refresh_factor_registry_snapshot", success)
+    monkeypatch.setattr(
+        pipeline,
+        "resolve_daily_dependency_source_options",
+        lambda scope: {
+            "scope": scope,
+            "include_market_daily": True,
+            "include_daily_basic": scope in {"all", "short", "chan", "long", "cbAllotment"},
+            "include_stock_basic": scope in {"all", "long", "cbAllotment", "similar"},
+            "include_index": scope in {"all", "long", "similar"},
+            "include_market_regime": scope in {"all", "long"},
+            "include_financials": scope in {"all", "long"},
+            "include_analyst": scope in {"all", "long"},
+            "include_tradability": False,
+            "long_factor_datasets": (),
+            "active_source_nodes": (),
+            "effective_feature_requirements": {},
+            "model_contract_audit": {"status": "success"},
+        },
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "publish_daily_dependency_contract",
+        lambda target_date, scope, results, **kwargs: {
+            "status": "success",
+            "target_trade_date": target_date,
+            "scope": scope,
+            "phase": kwargs.get("phase"),
+            "freshness_audit": {
+                "status": "success",
+                "checked_nodes": [],
+                "failures": [],
+            },
+        },
+    )
     monkeypatch.setattr(pipeline, "build_features", build_features or success)
     monkeypatch.setattr(pipeline, "refresh_strategy_signal_cache", success)
     monkeypatch.setattr(pipeline, "generate_daily_plan", generate_daily_plan or success)
@@ -120,7 +155,11 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(
         services,
         "_run_similar_pattern_analysis_isolated",
-        lambda: {"generated_at": "2026-07-23T18:00:00", "results": []},
+        lambda: {
+            "generated_at": "2026-07-23T18:00:00",
+            "target_date": "2026-07-23",
+            "results": [],
+        },
     )
     monkeypatch.setattr(services, "_write_strategy_pool_snapshots", lambda *args, **kwargs: [])
     monkeypatch.setattr(services, "_run_post_snapshot_cache_cleanup", lambda results: None)
@@ -148,11 +187,15 @@ def test_historical_scores_are_independent_of_current_candidate_pool(monkeypatch
         "symbol": "000001.SZ",
         "historical_buy_score": 72.4,
         "historical_hold_score": 61.3,
+        "buy_score_source": "historical_return_model",
+        "hold_score_source": "historical_return_model",
     }
     other_row = {
         "symbol": "000002.SZ",
         "historical_buy_score": 99.0,
         "historical_hold_score": 5.0,
+        "buy_score_source": "historical_return_model",
+        "hold_score_source": "historical_return_model",
     }
 
     score_alone = services._apply_historical_score_normalization([dict(base_row)])[0]
@@ -184,8 +227,8 @@ def test_return_model_scores_use_fixed_historical_reference(monkeypatch) -> None
         services,
         "_selector_model_feature_rows",
         lambda signal_date: {
-            "000001.SZ": {"selector_return_5d": 1.0},
-            "000002.SZ": {"selector_return_5d": 3.0},
+            "000001.SZ": {"date": signal_date, "selector_return_5d": 1.0},
+            "000002.SZ": {"date": signal_date, "selector_return_5d": 3.0},
         },
     )
     rows = [
@@ -233,6 +276,7 @@ def test_watchlist_buy_hold_scores_accepts_numpy_matched_groups(monkeypatch) -> 
                 score_target="historical_return_model_score",
                 buy_score_source="historical_return_model",
                 hold_score_source="historical_return_model",
+                model_score_available=True,
             )
 
     monkeypatch.setattr(services, "_apply_historical_score_normalization", apply_scores)
@@ -326,6 +370,11 @@ def test_api_refresh_runs_cleanup_before_data_refresh_even_when_refresh_fails(mo
     )
     monkeypatch.setattr(
         pipeline,
+        "resolve_daily_dependency_source_options",
+        lambda scope: {},
+    )
+    monkeypatch.setattr(
+        pipeline,
         "refresh_data",
         lambda **kwargs: call_order.append("refresh") or {"status": "failed", "stderr_tail": "boom"},
     )
@@ -366,7 +415,11 @@ def test_global_refresh_starts_independent_workspaces_before_feature_build(
         ),
         convertible_bond_allotment=early_step(
             "convertible_bond_allotment",
-            {"asof": "2026-07-23", "records": []},
+            {
+                "asof": "2026-07-23",
+                "event_polled_through": "2026-07-23",
+                "records": [],
+            },
         ),
         byd_daily_plan=early_step(
             "byd_daily_plan",
@@ -376,7 +429,7 @@ def test_global_refresh_starts_independent_workspaces_before_feature_build(
 
     services._run_latest_refresh_job("all", run_id="parallel-early-workspaces")
 
-    assert status["status"] == "success"
+    assert status["status"] == "success", status.get("error")
     assert sorted(calls) == [
         "byd_daily_plan",
         "convertible_bond_allotment",
@@ -384,6 +437,12 @@ def test_global_refresh_starts_independent_workspaces_before_feature_build(
     ]
     assert status["result"]["convertible_bond_plan"]["status"] == "success"
     assert status["result"]["convertible_bond_allotment"]["status"] == "success"
+    assert (
+        status["result"]["convertible_bond_allotment"][
+            "event_polled_through"
+        ]
+        == "2026-07-23"
+    )
     assert status["result"]["byd_daily_plan"]["status"] == "success"
 
 
@@ -467,7 +526,20 @@ def test_allotment_quality_gate_rejects_stale_or_incomplete_payload(
 def test_allotment_scope_refreshes_daily_basic_inputs(monkeypatch) -> None:
     from quant.routine import pipeline
 
-    status = _stub_successful_global_refresh(monkeypatch)
+    allotment_calls = []
+
+    def refresh_allotments(*args, **kwargs):
+        allotment_calls.append((args, kwargs))
+        return {
+            "asof": "2026-07-23",
+            "event_polled_through": "2026-07-23",
+            "records": [],
+        }
+
+    status = _stub_successful_global_refresh(
+        monkeypatch,
+        convertible_bond_allotment=refresh_allotments,
+    )
     daily_basic_calls = []
     monkeypatch.setattr(
         pipeline,
@@ -482,7 +554,24 @@ def test_allotment_scope_refreshes_daily_basic_inputs(monkeypatch) -> None:
     )
 
     assert status["status"] == "success"
+    assert (
+        status["result"]["convertible_bond_allotment"][
+            "event_polled_through"
+        ]
+        == "2026-07-23"
+    )
     assert len(daily_basic_calls) == 1
+    assert allotment_calls == [
+        (
+            (),
+            {
+                "refresh": True,
+                "stage_scope": "pipeline",
+                "expected_trade_date": "2026-07-23",
+                "validate_quality": True,
+            },
+        )
+    ]
 
 
 def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -> None:
@@ -583,7 +672,11 @@ def test_global_refresh_checkpoints_early_results_before_terminal_failure(
             {"trade_date": "20260723", "candidates": [{"code": "123001"}]},
         ),
         convertible_bond_allotment=early_success(
-            {"asof": "2026-07-23", "records": [{"code": "600001"}]},
+            {
+                "asof": "2026-07-23",
+                "event_polled_through": "2026-07-23",
+                "records": [{"code": "600001"}],
+            },
         ),
         byd_daily_plan=early_success(
             {
@@ -599,7 +692,125 @@ def test_global_refresh_checkpoints_early_results_before_terminal_failure(
     assert "feature build failed" in status["error"]
     assert status["result"]["convertible_bond_plan"]["candidates"] == 1
     assert status["result"]["convertible_bond_allotment"]["records"] == 1
+    assert (
+        status["result"]["convertible_bond_allotment"][
+            "event_polled_through"
+        ]
+        == "2026-07-23"
+    )
     assert status["result"]["byd_daily_plan"]["alerts"] == 1
+
+
+def test_global_refresh_reruns_same_day_early_product_when_contract_is_dirty(
+    monkeypatch,
+) -> None:
+    """A successful old checkpoint must not hide a same-day contract change."""
+
+    from quant.routine import pipeline
+
+    calls = {"cb": 0, "allotment": 0, "byd": 0}
+
+    def cb_plan(*args, **kwargs):
+        calls["cb"] += 1
+        return {"trade_date": "20260723", "candidates": []}
+
+    def allotment(*args, **kwargs):
+        calls["allotment"] += 1
+        return {"asof": "2026-07-23", "records": []}
+
+    def byd(*args, **kwargs):
+        calls["byd"] += 1
+        return {
+            "planned_t": {"signal_date": "2026-07-23"},
+            "alerts": [],
+        }
+
+    status = _stub_successful_global_refresh(
+        monkeypatch,
+        convertible_bond_plan=cb_plan,
+        convertible_bond_allotment=allotment,
+        byd_daily_plan=byd,
+    )
+
+    def publish_contract(target_date, scope, results, **kwargs):
+        phase = kwargs.get("phase")
+        dirty = phase != "postflight"
+        return {
+            "status": "success",
+            "target_trade_date": target_date,
+            "scope": scope,
+            "phase": phase,
+            "refresh_node_ids": ["product.cb_grid"] if dirty else [],
+            "refresh_nodes": (
+                [
+                    {
+                        "node_id": "product.cb_grid",
+                        "layer": "product",
+                        "action": "refresh",
+                        "ui_step": "convertible_bond_plan",
+                    }
+                ]
+                if dirty
+                else []
+            ),
+            "freshness_audit": {
+                "status": "success",
+                "checked_nodes": [],
+                "failures": [],
+            },
+        }
+
+    monkeypatch.setattr(
+        pipeline,
+        "publish_daily_dependency_contract",
+        publish_contract,
+    )
+    started_at = pd.Timestamp.now().isoformat()
+    resume_status = {
+        "status": "failed",
+        "run_id": "same-day-product-checkpoint",
+        "attempt": 1,
+        "started_at": started_at,
+        "steps": services._progress_steps("all"),
+        "result": {
+            "refresh_data": {
+                "status": "success",
+                "expected_trade_date": "20260723",
+                "dataset_trade_date": "20260723",
+            },
+            "refresh_daily_basic": {
+                "status": "success",
+                "latest_trade_date": "20260723",
+            },
+            "refresh_reference_inputs": {
+                "status": "success",
+                "steps": {
+                    "analyst_forecast_snapshot": {"status": "success"},
+                },
+            },
+            "convertible_bond_plan": {
+                "status": "success",
+                "trade_date": "20260723",
+            },
+            "convertible_bond_allotment": {
+                "status": "success",
+                "asof": "2026-07-23",
+            },
+            "byd_daily_plan": {
+                "status": "success",
+                "signal_date": "2026-07-23",
+            },
+        },
+    }
+
+    services._run_latest_refresh_job(
+        "all",
+        resume_status=resume_status,
+        run_id="same-day-product-rerun",
+    )
+
+    assert status["status"] == "success"
+    assert calls == {"cb": 1, "allotment": 0, "byd": 0}
 
 
 def test_terminal_refresh_writes_immutable_manifest_with_step_timings(
@@ -765,8 +976,29 @@ def test_resumed_refresh_starts_independent_attempt_timing(
 
 def test_input_resume_marks_only_reused_steps_as_checkpoints(
     monkeypatch,
+    tmp_path,
 ) -> None:
     status = _stub_successful_global_refresh(monkeypatch)
+    feature_dir = tmp_path / "data/features/b1"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "training_xgb_project_vars.parquet").touch()
+    (feature_dir / "active_candidate_project_features.parquet").touch()
+    (feature_dir / "b1_family_rule_candidates.parquet").touch()
+    (feature_dir.parent / "z_skill_daily_candidates.parquet").touch()
+    (feature_dir / "active_candidate_project_features_manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "target_date": "2026-07-23",
+                "candidate_coverage_status": "complete",
+                "factor_count": 147,
+                "factor_schema_version": "project-v1-latest-scale-global-rank",
+                "union_candidate_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "PROJECT_ROOT", tmp_path)
     source_started_at = pd.Timestamp.now().isoformat()
     resume_status = {
         "status": "failed",
@@ -826,6 +1058,93 @@ def test_input_resume_marks_only_reused_steps_as_checkpoints(
         assert step_map[key]["checkpoint_reused"] is True
         assert step_map[key]["elapsed_seconds"] == 0.0
     assert step_map["daily_plan"]["checkpoint_reused"] is False
+
+
+def test_input_resume_recomputes_same_day_model_score_when_artifact_is_dirty(
+    monkeypatch,
+) -> None:
+    from quant.routine import pipeline
+
+    score_calls = 0
+
+    def score(*args, **kwargs):
+        nonlocal score_calls
+        score_calls += 1
+        return {"status": "success"}
+
+    status = _stub_successful_global_refresh(
+        monkeypatch,
+        score_latest_models=score,
+    )
+
+    def publish_contract(target_date, scope, results, **kwargs):
+        phase = kwargs.get("phase")
+        dirty = phase != "postflight"
+        return {
+            "status": "success",
+            "target_trade_date": target_date,
+            "scope": scope,
+            "phase": phase,
+            "refresh_node_ids": ["score.z_skill"] if dirty else [],
+            "refresh_nodes": (
+                [
+                    {
+                        "node_id": "score.z_skill",
+                        "layer": "model_score",
+                        "action": "refresh",
+                        "ui_step": "model_score",
+                    }
+                ]
+                if dirty
+                else []
+            ),
+            "freshness_audit": {
+                "status": "success",
+                "checked_nodes": [],
+                "failures": [],
+            },
+        }
+
+    monkeypatch.setattr(
+        pipeline,
+        "publish_daily_dependency_contract",
+        publish_contract,
+    )
+    resume_status = {
+        "status": "failed",
+        "run_id": "same-day-score-checkpoint",
+        "attempt": 1,
+        "started_at": pd.Timestamp.now().isoformat(),
+        "steps": services._progress_steps("all"),
+        "result": {
+            "refresh_data": {
+                "status": "success",
+                "expected_trade_date": "20260723",
+                "dataset_trade_date": "20260723",
+            },
+            "refresh_daily_basic": {
+                "status": "success",
+                "latest_trade_date": "20260723",
+            },
+            "refresh_reference_inputs": {
+                "status": "success",
+                "steps": {
+                    "analyst_forecast_snapshot": {"status": "success"},
+                },
+            },
+            "model_score": {"status": "success"},
+        },
+    }
+
+    services._run_latest_refresh_job(
+        "all",
+        resume_status=resume_status,
+        run_id="same-day-score-rerun",
+    )
+
+    assert status["status"] == "success"
+    assert score_calls == 1
+    assert status["result"]["model_score"].get("checkpoint_reused") is not True
 
 
 def test_starting_refresh_clears_stale_manifest_path(monkeypatch, tmp_path) -> None:
@@ -913,38 +1232,19 @@ def test_global_refresh_includes_daily_similar_pattern_step() -> None:
     assert "similar_patterns" in step_keys
 
 
-def test_similar_refresh_scope_runs_only_the_isolated_analysis(monkeypatch) -> None:
-    status = {
-        "status": "queued",
-        "run_id": "similar-run",
-        "attempt": 1,
-        "started_at": "2026-07-30T20:00:00",
-        "steps": services._progress_steps("similar"),
-        "scope": "similar",
-    }
-    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
-    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
-    monkeypatch.setattr(services, "_write_terminal_refresh_manifest_unlocked", lambda: None)
-    monkeypatch.setattr(
-        services,
-        "run_cache_cleanup",
-        lambda *args, **kwargs: pytest.fail("单独刷新自选分析不应清理全站缓存"),
-    )
-    monkeypatch.setattr(
-        services,
-        "_run_similar_pattern_analysis_isolated",
-        lambda: {
-            "generated_at": "2026-07-30T20:01:00",
-            "results": [{"target": {"symbol": "002594.SZ"}}],
-        },
-    )
+def test_similar_refresh_scope_refreshes_shared_daily_inputs_first(monkeypatch) -> None:
+    status = _stub_successful_global_refresh(monkeypatch)
 
     services._run_latest_refresh_job("similar", run_id="similar-run")
 
-    assert [step["key"] for step in status["steps"]] == ["similar_patterns"]
+    assert [step["key"] for step in status["steps"]] == [
+        "refresh_data",
+        "similar_patterns",
+    ]
     assert status["status"] == "success"
     assert status["percent"] == 100
-    assert status["result"]["similar_patterns"]["targets"] == 1
+    assert status["result"]["similar_patterns"]["target_date"] == "2026-07-23"
+    assert status["result"]["dependency_postflight"]["status"] == "success"
 
 
 def test_refresh_progress_ignores_stale_run_context(monkeypatch) -> None:
@@ -1797,7 +2097,15 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
     monkeypatch.setattr(services, "get_chan_model_strategy_plan", lambda *args, **kwargs: {"signal_date": "2026-07-20", "candidates": []})
     monkeypatch.setattr(services, "_refresh_long_stock_pool_variants", lambda *args, **kwargs: [])
     monkeypatch.setattr(services, "get_convertible_bond_grid_plan", lambda *args, **kwargs: {"trade_date": "20260720", "candidates": []})
-    monkeypatch.setattr(services, "get_convertible_bond_allotments", lambda *args, **kwargs: {"asof": "2026-07-20", "records": []})
+    monkeypatch.setattr(
+        services,
+        "get_convertible_bond_allotments",
+        lambda *args, **kwargs: {
+            "asof": "2026-07-20",
+            "event_polled_through": "2026-07-20",
+            "records": [],
+        },
+    )
     monkeypatch.setattr(services, "get_byd_daily_strategy", lambda *args, **kwargs: {"planned_t": {"signal_date": "2026-07-20"}, "alerts": []})
     monkeypatch.setattr(services, "_run_similar_pattern_analysis_isolated", lambda: {"generated_at": "2026-07-20T20:00:00", "results": []})
     monkeypatch.setattr(
@@ -1832,6 +2140,10 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
     assert ("max_workers", 6) in submitted
     assert len([item for item in submitted if item[0] == "submit"]) == 6
     assert result["snapshot"]["strategy_pools"] == {"ALL": 0}
+    assert (
+        result["convertible_bond_allotment"]["event_polled_through"]
+        == "2026-07-20"
+    )
     assert result["similar_patterns"]["status"] == "success"
     assert result["cache_cleanup_after_snapshot"]["status"] == "success"
     assert maintenance_order[-2:] == ["snapshot", "cleanup"]
@@ -1972,7 +2284,11 @@ def test_similar_pattern_refresh_reuses_current_weekly_library_but_analyzes_live
     def fake_analyze(*args, **kwargs):
         calls["analysis"] += 1
         assert kwargs["target_symbols"] == ["002594.SZ"]
-        return {"002594.SZ": object()}
+        return {
+            "002594.SZ": SimpleNamespace(
+                target=SimpleNamespace(target_date=pd.Timestamp("2026-07-21"))
+            )
+        }
 
     monkeypatch.setattr(services, "build_vector_caches_parallel", fake_build)
     monkeypatch.setattr(services, "analyze_targets_by_threshold", fake_analyze)
@@ -2320,6 +2636,12 @@ def test_similar_pattern_payload_includes_optimized_decision_and_validation() ->
     )
 
     assert payload["optimized_forecast"]
+    assert payload["feature_freshness"] == {
+        "target_date": "2025-01-02",
+        "market_regime_date": "2025-01-02",
+        "industry_regime_date": "2025-01-02",
+        "exact_date_contract": True,
+    }
     assert payload["decisions"][0]["signal"] in {"bullish", "bearish", "observe"}
     assert payload["optimization_summary"]["effective_sample_size"] > 0
     assert payload["validation_summary"][0]["coverage"] == 40.0

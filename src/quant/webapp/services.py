@@ -38,6 +38,10 @@ from quant.application.workspaces.byd import (
     build_byd_daily_strategy,
 )
 from quant.application.workspaces.convertible_bonds import (
+    DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
+    DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
+    DEFAULT_ALLOTMENT_LIMIT,
+    DEFAULT_ALLOTMENT_STAGE_SCOPE,
     ConvertibleBondAllotmentDependencies,
     ConvertibleBondGridDependencies,
     build_convertible_bond_allotment_workspace,
@@ -100,6 +104,28 @@ SELECTOR_HISTORY_SIGNAL_SAMPLES = PROJECT_ROOT / "data/research/selector_history
 SELECTOR_BUY_HOLD_SCORE_CALIBRATION = PROJECT_ROOT / "config/selector_buy_hold_score_calibration.json"
 SELECTOR_BUY_HOLD_MODEL_DIR = PROJECT_ROOT / "models/production/selector_buy_hold"
 SELECTOR_MODEL_HISTORY = PROJECT_ROOT / "data/research/selector_model_history_2020.parquet"
+SELECTOR_DAILY_BASIC_DIR = PROJECT_ROOT / "data/raw/daily_basic"
+SELECTOR_MARKET_FEATURE_COLUMNS = (
+    "selector_market_mean_1d",
+    "selector_market_median_1d",
+    "selector_market_dispersion_1d",
+    "selector_market_up_ratio_1d",
+    "selector_market_up5_ratio_1d",
+    "selector_market_down5_ratio_1d",
+    "selector_market_mean_5d",
+    "selector_market_mean_20d",
+    "selector_market_up_ratio_5d",
+    "selector_market_up_ratio_20d",
+)
+LONG_MARKET_REGIME_FEATURE_COLUMNS = (
+    "market_regime",
+    "index_ma_120_slope_20d",
+    "index_return_20d",
+    "index_return_60d",
+    "index_return_120d",
+    "index_drawdown_60d",
+    "index_overheat",
+)
 FAMILY_RULE_PATTERN = "b1_family_rule_backtest_*.csv"
 FUSION_PATTERN = "b1_model_zettaranc_fusion_*.csv"
 MODEL_FILTERED_SIGNALS = {
@@ -187,7 +213,7 @@ DEFAULT_FAMILIES = {
 }
 DEFAULT_SELECTOR_LIMIT = 50
 DEFAULT_FAMILY_CAP = 12
-SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v8_robust_return_models"
+SELECTOR_SNAPSHOT_SCHEMA_VERSION = "buy_hold_score_v9_exact_date_feature_contract"
 SELECTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/selector_snapshots"
 SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
 LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v12_price_bands_structure_evidence"
@@ -460,10 +486,6 @@ def _similar_pattern_vector_cache_refresh_decision(
     }
 
     refreshed_at = pd.to_datetime(metadata.get("refreshed_at"), errors="coerce")
-    inferred_legacy = False
-    if pd.isna(refreshed_at) and cache_files:
-        refreshed_at = pd.Timestamp.fromtimestamp(max(path.stat().st_mtime for path in cache_files))
-        inferred_legacy = True
 
     refresh_age_days = (
         max(0.0, (current - refreshed_at.to_pydatetime()).total_seconds() / 86_400)
@@ -514,7 +536,7 @@ def _similar_pattern_vector_cache_refresh_decision(
         "refresh_age_days": refresh_age_days,
         "minimum_refresh_age_days": SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS,
         "metadata": metadata,
-        "inferred_legacy": inferred_legacy,
+        "inferred_legacy": False,
     }
 
 
@@ -666,6 +688,14 @@ def _step_status_map(status: dict[str, Any] | None) -> dict[str, str]:
 def _tail_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
     if not status or scope not in {"all", "short"}:
         return False
+    dependency_audit = (
+        ((status.get("result") or {}).get("dependency_postflight") or {}).get(
+            "freshness_audit"
+        )
+        or {}
+    )
+    if dependency_audit.get("status") == "failed":
+        return False
     step_map = _step_status_map(status)
     return step_map.get("selector_extended") == "success" and step_map.get("snapshot") != "success"
 
@@ -699,11 +729,11 @@ def _input_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
     expected_trade_date = _source_expected_trade_date(results)
     if expected_trade_date is None or _local_market_trade_date() != expected_trade_date:
         return False
-    if scope in {"all", "short", "chan", "long"} and (
+    if scope in {"all", "short", "chan", "long", "cbAllotment"} and (
         results.get("refresh_daily_basic") or {}
     ).get("status") != "success":
         return False
-    if scope in {"all", "short", "chan", "long"}:
+    if scope in {"all", "short", "chan", "long", "cbAllotment"}:
         basic_date = str(
             (results.get("refresh_daily_basic") or {}).get("latest_trade_date")
             or ""
@@ -951,6 +981,12 @@ def get_byd_daily_strategy(
 ) -> dict[str, Any]:
     """Compatibility facade for the application-layer BYD workspace."""
 
+    def is_snapshot_current(payload: dict[str, Any]) -> bool:
+        expected = str(_local_market_trade_date() or "").replace("-", "")
+        planned = payload.get("planned_t") or payload.get("daily_t_plan") or {}
+        actual = str(planned.get("signal_date") or "").replace("-", "")
+        return not expected or actual == expected
+
     return build_byd_daily_strategy(
         shares=shares,
         cost=cost,
@@ -958,6 +994,7 @@ def get_byd_daily_strategy(
         dependencies=BydWorkspaceDependencies(
             read_snapshot=_read_workspace_snapshot,
             write_snapshot=_write_workspace_snapshot,
+            is_snapshot_current=is_snapshot_current,
         ),
     )
 
@@ -1167,6 +1204,52 @@ def _load_live_long_base(
     return features, daily_basic, stock_basic, dict(coverage)
 
 
+def _require_exact_regime_row(
+    frame: pd.DataFrame,
+    target_date: str | pd.Timestamp,
+    *,
+    context: str,
+    required_columns: list[str] | tuple[str, ...],
+) -> pd.Series:
+    """Return a complete regime row for the exact decision date.
+
+    Current inference must never substitute a previous observation or a
+    synthetic neutral value when a market/industry context feature is stale.
+    Historical rows may still retain their documented neutral semantics.
+    """
+
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        raise RuntimeError(f"{context} has an invalid decision date: {target_date!r}")
+    target = pd.Timestamp(target).normalize()
+    if frame.empty or "date" not in frame.columns:
+        raise RuntimeError(
+            f"{context} has no exact decision date observation for "
+            f"{target.date().isoformat()}"
+        )
+    normalized = frame.copy()
+    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce").dt.normalize()
+    exact = normalized.loc[normalized["date"].eq(target)]
+    if exact.empty:
+        latest = normalized["date"].dropna().max()
+        latest_text = latest.date().isoformat() if pd.notna(latest) else "none"
+        raise RuntimeError(
+            f"{context} has no exact decision date observation for "
+            f"{target.date().isoformat()}; latest={latest_text}"
+        )
+    missing_columns = [column for column in required_columns if column not in exact.columns]
+    if missing_columns:
+        raise RuntimeError(f"{context} missing required columns: {missing_columns}")
+    row = exact.iloc[-1]
+    missing_values = [column for column in required_columns if pd.isna(row[column])]
+    if missing_values:
+        raise RuntimeError(
+            f"{context} missing required values on {target.date().isoformat()}: "
+            f"{missing_values}"
+        )
+    return row
+
+
 def _prepare_tea_master_live_data(
     module: Any,
     signal_date: str | None,
@@ -1203,14 +1286,17 @@ def _prepare_tea_master_live_data(
     )
     merged = module.load_financial_asof(merged)
     merged = module.add_empty_analyst_forecast_columns(merged)
-    market_regime = module.load_market_regime(merged["date"].min(), merged["date"].max())
+    decision_date = pd.to_datetime(merged["date"], errors="coerce").max()
+    market_regime = module.load_market_regime(merged["date"].min(), decision_date)
+    regime_row = _require_exact_regime_row(
+        market_regime,
+        decision_date,
+        context="tea live market regime",
+        required_columns=LONG_MARKET_REGIME_FEATURE_COLUMNS,
+    )
+    coverage["market_regime_feature_date"] = pd.Timestamp(regime_row["date"]).date().isoformat()
     merged = merged.merge(market_regime, on="date", how="left")
     merged["market_regime"] = merged["market_regime"].fillna("neutral")
-    for column in ["index_return_20d", "index_return_60d", "index_drawdown_60d"]:
-        if column not in merged.columns:
-            merged[column] = np.nan
-    if "index_overheat" not in merged.columns:
-        merged["index_overheat"] = False
     return merged, stock_basic, coverage
 
 
@@ -2828,42 +2914,40 @@ def _build_long_stock_pool_cached(variant_key: str, signal_date: str | None, per
     if not common_dates:
         raise RuntimeError("日线特征与 daily_basic 没有共同信号日期")
     signal_ts = common_dates[-1]
-    merged = pd.DataFrame()
-    for candidate_date in reversed(common_dates):
-        latest_features = features[features["date"] == candidate_date].copy()
-        latest_basic = daily_basic[daily_basic["date"] == candidate_date].copy()
-        latest_features = latest_features.sort_values(["date", "ts_code", "trade_date"]).drop_duplicates(["date", "ts_code"], keep="last")
-        latest_basic = latest_basic.sort_values(["date", "ts_code", "trade_date"]).drop_duplicates(["date", "ts_code"], keep="last")
-        if variant in getattr(module, "PIT_UNIVERSE_VARIANTS", set()):
-            latest_basic = module.filter_daily_basic_point_in_time(latest_basic, config)
-        candidate_merged = latest_features.merge(
-            latest_basic.drop(columns=["trade_date"]),
-            on=["date", "ts_code"],
-            how="inner",
+    latest_features = features[features["date"] == signal_ts].copy()
+    latest_basic = daily_basic[daily_basic["date"] == signal_ts].copy()
+    latest_features = latest_features.sort_values(
+        ["date", "ts_code", "trade_date"]
+    ).drop_duplicates(["date", "ts_code"], keep="last")
+    latest_basic = latest_basic.sort_values(
+        ["date", "ts_code", "trade_date"]
+    ).drop_duplicates(["date", "ts_code"], keep="last")
+    if variant in getattr(module, "PIT_UNIVERSE_VARIANTS", set()):
+        latest_basic = module.filter_daily_basic_point_in_time(latest_basic, config)
+    merged = latest_features.merge(
+        latest_basic.drop(columns=["trade_date"]),
+        on=["date", "ts_code"],
+        how="inner",
+    )
+    if len(merged) < 50:
+        raise RuntimeError(
+            "最新信号日长线截面不完整: "
+            f"date={pd.Timestamp(signal_ts).date().isoformat()} rows={len(merged)}"
         )
-        if len(candidate_merged) >= 50:
-            signal_ts = candidate_date
-            merged = candidate_merged
-            break
-    if merged.empty:
-        raise RuntimeError("最近信号日无可用长线截面")
     merged = module.load_financial_asof(merged)
     if variant in module.GROWTH_VARIANTS:
         merged = module.load_analyst_forecast_asof(merged)
     else:
         merged = module.add_empty_analyst_forecast_columns(merged)
     market_regime = module.load_market_regime(signal_ts, signal_ts)
-    if market_regime.empty:
-        merged["market_regime"] = "neutral"
-        merged["index_ma_120_slope_20d"] = np.nan
-        merged["index_return_20d"] = np.nan
-        merged["index_return_60d"] = np.nan
-        merged["index_return_120d"] = np.nan
-        merged["index_drawdown_60d"] = np.nan
-        merged["index_overheat"] = False
-    else:
-        merged = merged.merge(market_regime, on="date", how="left")
-        merged["market_regime"] = merged["market_regime"].fillna("neutral")
+    regime_row = _require_exact_regime_row(
+        market_regime,
+        signal_ts,
+        context=f"{variant_key} live market regime",
+        required_columns=LONG_MARKET_REGIME_FEATURE_COLUMNS,
+    )
+    coverage["market_regime_feature_date"] = pd.Timestamp(regime_row["date"]).date().isoformat()
+    merged = merged.merge(market_regime, on="date", how="left")
     merged["cashflow_quality"] = np.nan
     scored = module.build_scores(merged, config)
     targets = module.make_monthly_targets(scored, config)
@@ -3589,25 +3673,46 @@ def _similar_pattern_result_payload(
     profile = profile or {}
     validation = validation or {}
     optimized_cases = result.similar_cases.copy()
-    target_market_regime = "neutral"
+    market_regime = market_regime if market_regime is not None else pd.DataFrame()
+    market_row = _require_exact_regime_row(
+        market_regime,
+        result.target.target_date,
+        context="similar-pattern market regime",
+        required_columns=["market_regime"],
+    )
+    target_market_regime = str(market_row["market_regime"])
+    market_regime_feature_date = pd.Timestamp(market_row["date"]).date().isoformat()
+    normalized_market_regime = market_regime.copy()
+    normalized_market_regime["date"] = pd.to_datetime(
+        normalized_market_regime["date"], errors="coerce"
+    ).dt.normalize()
+    market_map = normalized_market_regime.set_index("date")["market_regime"]
+    optimized_cases["date"] = pd.to_datetime(optimized_cases["date"], errors="coerce").dt.normalize()
+    optimized_cases["market_regime"] = optimized_cases["date"].map(market_map).fillna("neutral")
+
     target_industry_regime = "neutral"
-    if market_regime is not None and not market_regime.empty:
-        market_map = market_regime.set_index("date")["market_regime"]
-        optimized_cases["date"] = pd.to_datetime(optimized_cases["date"], errors="coerce")
-        optimized_cases["market_regime"] = optimized_cases["date"].map(market_map).fillna("neutral")
-        eligible = market_regime[market_regime["date"] <= result.target.target_date]
-        if not eligible.empty:
-            target_market_regime = str(eligible.iloc[-1]["market_regime"])
-    if industry_regime is not None and not industry_regime.empty:
-        industry_map = industry_regime.set_index("date")["industry_regime"]
+    industry_regime_feature_date: str | None = None
+    target_industry = str(profile.get("industry") or "")
+    if target_industry:
+        industry_regime = industry_regime if industry_regime is not None else pd.DataFrame()
+        industry_row = _require_exact_regime_row(
+            industry_regime,
+            result.target.target_date,
+            context=f"similar-pattern industry regime ({target_industry})",
+            required_columns=["industry_regime"],
+        )
+        target_industry_regime = str(industry_row["industry_regime"])
+        industry_regime_feature_date = pd.Timestamp(industry_row["date"]).date().isoformat()
+        normalized_industry_regime = industry_regime.copy()
+        normalized_industry_regime["date"] = pd.to_datetime(
+            normalized_industry_regime["date"], errors="coerce"
+        ).dt.normalize()
+        industry_map = normalized_industry_regime.set_index("date")["industry_regime"]
         optimized_cases["industry_regime"] = np.where(
-            optimized_cases["industry"].fillna("").astype(str).eq(str(profile.get("industry") or "")),
+            optimized_cases["industry"].fillna("").astype(str).eq(target_industry),
             optimized_cases["date"].map(industry_map).fillna("neutral"),
             "cross_industry",
         )
-        eligible = industry_regime[industry_regime["date"] <= result.target.target_date]
-        if not eligible.empty:
-            target_industry_regime = str(eligible.iloc[-1]["industry_regime"])
     context_cases = optimized_cases.copy()
     optimized_cases, optimization_summary = optimize_similar_cases(
         optimized_cases,
@@ -3715,6 +3820,12 @@ def _similar_pattern_result_payload(
         "optimization_summary": _json_ready(optimization_summary),
         "market_regime": target_market_regime,
         "industry_regime": target_industry_regime,
+        "feature_freshness": {
+            "target_date": result.target.target_date.strftime("%Y-%m-%d"),
+            "market_regime_date": market_regime_feature_date,
+            "industry_regime_date": industry_regime_feature_date,
+            "exact_date_contract": True,
+        },
         "validation_summary": [
             item for item in (validation.get("summary") or []) if item.get("symbol") == result.target.symbol
         ],
@@ -3868,13 +3979,6 @@ def _refresh_similar_pattern_analysis_once(
     else:
         cache_audit = pd.DataFrame(columns=["status"])
         cache_metadata = dict(cache_schedule["metadata"])
-        if cache_schedule["inferred_legacy"]:
-            inferred_at = pd.Timestamp(cache_schedule["refreshed_at"]).to_pydatetime()
-            cache_metadata = _write_similar_pattern_vector_cache_metadata(
-                refreshed_at=inferred_at,
-                source_trade_date=source_trade_date,
-                cache_audit=cache_audit,
-            )
         cache_refreshed = False
     results = analyze_targets_by_threshold(
         DAILY_DIR,
@@ -3892,6 +3996,16 @@ def _refresh_similar_pattern_analysis_once(
             f"相似走势未生成全部自选股目标结果: missing={len(missing_targets)}/{len(symbols)} "
             f"({preview}{suffix})"
         )
+    target_dates = {
+        results[symbol].target.target_date.strftime("%Y-%m-%d")
+        for symbol in symbols
+        if symbol in results
+    }
+    if not source_trade_date or (symbols and target_dates != {source_trade_date}):
+        raise RuntimeError(
+            "相似走势目标特征日期未统一更新到最新交易日: "
+            f"expected={source_trade_date} actual={sorted(target_dates)}"
+        )
     validation = _read_similar_pattern_validation()
     global_model_selection = validation.get("model_selection") or {}
     next_day_policy = (global_model_selection.get("next_1d", {}).get("selected") or {})
@@ -3908,6 +4022,7 @@ def _refresh_similar_pattern_analysis_once(
     }
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "target_date": source_trade_date,
         "watchlist": _similar_pattern_watchlist_profiles(basic),
         "config": {
             "candidate_start_date": SIMILAR_PATTERN_CONFIG.candidate_start_date,
@@ -4709,7 +4824,7 @@ def _convertible_bond_grid_payload_is_usable(payload: dict[str, Any] | None) -> 
     if quality:
         coverage = _safe_float(quality.get("premium_coverage"), 0.0) or 0.0
         minimum = _safe_float(quality.get("minimum_premium_coverage"), 0.90) or 0.90
-        if quality.get("status") != "success" or coverage < minimum:
+        if quality.get("status") != "success" or quality.get("stale") or coverage < minimum:
             return False
     candidates = [item for item in payload.get("candidates") or [] if isinstance(item, dict)]
     if len(candidates) < 3:
@@ -4726,7 +4841,7 @@ def _convertible_bond_grid_payload_is_usable(payload: dict[str, Any] | None) -> 
 
 def get_convertible_bond_grid_plan(
     trade_date: str | None = None,
-    limit: int = 18,
+    limit: int = DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
     refresh: bool = False,
 ) -> dict[str, Any]:
     def read_snapshot(*args, **kwargs) -> dict[str, Any] | None:
@@ -4787,10 +4902,10 @@ def _convertible_bond_allotment_quality(
 
 
 def get_convertible_bond_allotments(
-    limit: int = 80,
-    include_listed_days: int = 90,
+    limit: int = DEFAULT_ALLOTMENT_LIMIT,
+    include_listed_days: int = DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
     refresh: bool = False,
-    stage_scope: str = "pipeline",
+    stage_scope: str = DEFAULT_ALLOTMENT_STAGE_SCOPE,
     expected_trade_date: str | None = None,
     validate_quality: bool = False,
 ) -> dict[str, Any]:
@@ -5856,31 +5971,133 @@ def _selector_model_feature_rows(signal_date: str) -> dict[str, dict[str, Any]]:
 
 @lru_cache(maxsize=32)
 def _selector_model_score_date(signal_date: str | None) -> str | None:
-    """Resolve the newest model-feature date available on or before the market date."""
-    if not SELECTOR_MODEL_HISTORY.exists():
+    """Use the requested market date; never substitute an older feature date."""
+    if not signal_date:
         return None
     try:
-        dates = pd.read_parquet(SELECTOR_MODEL_HISTORY, columns=["date"])["date"]
-    except Exception:
+        value = pd.Timestamp(signal_date)
+    except (TypeError, ValueError):
         return None
-    dates = pd.to_datetime(dates, errors="coerce").dropna()
-    if signal_date:
-        dates = dates[dates <= pd.Timestamp(signal_date)]
-    if dates.empty:
+    if pd.isna(value):
         return None
-    return dates.max().strftime("%Y-%m-%d")
+    return value.strftime("%Y-%m-%d")
 
 
-def _selector_market_feature_values(signal_date: str) -> dict[str, Any]:
-    rows = _selector_model_feature_rows(signal_date)
-    if not rows:
+def _selector_market_feature_values_from_daily(
+    daily: pd.DataFrame,
+    signal_date: str,
+) -> dict[str, Any]:
+    """Calculate the model's market cross-section on the exact signal date."""
+    if daily.empty or "pct_chg" not in daily.columns:
         return {}
-    source = next(iter(rows.values()))
+    date_values = (
+        daily["date"]
+        if "date" in daily.columns
+        else daily.get("trade_date")
+    )
+    if date_values is None:
+        return {}
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(date_values, errors="coerce"),
+            "pct_chg": pd.to_numeric(daily["pct_chg"], errors="coerce"),
+        }
+    ).dropna(subset=["date", "pct_chg"])
+    if frame.empty:
+        return {}
+    frame["date"] = frame["date"].dt.normalize()
+    frame["up"] = (frame["pct_chg"] > 0).astype(float)
+    frame["up5"] = (frame["pct_chg"] >= 5).astype(float)
+    frame["down5"] = (frame["pct_chg"] <= -5).astype(float)
+    market = (
+        frame.groupby("date", as_index=True)
+        .agg(
+            selector_market_mean_1d=("pct_chg", "mean"),
+            selector_market_median_1d=("pct_chg", "median"),
+            selector_market_dispersion_1d=("pct_chg", "std"),
+            selector_market_up_ratio_1d=("up", "mean"),
+            selector_market_up5_ratio_1d=("up5", "mean"),
+            selector_market_down5_ratio_1d=("down5", "mean"),
+        )
+        .sort_index()
+    )
+    for source, window in (
+        ("selector_market_mean_1d", 5),
+        ("selector_market_mean_1d", 20),
+        ("selector_market_up_ratio_1d", 5),
+        ("selector_market_up_ratio_1d", 20),
+    ):
+        target = source.removesuffix("_1d") + f"_{window}d"
+        market[target] = market[source].rolling(window, min_periods=window).mean()
+    target_date = pd.Timestamp(signal_date).normalize()
+    if target_date not in market.index:
+        return {}
+    row = market.loc[target_date]
     return {
-        key: value
-        for key, value in source.items()
-        if key.startswith("selector_market_")
+        column: row.get(column, np.nan)
+        for column in SELECTOR_MARKET_FEATURE_COLUMNS
     }
+
+
+def _selector_turnover_feature_rows(
+    symbols: list[str],
+    signal_date: str,
+    daily_basic_dir: Path | None = None,
+) -> dict[str, dict[str, float]]:
+    """Build exact-date turnover ratios from current and trailing daily_basic."""
+    if not symbols:
+        return {}
+    root = daily_basic_dir or SELECTOR_DAILY_BASIC_DIR
+    target = pd.Timestamp(signal_date).normalize()
+    dated_paths: list[tuple[pd.Timestamp, Path]] = []
+    for path in root.glob("*.parquet"):
+        if not (path.stem.isdigit() and len(path.stem) == 8):
+            continue
+        path_date = pd.to_datetime(path.stem, format="%Y%m%d", errors="coerce")
+        if pd.notna(path_date) and path_date <= target:
+            dated_paths.append((path_date, path))
+    frames: list[pd.DataFrame] = []
+    for _, path in sorted(dated_paths)[-30:]:
+        try:
+            frame = pd.read_parquet(
+                path,
+                columns=["ts_code", "trade_date", "turnover_rate"],
+            )
+        except Exception:
+            continue
+        frames.append(frame)
+    if not frames:
+        return {}
+    turnover = pd.concat(frames, ignore_index=True)
+    turnover["ts_code"] = turnover["ts_code"].astype(str)
+    turnover = turnover[turnover["ts_code"].isin(symbols)].copy()
+    turnover["date"] = pd.to_datetime(
+        turnover["trade_date"].astype(str).str.replace("-", "", regex=False),
+        format="%Y%m%d",
+        errors="coerce",
+    )
+    turnover["turnover_rate"] = pd.to_numeric(
+        turnover["turnover_rate"],
+        errors="coerce",
+    )
+    result: dict[str, dict[str, float]] = {}
+    for symbol, part in turnover.groupby("ts_code", sort=False):
+        part = part.sort_values("date").drop_duplicates("date", keep="last")
+        current = part[part["date"].eq(target)]
+        if current.empty or pd.isna(current.iloc[-1]["turnover_rate"]):
+            continue
+        current_value = float(current.iloc[-1]["turnover_rate"])
+        history = part[part["date"] <= target]["turnover_rate"]
+        values: dict[str, float] = {}
+        for window in (5, 20):
+            mean = history.tail(window).mean()
+            values[f"selector_turnover_relative_{window}d"] = (
+                current_value / float(mean)
+                if pd.notna(mean) and float(mean) != 0
+                else np.nan
+            )
+        result[str(symbol)] = values
+    return result
 
 
 def _selector_watchlist_feature_row_from_daily(
@@ -5888,7 +6105,7 @@ def _selector_watchlist_feature_row_from_daily(
     signal_date: str,
     daily: pd.DataFrame,
 ) -> dict[str, Any]:
-    required = {"date", "open", "high", "low", "close", "pre_close", "pct_chg", "volume", "turnover"}
+    required = {"date", "open", "high", "low", "close", "pre_close", "pct_chg", "volume"}
     if daily.empty or not required.issubset(daily.columns):
         return {}
     daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
@@ -5901,6 +6118,8 @@ def _selector_watchlist_feature_row_from_daily(
     returns = daily["pct_chg"] / 100.0
     log_returns = np.log1p(returns.clip(lower=-0.999999))
     latest = daily.iloc[-1]
+    if pd.Timestamp(latest["date"]).normalize() != pd.Timestamp(signal_date).normalize():
+        return {}
     values: dict[str, Any] = {
         "symbol": symbol,
         "date": latest["date"],
@@ -5922,11 +6141,68 @@ def _selector_watchlist_feature_row_from_daily(
         values[f"selector_volume_relative_{window}d"] = latest["volume"] / daily["volume"].tail(window).mean()
     for window in (5, 10, 20):
         values[f"selector_positive_ratio_{window}d"] = (daily["pct_chg"].tail(window) > 0).mean()
-    for window in (5, 20):
-        values[f"selector_turnover_relative_{window}d"] = latest["turnover"] / daily["turnover"].tail(window).mean()
-    values.update(_selector_market_feature_values(signal_date))
-    values["selector_excess_return_1d"] = latest["pct_chg"] - values.get("selector_market_mean_1d", np.nan)
     return values
+
+
+def _selector_live_feature_rows(
+    symbols: list[str],
+    signal_date: str,
+) -> dict[str, dict[str, Any]]:
+    """Build complete live selector factors from exact-date local inputs."""
+    if not symbols:
+        return {}
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    target = pd.Timestamp(signal_date).normalize()
+    market = store.read_market_range(
+        DAILY_DIR.name,
+        start_date=(target - pd.Timedelta(days=45)).strftime("%Y-%m-%d"),
+        end_date=target.strftime("%Y-%m-%d"),
+        columns=["ts_code", "trade_date", "date", "pct_chg"],
+    )
+    market_values = _selector_market_feature_values_from_daily(market, signal_date)
+    daily = store.read_market_range(
+        DAILY_DIR.name,
+        start_date=(target - pd.Timedelta(days=130)).strftime("%Y-%m-%d"),
+        end_date=target.strftime("%Y-%m-%d"),
+        symbols=symbols,
+        columns=[
+            "ts_code",
+            "symbol",
+            "trade_date",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "pct_chg",
+            "volume",
+        ],
+    )
+    if daily.empty:
+        return {}
+    turnover_rows = _selector_turnover_feature_rows(symbols, signal_date)
+    symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
+    result: dict[str, dict[str, Any]] = {}
+    for symbol, frame in daily.groupby(symbol_column, sort=False):
+        canonical_symbol = str(symbol)
+        feature = _selector_watchlist_feature_row_from_daily(
+            canonical_symbol,
+            signal_date,
+            frame.copy(),
+        )
+        if not feature:
+            continue
+        feature.update(market_values)
+        feature.update(turnover_rows.get(canonical_symbol, {}))
+        feature["selector_excess_return_1d"] = (
+            feature.get("selector_return_1d", np.nan)
+            - feature.get("selector_market_mean_1d", np.nan)
+        )
+        feature["_score_feature_source"] = "live_daily+daily_basic+market_cross_section"
+        feature["_score_feature_date"] = signal_date
+        result[canonical_symbol] = feature
+    return result
 
 
 @lru_cache(maxsize=4096)
@@ -5936,11 +6212,9 @@ def _selector_watchlist_feature_row(symbol: str, signal_date: str) -> dict[str, 
     if candidate is not None:
         return dict(candidate)
     try:
-        store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
-        daily = store.read_frame(DAILY_DIR.name, symbol).copy()
+        return _selector_live_feature_rows([symbol], signal_date).get(symbol, {})
     except Exception:
         return {}
-    return _selector_watchlist_feature_row_from_daily(symbol, signal_date, daily)
 
 
 def _historical_percentile_scores(
@@ -5985,7 +6259,6 @@ def _selector_feature_rows_for_score_rows(rows: list[dict[str, Any]]) -> dict[st
         if symbol and signal_date:
             symbols_by_date.setdefault(signal_date, set()).add(symbol)
     feature_rows: dict[str, dict[str, Any]] = {}
-    store: MarketDataStore | None = None
     for signal_date, symbols in symbols_by_date.items():
         historical = _selector_model_feature_rows(signal_date)
         for symbol in symbols:
@@ -5993,41 +6266,16 @@ def _selector_feature_rows_for_score_rows(rows: list[dict[str, Any]]) -> dict[st
                 feature_rows[symbol] = {
                     **historical[symbol],
                     "_score_feature_source": "model_history",
+                    "_score_feature_date": signal_date,
                 }
         missing_symbols = sorted(symbol for symbol in symbols if symbol not in feature_rows)
         if not missing_symbols:
             continue
         try:
-            store = store or MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
-            start_date = (pd.Timestamp(signal_date) - pd.Timedelta(days=130)).strftime("%Y-%m-%d")
-            daily = store.read_market_range(
-                DAILY_DIR.name,
-                start_date=start_date,
-                end_date=signal_date,
-                symbols=missing_symbols,
-                columns=[
-                    "symbol",
-                    "date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "pre_close",
-                    "pct_chg",
-                    "volume",
-                    "turnover",
-                ],
-            )
+            live_rows = _selector_live_feature_rows(missing_symbols, signal_date)
         except Exception:
-            daily = pd.DataFrame()
-        if daily.empty:
-            continue
-        symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
-        for symbol, frame in daily.groupby(symbol_column, sort=False):
-            feature = _selector_watchlist_feature_row_from_daily(str(symbol), signal_date, frame.copy())
-            if feature:
-                feature["_score_feature_source"] = "live_daily"
-                feature_rows[str(symbol)] = feature
+            live_rows = {}
+        feature_rows.update(live_rows)
     return feature_rows
 
 
@@ -6037,6 +6285,13 @@ def _apply_return_model_scores(
 ) -> None:
     artifacts = _selector_buy_hold_models()
     if not artifacts:
+        for row in rows:
+            row["feature_quality"] = {
+                "status": "failed",
+                "error": "selector_return_models_unavailable",
+                "source": "unavailable",
+                "date": str(row.get("date") or "") or None,
+            }
         return
     if feature_rows_by_symbol is None:
         feature_rows_by_symbol = _selector_feature_rows_for_score_rows(rows)
@@ -6051,6 +6306,35 @@ def _apply_return_model_scores(
             symbol = str(row.get("symbol") or "")
             source = feature_rows_by_symbol.get(symbol)
             if source is None:
+                row["feature_quality"] = {
+                    "status": "failed",
+                    "error": "missing_exact_date_feature_row",
+                    "source": "unavailable",
+                    "date": signal_date or None,
+                }
+                continue
+            source_name = str(source.get("_score_feature_source") or "model_history")
+            source_date = pd.to_datetime(
+                source.get("_score_feature_date", source.get("date")),
+                errors="coerce",
+            )
+            expected_date = pd.to_datetime(signal_date, errors="coerce")
+            if (
+                pd.isna(source_date)
+                or pd.isna(expected_date)
+                or source_date.normalize() != expected_date.normalize()
+            ):
+                row["feature_quality"] = {
+                    "status": "failed",
+                    "error": "feature_date_mismatch",
+                    "source": source_name,
+                    "date": (
+                        source_date.strftime("%Y-%m-%d")
+                        if pd.notna(source_date)
+                        else None
+                    ),
+                    "expected_date": signal_date or None,
+                }
                 continue
             groups = set(_matched_group_values(row.get("matched_groups")))
             values = dict(source)
@@ -6064,7 +6348,62 @@ def _apply_return_model_scores(
             feature_rows.append(values)
         if not feature_rows:
             continue
-        frame = pd.DataFrame(feature_rows).reindex(columns=features).replace([np.inf, -np.inf], np.nan)
+        raw_frame = pd.DataFrame(feature_rows)
+        missing_columns = [feature for feature in features if feature not in raw_frame.columns]
+        frame = raw_frame.reindex(columns=features).replace([np.inf, -np.inf], np.nan)
+        all_nan_features = [feature for feature in features if frame[feature].isna().all()]
+        if missing_columns or all_nan_features:
+            error = (
+                "incomplete_model_features: "
+                f"missing_columns={missing_columns}; all_nan_features={all_nan_features}"
+            )
+            for index in indexes:
+                source = feature_rows_by_symbol.get(str(rows[index].get("symbol") or ""), {})
+                source_name = str(source.get("_score_feature_source") or "model_history")
+                rows[index]["feature_quality"] = {
+                    "status": "failed",
+                    "error": error,
+                    "source": source_name,
+                    "date": str(rows[index].get("date") or "") or None,
+                    "required_feature_count": len(features),
+                    "missing_columns": missing_columns,
+                    "all_nan_features": all_nan_features,
+                }
+                rows[index]["score_feature_source"] = source_name
+                rows[index]["score_date"] = str(rows[index].get("date") or "") or None
+            continue
+        invalid_positions = frame.isna().any(axis=1)
+        if invalid_positions.any():
+            valid_positions: list[int] = []
+            for position, invalid in enumerate(invalid_positions.tolist()):
+                if not invalid:
+                    valid_positions.append(position)
+                    continue
+                index = indexes[position]
+                source = feature_rows_by_symbol.get(
+                    str(rows[index].get("symbol") or ""),
+                    {},
+                )
+                source_name = str(
+                    source.get("_score_feature_source") or "model_history"
+                )
+                missing_features = frame.columns[
+                    frame.iloc[position].isna()
+                ].tolist()
+                rows[index]["feature_quality"] = {
+                    "status": "failed",
+                    "error": "incomplete_row_features",
+                    "source": source_name,
+                    "date": str(rows[index].get("date") or "") or None,
+                    "required_feature_count": len(features),
+                    "missing_features": missing_features,
+                }
+                rows[index]["score_feature_source"] = source_name
+                rows[index]["score_date"] = str(rows[index].get("date") or "") or None
+            if not valid_positions:
+                continue
+            indexes = [indexes[position] for position in valid_positions]
+            frame = frame.iloc[valid_positions].reset_index(drop=True)
         try:
             transformed = artifact["imputer"].transform(frame)
             if "models" in artifact:
@@ -6085,20 +6424,41 @@ def _apply_return_model_scores(
                     artifact["score_reference"],
                     artifact.get("normalization_width", 2.0),
                 )
-        except Exception:
+        except Exception as exc:
+            for index in indexes:
+                source = feature_rows_by_symbol.get(str(rows[index].get("symbol") or ""), {})
+                source_name = str(source.get("_score_feature_source") or "model_history")
+                rows[index]["feature_quality"] = {
+                    "status": "failed",
+                    "error": f"model_scoring_failed: {type(exc).__name__}: {exc}",
+                    "source": source_name,
+                    "date": str(rows[index].get("date") or "") or None,
+                    "required_feature_count": len(features),
+                }
             continue
         historical_name = "historical_buy_score" if mode == "buy" else "historical_hold_score"
         for index, score in zip(indexes, scores):
             rows[index][historical_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
             rows[index][f"{mode}_score_source"] = "historical_return_model"
             source = feature_rows_by_symbol.get(str(rows[index].get("symbol") or ""), {})
-            score_date = pd.to_datetime(source.get("date"), errors="coerce")
+            score_date = pd.to_datetime(
+                source.get("_score_feature_date", source.get("date")),
+                errors="coerce",
+            )
             rows[index]["score_date"] = (
                 score_date.strftime("%Y-%m-%d")
                 if pd.notna(score_date)
                 else str(rows[index].get("date") or "") or None
             )
-            rows[index]["score_feature_source"] = source.get("_score_feature_source") or "model_history"
+            source_name = str(source.get("_score_feature_source") or "model_history")
+            rows[index]["score_feature_source"] = source_name
+            rows[index]["feature_quality"] = {
+                "status": "complete",
+                "error": None,
+                "source": source_name,
+                "date": rows[index]["score_date"],
+                "required_feature_count": len(features),
+            }
 
 
 def _apply_historical_score_normalization(
@@ -6116,6 +6476,14 @@ def _apply_historical_score_normalization(
         return rows
     _apply_return_model_scores(rows, feature_rows_by_symbol)
     for row in rows:
+        has_model_scores = (
+            row.get("buy_score_source") == "historical_return_model"
+            and row.get("hold_score_source") == "historical_return_model"
+        )
+        if not has_model_scores:
+            row["model_score_available"] = False
+            row["score_target"] = "historical_strategy_quality_fallback"
+            continue
         historical_buy_score = _safe_float(row.get("historical_buy_score"), 50.0)
         historical_hold_score = _safe_float(row.get("historical_hold_score"), 50.0)
         buy_score = float(np.clip(50.0 if historical_buy_score is None else historical_buy_score, 0.0, 100.0))
@@ -6124,6 +6492,7 @@ def _apply_historical_score_normalization(
         row["holding_score"] = round(hold_score, 1)
         row["selector_score"] = row["opportunity_score"]
         row["score_target"] = "historical_return_model_score"
+        row["model_score_available"] = True
         row.update(_score_interpretation(row["opportunity_score"], row["holding_score"]))
     return rows
 
@@ -6138,68 +6507,57 @@ def _watchlist_buy_hold_scores(symbols: tuple[str, ...]) -> dict[str, dict[str, 
         return {}
     candidate_rows = _selector_model_feature_rows(score_date)
     feature_rows = {
-        symbol: dict(candidate_rows[symbol])
+        symbol: {
+            **candidate_rows[symbol],
+            "_score_feature_source": "model_history",
+            "_score_feature_date": score_date,
+        }
         for symbol in symbols
         if symbol in candidate_rows
     }
     missing_symbols = [symbol for symbol in symbols if symbol not in feature_rows]
     if missing_symbols:
         try:
-            store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
-            start_date = (pd.Timestamp(score_date) - pd.Timedelta(days=130)).strftime("%Y-%m-%d")
-            daily = store.read_market_range(
-                DAILY_DIR.name,
-                start_date=start_date,
-                end_date=score_date,
-                symbols=missing_symbols,
-                columns=[
-                    "symbol",
-                    "date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "pre_close",
-                    "pct_chg",
-                    "volume",
-                    "turnover",
-                ],
+            feature_rows.update(
+                _selector_live_feature_rows(missing_symbols, score_date)
             )
         except Exception:
-            daily = pd.DataFrame()
-        if not daily.empty:
-            symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
-            for symbol, frame in daily.groupby(symbol_column, sort=False):
-                feature = _selector_watchlist_feature_row_from_daily(str(symbol), score_date, frame.copy())
-                if feature:
-                    feature_rows[str(symbol)] = feature
+            pass
     rows = [
         {
             "symbol": symbol,
             "date": score_date,
             "matched_groups": _matched_group_values(
-                feature_rows[symbol].get("matched_groups"),
+                feature_rows.get(symbol, {}).get("matched_groups"),
             ),
-            "best_profit_factor": feature_rows[symbol].get("best_profit_factor"),
-            "best_avg_return_pct": feature_rows[symbol].get("best_avg_return_pct"),
+            "best_profit_factor": feature_rows.get(symbol, {}).get(
+                "best_profit_factor"
+            ),
+            "best_avg_return_pct": feature_rows.get(symbol, {}).get(
+                "best_avg_return_pct"
+            ),
         }
         for symbol in symbols
-        if symbol in feature_rows
     ]
     _apply_historical_score_normalization(rows, feature_rows)
-    return {
-        row["symbol"]: {
-            "opportunity_score": row["opportunity_score"],
-            "holding_score": row["holding_score"],
-            "buy_score": row["opportunity_score"],
-            "hold_score": row["holding_score"],
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        score = {
             "score_date": score_date,
             "score_target": row["score_target"],
+            "score_feature_source": row.get("score_feature_source"),
+            "feature_quality": row.get("feature_quality"),
+            "model_score_available": bool(row.get("model_score_available")),
         }
-        for row in rows
-        if row.get("buy_score_source") == "historical_return_model"
-        and row.get("hold_score_source") == "historical_return_model"
-    }
+        if row.get("model_score_available"):
+            score.update(
+                opportunity_score=row["opportunity_score"],
+                holding_score=row["holding_score"],
+                buy_score=row["opportunity_score"],
+                hold_score=row["holding_score"],
+            )
+        result[row["symbol"]] = score
+    return result
 
 
 def _score_interpretation(opportunity_score: float, holding_score: float) -> dict[str, str]:
@@ -6209,20 +6567,24 @@ def _score_interpretation(opportunity_score: float, holding_score: float) -> dic
     buckets better than treating the raw decimal as a precise probability.
     """
     if opportunity_score >= 85:
-        band = "极高"
-        percentile = "约 Top 1%"
+        band = "极端尾部"
+        percentile = "历史参考约 Top 0.02%"
         usage = "买入条件质量很强，仍需按开盘条件和止损执行"
     elif opportunity_score >= 70:
-        band = "高"
-        percentile = "约 Top 5%"
+        band = "极高"
+        percentile = "历史参考约 Top 1.4%"
         usage = "优先观察，等待开盘条件确认"
     elif opportunity_score >= 60:
-        band = "偏高"
-        percentile = "约 Top 10%"
+        band = "高"
+        percentile = "历史参考约 Top 8.6%"
         usage = "可观察，不适合追高"
+    elif opportunity_score >= 50:
+        band = "中上"
+        percentile = "高于历史参考中位数"
+        usage = "只适合结合策略细节筛选"
     elif opportunity_score >= 45:
-        band = "中性"
-        percentile = "约 Top 25%"
+        band = "中性偏低"
+        percentile = "历史参考中段偏下"
         usage = "只适合结合策略细节筛选"
     else:
         band = "低"
@@ -6336,7 +6698,8 @@ def build_selector_stock_row(
         "buy_raw_score": round(float(buy_raw_score), 4),
         "hold_raw_score": round(float(hold_raw_score), 4),
         "legacy_selector_score": round(float(legacy_score), 2),
-        "score_target": "historical_return_model_score",
+        "score_target": "historical_strategy_quality_fallback",
+        "model_score_available": False,
         **score_info,
         "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(groups)} 个策略组共振；当前买入分按未来 5 日冲高目标做历史校准",
         "signals": ordered_signals,
@@ -7016,14 +7379,20 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
             "缠论模型策略候选生成失败",
         ),
         ("long_stock_pool", lambda: _refresh_long_stock_pool_variants(long_variants, signal_date), "长线策略股票池生成失败"),
-        ("convertible_bond_plan", lambda: get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date)), "可转债策略计划刷新失败"),
+        (
+            "convertible_bond_plan",
+            lambda: get_convertible_bond_grid_plan(
+                trade_date,
+                DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
+                bool(trade_date),
+            ),
+            "可转债策略计划刷新失败",
+        ),
         (
             "convertible_bond_allotment",
             lambda: get_convertible_bond_allotments(
-                80,
-                90,
-                True,
-                "pipeline",
+                refresh=True,
+                stage_scope=DEFAULT_ALLOTMENT_STAGE_SCOPE,
                 expected_trade_date=signal_date,
                 validate_quality=True,
             ),
@@ -7083,6 +7452,9 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                     results[step_key] = {
                         "status": "success",
                         "asof": payload.get("asof"),
+                        "event_polled_through": payload.get(
+                            "event_polled_through"
+                        ),
                         "records": len(payload.get("records") or []),
                         "quality": payload.get("quality"),
                     }
@@ -7090,6 +7462,10 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                     results[step_key] = {
                         "status": "success",
                         "generated_at": payload.get("generated_at"),
+                        "target_date": payload.get("target_date"),
+                        "reference_library_refreshed_at": (
+                            payload.get("cache") or {}
+                        ).get("reference_library_refreshed_at"),
                         "targets": len(payload.get("results") or []),
                     }
                 else:
@@ -7134,6 +7510,8 @@ def _run_latest_refresh_job(
         refresh_daily_basic_data,
         refresh_factor_registry_snapshot,
         refresh_reference_inputs,
+        publish_daily_dependency_contract,
+        resolve_daily_dependency_source_options,
         refresh_strategy_signal_cache,
         score_latest_models,
     )
@@ -7162,6 +7540,100 @@ def _run_latest_refresh_job(
             cancel_futures=cancel_pending,
         )
         early_workspace_executor = None
+
+    def publish_dependency_gate(
+        results: dict[str, Any],
+        target_date: str,
+        *,
+        phase: str,
+        strict_freshness: bool,
+    ) -> dict[str, Any]:
+        result = publish_daily_dependency_contract(
+            target_date,
+            refresh_scope,
+            results,
+            phase=phase,
+            strict_freshness=strict_freshness,
+        )
+        results[f"dependency_{phase}"] = result
+        unresolved = result.get("refresh_node_ids") or []
+        if strict_freshness and (
+            result.get("status") != "success" or unresolved
+        ):
+            failures = (result.get("freshness_audit") or {}).get("failures") or []
+            details = ", ".join(
+                f"{item.get('node_id')}={item.get('actual')}"
+                for item in failures
+            )
+            if unresolved:
+                details = "; ".join(
+                    part
+                    for part in (
+                        details,
+                        "unresolved=" + ",".join(str(value) for value in unresolved),
+                    )
+                    if part
+                )
+            raise RuntimeError(
+                "每日依赖合同新鲜度门禁失败: " + (details or "unknown failure")
+            )
+        return result
+
+    resume_contract_preview: dict[str, Any] = {}
+    resume_preview_requires_source_refresh = False
+    inherited_refresh_nodes = set(
+        (
+            ((resume_status or {}).get("result") or {}).get(
+                "dependency_preflight"
+            )
+            or {}
+        ).get("refresh_node_ids")
+        or []
+    )
+    if resume_tail or resume_inputs:
+        prior_results = dict((resume_status or {}).get("result") or {})
+        prior_trade_date = _source_expected_trade_date(prior_results)
+        if prior_trade_date is None:
+            resume_tail = False
+            resume_inputs = False
+        else:
+            resume_contract_preview = publish_daily_dependency_contract(
+                pd.to_datetime(prior_trade_date, format="%Y%m%d").date().isoformat(),
+                refresh_scope,
+                prior_results,
+                phase="resume_preflight",
+                strict_freshness=False,
+            )
+            preview_nodes = resume_contract_preview.get("refresh_nodes") or []
+            resume_preview_requires_source_refresh = any(
+                item.get("layer") == "data_source"
+                for item in preview_nodes
+            )
+            inherited_refresh_nodes.update(
+                str(item.get("node_id"))
+                for item in preview_nodes
+                if item.get("node_id")
+            )
+            if resume_tail:
+                completed_steps = {
+                    key
+                    for key, value in _step_status_map(resume_status).items()
+                    if value == "success"
+                }
+                tail_conflicts = [
+                    item
+                    for item in preview_nodes
+                    if not item.get("ui_step")
+                    or str(item.get("ui_step")) in completed_steps
+                ]
+                if tail_conflicts:
+                    resume_tail = False
+                    resume_inputs = _input_resume_ready(
+                        resume_status,
+                        refresh_scope,
+                    )
+            if resume_inputs and resume_preview_requires_source_refresh:
+                resume_inputs = False
 
     try:
         with _REFRESH_LOCK:
@@ -7209,7 +7681,7 @@ def _run_latest_refresh_job(
                     "percent": 90 if resume_tail else 35 if resume_inputs else 1,
                     "current_step": (
                         "similar_patterns"
-                        if refresh_scope == "similar" or resume_tail
+                        if (refresh_scope == "similar" and resume_inputs) or resume_tail
                         else "feature_cache"
                         if resume_inputs
                         else "refresh_data"
@@ -7234,38 +7706,14 @@ def _run_latest_refresh_job(
                     if step.get("key") in reused_keys:
                         _mark_refresh_step_checkpoint_reused(step, now)
             _persist_refresh_status_unlocked()
-        if refresh_scope == "similar":
-            _set_refresh_progress(
-                step_key="similar_patterns",
-                message="正在后台刷新相似走势决策台",
-                percent=10,
-            )
-            payload = _run_similar_pattern_analysis_isolated()
-            results = {
-                "similar_patterns": {
-                    "status": "success",
-                    "generated_at": payload.get("generated_at"),
-                    "targets": len(payload.get("results") or []),
-                }
-            }
-            _set_refresh_progress(
-                status="success",
-                step_key="similar_patterns",
-                step_status="success",
-                message="自选池相似走势刷新完成",
-                percent=100,
-                result=results,
-            )
-            with _REFRESH_LOCK:
-                for step in _REFRESH_STATUS["steps"]:
-                    step["status"] = "success"
-                _persist_refresh_status_unlocked()
-            return
         cache_cleanup = run_cache_cleanup(PROJECT_ROOT)
+        source_options = resolve_daily_dependency_source_options(refresh_scope)
+        source_option_result = {"status": "success", **source_options}
         results: dict[str, Any] = (
             dict((resume_status or {}).get("result") or {}) if resume_inputs else {}
         )
         results["cache_cleanup"] = cache_cleanup
+        results["dependency_source_options"] = source_option_result
         if resume_tail:
             try:
                 results = _resume_tail_refresh_from_cached_selector(refresh_scope, resume_status)
@@ -7278,6 +7726,8 @@ def _run_latest_refresh_job(
                 # retrying downstream workspaces.
                 resume_tail = False
                 resume_inputs = _input_resume_ready(resume_status, refresh_scope)
+                if resume_preview_requires_source_refresh:
+                    resume_inputs = False
                 if not resume_inputs:
                     # Source checkpoints without an independent expected trade
                     # date are not safe to recover from downstream artifacts.
@@ -7291,8 +7741,22 @@ def _run_latest_refresh_job(
                     "action": "recompute_from_same_day_inputs",
                 }
                 results["cache_cleanup"] = cache_cleanup
+                results["dependency_source_options"] = source_option_result
             else:
                 results["cache_cleanup"] = cache_cleanup
+                results["dependency_source_options"] = source_option_result
+                expected_tail_trade_date = _source_expected_trade_date(results)
+                if expected_tail_trade_date is None:
+                    raise RuntimeError("断点续跑缺少目标交易日，无法执行每日依赖门禁")
+                publish_dependency_gate(
+                    results,
+                    pd.to_datetime(
+                        expected_tail_trade_date,
+                        format="%Y%m%d",
+                    ).date().isoformat(),
+                    phase="postflight",
+                    strict_freshness=True,
+                )
                 _set_refresh_progress(
                     status="success",
                     step_key="snapshot",
@@ -7319,7 +7783,7 @@ def _run_latest_refresh_job(
             if results["refresh_data"].get("status") == "failed":
                 raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
-            if refresh_scope in {"all", "short", "chan", "long", "cbAllotment"}:
+            if source_options["include_daily_basic"]:
                 results["refresh_daily_basic"] = refresh_daily_basic_data(
                     dry_run=False,
                     progress_callback=lambda percent, message: _set_refresh_progress(
@@ -7334,7 +7798,13 @@ def _run_latest_refresh_job(
 
             results["refresh_reference_inputs"] = refresh_reference_inputs(
                 dry_run=False,
-                include_financials=refresh_scope in {"all", "long"},
+                include_financials=source_options["include_financials"],
+                include_analyst=source_options["include_analyst"],
+                include_stock_basic=source_options["include_stock_basic"],
+                include_index=source_options["include_index"],
+                include_market_regime=source_options["include_market_regime"],
+                include_tradability=source_options["include_tradability"],
+                long_factor_datasets=source_options["long_factor_datasets"],
             )
             if results["refresh_reference_inputs"].get("status") not in {"success", "skipped"}:
                 details = results["refresh_reference_inputs"].get("critical_errors") or []
@@ -7378,6 +7848,47 @@ def _run_latest_refresh_job(
                     timespec="seconds"
                 )
                 _persist_refresh_status_unlocked()
+        dependency_preflight = publish_dependency_gate(
+            results,
+            expected_signal_date,
+            phase="preflight",
+            strict_freshness=False,
+        )
+        planned_refresh_nodes = set(
+            dependency_preflight.get("refresh_node_ids") or []
+        )
+        planned_refresh_nodes.update(inherited_refresh_nodes)
+        dependency_preflight["refresh_node_ids"] = sorted(planned_refresh_nodes)
+        planned_refresh_ui_steps = {
+            str(item.get("ui_step"))
+            for contract_payload in (
+                dependency_preflight,
+                resume_contract_preview,
+                (
+                    ((resume_status or {}).get("result") or {}).get(
+                        "dependency_preflight"
+                    )
+                    or {}
+                ),
+            )
+            for item in (contract_payload.get("refresh_nodes") or [])
+            if item.get("ui_step")
+        }
+        if resume_contract_preview:
+            dependency_preflight["resume_contract_preview"] = {
+                "refresh_node_ids": resume_contract_preview.get(
+                    "refresh_node_ids"
+                )
+                or [],
+                "changed_model_nodes": resume_contract_preview.get(
+                    "changed_model_nodes"
+                )
+                or [],
+                "changed_contract_nodes": resume_contract_preview.get(
+                    "changed_contract_nodes"
+                )
+                or [],
+            }
 
         # These workspaces only need the refreshed shared inputs. Start their
         # network-heavy work before the CPU-bound short-selector branch and
@@ -7390,7 +7901,7 @@ def _run_latest_refresh_job(
                     "convertible_bond_plan",
                     lambda: get_convertible_bond_grid_plan(
                         early_trade_date,
-                        18,
+                        DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
                         True,
                     ),
                     "可转债策略计划刷新失败",
@@ -7399,10 +7910,8 @@ def _run_latest_refresh_job(
                 (
                     "convertible_bond_allotment",
                     lambda: get_convertible_bond_allotments(
-                        80,
-                        90,
-                        True,
-                        "pipeline",
+                        refresh=True,
+                        stage_scope=DEFAULT_ALLOTMENT_STAGE_SCOPE,
                         expected_trade_date=early_signal_date,
                         validate_quality=True,
                     ),
@@ -7451,6 +7960,9 @@ def _run_latest_refresh_job(
                         results[step_key] = {
                             "status": "success",
                             "asof": payload.get("asof"),
+                            "event_polled_through": payload.get(
+                                "event_polled_through"
+                            ),
                             "records": len(payload.get("records") or []),
                             "quality": payload.get("quality"),
                         }
@@ -7473,7 +7985,10 @@ def _run_latest_refresh_job(
             pending_early_jobs = [
                 item
                 for item in early_jobs
-                if (results.get(item[0]) or {}).get("status") != "success"
+                if (
+                    (results.get(item[0]) or {}).get("status") != "success"
+                    or item[0] in planned_refresh_ui_steps
+                )
             ]
             if pending_early_jobs:
                 early_workspace_executor = ThreadPoolExecutor(
@@ -7547,7 +8062,11 @@ def _run_latest_refresh_job(
                 )
             elif refresh_scope == "cb":
                 _set_refresh_progress(step_key="convertible_bond_plan", message="正在刷新可转债策略计划", percent=92)
-                payload = get_convertible_bond_grid_plan(trade_date, 18, bool(trade_date))
+                payload = get_convertible_bond_grid_plan(
+                    trade_date,
+                    DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
+                    bool(trade_date),
+                )
                 actual_date = str(payload.get("trade_date") or "").replace("-", "")
                 if actual_date != trade_date:
                     raise RuntimeError(
@@ -7570,16 +8089,17 @@ def _run_latest_refresh_job(
             elif refresh_scope == "cbAllotment":
                 _set_refresh_progress(step_key="convertible_bond_allotment", message="正在刷新配债股数据", percent=92)
                 payload = get_convertible_bond_allotments(
-                    80,
-                    90,
-                    True,
-                    "pipeline",
+                    refresh=True,
+                    stage_scope=DEFAULT_ALLOTMENT_STAGE_SCOPE,
                     expected_trade_date=signal_date,
                     validate_quality=True,
                 )
                 results["convertible_bond_allotment"] = {
                     "status": "success",
                     "asof": payload.get("asof"),
+                    "event_polled_through": payload.get(
+                        "event_polled_through"
+                    ),
                     "records": len(payload.get("records") or []),
                     "quality": payload.get("quality"),
                 }
@@ -7612,6 +8132,40 @@ def _run_latest_refresh_job(
                     percent=98,
                     complete_previous=False,
                 )
+            elif refresh_scope == "similar":
+                _set_refresh_progress(
+                    step_key="similar_patterns",
+                    message="正在刷新最新交易日的自选池相似走势",
+                    percent=92,
+                )
+                payload = _run_similar_pattern_analysis_isolated()
+                if str(payload.get("target_date") or "") != signal_date:
+                    raise RuntimeError(
+                        "相似走势目标日期未更新到目标交易日: "
+                        f"expected={signal_date} actual={payload.get('target_date')}"
+                    )
+                results["similar_patterns"] = {
+                    "status": "success",
+                    "generated_at": payload.get("generated_at"),
+                    "target_date": payload.get("target_date"),
+                    "reference_library_refreshed_at": (
+                        payload.get("cache") or {}
+                    ).get("reference_library_refreshed_at"),
+                    "targets": len(payload.get("results") or []),
+                }
+                _set_refresh_progress(
+                    step_key="similar_patterns",
+                    step_status="success",
+                    message="自选池相似走势刷新完成",
+                    percent=98,
+                    complete_previous=False,
+                )
+            publish_dependency_gate(
+                results,
+                signal_date,
+                phase="postflight",
+                strict_freshness=True,
+            )
             _set_refresh_progress(
                 status="success",
                 step_key=_REFRESH_STATUS.get("current_step"),
@@ -7658,10 +8212,45 @@ def _run_latest_refresh_job(
             except (OSError, json.JSONDecodeError, TypeError):
                 return False
 
+        def active_feature_sidecar_current() -> bool:
+            """Require both the exact-date sidecar and its complete coverage proof."""
+
+            parquet_path = (
+                PROJECT_ROOT
+                / "data/features/b1/active_candidate_project_features.parquet"
+            )
+            manifest_path = (
+                PROJECT_ROOT
+                / "data/features/b1/active_candidate_project_features_manifest.json"
+            )
+            if not parquet_path.is_file() or not manifest_path.is_file():
+                return False
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                target = pd.to_datetime(payload.get("target_date"), errors="coerce")
+                union_count = int(payload.get("union_candidate_count") or 0)
+                parquet_current = (
+                    union_count == 0 or artifact_current(parquet_path)
+                )
+                return (
+                    payload.get("status") == "success"
+                    and payload.get("candidate_coverage_status") == "complete"
+                    and int(payload.get("factor_count") or 0) == 147
+                    and payload.get("factor_schema_version")
+                    == "project-v1-latest-scale-global-rank"
+                    and pd.notna(target)
+                    and target.normalize() == expected_incremental_date
+                    and parquet_current
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                return False
+
         feature_ready = (
             resume_inputs
+            and "feature.project_daily" not in planned_refresh_nodes
             and (results.get("feature_cache") or {}).get("status") == "success"
             and artifact_current(PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet")
+            and active_feature_sidecar_current()
         )
         signal_ready = resume_inputs and all(
             artifact_current(path)
@@ -7669,7 +8258,9 @@ def _run_latest_refresh_job(
                 PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
                 PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
             )
-        ) and (feature_ready or b1_gate_current())
+        ) and (feature_ready or b1_gate_current()) and (
+            "feature.strategy_signals" not in planned_refresh_nodes
+        )
         if feature_ready:
             results["feature_cache"]["checkpoint_reused"] = True
             _set_refresh_progress(
@@ -7763,7 +8354,14 @@ def _run_latest_refresh_job(
             percent=50,
             complete_previous=False,
         )
-        model_score_ready = resume_inputs and (results.get("model_score") or {}).get("status") == "success"
+        model_score_ready = (
+            resume_inputs
+            and not (
+                planned_refresh_nodes
+                & {"score.z_skill"}
+            )
+            and (results.get("model_score") or {}).get("status") == "success"
+        )
         _set_refresh_progress(
             step_key="model_score",
             message="已复用同日策略模型分检查点" if model_score_ready else "正在计算当日策略模型分",
@@ -7913,6 +8511,12 @@ def _run_latest_refresh_job(
                 "strategy_pools": written_pools,
             }
             _run_post_snapshot_cache_cleanup(results)
+            publish_dependency_gate(
+                results,
+                expected_signal_date,
+                phase="postflight",
+                strict_freshness=True,
+            )
             _set_refresh_progress(
                 status="success",
                 step_key="snapshot",
@@ -8001,12 +8605,25 @@ def _run_latest_refresh_job(
                     results[result_key] = {
                         "status": "success",
                         "asof": payload.get("asof"),
+                        "event_polled_through": payload.get(
+                            "event_polled_through"
+                        ),
                         "records": len(payload.get("records") or []),
                     }
                 elif result_key == "similar_patterns":
+                    if str(payload.get("target_date") or "") != expected_signal_date:
+                        raise RuntimeError(
+                            "相似走势目标日期未更新到目标交易日: "
+                            f"expected={expected_signal_date} "
+                            f"actual={payload.get('target_date')}"
+                        )
                     results[result_key] = {
                         "status": "success",
                         "generated_at": payload.get("generated_at"),
+                        "target_date": payload.get("target_date"),
+                        "reference_library_refreshed_at": (
+                            payload.get("cache") or {}
+                        ).get("reference_library_refreshed_at"),
                         "targets": len(payload.get("results") or []),
                     }
                 else:
@@ -8040,6 +8657,12 @@ def _run_latest_refresh_job(
             "long_stock_pools": results["long_stock_pool"]["variants"],
         }
         _run_post_snapshot_cache_cleanup(results)
+        publish_dependency_gate(
+            results,
+            expected_signal_date,
+            phase="postflight",
+            strict_freshness=True,
+        )
 
         _set_refresh_progress(
             status="success",
@@ -8320,8 +8943,8 @@ def get_stock_selector_payload(
             "选股器按合并后的策略组聚合命中；同一策略组下相同买入操作只保留综合效果最优的一版，不同买入操作会同时展示，命中按策略组去重计算。",
             "2026-06-14 已统一短线和长线为前复权价格口径；模型训练、标签、策略回测和页面价格展示使用同一套价格体系。",
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
-            "买入分为跨日期可比的 0-100 固定历史分位，模型按未来 5 日最大冲高收益训练，不再混入当日候选名单分位。",
-            "持有分为跨日期可比的 0-100 固定历史分位，以未来 5 日收盘收益排名为主、冲高能力为辅助做多任务训练；分数用于历史排序，不等同于收益承诺。",
+            "买入分使用同一模型版本下跨日期可比的 0-100 固定历史参考标尺；它是未来 5 日最大冲高收益预测的鲁棒映射，不是胜率，也不是直接经验分位。",
+            "持有分使用同一模型版本下跨日期可比的固定历史参考标尺，以未来 5 日收盘收益为主、冲高能力为辅助；分数用于历史排序，不等同于收益承诺。",
             f"前端默认先过滤为可操作候选，再展示保守预期收益分 Top{DEFAULT_SELECTOR_LIMIT}；MySQL 快照仍保存完整规则全集，便于后续复盘和重新训练。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",

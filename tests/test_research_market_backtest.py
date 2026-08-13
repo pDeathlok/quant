@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,13 @@ if str(RESEARCH_DIR) not in sys.path:
 import analyze_b1_entry_exit_grid as entry_exit  # noqa: E402
 from analyze_b1_entry_exit_grid import add_future_prices  # noqa: E402
 from analyze_b1_formal_combos import COMBOS, combo_mask  # noqa: E402
-from refresh_chan_model_live_scores import _build_recent_feature_dataset, _resolve_daily_path  # noqa: E402
+from refresh_chan_model_live_scores import (  # noqa: E402
+    _add_predictions,
+    _build_recent_feature_dataset,
+    _resolve_daily_path,
+)
+from quant.ml.feature_coverage import RequiredFeatureCoverageError  # noqa: E402
+from train_chan_daily_models import select_live_model_features  # noqa: E402
 from quant.data import MarketDataStore, MarketDataStoreConfig  # noqa: E402
 
 
@@ -173,3 +180,98 @@ def test_chan_live_features_read_canonical_market_partitions(tmp_path: Path) -> 
     assert len(result) == 1
     assert result.iloc[0]["symbol"] == "002440.SZ"
     assert pd.notna(result.iloc[0]["ret_20d"])
+
+
+def test_chan_model_feature_contract_excludes_next_day_open_gap() -> None:
+    data = pd.DataFrame(
+        {
+            "entry_gap_pct": [1.0, 2.0],
+            "chan_stroke_amplitude": [0.1, 0.2],
+            "ret_1d": [0.5, -0.2],
+            "chan_score": [90.0, 95.0],
+        }
+    )
+
+    features = select_live_model_features(data, data)
+
+    assert "entry_gap_pct" not in features
+    assert "chan_stroke_amplitude" not in features
+    assert {"ret_1d", "chan_score"} <= set(features)
+
+
+def test_chan_live_prediction_rejects_an_entirely_missing_required_feature() -> None:
+    models = {
+        "target_good": {
+            "features": ["ret_1d", "db_volume_ratio"],
+            "imputer": object(),
+            "model": object(),
+        }
+    }
+
+    with pytest.raises(RequiredFeatureCoverageError, match="db_volume_ratio"):
+        _add_predictions(
+            pd.DataFrame(
+                {
+                    "date": [pd.Timestamp("2026-08-12")],
+                    "ret_1d": [1.0],
+                    "db_volume_ratio": [np.nan],
+                }
+            ),
+            models,
+        )
+
+
+def test_chan_live_turnover_history_comes_from_same_day_daily_basic(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    daily_dir = raw_root / "daily"
+    daily_basic_dir = raw_root / "daily_basic"
+    daily_basic_dir.mkdir(parents=True)
+    dates = pd.bdate_range("2026-01-01", periods=150)
+    close = pd.Series(range(len(dates)), dtype=float) / 100 + 10.0
+    MarketDataStore(MarketDataStoreConfig(backend="parquet", root=raw_root)).write_market_batch(
+        pd.DataFrame(
+            {
+                "ts_code": ["002440.SZ"] * len(dates),
+                "trade_date": dates.strftime("%Y%m%d"),
+                "date": dates,
+                "open": close,
+                "high": close + 0.2,
+                "low": close - 0.2,
+                "close": close,
+                "pre_close": close.shift(1).fillna(close.iloc[0]),
+                "pct_chg": close.pct_change().fillna(0.0) * 100,
+                "vol": 1_000_000.0,
+                "volume": 1_000_000.0,
+                "amount": 10_000_000.0,
+            }
+        )
+    )
+    for offset, current in enumerate(dates[-30:], start=1):
+        pd.DataFrame(
+            {
+                "ts_code": ["002440.SZ"],
+                "trade_date": [current.strftime("%Y%m%d")],
+                "turnover_rate": [float(offset)],
+            }
+        ).to_parquet(daily_basic_dir / f"{current:%Y%m%d}.parquet", index=False)
+    signal_date = dates[-1]
+    candidates = pd.DataFrame(
+        {
+            "symbol": ["002440.SZ"],
+            "date": [signal_date],
+            "signal_chan_daily_long": [1],
+        }
+    )
+
+    result = _build_recent_feature_dataset(
+        candidates,
+        daily_dir,
+        daily_basic_dir,
+        raw_root / "moneyflow",
+        signal_date.strftime("%Y-%m-%d"),
+        signal_date.strftime("%Y-%m-%d"),
+    )
+
+    assert result.iloc[0]["turnover_rate"] == 30.0
+    assert pd.notna(result.iloc[0]["turnover_rate_ma20"])
+    assert pd.notna(result.iloc[0]["turnover_rate_rel20"])

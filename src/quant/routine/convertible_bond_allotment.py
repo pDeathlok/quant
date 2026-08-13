@@ -861,33 +861,50 @@ def _attach_allotment_metrics(records: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _load_basic(refresh: bool = False, fetcher: TushareDataFetcher | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
-    meta: dict[str, Any] = {"source": str(CB_BASIC_PATH), "refreshed": False, "error": None}
+    meta: dict[str, Any] = {
+        "source": str(CB_BASIC_PATH),
+        "refreshed": False,
+        "poll_status": "not_requested",
+        "error": None,
+    }
     if refresh or not CB_BASIC_PATH.exists():
         fetcher = fetcher or TushareDataFetcher(cache_dir=CB_DATA_DIR / "tushare_cache")
         try:
             basic = fetcher.get_cb_basic(list_status="all")
+            basic = basic if isinstance(basic, pd.DataFrame) else pd.DataFrame()
+            meta["poll_status"] = "success"
             if not basic.empty:
                 CB_BASIC_PATH.parent.mkdir(parents=True, exist_ok=True)
                 basic.to_parquet(CB_BASIC_PATH, index=False)
                 meta["refreshed"] = True
                 return basic, meta
         except Exception as exc:
+            meta["poll_status"] = "failed"
             meta["error"] = str(exc)
     return _read_frame(CB_BASIC_PATH), meta
 
 
 def _load_issue(refresh: bool = False, fetcher: TushareDataFetcher | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
-    meta: dict[str, Any] = {"source": str(CB_ISSUE_PATH), "refreshed": False, "available": CB_ISSUE_PATH.exists(), "error": None}
+    meta: dict[str, Any] = {
+        "source": str(CB_ISSUE_PATH),
+        "refreshed": False,
+        "poll_status": "not_requested",
+        "available": CB_ISSUE_PATH.exists(),
+        "error": None,
+    }
     if refresh:
         fetcher = fetcher or TushareDataFetcher(cache_dir=CB_DATA_DIR / "tushare_cache")
         try:
             issue = fetcher.get_cb_issue()
-            if issue is not None and not issue.empty:
+            issue = issue if isinstance(issue, pd.DataFrame) else pd.DataFrame()
+            meta["poll_status"] = "success"
+            if not issue.empty:
                 CB_ISSUE_PATH.parent.mkdir(parents=True, exist_ok=True)
                 issue.to_parquet(CB_ISSUE_PATH, index=False)
                 meta.update({"refreshed": True, "available": True})
                 return issue, meta
         except Exception as exc:
+            meta["poll_status"] = "failed"
             meta["error"] = str(exc)
     frame = _read_frame(CB_ISSUE_PATH)
     meta["available"] = not frame.empty
@@ -898,6 +915,7 @@ def _load_pipeline_candidates(refresh: bool = False, today: date | None = None) 
     meta: dict[str, Any] = {
         "source": str(CB_PIPELINE_PATH),
         "refreshed": False,
+        "poll_status": "not_requested",
         "available": CB_PIPELINE_PATH.exists(),
         "error": None,
     }
@@ -921,6 +939,7 @@ def _load_pipeline_candidates(refresh: bool = False, today: date | None = None) 
                     frames.append(frame)
             announcements = pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
             pipeline = _pipeline_from_announcements(announcements)
+            meta["poll_status"] = "success"
             if not pipeline.empty:
                 CB_PIPELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
                 pipeline.to_parquet(CB_PIPELINE_PATH, index=False)
@@ -928,6 +947,7 @@ def _load_pipeline_candidates(refresh: bool = False, today: date | None = None) 
                 return pipeline, meta
             meta.update({"refreshed": True, "available": False, "raw_rows": int(len(announcements)), "keywords": ["可转债", "可转换公司债券"]})
         except Exception as exc:
+            meta["poll_status"] = "failed"
             meta["error"] = str(exc)
     frame = _read_any_frame(CB_PIPELINE_PATH)
     meta["available"] = not frame.empty
@@ -938,6 +958,7 @@ def _load_cninfo_issue(refresh: bool = False, today: date | None = None) -> tupl
     meta: dict[str, Any] = {
         "source": str(CB_CNINFO_ISSUE_PATH),
         "refreshed": False,
+        "poll_status": "not_requested",
         "available": CB_CNINFO_ISSUE_PATH.exists(),
         "error": None,
     }
@@ -951,12 +972,16 @@ def _load_cninfo_issue(refresh: bool = False, today: date | None = None) -> tupl
                 start_date=start.strftime("%Y%m%d"),
                 end_date=end.strftime("%Y%m%d"),
             )
-            if issue is not None and not issue.empty:
+            issue = issue if isinstance(issue, pd.DataFrame) else pd.DataFrame()
+            meta["poll_status"] = "success"
+            if not issue.empty:
                 CB_CNINFO_ISSUE_PATH.parent.mkdir(parents=True, exist_ok=True)
                 issue.to_parquet(CB_CNINFO_ISSUE_PATH, index=False)
                 meta.update({"refreshed": True, "available": True})
                 return issue, meta
+            meta.update({"refreshed": True, "available": False})
         except Exception as exc:
+            meta["poll_status"] = "failed"
             meta["error"] = str(exc)
     frame = _read_any_frame(CB_CNINFO_ISSUE_PATH)
     meta["available"] = not frame.empty
@@ -1380,6 +1405,30 @@ def _record_date_expired(item: dict[str, Any], today_text: str) -> bool:
     return bool(record_date and record_date < today_text)
 
 
+def _event_poll_contract(
+    *,
+    refresh: bool,
+    today_text: str,
+    sources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    statuses = {
+        name: meta.get("poll_status")
+        for name, meta in sources.items()
+    }
+    status = (
+        "success"
+        if refresh and all(value == "success" for value in statuses.values())
+        else ("failed" if refresh else "not_requested")
+    )
+    return {
+        "event_poll_status": status,
+        "event_poll_sources": statuses,
+        "event_polled_through": (
+            _display_date(today_text) if status == "success" else None
+        ),
+    }
+
+
 def build_convertible_bond_allotment_payload(
     limit: int = 80,
     include_listed_days: int = 90,
@@ -1427,9 +1476,22 @@ def build_convertible_bond_allotment_payload(
     filtered, pipeline_issue_size_meta = _attach_pipeline_issue_sizes(filtered, refresh=refresh, today=today)
     filtered = _attach_allotment_metrics(filtered)
     stage_counts = pd.Series([item["stage"] for item in filtered]).value_counts().to_dict() if filtered else {}
+    event_poll = _event_poll_contract(
+        refresh=refresh,
+        today_text=today_text,
+        sources={
+            "pipeline": pipeline_meta,
+            "cninfo_issue": cninfo_issue_meta,
+            "basic": basic_meta,
+            "issue": issue_meta,
+        },
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "asof": _display_date(today_text),
+        # Event rows may legitimately be empty.  Only completed provider polls
+        # advance this marker; cached fallbacks and caught exceptions do not.
+        **event_poll,
         "stage_scope": stage_scope,
         "records": filtered,
         "stage_counts": {str(key): int(value) for key, value in stage_counts.items()},

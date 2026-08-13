@@ -7,7 +7,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
 
@@ -104,16 +104,26 @@ def _report_periods(end_date: str, count: int) -> list[str]:
     return [(cursor - pd.offsets.QuarterEnd(index)).strftime("%Y%m%d") for index in range(max(1, count))]
 
 
-def refresh_stock_basic(fetcher: TushareDataFetcher, raw_dir: Path) -> dict[str, Any]:
-    # The daily market refresh already checks this 24-hour cache.  Reuse that
-    # result here instead of making the same stock_basic request twice per run.
-    frame = fetcher.get_stock_basic(force_refresh=False)
+def refresh_stock_basic(
+    fetcher: TushareDataFetcher,
+    raw_dir: Path,
+    polled_through: str,
+) -> dict[str, Any]:
+    # stock_basic is an event source: a stale 24-hour cache can still predate
+    # today's listing/status changes.  Force one provider poll here and only
+    # publish the poll watermark after the response passes the universe gate.
+    frame = fetcher.get_stock_basic(force_refresh=True)
     if frame is None or frame.empty:
         raise RuntimeError("Tushare stock_basic returned no rows")
     frame = frame.drop_duplicates("ts_code", keep="last").sort_values("ts_code").reset_index(drop=True)
     path = raw_dir / "stock_basic.parquet"
     _atomic_write_parquet(frame, path)
-    return {"status": "success", "rows": len(frame), "path": str(path)}
+    return {
+        "status": "success",
+        "rows": len(frame),
+        "path": str(path),
+        "polled_through": polled_through,
+    }
 
 
 def refresh_index_daily(fetcher: TushareDataFetcher, raw_dir: Path, end_date: str) -> dict[str, Any]:
@@ -257,10 +267,18 @@ def refresh_financial_periods(
             "errors": errors,
             "path": str(path),
         }
+    status = (
+        "success"
+        if all(item["status"] == "success" for item in results.values())
+        else "partial"
+    )
     return {
-        "status": "success" if all(item["status"] == "success" for item in results.values()) else "partial",
+        "status": status,
         "periods": periods,
         "datasets": results,
+        # An empty response is a successful event poll; any request exception
+        # leaves the aggregate watermark absent even when old cache rows exist.
+        "polled_through": end_date if status == "success" else None,
     }
 
 
@@ -269,16 +287,32 @@ def refresh_long_factor_daily_sources(
     raw_dir: Path,
     audit_dir: Path,
     trade_date: str,
+    *,
+    datasets: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Refresh cheap daily/event sources while leaving full pledge scans low-frequency."""
+    """Refresh only the long-factor datasets requested by active consumers."""
 
-    required_methods = [
-        "trade_cal",
-        "margin_detail",
-        "moneyflow",
-        "top_list",
-        "stk_holdertrade",
-    ]
+    allowed = ("margin_detail", "moneyflow", "top_list", "holder_trade_recent")
+    selected = tuple(dict.fromkeys(datasets if datasets is not None else allowed))
+    unknown = sorted(set(selected) - set(allowed))
+    if unknown:
+        raise ValueError(f"unsupported long-factor refresh datasets: {unknown}")
+    if not selected:
+        return {
+            "status": "skipped",
+            "reason": "no active production consumer requested a long-factor dataset",
+            "datasets": {},
+        }
+
+    method_by_dataset = {
+        "margin_detail": "margin_detail",
+        "moneyflow": "moneyflow",
+        "top_list": "top_list",
+        "holder_trade_recent": "stk_holdertrade",
+    }
+    required_methods = [method_by_dataset[dataset] for dataset in selected]
+    if set(selected) & {"margin_detail", "moneyflow", "top_list"}:
+        required_methods.append("trade_cal")
     missing_methods = [
         method for method in required_methods if not callable(getattr(fetcher.pro, method, None))
     ]
@@ -295,8 +329,12 @@ def refresh_long_factor_daily_sources(
         ),
     )
     datasets: dict[str, Any] = {}
-    for dataset in ("margin_detail", "moneyflow", "top_list"):
-        datasets[dataset] = backfill_trade_date_partitions(
+    for dataset in (
+        dataset
+        for dataset in ("margin_detail", "moneyflow", "top_list")
+        if dataset in selected
+    ):
+        dataset_result = backfill_trade_date_partitions(
             fetcher.pro,
             dataset,
             trade_date,
@@ -305,14 +343,18 @@ def refresh_long_factor_daily_sources(
             audit_dir,
             policy=policy,
         )
-    datasets["holder_trade_recent"] = refresh_holder_trade_recent(
-        fetcher.pro,
-        trade_date,
-        raw_dir,
-        audit_dir,
-        lookback_days=max(1, int(os.getenv("ROUTINE_HOLDER_TRADE_LOOKBACK_DAYS", "45"))),
-        policy=policy,
-    )
+        if dataset_result.get("status") == "success":
+            dataset_result["polled_through"] = trade_date
+        datasets[dataset] = dataset_result
+    if "holder_trade_recent" in selected:
+        datasets["holder_trade_recent"] = refresh_holder_trade_recent(
+            fetcher.pro,
+            trade_date,
+            raw_dir,
+            audit_dir,
+            lookback_days=max(1, int(os.getenv("ROUTINE_HOLDER_TRADE_LOOKBACK_DAYS", "45"))),
+            policy=policy,
+        )
     statuses = {item.get("status") for item in datasets.values()}
     status = (
         "failed"
@@ -332,6 +374,10 @@ def refresh_reference_data(
     financial_periods: int | None = None,
     force_financials: bool = False,
     include_long_factor_sources: bool = True,
+    long_factor_datasets: Iterable[str] | None = None,
+    include_stock_basic: bool = True,
+    include_index: bool = True,
+    include_tradability: bool = True,
     state_path: Path | None = None,
 ) -> dict[str, Any]:
     """Refresh all non-daily inputs with bounded, idempotent requests."""
@@ -342,10 +388,27 @@ def refresh_reference_data(
     audit_dir = audit_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_reference_data"
     audit_dir.mkdir(parents=True, exist_ok=True)
     stock_basic_frame: pd.DataFrame | None = None
-    for name, operation in [
-        ("stock_basic", lambda: refresh_stock_basic(fetcher, raw_dir)),
-        ("index_000300", lambda: refresh_index_daily(fetcher, raw_dir, end_date)),
-    ]:
+    operations = []
+    if include_stock_basic:
+        operations.append(
+            (
+                "stock_basic",
+                lambda: refresh_stock_basic(fetcher, raw_dir, end_date),
+            )
+        )
+    else:
+        steps["stock_basic"] = {
+            "status": "skipped",
+            "reason": "not required for this refresh scope",
+        }
+    if include_index:
+        operations.append(("index_000300", lambda: refresh_index_daily(fetcher, raw_dir, end_date)))
+    else:
+        steps["index_000300"] = {
+            "status": "skipped",
+            "reason": "not required for this refresh scope",
+        }
+    for name, operation in operations:
         try:
             steps[name] = operation()
             if name == "stock_basic":
@@ -353,7 +416,12 @@ def refresh_reference_data(
         except Exception as exc:
             steps[name] = {"status": "failed", "error": str(exc)}
             critical_errors.append(f"{name}: {exc}")
-    if stock_basic_frame is None:
+    if not include_tradability:
+        steps["tradability"] = {
+            "status": "skipped",
+            "reason": "no active production consumer",
+        }
+    elif stock_basic_frame is None:
         steps["tradability"] = {
             "status": "failed",
             "error": "stock_basic is unavailable",
@@ -370,13 +438,19 @@ def refresh_reference_data(
         except Exception as exc:
             steps["tradability"] = {"status": "failed", "error": str(exc)}
             critical_errors.append(f"tradability: {exc}")
-    if include_long_factor_sources:
+    selected_long_datasets = (
+        None
+        if long_factor_datasets is None
+        else tuple(dict.fromkeys(str(value) for value in long_factor_datasets))
+    )
+    if include_long_factor_sources and selected_long_datasets != ():
         try:
             steps["long_factor_sources"] = refresh_long_factor_daily_sources(
                 fetcher,
                 raw_dir,
                 audit_dir,
                 end_date,
+                datasets=selected_long_datasets,
             )
         except Exception as exc:
             steps["long_factor_sources"] = {"status": "failed", "error": str(exc)}
@@ -397,6 +471,7 @@ def refresh_reference_data(
             "status": "skipped",
             "reason": "successful financial refresh for this trade date already completed today",
             "checkpoint": str(effective_state_path),
+            "polled_through": end_date,
         }
     elif include_financials:
         steps["financials"] = refresh_financial_periods(
@@ -408,14 +483,16 @@ def refresh_reference_data(
         )
     else:
         steps["financials"] = {"status": "skipped", "reason": "not required for this refresh scope"}
+    index_status = steps["index_000300"].get("status")
     financial_status = steps["financials"].get("status")
     long_factor_status = steps["long_factor_sources"].get("status")
     status = (
         "failed"
-        if critical_errors
+        if critical_errors or (include_index and index_status == "failed")
         else (
             "partial"
-            if financial_status == "partial"
+            if (include_index and index_status != "success")
+            or financial_status == "partial"
             or long_factor_status in {"failed", "partial", "deferred"}
             else "success"
         )

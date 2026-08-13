@@ -2,6 +2,9 @@ release:
   id: b1-20260722
   lifecycle: production
   consumer: quant.routine.b1_daily_plan
+  dependency_nodes:
+    - score.b1
+    - product.b1_plan
   model_dir: models/production/b1
   model_manifest: models/production/b1/manifest.json
   model_names:

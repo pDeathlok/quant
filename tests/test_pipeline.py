@@ -9,6 +9,18 @@ import pytest
 from quant.routine import pipeline
 
 
+def test_daily_basic_incremental_start_revalidates_rolling_window(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    daily_basic_dir = tmp_path / "data/raw/daily_basic"
+    daily_basic_dir.mkdir(parents=True)
+    (daily_basic_dir / "20260812.parquet").touch()
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+
+    assert pipeline._incremental_daily_basic_start() == "20260628"
+
+
 def test_refresh_daily_basic_reports_partial_failure(monkeypatch) -> None:
     monkeypatch.setattr(pipeline, "_incremental_daily_basic_start", lambda: "20260720")
     monkeypatch.setattr(
@@ -113,6 +125,7 @@ def test_analyst_snapshot_reuses_today_checkpoint(monkeypatch, tmp_path) -> None
 
     assert result["status"] == "skipped"
     assert result["latest_report_date"] == today.date().isoformat()
+    assert result["polled_through"] == today.date().isoformat()
 
 
 def test_daily_analyst_refresh_fetches_broker_reports_for_long_candidates(monkeypatch, tmp_path) -> None:
@@ -189,6 +202,8 @@ def test_daily_analyst_timeout_uses_last_known_good_research(monkeypatch, tmp_pa
     assert step["status"] == "degraded"
     assert step["returncode"] == 124
     assert step["fallback_symbols"] == 1
+    assert step["polled_through"] is None
+    assert result["polled_through"] == today.date().isoformat()
     assert not (tmp_path / "data/raw/analyst_research_refresh_status.json").exists()
 
 
@@ -247,6 +262,7 @@ def test_daily_analyst_low_ratio_research_failures_are_isolated(monkeypatch, tmp
     assert step["failed_symbols"] == [symbols[-1]]
     assert step["failure_rate"] < step["soft_failure_threshold"]
     assert "isolated low-ratio" in step["warning"]
+    assert step["polled_through"] is None
 
 
 def test_daily_analyst_no_data_research_symbols_are_not_degraded(monkeypatch, tmp_path) -> None:
@@ -305,6 +321,37 @@ def test_daily_analyst_no_data_research_symbols_are_not_degraded(monkeypatch, tm
     assert step["degraded_symbols"] == []
     assert step["failure_rate"] == 0.0
     assert step["warning"] is None
+    assert step["polled_through"] == today.date().isoformat()
+
+
+def test_analyst_consensus_fallback_does_not_advance_poll_watermark(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    output = tmp_path / "data/raw/analyst_forecasts.parquet"
+    output.parent.mkdir(parents=True)
+    prior = pd.Timestamp.now().normalize() - pd.Timedelta(days=1)
+    pd.DataFrame(
+        {
+            "source": ["akshare_em_snapshot"],
+            "ts_code": ["000001.SZ"],
+            "report_date": [prior],
+        }
+    ).to_parquet(output, index=False)
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "provider unavailable"
+
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(pipeline.subprocess, "run", lambda command, **kwargs: Result())
+
+    result = pipeline._refresh_analyst_forecast_snapshot()
+
+    assert result["status"] == "degraded"
+    assert result["polled_through"] is None
+    assert result["steps"]["consensus_snapshot"]["polled_through"] is None
 
 
 def test_daily_candidate_report_refresh_requires_explicit_external_opt_in(monkeypatch, tmp_path) -> None:
@@ -486,6 +533,46 @@ def test_pipeline_subprocesses_stay_in_web_service_process_group(
     assert "start_new_session" not in captured[0]
 
 
+def test_refresh_data_reports_market_availability_retry_progress(monkeypatch) -> None:
+    progress: list[tuple[int, str]] = []
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs) -> None:
+            assert command[command.index("--availability-retry-failures") + 1] == "12"
+            assert command[command.index("--availability-retry-interval") + 1] == "300"
+            self.stdout = io.StringIO(
+                "\n".join(
+                    [
+                        "market daily availability retry: trade_date=20260803 "
+                        "failed_attempts=1/12 retry_in_seconds=300 error=not ready",
+                        json.dumps(
+                            {
+                                "status": "success",
+                                "expected_trade_date": "20260803",
+                                "dataset_trade_date": "20260803",
+                            }
+                        ),
+                    ]
+                )
+            )
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260731")
+
+    result = pipeline.refresh_data(
+        dry_run=False,
+        progress_callback=lambda percent, message: progress.append((percent, message)),
+    )
+
+    assert result["status"] == "success"
+    assert progress == [
+        (10, "20260803 日线尚未完整发布；已失败 1/12 次，300 秒后重试")
+    ]
+
+
 def test_strategy_signal_cache_reports_family_and_z_skill_progress(monkeypatch) -> None:
     progress: list[tuple[int, str]] = []
 
@@ -534,6 +621,7 @@ def test_model_scoring_uses_batched_processes_and_exposes_manifest(
         stdout = json.dumps(
             {
                 "status": "success",
+                "target_date": "2026-08-12",
                 "executor_type": "processes",
                 "batch_size": 8,
                 "feature_elapsed_seconds": 73.4,
@@ -547,12 +635,15 @@ def test_model_scoring_uses_batched_processes_and_exposes_manifest(
         return Result()
 
     monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260812")
     monkeypatch.setenv("ROUTINE_MODEL_SCORE_EXECUTOR", "processes")
     monkeypatch.setenv("ROUTINE_MODEL_SCORE_BATCH_SIZE", "8")
 
     result = pipeline.score_latest_models(workers=4)
 
-    assert captured[-6:] == [
+    assert captured[-8:] == [
+        "--target-date",
+        "2026-08-12",
         "--workers",
         "4",
         "--executor",
@@ -564,6 +655,30 @@ def test_model_scoring_uses_batched_processes_and_exposes_manifest(
     assert result["executor_type"] == "processes"
     assert result["feature_elapsed_seconds"] == 73.4
     assert result["script_elapsed_seconds"] == 76.8
+    assert result["expected_trade_date"] == "2026-08-12"
+    assert result["scored_trade_date"] == "2026-08-12"
+
+
+def test_model_scoring_rejects_a_stale_success_manifest(monkeypatch) -> None:
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "status": "success",
+                "target_date": "2026-08-11",
+                "feature_coverage": {"status": "valid"},
+            }
+        )
+        stderr = ""
+
+    monkeypatch.setattr(pipeline.subprocess, "run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260812")
+
+    result = pipeline.score_latest_models(workers=1)
+
+    assert result["status"] == "failed"
+    assert result["expected_trade_date"] == "2026-08-12"
+    assert result["scored_trade_date"] == "2026-08-11"
 
 
 def test_run_selected_strategies_uses_packaged_module(monkeypatch) -> None:
@@ -625,7 +740,20 @@ def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, 
     monkeypatch.setattr(
         pipeline,
         "refresh_reference_inputs",
-        lambda dry_run, include_financials: call_order.append("reference") or {"status": "success"},
+        lambda *args, **kwargs: call_order.append("reference") or {"status": "success"},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "resolve_daily_dependency_source_options",
+        lambda scope: {
+            "include_financials": False,
+            "include_analyst": False,
+            "include_stock_basic": False,
+            "include_index": False,
+            "include_market_regime": False,
+            "include_tradability": False,
+            "long_factor_datasets": (),
+        },
     )
     monkeypatch.setattr(
         pipeline,

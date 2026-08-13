@@ -10,6 +10,9 @@
 release:
   lifecycle: production
   consumer: quant.strategies.custom.triple_volume_breakout
+  dependency_nodes:
+    - feature.strategy_signals
+    - product.selector_extended
 
 strategy:
   id: triple_volume_breakout

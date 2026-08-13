@@ -21,6 +21,30 @@ DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
 DAILY_BASIC_DIR = PROJECT_ROOT / "data/raw/daily_basic"
 AUDIT_ROOT = PROJECT_ROOT / "data/raw/source_audit"
 
+# These are the raw daily_basic columns consumed by the production B1 and Chan
+# feature builders. Row-count coverage alone is insufficient: Tushare can
+# return a full stock cross-section while selected fields are entirely null.
+# Dividend yield is naturally sparse, hence its lower (but still non-zero)
+# threshold; the remaining market/share fields should cover virtually all
+# listed stocks on the decision date.
+DAILY_BASIC_FEATURE_COVERAGE: dict[str, float] = {
+    "turnover_rate": 0.98,
+    "turnover_rate_f": 0.98,
+    "volume_ratio": 0.95,
+    "pe": 0.70,
+    "pe_ttm": 0.70,
+    "pb": 0.95,
+    "ps": 0.95,
+    "ps_ttm": 0.95,
+    "dv_ratio": 0.50,
+    "dv_ttm": 0.50,
+    "total_share": 0.98,
+    "float_share": 0.98,
+    "free_share": 0.98,
+    "total_mv": 0.98,
+    "circ_mv": 0.98,
+}
+
 
 def load_trade_dates_from_daily(daily_dir: Path, start_date: str, end_date: str | None) -> list[str]:
     return sorted(load_trade_date_symbol_counts(daily_dir, start_date, end_date))
@@ -59,23 +83,55 @@ def fetch_one_trade_date(
     retry_max_delay: float,
     expected_rows: int | None = None,
     minimum_coverage_rate: float = 0.98,
+    availability_retry_failures: int = 0,
+    availability_retry_interval: float = 60.0,
 ) -> dict:
     attempts = max(1, retries + 1)
+    maximum_attempts = attempts + max(0, availability_retry_failures)
     last_error = ""
     output_path = output_dir / f"{trade_date}.parquet"
-    for attempt in range(1, attempts + 1):
+    minimum_rows = max(
+        1,
+        math.ceil((expected_rows or 1) * minimum_coverage_rate),
+    )
+    if output_path.exists():
+        try:
+            local = validate_daily_basic_frame(
+                pd.read_parquet(output_path),
+                trade_date,
+                minimum_rows=minimum_rows,
+                required_feature_coverage=DAILY_BASIC_FEATURE_COVERAGE,
+            )
+        except Exception:
+            # Keep the last file recoverable until a complete replacement has
+            # been fetched and atomically written below.
+            pass
+        else:
+            return {
+                "trade_date": trade_date,
+                "source": "local_validated",
+                "status": "success",
+                "rows": len(local),
+                "expected_rows": expected_rows,
+                "minimum_rows": minimum_rows,
+                "coverage_rate": (
+                    round(len(local) / expected_rows, 6) if expected_rows else None
+                ),
+                "feature_coverage": local.attrs.get("feature_coverage", {}),
+                "path": str(output_path),
+                "attempts": 0,
+                "error": None,
+            }
+    for attempt in range(1, maximum_attempts + 1):
         try:
             limiter.wait()
             fetcher = TushareDataFetcher(cache_dir=cache_dir)
-            minimum_rows = max(
-                1,
-                math.ceil((expected_rows or 1) * minimum_coverage_rate),
-            )
             try:
                 df = validate_daily_basic_frame(
                     fetcher.get_daily_basic(trade_date),
                     trade_date,
                     minimum_rows=minimum_rows,
+                    required_feature_coverage=DAILY_BASIC_FEATURE_COVERAGE,
                 )
             except ValueError:
                 # The fetcher's basic schema check intentionally accepts small
@@ -96,6 +152,7 @@ def fetch_one_trade_date(
                 "coverage_rate": (
                     round(len(df) / expected_rows, 6) if expected_rows else None
                 ),
+                "feature_coverage": df.attrs.get("feature_coverage", {}),
                 "path": str(output_path),
                 "attempts": attempt,
                 "error": None,
@@ -103,7 +160,11 @@ def fetch_one_trade_date(
         except Exception as exc:
             last_error = str(exc)
             retryable = _is_retryable_error(last_error) or "daily_basic" in last_error
-            if attempt >= attempts or not retryable:
+            availability_retry = (
+                "feature coverage" in last_error
+                and attempt <= availability_retry_failures
+            )
+            if attempt >= maximum_attempts or (not retryable and not availability_retry):
                 return {
                     "trade_date": trade_date,
                     "source": "tushare",
@@ -113,14 +174,17 @@ def fetch_one_trade_date(
                     "attempts": attempt,
                     "error": last_error,
                 }
-            time.sleep(min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1))))
+            if availability_retry:
+                time.sleep(max(0.0, availability_retry_interval))
+            else:
+                time.sleep(min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1))))
     return {
         "trade_date": trade_date,
         "source": "tushare",
         "status": "failed",
         "rows": 0,
         "path": str(output_path),
-        "attempts": attempts,
+        "attempts": maximum_attempts,
         "error": last_error or "unknown error",
     }
 
@@ -147,6 +211,12 @@ def refresh_daily_basic(
     minimum_coverage_rate = float(
         os.getenv("ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE", "0.98")
     )
+    availability_retry_failures = int(
+        os.getenv("ROUTINE_DAILY_BASIC_AVAILABILITY_RETRY_FAILURES", "2")
+    )
+    availability_retry_interval = float(
+        os.getenv("ROUTINE_DAILY_BASIC_AVAILABILITY_RETRY_INTERVAL", "60")
+    )
     if not 0 < minimum_coverage_rate <= 1:
         raise ValueError(
             "ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE must be in (0, 1]"
@@ -168,6 +238,8 @@ def refresh_daily_basic(
                 retry_max_delay,
                 expected_rows_by_date.get(trade_date),
                 minimum_coverage_rate,
+                availability_retry_failures if trade_date == max(trade_dates) else 0,
+                availability_retry_interval,
             )
             for trade_date in trade_dates
         ]
@@ -194,6 +266,9 @@ def refresh_daily_basic(
         "trade_dates": len(trade_dates),
         "latest_trade_date": max(trade_dates),
         "minimum_coverage_rate": minimum_coverage_rate,
+        "required_feature_coverage": DAILY_BASIC_FEATURE_COVERAGE,
+        "availability_retry_failures": availability_retry_failures,
+        "availability_retry_interval_seconds": availability_retry_interval,
         "success": int((audit_df["status"] == "success").sum()),
         "failed": int((audit_df["status"] == "failed").sum()),
         "workers": workers,

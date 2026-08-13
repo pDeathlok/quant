@@ -17,6 +17,7 @@ from quant.features.project_factor_layer import (
     LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
     PROJECT_FACTOR_SCHEMA_VERSION,
 )
+from quant.ml.feature_coverage import validate_required_feature_coverage
 from quant.routine.paths import CONFIG_PATH, PROJECT_ROOT, ROUTINE_DIR, WEB_DATA_DIR
 from quant.routine.strategies import ExitConfig, StrategyConfig, StrategyRelease, load_strategy_release
 
@@ -128,6 +129,7 @@ def predict_models(
         # Released pre-v4 caches did not carry schema metadata. Their only
         # valid interpretation is the legacy latest-scale/global-rank schema.
         candidate_schema = LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+    loaded_models: list[tuple[str, Path, Any]] = []
     for model_name in model_names:
         model_path = model_dir / f"{model_name}.joblib"
         model = joblib.load(model_path)
@@ -141,14 +143,37 @@ def predict_models(
                 f"{model_path} model={model_schema} candidates={candidate_schema}; "
                 f"current_research={PROJECT_FACTOR_SCHEMA_VERSION}"
             )
+        loaded_models.append((model_name, model_path, model))
+
+    required_features = list(
+        dict.fromkeys(
+            str(feature)
+            for _, _, model in loaded_models
+            for feature in getattr(model, "feature_names_in_", [])
+        )
+    )
+    if not required_features:
+        raise RuntimeError("Released B1 models declare no required features")
+    target_date = (
+        pd.to_datetime(out["date"], errors="coerce").max()
+        if "date" in out.columns
+        else None
+    )
+    feature_coverage = validate_required_feature_coverage(
+        out,
+        required_features,
+        target_date=target_date,
+        context="B1 daily plan scoring",
+    )
+
+    for model_name, _, model in loaded_models:
         feature_cols = list(model.feature_names_in_)
-        missing = [col for col in feature_cols if col not in out.columns]
-        if missing:
-            raise ValueError(f"{model_path} 缺少特征列: {missing[:20]}")
         features = out[feature_cols].replace([np.inf, -np.inf], np.nan)
         out[f"pred_{model_name}"] = model.predict_proba(features)[:, 1]
     prediction_columns = [f"pred_{name}" for name in model_names]
-    return out.dropna(subset=prediction_columns).copy()
+    result = out.dropna(subset=prediction_columns).copy()
+    result.attrs["feature_coverage"] = feature_coverage
+    return result
 
 
 def _thresholds(strategy: StrategyConfig) -> EntryThresholds:
@@ -342,12 +367,14 @@ def build_daily_plan(
         latest = latest[
             ~names.str.upper().str.contains("ST") & ~names.str.contains("退")
         ].copy()
+    feature_coverage: dict[str, Any] | None = None
     if not latest.empty:
         latest = predict_models(
             latest,
             model_dir=model_dir,
             model_names=release.model_names,
         )
+        feature_coverage = dict(latest.attrs["feature_coverage"])
 
     plan_rows: list[pd.DataFrame] = []
     for strategy in release.strategies:
@@ -398,6 +425,7 @@ def build_daily_plan(
         "signal_date": target_date.strftime("%Y-%m-%d"),
         "execution_date": "下一个交易日",
         "release_id": release.id,
+        "feature_coverage": feature_coverage,
         "source": {
             "feature_path": str(feature_path),
             "strategy_config_path": str(config_path),

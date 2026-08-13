@@ -5,7 +5,10 @@ from pathlib import Path
 import pandas as pd
 
 from quant.data.tushare_fetcher import TushareDataFetcher
-from quant.routine.reference_data_refresh import refresh_reference_data
+from quant.routine.reference_data_refresh import (
+    refresh_financial_periods,
+    refresh_reference_data,
+)
 
 
 class FakePro:
@@ -150,7 +153,15 @@ def test_reference_refresh_is_idempotent_and_updates_every_dataset(tmp_path: Pat
 
     assert first["status"] == "success"
     assert second["status"] == "success"
-    assert fetcher.force_refresh is False
+    assert fetcher.force_refresh is True
+    assert first["steps"]["stock_basic"]["polled_through"] == "20260721"
+    assert first["steps"]["financials"]["polled_through"] == "20260721"
+    assert (
+        first["steps"]["long_factor_sources"]["datasets"]["top_list"][
+            "polled_through"
+        ]
+        == "20260721"
+    )
     assert len(pd.read_parquet(raw_dir / "stock_basic.parquet")) == 1
     assert len(pd.read_parquet(raw_dir / "index_000300.SH.parquet")) == 2
     assert len(pd.read_parquet(raw_dir / "fina_indicator.parquet")) == 1
@@ -166,6 +177,47 @@ def test_reference_refresh_is_idempotent_and_updates_every_dataset(tmp_path: Pat
     assert not pd.read_parquet(raw_dir / "fina_indicator.parquet").duplicated(["ts_code", "ann_date", "end_date"]).any()
     assert second["steps"]["financials"]["status"] == "skipped"
     assert "already completed today" in second["steps"]["financials"]["reason"]
+    assert second["steps"]["financials"]["polled_through"] == "20260721"
+
+
+def test_financial_empty_poll_advances_but_exception_does_not(
+    tmp_path: Path,
+) -> None:
+    class EmptyPro:
+        def fina_indicator_vip(self, **kwargs):
+            return pd.DataFrame()
+
+        def income_vip(self, **kwargs):
+            return pd.DataFrame()
+
+        def cashflow_vip(self, **kwargs):
+            return pd.DataFrame()
+
+    empty = refresh_financial_periods(
+        type("Fetcher", (), {"pro": EmptyPro()})(),
+        tmp_path / "empty",
+        "20260721",
+        period_count=1,
+        sleep_seconds=0,
+    )
+
+    assert empty["status"] == "success"
+    assert empty["polled_through"] == "20260721"
+
+    class PartialPro(EmptyPro):
+        def income_vip(self, **kwargs):
+            raise RuntimeError("provider unavailable")
+
+    partial = refresh_financial_periods(
+        type("Fetcher", (), {"pro": PartialPro()})(),
+        tmp_path / "partial",
+        "20260721",
+        period_count=1,
+        sleep_seconds=0,
+    )
+
+    assert partial["status"] == "partial"
+    assert partial["polled_through"] is None
 
 
 def test_reference_refresh_can_skip_financials(tmp_path: Path) -> None:
@@ -179,6 +231,30 @@ def test_reference_refresh_can_skip_financials(tmp_path: Path) -> None:
 
     assert result["status"] == "success"
     assert result["steps"]["financials"]["status"] == "skipped"
+
+
+def test_reference_refresh_reports_partial_when_index_is_stale(tmp_path: Path) -> None:
+    fetcher = FakeFetcher()
+    fetcher.pro.index_daily = lambda **kwargs: pd.DataFrame(
+        {
+            "ts_code": ["000300.SH"],
+            "trade_date": ["20260720"],
+            "close": [4500.0],
+        }
+    )
+
+    result = refresh_reference_data(
+        "20260721",
+        include_financials=False,
+        include_long_factor_sources=False,
+        fetcher=fetcher,
+        raw_dir=tmp_path / "raw",
+        audit_root=tmp_path / "audit",
+    )
+
+    assert result["status"] == "partial"
+    assert result["steps"]["index_000300"]["status"] == "partial"
+    assert result["steps"]["index_000300"]["latest_trade_date"] == "20260720"
 
 
 def test_stock_basic_cache_obeys_ttl_and_force_refresh(tmp_path: Path) -> None:

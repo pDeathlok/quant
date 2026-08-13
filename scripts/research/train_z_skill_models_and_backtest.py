@@ -53,6 +53,7 @@ from quant.features.variable_library import (
     build_continuous_ohlc,
     build_latest_scale_ohlc,
 )
+from quant.ml.feature_coverage import model_feature_history_start
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
 
@@ -278,7 +279,7 @@ def _process_daily_for_dataset(args: tuple[str, pd.DataFrame, list[str], str]) -
         daily = read_partitioned_symbol_file(path)
         daily = normalize_tushare_daily(daily, path.stem)
         daily = daily.sort_values("date").reset_index(drop=True)
-        history_start = pd.Timestamp(start_date) - pd.Timedelta(days=450)
+        history_start = model_feature_history_start(start_date)
         daily = daily[daily["date"] >= history_start].reset_index(drop=True)
         if len(daily) < 130:
             return None

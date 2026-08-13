@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from quant.features.market_regime import classify_market_regime
 
@@ -57,3 +58,32 @@ def test_market_regime_rejects_insufficient_history() -> None:
 
     with np.testing.assert_raises_regex(ValueError, "at least 60"):
         classify_market_regime(index, market)
+
+
+def test_market_regime_rejects_mismatched_terminal_observation_dates() -> None:
+    market = _market_frame()
+    dates = sorted(market["trade_date"].unique())
+    index = (
+        market.loc[market["ts_code"] == "000001.SZ", ["trade_date", "close"]]
+        .iloc[:-1]
+        .assign(ts_code="000300.SH")
+    )
+
+    with pytest.raises(ValueError, match="terminal observation dates differ"):
+        classify_market_regime(index, market, as_of=dates[-1])
+
+
+def test_market_regime_rejects_inputs_stale_for_requested_decision_date() -> None:
+    market = _market_frame()
+    dates = sorted(market["trade_date"].unique())
+    stale_market = market.loc[market["trade_date"] < dates[-1]].copy()
+    index = (
+        stale_market.loc[
+            stale_market["ts_code"] == "000001.SZ",
+            ["trade_date", "close"],
+        ]
+        .assign(ts_code="000300.SH")
+    )
+
+    with pytest.raises(ValueError, match="requested decision date"):
+        classify_market_regime(index, stale_market, as_of=dates[-1])

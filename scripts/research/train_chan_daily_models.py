@@ -85,6 +85,32 @@ BASE_FEATURES = [
     "db_pb_pct_rank",
 ]
 
+# The model is scored after the signal-date close.  ``entry_gap_pct`` depends
+# on the next session's open and is therefore useful for trade execution
+# analysis, but it is not a live model feature and must never enter training.
+LIVE_UNAVAILABLE_FEATURES = {
+    "entry_gap_pct",
+    # Historical candidate datasets recorded this value only on a stroke's
+    # endpoint (~11% coverage), while live signals occur on later bars.  The
+    # signal builder now carries the point-in-time value forward, but existing
+    # production models must be retrained without the incompatible legacy
+    # column before it can be reconsidered in a fully rebuilt dataset.
+    "chan_stroke_amplitude",
+}
+
+
+def select_live_model_features(
+    data: pd.DataFrame,
+    train_part: pd.DataFrame,
+) -> list[str]:
+    return [
+        column
+        for column in BASE_FEATURES
+        if column not in LIVE_UNAVAILABLE_FEATURES
+        and column in data.columns
+        and train_part[column].notna().any()
+    ]
+
 
 def read_daily_file(path: Path) -> pd.DataFrame:
     df = read_partitioned_symbol_file(path)
@@ -220,8 +246,8 @@ def build_feature_dataset(
 
     for col in ["top_list_count", "top_net_amount_ratio", "top_net_rate"]:
         if col not in data.columns:
-            data[col] = np.nan
-    data["top_list_count"] = data["top_list_count"].fillna(0)
+            data[col] = 0.0
+        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0.0)
     data = add_candidate_cross_section_ranks(data)
     data = assign_stock_time_splits(data)
     return data.replace([np.inf, -np.inf], np.nan)
@@ -365,7 +391,18 @@ def train_model(data: pd.DataFrame, target: str, features: list[str], model_dir:
         metrics[f"{split}_rows"] = int(len(part))
         metrics[f"{split}_positive_rate"] = float(part[target].mean())
     model_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": model, "imputer": imputer, "features": features, "target": target}, model_dir / f"{target}.joblib")
+    joblib.dump(
+        {
+            "model": model,
+            "imputer": imputer,
+            "features": features,
+            "target": target,
+            "feature_availability": "signal_date_close",
+            "excluded_non_live_features": sorted(LIVE_UNAVAILABLE_FEATURES),
+            "trained_at": datetime.now().isoformat(timespec="seconds"),
+        },
+        model_dir / f"{target}.joblib",
+    )
     return model, imputer, metrics
 
 
@@ -493,11 +530,12 @@ def run(args: argparse.Namespace) -> None:
         data.to_parquet(dataset_path, index=False)
         data.to_csv(args.output_dir / "chan_model_dataset_sample.csv", index=False)
 
+    for column in ["top_list_count", "top_net_amount_ratio", "top_net_rate"]:
+        if column in data.columns:
+            data[column] = pd.to_numeric(data[column], errors="coerce").fillna(0.0)
+
     train_part = data[data["split"].eq("train")]
-    features = [
-        col for col in BASE_FEATURES
-        if col in data.columns and train_part[col].notna().any()
-    ]
+    features = select_live_model_features(data, train_part)
     models = {}
     model_metrics = {}
     for target in ["target_win10", "target_big10", "target_good"]:

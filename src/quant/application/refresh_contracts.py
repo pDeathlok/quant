@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+
 
 REFRESH_SCOPE_LABELS = {
     "all": "全部工作区",
@@ -14,39 +16,12 @@ REFRESH_SCOPE_LABELS = {
     "similar": "自选池",
 }
 
+# Compatibility export used by the Web progress UI.  The dependency registry
+# is the source of truth; this is a derived presentation view, not a second
+# hand-maintained workflow definition.
 REFRESH_SCOPE_STEPS = {
-    "all": [
-        "refresh_data",
-        "feature_cache",
-        "daily_plan",
-        "signal_cache",
-        "model_score",
-        "selector_core",
-        "selector_extended",
-        "chan_model_strategy",
-        "long_stock_pool",
-        "convertible_bond_plan",
-        "convertible_bond_allotment",
-        "byd_daily_plan",
-        "similar_patterns",
-        "snapshot",
-    ],
-    "short": [
-        "refresh_data",
-        "feature_cache",
-        "daily_plan",
-        "signal_cache",
-        "model_score",
-        "selector_core",
-        "selector_extended",
-        "snapshot",
-    ],
-    "chan": ["refresh_data", "chan_model_strategy"],
-    "long": ["refresh_data", "long_stock_pool"],
-    "cb": ["refresh_data", "convertible_bond_plan"],
-    "cbAllotment": ["refresh_data", "convertible_bond_allotment"],
-    "byd": ["refresh_data", "byd_daily_plan"],
-    "similar": ["similar_patterns"],
+    scope: list(DEFAULT_DAILY_DEPENDENCY_REGISTRY.progress_steps(scope))
+    for scope in DEFAULT_DAILY_DEPENDENCY_REGISTRY.scope_roots
 }
 
 REFRESH_STEP_DEFINITIONS = {

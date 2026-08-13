@@ -253,6 +253,8 @@ def _merge_incremental_cache(
     cached: pd.DataFrame | None,
     frames: list[pd.DataFrame],
     rebuild_from: pd.Timestamp,
+    *,
+    empty_columns: set[str] | None = None,
 ) -> pd.DataFrame:
     recent = (
         pd.concat(frames, ignore_index=True, sort=False)
@@ -269,7 +271,13 @@ def _merge_incremental_cache(
     )
     combined = pd.concat([old, recent], ignore_index=True, sort=False)
     if combined.empty:
-        raise RuntimeError("signal cache rebuild produced no rows")
+        # A completed market scan can legitimately produce no rule hits.  The
+        # target-day manifest, rather than a candidate row, is the freshness
+        # truth for that case.  Keep a schema-bearing parquet so downstream
+        # readers can still load the empty candidate set deterministically.
+        return pd.DataFrame(
+            columns=["symbol", "date", *sorted(empty_columns or set())]
+        )
     return (
         combined.dropna(subset=["symbol", "date"])
         .sort_values(["symbol", "date"])
@@ -390,11 +398,13 @@ def main() -> None:
         family_cached,
         family_frames,
         rebuild_from,
+        empty_columns=family_columns,
     )
     extended = _merge_incremental_cache(
         extended_cached,
         extended_frames,
         rebuild_from,
+        empty_columns=extended_columns,
     )
     b1_gate_cached = (
         pd.read_parquet(args.b1_gate_cache)
@@ -432,23 +442,42 @@ def main() -> None:
     atomic_write_parquet(family, family_rules.SIGNAL_CACHE, index=False)
     atomic_write_parquet(extended, z_skills.SIGNAL_CACHE, index=False)
     atomic_write_parquet(b1_gate, args.b1_gate_cache, index=False)
-    atomic_write_json(
-        {
-            "status": "success",
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "incremental_start_date": rebuild_from.strftime("%Y-%m-%d"),
-            "processed_through_date": processed_through.strftime("%Y-%m-%d"),
-            "source_symbol_count": len(tasks),
-            "candidate_rows": int(len(recent_b1_gate)),
-            "candidate_symbols": int(
-                recent_b1_gate["symbol"].nunique()
-                if not recent_b1_gate.empty
-                else 0
-            ),
-            "factor_mode": args.factor_mode,
-        },
-        args.b1_gate_manifest,
-    )
+    target_date = processed_through.normalize()
+
+    def target_symbols(frame: pd.DataFrame) -> set[str]:
+        if frame.empty or not {"symbol", "date"} <= set(frame.columns):
+            return set()
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        return set(
+            frame.loc[dates.eq(target_date), "symbol"].dropna().astype(str)
+        )
+
+    family_target_symbols = target_symbols(family)
+    z_target_symbols = target_symbols(extended)
+    b1_target_symbols = target_symbols(b1_gate)
+    active_union_symbols = b1_target_symbols | z_target_symbols
+    signal_manifest = {
+        "status": "success",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "incremental_start_date": rebuild_from.strftime("%Y-%m-%d"),
+        "processed_through_date": target_date.strftime("%Y-%m-%d"),
+        "source_symbol_count": len(tasks),
+        "candidate_rows": int(len(recent_b1_gate)),
+        "candidate_symbols": int(
+            recent_b1_gate["symbol"].nunique()
+            if not recent_b1_gate.empty
+            else 0
+        ),
+        "family_target_candidate_count": len(family_target_symbols),
+        "b1_candidate_count": len(b1_target_symbols),
+        "z_candidate_count": len(z_target_symbols),
+        "union_candidate_count": len(active_union_symbols),
+        "overlap_candidate_count": len(b1_target_symbols & z_target_symbols),
+        "empty_candidate_set": not active_union_symbols,
+        "signal_scan_status": "complete",
+        "factor_mode": args.factor_mode,
+    }
+    atomic_write_json(signal_manifest, args.b1_gate_manifest)
 
     family_summary = _summary(family, sorted(family_columns))
     extended_summary = _summary(extended, sorted(extended_columns))

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from quant.routine import convertible_bond_grid_plan as bond_plan
 from quant.application.workspaces.convertible_bonds import (
@@ -74,25 +76,18 @@ def test_similar_probability_does_not_apply_cross_stock_medium_term_model() -> N
 
 def test_selector_features_fall_back_to_same_day_market_data(monkeypatch) -> None:
     monkeypatch.setattr(services, "_selector_model_feature_rows", lambda _date: {})
-
-    class FakeStore:
-        def read_market_range(self, *args, **kwargs):
-            return pd.DataFrame(
-                {
-                    "symbol": ["000001.SZ", "000002.SZ"],
-                    "date": pd.to_datetime(["2026-07-31", "2026-07-31"]),
-                    "close": [10.0, 20.0],
-                }
-            )
-
-    monkeypatch.setattr(services, "MarketDataStore", lambda _config: FakeStore())
     monkeypatch.setattr(
         services,
-        "_selector_watchlist_feature_row_from_daily",
-        lambda symbol, signal_date, _frame: {
-            "symbol": symbol,
-            "date": signal_date,
-            "feature_value": 1.0 if symbol == "000001.SZ" else 2.0,
+        "_selector_live_feature_rows",
+        lambda symbols, signal_date: {
+            symbol: {
+                "symbol": symbol,
+                "date": signal_date,
+                "feature_value": 1.0 if symbol == "000001.SZ" else 2.0,
+                "_score_feature_source": "live_daily+daily_basic+market_cross_section",
+                "_score_feature_date": signal_date,
+            }
+            for symbol in symbols
         },
     )
 
@@ -105,7 +100,229 @@ def test_selector_features_fall_back_to_same_day_market_data(monkeypatch) -> Non
 
     assert features["000001.SZ"]["feature_value"] == 1.0
     assert features["000002.SZ"]["feature_value"] == 2.0
-    assert {row["_score_feature_source"] for row in features.values()} == {"live_daily"}
+    assert {row["_score_feature_source"] for row in features.values()} == {
+        "live_daily+daily_basic+market_cross_section"
+    }
+
+
+def test_selector_market_features_are_built_for_exact_signal_date() -> None:
+    dates = pd.bdate_range("2026-07-16", periods=20)
+    daily = pd.DataFrame(
+        {
+            "date": dates.repeat(2),
+            "pct_chg": np.tile([1.0, -1.0], len(dates)),
+        }
+    )
+
+    features = services._selector_market_feature_values_from_daily(
+        daily,
+        dates[-1].strftime("%Y-%m-%d"),
+    )
+
+    assert set(features) == set(services.SELECTOR_MARKET_FEATURE_COLUMNS)
+    assert features["selector_market_mean_1d"] == 0.0
+    assert features["selector_market_median_1d"] == 0.0
+    assert features["selector_market_up_ratio_1d"] == 0.5
+    assert features["selector_market_mean_20d"] == 0.0
+    assert features["selector_market_up_ratio_20d"] == 0.5
+
+
+def test_selector_turnover_features_use_exact_date_and_trailing_history(tmp_path) -> None:
+    dates = pd.bdate_range("2026-07-16", periods=20)
+    for offset, trade_date in enumerate(dates, start=1):
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": [trade_date.strftime("%Y%m%d")],
+                "turnover_rate": [float(offset)],
+            }
+        ).to_parquet(tmp_path / f"{trade_date:%Y%m%d}.parquet", index=False)
+
+    features = services._selector_turnover_feature_rows(
+        ["000001.SZ"],
+        dates[-1].strftime("%Y-%m-%d"),
+        tmp_path,
+    )["000001.SZ"]
+
+    assert features["selector_turnover_relative_5d"] == 20.0 / 18.0
+    assert features["selector_turnover_relative_20d"] == 20.0 / 10.5
+
+
+def test_selector_score_date_never_falls_back_to_stale_history() -> None:
+    assert services._selector_model_score_date("2026-08-12") == "2026-08-12"
+
+
+def test_selector_score_labels_match_the_current_robust_reference_distribution() -> None:
+    assert services._score_interpretation(85.0, 50.0)["score_percentile_label"] == (
+        "历史参考约 Top 0.02%"
+    )
+    assert services._score_interpretation(70.0, 50.0)["score_percentile_label"] == (
+        "历史参考约 Top 1.4%"
+    )
+    assert services._score_interpretation(60.0, 50.0)["score_percentile_label"] == (
+        "历史参考约 Top 8.6%"
+    )
+
+
+def test_decision_regime_requires_an_exact_feature_date() -> None:
+    regime = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-08-11")],
+            "market_regime": ["risk_on"],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="exact decision date"):
+        services._require_exact_regime_row(
+            regime,
+            pd.Timestamp("2026-08-12"),
+            context="test regime",
+            required_columns=["market_regime"],
+        )
+
+
+def test_decision_regime_rejects_missing_required_values() -> None:
+    regime = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-08-12")],
+            "market_regime": ["risk_on"],
+            "index_return_20d": [np.nan],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="missing required values"):
+        services._require_exact_regime_row(
+            regime,
+            pd.Timestamp("2026-08-12"),
+            context="test regime",
+            required_columns=["market_regime", "index_return_20d"],
+        )
+
+
+def test_selector_return_model_rejects_all_nan_required_feature(monkeypatch) -> None:
+    class FakeImputer:
+        def transform(self, frame):
+            raise AssertionError("incomplete features must not reach the imputer")
+
+    artifact = {
+        "features": ["selector_return_5d", "selector_market_mean_1d"],
+        "imputer": FakeImputer(),
+        "model": object(),
+        "score_reference": np.array([0.0, 1.0]),
+    }
+    monkeypatch.setattr(
+        services,
+        "_selector_buy_hold_models",
+        lambda: {"buy": artifact},
+    )
+    row = {
+        "symbol": "000001.SZ",
+        "date": "2026-08-12",
+        "matched_groups": ["B1"],
+    }
+    feature_rows = {
+        "000001.SZ": {
+            "date": "2026-08-12",
+            "selector_return_5d": 1.0,
+            "selector_market_mean_1d": np.nan,
+            "_score_feature_source": "live_daily+daily_basic+market_cross_section",
+            "_score_feature_date": "2026-08-12",
+        }
+    }
+
+    services._apply_return_model_scores([row], feature_rows)
+
+    assert "historical_buy_score" not in row
+    assert row["feature_quality"]["status"] == "failed"
+    assert row["feature_quality"]["date"] == "2026-08-12"
+    assert row["feature_quality"]["source"] == "live_daily+daily_basic+market_cross_section"
+    assert row["feature_quality"]["all_nan_features"] == [
+        "selector_market_mean_1d"
+    ]
+
+
+def test_selector_return_model_rejects_only_the_row_with_partial_missing_features(
+    monkeypatch,
+) -> None:
+    class FakeImputer:
+        def transform(self, frame):
+            assert len(frame) == 1
+            assert frame.notna().all(axis=None)
+            return frame.to_numpy()
+
+    class FakeModel:
+        def predict(self, frame):
+            return np.array([1.0])
+
+    artifact = {
+        "features": ["selector_return_5d", "selector_market_mean_1d"],
+        "imputer": FakeImputer(),
+        "model": FakeModel(),
+        "score_reference": np.array([0.0, 1.0]),
+    }
+    monkeypatch.setattr(services, "_selector_buy_hold_models", lambda: {"buy": artifact})
+    rows = [
+        {"symbol": "000001.SZ", "date": "2026-08-12", "matched_groups": []},
+        {"symbol": "000002.SZ", "date": "2026-08-12", "matched_groups": []},
+    ]
+    feature_rows = {
+        "000001.SZ": {
+            "date": "2026-08-12",
+            "selector_return_5d": 1.0,
+            "selector_market_mean_1d": np.nan,
+            "_score_feature_source": "live",
+            "_score_feature_date": "2026-08-12",
+        },
+        "000002.SZ": {
+            "date": "2026-08-12",
+            "selector_return_5d": 2.0,
+            "selector_market_mean_1d": 0.5,
+            "_score_feature_source": "live",
+            "_score_feature_date": "2026-08-12",
+        },
+    }
+
+    services._apply_return_model_scores(rows, feature_rows)
+
+    assert rows[0]["feature_quality"]["status"] == "failed"
+    assert rows[0]["feature_quality"]["missing_features"] == [
+        "selector_market_mean_1d"
+    ]
+    assert "historical_buy_score" not in rows[0]
+    assert rows[1]["feature_quality"]["status"] == "complete"
+    assert "historical_buy_score" in rows[1]
+
+
+def test_watchlist_reports_exact_date_feature_failure_instead_of_dropping_symbol(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        services,
+        "_latest_similar_pattern_target_date",
+        lambda _symbols: "2026-08-12",
+    )
+    monkeypatch.setattr(services, "_selector_model_feature_rows", lambda _date: {})
+
+    def fail_live_features(_symbols, _date):
+        raise RuntimeError("daily input unavailable")
+
+    monkeypatch.setattr(services, "_selector_live_feature_rows", fail_live_features)
+    monkeypatch.setattr(
+        services,
+        "_selector_buy_hold_models",
+        lambda: {"buy": {"features": ["selector_return_5d"]}},
+    )
+
+    result = services._watchlist_buy_hold_scores(("000001.SZ",))
+
+    assert set(result) == {"000001.SZ"}
+    assert result["000001.SZ"]["model_score_available"] is False
+    assert result["000001.SZ"]["feature_quality"] == {
+        "status": "failed",
+        "error": "missing_exact_date_feature_row",
+        "source": "unavailable",
+        "date": "2026-08-12",
+    }
 
 
 def test_selector_cache_upgrade_preserves_rows_without_model_features(monkeypatch) -> None:
@@ -201,6 +418,57 @@ def test_bond_grid_cache_rejects_fabricated_zero_premiums() -> None:
     }
 
     assert services._convertible_bond_grid_payload_is_usable(payload) is False
+
+
+def test_bond_grid_cache_rejects_quality_fallback_snapshot() -> None:
+    payload = {
+        "data_quality": {
+            "status": "success",
+            "premium_coverage": 1.0,
+            "minimum_premium_coverage": 0.9,
+            "stale": True,
+        },
+        "candidates": [],
+    }
+
+    assert services._convertible_bond_grid_payload_is_usable(payload) is False
+
+
+def test_missing_latest_bond_premium_is_repaired_from_stock_close_and_conversion_price() -> None:
+    daily = pd.DataFrame(
+        {
+            "ts_code": ["110001.SH", "123001.SZ"],
+            "trade_date": ["20260807", "20260807"],
+            "close": [110.0, 125.0],
+            "bond_value": [float("nan"), float("nan")],
+            "bond_over_rate": [float("nan"), float("nan")],
+        }
+    )
+    basic = pd.DataFrame(
+        {
+            "ts_code": ["110001.SH", "123001.SZ"],
+            "stk_code": ["600001.SH", "300001.SZ"],
+            "conv_price": [10.0, 20.0],
+        }
+    )
+    stock_daily = pd.DataFrame(
+        {
+            "ts_code": ["600001.SH", "300001.SZ"],
+            "trade_date": ["20260807", "20260807"],
+            "close": [11.0, 20.0],
+        }
+    )
+
+    repaired, repaired_rows = bond_plan._fill_missing_premium_fields(
+        daily,
+        basic,
+        stock_daily,
+    )
+
+    assert repaired_rows == 2
+    assert repaired["bond_value"].round(6).tolist() == [110.0, 100.0]
+    assert repaired["bond_over_rate"].round(6).tolist() == [0.0, 25.0]
+    assert bond_plan._premium_coverage_for_date(repaired, "20260807") == 1.0
 
 
 def test_bond_workspace_caches_quality_fallback_under_requested_date() -> None:
