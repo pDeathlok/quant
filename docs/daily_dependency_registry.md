@@ -174,4 +174,4 @@ python -m json.tool data/routine/latest_refresh_status.json
 - 单元/集成测试覆盖 DAG、动态 source pruning、artifact cache、配置哈希 dirty 传播、新鲜度汇总和 Web 前后置门禁。
 - 以 2026-08-12 为目标交易日的严格 `all` postflight 已通过：37 个活动节点（11 个数据源、10 个特征、6 个模型分、10 个最终产物），32 个 final-gate 节点无失败，`refresh_node_ids=[]`；
 - B1/Z 活动候选并集 460 只，457 只完成 147 因子，3 只均有 ST/退市政策排除原因且无无法解释的漏算；Z 为 112/112 输入有效，Chan 为 46/46 输入有效；
-- 在仅含本次暂存内容的干净目录中，上述 20 个注册表与受影响回归文件实际结果为 `271 passed`；完整无凭证测试收集为 `568 passed, 10 failed`，10 项均是未改动的配债测试依赖本地 Tushare 部署资产，在纯 HEAD 中可复现；`compileall` 与 `git diff --cached --check` 同时通过。
+- 在仅含本次暂存内容的干净目录中，上述 20 个注册表与受影响回归文件实际结果为 `271 passed`；在同一干净目录显式加载工作区部署 `.env` 后，完整测试为 `578 passed`；`compileall` 与 `git diff --cached --check` 同时通过。
