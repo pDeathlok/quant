@@ -444,6 +444,26 @@ def _validate_active_candidate_coverage(
     }
 
 
+def _read_required_additional_gate(
+    path: Path,
+    *,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Load the Z candidate sidecar proven by the unified signal manifest."""
+
+    if not path.is_file():
+        raise RuntimeError(
+            "Unified signal checkpoint is incomplete: "
+            f"missing {path}"
+        )
+    return _read_candidate_gate(
+        path,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Incrementally refresh B1 feature cache")
     parser.add_argument("--daily-dir", type=Path, default=PROJECT_ROOT / "data/raw/daily")
@@ -466,6 +486,14 @@ def parse_args() -> argparse.Namespace:
         "--active-feature-manifest",
         type=Path,
         default=DEFAULT_ACTIVE_FEATURE_MANIFEST,
+    )
+    parser.add_argument(
+        "--live-only",
+        action="store_true",
+        help=(
+            "Publish only the exact-date active-candidate inference cache. "
+            "The historical training cache is intentionally left unchanged."
+        ),
     )
     parser.add_argument("--incremental-start-date", required=True)
     parser.add_argument("--oot-start", default="2025-01-01")
@@ -544,20 +572,27 @@ def main() -> None:
         except Exception as exc:
             gate_reason = str(exc)
 
+    if args.live_only and gate_mode != "signal_gate":
+        raise RuntimeError(
+            "Live feature refresh requires the exact-date unified signal gate: "
+            f"{gate_reason or 'gate cache/manifest unavailable'}"
+        )
+
     # The B1 gate manifest is the freshness checkpoint of the unified signal
     # refresh that also writes z_skill_daily_candidates.  Only consume the
     # additional gate when that checkpoint matches canonical market data.
     if gate_mode == "signal_gate" and args.additional_gate_cache is not None:
-        if args.additional_gate_cache.is_file():
-            additional_gate_rows = _read_candidate_gate(
+        try:
+            additional_gate_rows = _read_required_additional_gate(
                 args.additional_gate_cache,
                 start_date=start_ts,
                 end_date=actual_source_latest,
             )
             additional_gate_mode = "signal_gate"
-        else:
+        except RuntimeError:
             additional_gate_mode = "missing"
             additional_gate_reason = f"missing {args.additional_gate_cache}"
+            raise
 
     if candidate_symbols == []:
         incremental = pd.DataFrame()
@@ -645,7 +680,7 @@ def main() -> None:
             columns="_active_origin"
         ).reset_index(drop=True)
 
-    if args.dataset_out.exists():
+    if args.dataset_out.exists() and not args.live_only:
         existing = pd.read_parquet(args.dataset_out)
         existing["date"] = pd.to_datetime(existing["date"])
         if "factor_schema_version" not in existing.columns:
@@ -668,35 +703,41 @@ def main() -> None:
     else:
         combined = incremental
 
-    if combined.empty:
+    if combined.empty and not args.live_only:
         raise RuntimeError(
             "B1 feature cache has no historical rows and the incremental window "
             "produced no signals"
         )
 
-    combined["date"] = pd.to_datetime(combined["date"])
-    if "factor_schema_version" not in combined.columns:
-        combined["factor_schema_version"] = factor_schema_version
-    combined["factor_schema_version"] = combined["factor_schema_version"].fillna(
-        factor_schema_version
-    )
-    combined_schemas = set(
-        combined["factor_schema_version"].dropna().astype(str).unique()
-    )
-    if combined_schemas != {factor_schema_version}:
-        raise RuntimeError(
-            "B1 feature cache would mix factor schemas: "
-            f"expected={factor_schema_version} actual={sorted(combined_schemas)}"
+    if not combined.empty:
+        combined["date"] = pd.to_datetime(combined["date"])
+        if "factor_schema_version" not in combined.columns:
+            combined["factor_schema_version"] = factor_schema_version
+        combined["factor_schema_version"] = combined["factor_schema_version"].fillna(
+            factor_schema_version
         )
-    combined = (
-        combined.sort_values(["date", "symbol"])
-        .drop_duplicates(["symbol", "date"], keep="last")
-        .reset_index(drop=True)
-    )
-    combined = assign_symbol_splits(combined, args.oot_start, args.test_size, args.random_state)
+        combined_schemas = set(
+            combined["factor_schema_version"].dropna().astype(str).unique()
+        )
+        if combined_schemas != {factor_schema_version}:
+            raise RuntimeError(
+                "B1 feature cache would mix factor schemas: "
+                f"expected={factor_schema_version} actual={sorted(combined_schemas)}"
+            )
+        combined = (
+            combined.sort_values(["date", "symbol"])
+            .drop_duplicates(["symbol", "date"], keep="last")
+            .reset_index(drop=True)
+        )
+        if not args.live_only:
+            combined = assign_symbol_splits(
+                combined,
+                args.oot_start,
+                args.test_size,
+                args.random_state,
+            )
 
     required_features, release_id = _released_b1_required_features()
-    feature_coverage = _validate_latest_model_features(combined, required_features)
 
     if pd.isna(actual_source_latest):
         raise RuntimeError("Cannot publish active candidate features without a source trade date")
@@ -723,6 +764,39 @@ def main() -> None:
         active_stats,
         additional_coverage["excluded_candidates"],
     )
+    active_b1_features = (
+        active_features[
+            active_features["candidate_source_b1"].fillna(False)
+        ].copy()
+        if "candidate_source_b1" in active_features.columns
+        else active_features
+    )
+    if active_b1_features.empty:
+        feature_coverage = {
+            "status": "valid",
+            "target_date": actual_source_latest.strftime("%Y-%m-%d"),
+            "row_count": 0,
+            "required_feature_count": len(required_features),
+            "present_feature_count": len(
+                set(required_features) & set(active_features.columns)
+            ),
+            "covered_feature_count": 0,
+            "empty_candidate_set": True,
+            "missing_columns": sorted(
+                set(required_features) - set(active_features.columns)
+            ),
+            "all_null_features": [],
+            "partial_features": [],
+            "coverage": {},
+            "non_null_counts": {},
+        }
+    else:
+        feature_coverage = validate_required_feature_coverage(
+            active_b1_features,
+            required_features,
+            target_date=actual_source_latest,
+            context="B1 live active-candidate feature refresh",
+        )
     updated_at = datetime.now().isoformat(timespec="seconds")
     active_manifest = {
         "status": "success",
@@ -740,7 +814,8 @@ def main() -> None:
         "output": str(args.active_feature_out),
     }
 
-    atomic_write_parquet(combined, args.dataset_out, index=False)
+    if not args.live_only:
+        atomic_write_parquet(combined, args.dataset_out, index=False)
     atomic_write_parquet(active_features, args.active_feature_out, index=False)
     atomic_write_json(active_manifest, args.active_feature_manifest)
 
@@ -767,12 +842,13 @@ def main() -> None:
         if "turnover_rate" in incremental.columns and len(incremental)
         else 0.0,
         "total_rows": int(len(combined)),
+        "history_cache_updated": not args.live_only,
         "active_candidate_features": active_stats,
         "active_feature_output": str(args.active_feature_out),
         "active_feature_manifest": str(args.active_feature_manifest),
         "date_min": combined["date"].min().strftime("%Y-%m-%d") if not combined.empty else None,
         "date_max": combined["date"].max().strftime("%Y-%m-%d") if not combined.empty else None,
-        "output": str(args.dataset_out),
+        "output": str(args.active_feature_out if args.live_only else args.dataset_out),
         "elapsed_seconds": round(perf_counter() - started, 3),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)

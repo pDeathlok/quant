@@ -167,6 +167,58 @@ def test_active_candidate_coverage_allows_policy_exclusion_but_not_silent_miss()
         b1_refresh._validate_active_candidate_coverage(stats, [])
 
 
+def test_live_feature_refresh_requires_unified_z_candidate_sidecar(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RuntimeError, match="Unified signal checkpoint is incomplete"):
+        b1_refresh._read_required_additional_gate(
+            tmp_path / "missing-z-candidates.parquet",
+            start_date=pd.Timestamp("2026-08-12"),
+            end_date=pd.Timestamp("2026-08-12"),
+        )
+
+
+def test_live_only_feature_refresh_rejects_missing_unified_gate(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "incremental_start_date": "20260812",
+            "daily_dir": tmp_path / "daily",
+            "gate_cache": tmp_path / "missing-gate.parquet",
+            "gate_manifest": tmp_path / "missing-manifest.json",
+            "additional_gate_cache": tmp_path / "missing-z.parquet",
+            "live_only": True,
+        },
+    )()
+
+    class FakeStore:
+        def __init__(self, config) -> None:
+            pass
+
+        def read_market_range(self, *args, **kwargs):
+            return pd.DataFrame(
+                {
+                    "ts_code": ["000001.SZ"],
+                    "trade_date": ["20260812"],
+                }
+            )
+
+    monkeypatch.setattr(b1_refresh, "parse_args", lambda: args)
+    monkeypatch.setattr(b1_refresh, "MarketDataStore", FakeStore)
+    monkeypatch.setattr(
+        b1_refresh.MarketDataStoreConfig,
+        "from_env",
+        classmethod(lambda cls, **kwargs: object()),
+    )
+
+    with pytest.raises(RuntimeError, match="requires the exact-date unified signal gate"):
+        b1_refresh.main()
+
+
 def test_combine_training_frames_prefers_causal_factor_price_columns() -> None:
     daily = pd.DataFrame(
         {

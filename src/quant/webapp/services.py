@@ -48,7 +48,12 @@ from quant.application.workspaces.convertible_bonds import (
     build_convertible_bond_grid_workspace,
     evaluate_convertible_bond_allotment_quality,
 )
-from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
+from quant.data.atomic_io import (
+    atomic_write_csv,
+    atomic_write_json,
+    atomic_write_parquet,
+    atomic_write_text,
+)
 from quant.data.source_merge import normalize_ts_code
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
@@ -155,6 +160,8 @@ MODEL_SIGNAL_LABELS = {
 _LONG_RESEARCH_MODULE_LOCK = threading.Lock()
 _TEA_MASTER_MODULE_LOCK = threading.Lock()
 _LONG_LIVE_DATA_LOCK = threading.Lock()
+_SELECTOR_SNAPSHOT_SCHEMA_LOCK = threading.Lock()
+_SELECTOR_SNAPSHOT_SCHEMA_READY_URLS: set[str] = set()
 STRATEGY_GROUPS = [
     {"key": "B1", "label": "B1", "status": "超跌反弹，模型+规则", "members": ["B1"]},
     {"key": "B2", "label": "B2", "status": "B1后/独立右侧确认", "members": ["B2"]},
@@ -756,6 +763,80 @@ def _input_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
 
 def _refresh_resume_ready(status: dict[str, Any] | None, scope: str) -> bool:
     return _tail_resume_ready(status, scope) or _input_resume_ready(status, scope)
+
+
+def _completed_checkpoint_ready(
+    status: dict[str, Any] | None,
+    scope: str,
+) -> bool:
+    """Return whether a committed same-date run can seed idempotent reuse.
+
+    Source polling still runs before any reuse decision.  This checkpoint only
+    supplies prior result metadata; the dependency preflight decides whether
+    downstream artifacts remain reusable after the polls complete.
+    """
+
+    if not status or status.get("status") != "success":
+        return False
+    try:
+        if _normalize_refresh_scope(status.get("scope")) != _normalize_refresh_scope(scope):
+            return False
+    except ValueError:
+        return False
+    results = status.get("result") or {}
+    expected_trade_date = _source_expected_trade_date(results)
+    if expected_trade_date is None or _local_market_trade_date() != expected_trade_date:
+        return False
+    postflight = results.get("dependency_postflight") or {}
+    return bool(
+        postflight.get("status") == "success"
+        and postflight.get("baseline_committed") is True
+        and str(postflight.get("target_trade_date") or "").replace("-", "")
+        == expected_trade_date
+    )
+
+
+def _retry_preflight_identity_stable(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> bool:
+    """Prove that a failed run's completed checkpoints remain reusable.
+
+    A normal next-trading-day preflight marks every exact-date downstream node
+    dirty relative to yesterday's committed baseline.  On a same-day retry we
+    compare against the failed attempt's own preflight identity instead: code,
+    model and data-source identities must all remain unchanged.  Output nodes
+    are checked separately by their exact-date artifact gates.
+    """
+
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return False
+    if not (
+        previous.get("identity_complete") is True
+        and current.get("identity_complete") is True
+        and previous.get("scope") == current.get("scope")
+        and previous.get("target_trade_date") == current.get("target_trade_date")
+    ):
+        return False
+    for field in ("node_contract_hashes", "model_contract_hashes"):
+        old = previous.get(field)
+        new = current.get(field)
+        if not isinstance(old, dict) or not isinstance(new, dict) or old != new:
+            return False
+    old_states = previous.get("node_state_fingerprints")
+    new_states = current.get("node_state_fingerprints")
+    if not isinstance(old_states, dict) or not isinstance(new_states, dict):
+        return False
+    source_nodes = {
+        str(node_id)
+        for node_id in set(old_states) | set(new_states)
+        if str(node_id).startswith("data.")
+    }
+    return bool(source_nodes) and all(
+        old_states.get(node_id)
+        and old_states.get(node_id) == new_states.get(node_id)
+        for node_id in source_nodes
+    )
 
 
 def _new_refresh_run_id(scope: str) -> str:
@@ -4011,14 +4092,20 @@ def _refresh_similar_pattern_analysis_once(
     next_day_policy = (global_model_selection.get("next_1d", {}).get("selected") or {})
     market_regime = load_market_regime(PROJECT_ROOT / "data/raw/index_000300.SH.parquet")
     profiles = {symbol: _stock_profile_from_basic(symbol, basic) for symbol in symbols}
+    target_industries = sorted(
+        {
+            str(profile.get("industry") or "")
+            for profile in profiles.values()
+            if profile.get("industry")
+        }
+    )
     industry_regimes = {
-        str(profile.get("industry") or ""): build_industry_regime(
+        industry: build_industry_regime(
             DAILY_DIR,
             basic,
-            str(profile.get("industry") or ""),
+            industry,
         )
-        for profile in profiles.values()
-        if profile.get("industry")
+        for industry in target_industries
     }
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -4529,13 +4616,17 @@ def _read_selector_snapshot(
     return None
 
 
-def _write_selector_snapshot(
+def _prepare_selector_snapshot_write(
     payload: dict[str, Any],
     strategies: list[str] | None,
     include_extended: bool,
-) -> None:
+) -> dict[str, Any]:
     signal_date = str(payload.get("signal_date") or "")
-    snapshot_key, date_key, strategy_key = _selector_snapshot_key(signal_date, strategies, include_extended)
+    snapshot_key, date_key, strategy_key = _selector_snapshot_key(
+        signal_date,
+        strategies,
+        include_extended,
+    )
     payload_to_store = dict(payload)
     payload_to_store["selector_snapshot_schema_version"] = SELECTOR_SNAPSHOT_SCHEMA_VERSION
     payload_to_store["snapshot_scope"] = {
@@ -4544,78 +4635,145 @@ def _write_selector_snapshot(
     }
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
-    SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    snapshot_path = _selector_snapshot_path(snapshot_key)
-    temporary_path = snapshot_path.with_suffix(".json.tmp")
-    temporary_path.write_text(payload_json, encoding="utf-8")
-    temporary_path.replace(snapshot_path)
-    _selector_snapshot_dates_cached.cache_clear()
-    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    if store.config.sql_url:
-        try:
-            from sqlalchemy import text
+    return {
+        "snapshot_path": _selector_snapshot_path(snapshot_key),
+        "payload_json": payload_json,
+        "sql_values": {
+            "snapshot_key": snapshot_key,
+            "signal_date": date_key,
+            "strategies_key": strategy_key,
+            "include_extended": include_extended,
+            "generated_at": str(
+                payload.get("generated_at")
+                or datetime.now().isoformat(timespec="seconds")
+            ),
+            "stock_count": len(payload.get("stocks") or []),
+            "payload_json": payload_json,
+        },
+    }
 
-            with store._engine().begin() as conn:
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS {SELECTOR_SNAPSHOT_TABLE} (
-                            snapshot_key VARCHAR(64) PRIMARY KEY,
-                            signal_date VARCHAR(16) NOT NULL,
-                            strategies_key VARCHAR(512) NOT NULL,
-                            include_extended BOOLEAN NOT NULL,
-                            generated_at VARCHAR(32) NOT NULL,
-                            stock_count INT NOT NULL,
-                            payload_json LONGTEXT NOT NULL,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                        )
-                        """
-                    )
-                )
-                try:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE {SELECTOR_SNAPSHOT_TABLE} "
-                            "ADD COLUMN include_extended BOOLEAN NOT NULL DEFAULT 0"
-                        )
-                    )
-                except Exception:
-                    pass
-                try:
-                    legacy_flag_column = "include_" + "z" "_skill"
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE {SELECTOR_SNAPSHOT_TABLE} "
-                            f"MODIFY COLUMN {legacy_flag_column} BOOLEAN NOT NULL DEFAULT 0"
-                        )
-                    )
-                except Exception:
-                    pass
-                conn.execute(
-                    text(
-                        f"""
-                        INSERT INTO {SELECTOR_SNAPSHOT_TABLE}
-                            (snapshot_key, signal_date, strategies_key, include_extended, generated_at, stock_count, payload_json)
-                        VALUES
-                            (:snapshot_key, :signal_date, :strategies_key, :include_extended, :generated_at, :stock_count, :payload_json)
-                        ON DUPLICATE KEY UPDATE
-                            generated_at = VALUES(generated_at),
-                            stock_count = VALUES(stock_count),
-                            payload_json = VALUES(payload_json)
-                        """
-                    ),
-                    {
-                        "snapshot_key": snapshot_key,
-                        "signal_date": date_key,
-                        "strategies_key": strategy_key,
-                        "include_extended": include_extended,
-                        "generated_at": str(payload.get("generated_at") or datetime.now().isoformat(timespec="seconds")),
-                        "stock_count": len(payload.get("stocks") or []),
-                        "payload_json": payload_json,
-                    },
-                )
-        except Exception:
+
+def _selector_snapshot_schema_cache_key(sql_url: str) -> str:
+    return f"{sql_url}|{SELECTOR_SNAPSHOT_TABLE}"
+
+
+def _ensure_selector_snapshot_schema(engine: Any, sql_url: str) -> None:
+    """Initialize the selector snapshot schema once per process and SQL target."""
+
+    cache_key = _selector_snapshot_schema_cache_key(sql_url)
+    if cache_key in _SELECTOR_SNAPSHOT_SCHEMA_READY_URLS:
+        return
+    with _SELECTOR_SNAPSHOT_SCHEMA_LOCK:
+        if cache_key in _SELECTOR_SNAPSHOT_SCHEMA_READY_URLS:
             return
+        from sqlalchemy import text
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {SELECTOR_SNAPSHOT_TABLE} (
+                        snapshot_key VARCHAR(64) PRIMARY KEY,
+                        signal_date VARCHAR(16) NOT NULL,
+                        strategies_key VARCHAR(512) NOT NULL,
+                        include_extended BOOLEAN NOT NULL,
+                        generated_at VARCHAR(32) NOT NULL,
+                        stock_count INT NOT NULL,
+                        payload_json LONGTEXT NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            try:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {SELECTOR_SNAPSHOT_TABLE} "
+                        "ADD COLUMN include_extended BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                legacy_flag_column = "include_" + "z" "_skill"
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {SELECTOR_SNAPSHOT_TABLE} "
+                        f"MODIFY COLUMN {legacy_flag_column} BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
+            except Exception:
+                pass
+        _SELECTOR_SNAPSHOT_SCHEMA_READY_URLS.add(cache_key)
+
+
+def _write_selector_snapshot_batch(
+    snapshots: list[tuple[dict[str, Any], list[str] | None, bool]],
+) -> None:
+    if not snapshots:
+        return
+    prepared = [
+        _prepare_selector_snapshot_write(payload, strategies, include_extended)
+        for payload, strategies, include_extended in snapshots
+    ]
+
+    SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    published_files = 0
+    try:
+        for item in prepared:
+            atomic_write_text(item["payload_json"], item["snapshot_path"])
+            published_files += 1
+    finally:
+        if published_files:
+            _selector_snapshot_dates_cached.cache_clear()
+
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
+    sql_url = store.config.sql_url
+    if not sql_url:
+        return
+    engine = None
+    schema_cache_key = _selector_snapshot_schema_cache_key(str(sql_url))
+    try:
+        from sqlalchemy import text
+
+        engine = store._engine()
+        _ensure_selector_snapshot_schema(engine, str(sql_url))
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"""
+                    INSERT INTO {SELECTOR_SNAPSHOT_TABLE}
+                        (snapshot_key, signal_date, strategies_key, include_extended,
+                         generated_at, stock_count, payload_json)
+                    VALUES
+                        (:snapshot_key, :signal_date, :strategies_key, :include_extended,
+                         :generated_at, :stock_count, :payload_json)
+                    ON DUPLICATE KEY UPDATE
+                        generated_at = VALUES(generated_at),
+                        stock_count = VALUES(stock_count),
+                        payload_json = VALUES(payload_json)
+                    """
+                ),
+                [item["sql_values"] for item in prepared],
+            )
+    except Exception:
+        with _SELECTOR_SNAPSHOT_SCHEMA_LOCK:
+            _SELECTOR_SNAPSHOT_SCHEMA_READY_URLS.discard(schema_cache_key)
+        return
+    finally:
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+
+def _write_selector_snapshot(
+    payload: dict[str, Any],
+    strategies: list[str] | None,
+    include_extended: bool,
+) -> None:
+    _write_selector_snapshot_batch([(payload, strategies, include_extended)])
 
 
 def _strategy_keys_from_payload(payload: dict[str, Any]) -> list[str]:
@@ -4667,13 +4825,18 @@ def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -
 def _write_strategy_pool_snapshots(payload: dict[str, Any], include_extended: bool) -> dict[str, Any]:
     strategy_keys = _strategy_keys_from_payload(payload)
     extended_keys = {str(item.get("key") or "").upper() for item in EXTENDED_STRATEGIES}
-    _write_selector_snapshot(payload, None, include_extended)
+    snapshots: list[tuple[dict[str, Any], list[str] | None, bool]] = [
+        (payload, None, include_extended)
+    ]
     written = {"ALL": len(payload.get("stocks") or [])}
     for strategy_key in strategy_keys:
         filtered = _filtered_selector_payload(payload, [strategy_key])
         members = STRATEGY_GROUP_MEMBERS.get(strategy_key, {strategy_key})
-        _write_selector_snapshot(filtered, [strategy_key], bool(members & extended_keys))
+        snapshots.append(
+            (filtered, [strategy_key], bool(members & extended_keys))
+        )
         written[strategy_key] = len(filtered.get("stocks") or [])
+    _write_selector_snapshot_batch(snapshots)
     return written
 
 
@@ -7522,6 +7685,7 @@ def _run_latest_refresh_job(
     _REFRESH_CONTEXT.run_id = refresh_run_id
     resume_tail = _tail_resume_ready(resume_status, refresh_scope)
     resume_inputs = not resume_tail and _input_resume_ready(resume_status, refresh_scope)
+    reuse_completed = _completed_checkpoint_ready(resume_status, refresh_scope)
     early_workspace_executor: ThreadPoolExecutor | None = None
     early_workspace_futures: dict[Any, tuple[str, str]] = {}
     early_workspace_results_lock = threading.Lock()
@@ -7589,7 +7753,7 @@ def _run_latest_refresh_job(
             or {}
         ).get("refresh_node_ids")
         or []
-    )
+    ) if not reuse_completed else set()
     if resume_tail or resume_inputs:
         prior_results = dict((resume_status or {}).get("result") or {})
         prior_trade_date = _source_expected_trade_date(prior_results)
@@ -7664,10 +7828,14 @@ def _run_latest_refresh_job(
                         if current_run_id == refresh_run_id
                         else None
                     )
-                    or _refresh_attempt_number(resume_status),
+                    or (1 if reuse_completed else _refresh_attempt_number(resume_status)),
                     "resumed_from": _REFRESH_STATUS.get("resumed_from")
                     if current_run_id == refresh_run_id
-                    else _refresh_resume_source(resume_status),
+                    else (
+                        None
+                        if reuse_completed
+                        else _refresh_resume_source(resume_status)
+                    ),
                     "started_at": attempt_started_at,
                     "finished_at": None,
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -7676,6 +7844,8 @@ def _run_latest_refresh_job(
                         if resume_tail
                         else f"{refresh_label}检测到同日数据检查点，正在续跑计算阶段"
                         if resume_inputs
+                        else f"{refresh_label}正在轮询输入并校验同日成功基线"
+                        if reuse_completed
                         else f"{refresh_label}刷新任务已启动"
                     ),
                     "percent": 90 if resume_tail else 35 if resume_inputs else 1,
@@ -7710,7 +7880,9 @@ def _run_latest_refresh_job(
         source_options = resolve_daily_dependency_source_options(refresh_scope)
         source_option_result = {"status": "success", **source_options}
         results: dict[str, Any] = (
-            dict((resume_status or {}).get("result") or {}) if resume_inputs else {}
+            dict((resume_status or {}).get("result") or {})
+            if (resume_inputs or reuse_completed)
+            else {}
         )
         results["cache_cleanup"] = cache_cleanup
         results["dependency_source_options"] = source_option_result
@@ -7857,7 +8029,30 @@ def _run_latest_refresh_job(
         planned_refresh_nodes = set(
             dependency_preflight.get("refresh_node_ids") or []
         )
-        planned_refresh_nodes.update(inherited_refresh_nodes)
+        prior_attempt_preflight = (
+            ((resume_status or {}).get("result") or {}).get(
+                "dependency_preflight"
+            )
+            or {}
+        )
+        retry_identity_stable = bool(
+            (resume_inputs or resume_tail)
+            and _retry_preflight_identity_stable(
+                prior_attempt_preflight,
+                dependency_preflight,
+            )
+        )
+        if retry_identity_stable:
+            planned_refresh_nodes.difference_update(
+                str(node_id)
+                for node_id in prior_attempt_preflight.get(
+                    "refresh_node_ids"
+                )
+                or []
+            )
+        else:
+            planned_refresh_nodes.update(inherited_refresh_nodes)
+        dependency_preflight["retry_identity_stable"] = retry_identity_stable
         dependency_preflight["refresh_node_ids"] = sorted(planned_refresh_nodes)
         planned_refresh_ui_steps = {
             str(item.get("ui_step"))
@@ -7889,6 +8084,38 @@ def _run_latest_refresh_job(
                 )
                 or [],
             }
+
+        if reuse_completed and not planned_refresh_nodes:
+            # Source/event polls and contract compilation above are always
+            # executed.  If their semantic fingerprints did not change, all
+            # downstream exact-date products are already proven current by
+            # the committed baseline and can be reused atomically.
+            with _REFRESH_LOCK:
+                now = datetime.now()
+                for step in _REFRESH_STATUS["steps"]:
+                    if step.get("key") != "refresh_data":
+                        _mark_refresh_step_checkpoint_reused(step, now)
+                _persist_refresh_status_unlocked()
+            publish_dependency_gate(
+                results,
+                expected_signal_date,
+                phase="postflight",
+                strict_freshness=True,
+            )
+            _set_refresh_progress(
+                status="success",
+                step_key="snapshot",
+                message="输入与合同未变化，已复用同日全部下游产物",
+                percent=100,
+                result=results,
+                complete_previous=False,
+                checkpoint_reused=True,
+            )
+            with _REFRESH_LOCK:
+                for step in _REFRESH_STATUS["steps"]:
+                    step["status"] = "success"
+                _persist_refresh_status_unlocked()
+            return
 
         # These workspaces only need the refreshed shared inputs. Start their
         # network-heavy work before the CPU-bound short-selector branch and
@@ -8245,21 +8472,31 @@ def _run_latest_refresh_job(
             except (OSError, json.JSONDecodeError, TypeError):
                 return False
 
+        reusable_checkpoints = resume_inputs or reuse_completed
         feature_ready = (
-            resume_inputs
+            reusable_checkpoints
             and "feature.project_daily" not in planned_refresh_nodes
             and (results.get("feature_cache") or {}).get("status") == "success"
-            and artifact_current(PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet")
             and active_feature_sidecar_current()
         )
-        signal_ready = resume_inputs and all(
-            artifact_current(path)
-            for path in (
-                PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
-                PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
+        signal_paths = (
+            PROJECT_ROOT / "data/features/b1/b1_gate_candidates.parquet",
+            PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet",
+            PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet",
+        )
+        signal_ready = (
+            reusable_checkpoints
+            and "feature.strategy_signals" not in planned_refresh_nodes
+            and (
+                (
+                    feature_ready
+                    and all(artifact_current(path) for path in signal_paths[1:])
+                )
+                or (
+                    b1_gate_current()
+                    and all(path.is_file() for path in signal_paths)
+                )
             )
-        ) and (feature_ready or b1_gate_current()) and (
-            "feature.strategy_signals" not in planned_refresh_nodes
         )
         if feature_ready:
             results["feature_cache"]["checkpoint_reused"] = True
@@ -8355,7 +8592,7 @@ def _run_latest_refresh_job(
             complete_previous=False,
         )
         model_score_ready = (
-            resume_inputs
+            reusable_checkpoints
             and not (
                 planned_refresh_nodes
                 & {"score.z_skill"}
@@ -8709,6 +8946,9 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
         elif current_status.get("status") == "failed":
             if _refresh_resume_ready(current_status, refresh_scope):
                 resume_status = dict(current_status)
+        elif current_status.get("status") == "success":
+            if _completed_checkpoint_ready(current_status, refresh_scope):
+                resume_status = dict(current_status)
         elif current_status.get("status") == "idle":
             persisted = _load_persisted_refresh_status()
             if persisted and persisted.get("status") != "idle":
@@ -8717,6 +8957,12 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
                     persisted = _expire_interrupted_refresh_status_unlocked(persisted)
                 if _refresh_resume_ready(persisted, refresh_scope):
                     resume_status = dict(persisted)
+                elif _completed_checkpoint_ready(persisted, refresh_scope):
+                    resume_status = dict(persisted)
+        reuse_completed = _completed_checkpoint_ready(
+            resume_status,
+            refresh_scope,
+        )
         thread = threading.Thread(
             target=_run_latest_refresh_job,
             args=(refresh_scope, resume_status, run_id),
@@ -8731,14 +8977,20 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
                 "trade_date": _source_expected_trade_date(
                     (resume_status or {}).get("result")
                 ),
-                "attempt": _refresh_attempt_number(resume_status),
-                "resumed_from": _refresh_resume_source(resume_status),
+                "attempt": 1 if reuse_completed else _refresh_attempt_number(resume_status),
+                "resumed_from": (
+                    None if reuse_completed else _refresh_resume_source(resume_status)
+                ),
                 "started_at": attempt_started_at,
                 "finished_at": None,
                 "updated_at": attempt_started_at,
-                "message": f"{refresh_label}刷新任务已进入后台队列"
-                if not resume_status
-                else f"{refresh_label}检测到断点，已进入自动续跑队列",
+                "message": (
+                    f"{refresh_label}检测到同日成功基线，已进入增量校验队列"
+                    if reuse_completed
+                    else f"{refresh_label}刷新任务已进入后台队列"
+                    if not resume_status
+                    else f"{refresh_label}检测到断点，已进入自动续跑队列"
+                ),
                 "percent": 0 if not resume_status else int(resume_status.get("percent") or 35),
                 "current_step": None if not resume_status else str(resume_status.get("current_step") or "feature_cache"),
                 "steps": _progress_steps(refresh_scope),

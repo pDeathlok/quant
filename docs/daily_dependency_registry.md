@@ -63,6 +63,8 @@ data_source -> feature -> model_score -> product
 
 Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会把它们标成 `production_consumed_from_research_path` 技术债，但仍按生产模型严格编译特征和哈希。下一次晋级必须迁入 `models/production`，补齐正式 release manifest 后才能删除这项豁免。
 
+右侧统一排序的生产节点已预注册但默认 dormant。`configs/strategies/right_side_ranking_selector.yaml` 是 `score.selector` 排序上游的唯一显式 source 开关：默认消费 `score.z_skill`；只有 `promotion.enabled=true` 且 source 同时为 `right_side_unified` 时，`short/all` DAG 才切换到 `feature.right_side_unified -> score.right_side_unified`。独立 `rightSideRankingCandidate` scope 用于晋级前验证生产 artifact/schema/checksum/日期/覆盖。旧 `score.z_skill` 节点和工件保留为回滚源。统一模型只发布 `ranking_score`，不能伪装成旧的 up/down 概率；买卖策略层不在该模型合同内。
+
 因子字段的采样频率与生产物化频率是两个概念。例如财务字段按公告到达，长线选股截面仍要在每个交易日以 PIT 方式重新物化。当前长线节点读取 8 年估值上下文和 450 个自然日价格上下文，但只发布目标日分区。
 
 ## 增量计算规则
@@ -74,6 +76,9 @@ Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会
 - `daily_basic` 检查最近 45 个自然日空洞，滚动特征读取至少 20 个交易日；
 - 财报和事件源使用有限 overlap 窗口，按业务主键 upsert；
 - B1/Z 先生成当日候选并集，只计算这些 symbol 的 147 因子；B1 原缓存仍保持 B1 gate 语义，Z 复用共享 sidecar；
+- B1 每日计划优先消费精确日期的活动候选 sidecar；`training_xgb_project_vars.parquet` 是训练/研究历史，不在延迟敏感的日更路径重写；
+- 同一目标日再次刷新仍先轮询活动数据源；若 source/model/contract/output fingerprints 均未变化，则复用已提交的同日下游产物；
+- 每个阶段输出 `read/compute/write` 耗时与 cache mode；同日命中必须标为 `checkpoint_reused`，不能把零耗时伪装成重新计算；
 - 模型 artifact 只有 size/mtime 变化时才重新计算 SHA256 和加载特征合同；未变化直接读缓存；
 - `contract_sources` 中的数据采集/标准化实现、因子实现或策略配置内容变化，只 dirty 对应节点及下游，不重刷无关上游数据；
 - 节点本身的 edge、freshness、incremental、artifact 等注册定义也参与合同哈希；只改注册表同样会 dirty 对应节点；
@@ -82,6 +87,24 @@ Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会
 - 周频、静态和事件节点先做 `reuse/poll`，只有结果变化才向下游传播 dirty 分区。
 
 严禁用“文件存在”“生成时间是今天”或 imputer 成功预测作为新鲜度证据。合法空候选也必须有目标日 manifest。
+
+### 性能与缓存维护合同
+
+每个新增或修改的生产节点，还必须明确下列性能属性：
+
+- `partition_key` 与唯一键；
+- state/high-watermark artifact；
+- 读取上下文窗口与实际重写分区；
+- repair overlap 与 late correction 的失效传播范围；
+- cache key 中的 source fingerprint、calculator/contract hash、model/config hash；
+- full rebuild 触发条件和历史 compaction cadence；
+- 空分区的 manifest 证明。
+
+执行状态统一使用 `reused / appended / repaired / full_rebuild`。缓存身份缺失、损坏或不一致必须视为 miss；禁止按日期或 mtime 单独猜测命中。长历史文件应采用日期分区追加并在非关键路径 compact，不能为了发布一个目标日分区每日重写完整研究/训练历史。
+
+目前已固定的实现约束：selector 多策略快照使用一次数据库事务批量 upsert，DDL 只能在 migration/首次初始化执行；相似走势矩阵缓存必须由向量 schema、配置 key、canonical backend 的语义 source fingerprint 共同定版，SQL 与 Parquet 镜像并存时不得用镜像身份代替 SQL；长线 `daily_basic` 月末/周末截面使用内容 SHA-256 高水位，只重读变更周期。Tea/Tea-safe 可共享同日 enriched/scored 截面后再应用各自策略规则。
+
+规则信号三件套（B1 gate、family、Z）是一组事务产物：跨进程发布必须持独占锁，发布前再次校验 source fingerprint，先 staging、manifest 最后提交，失败恢复整组 last-known-good。生产 `--live-only` 特征刷新必须同时具备同日统一 gate manifest、B1 gate 与 Z gate；任一缺失不得退化为 B1-only 的“完整”sidecar。
 
 ## 新增或修改时的强制步骤
 
@@ -101,7 +124,8 @@ Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会
 3. 将计算器/配置文件加入对应 `feature.*.contract_sources`；
 4. 声明真实回看单位：`context_lookback_sessions`、`context_lookback_calendar_days` 或 `context_lookback_years`；
 5. 添加目标日、缺列、全空、覆盖率和历史修订的测试；
-6. 重新训练并晋级使用新 schema 的模型，不能让旧模型静默消费新口径。
+6. 添加 full-vs-incremental golden parity、重复运行幂等和 cache invalidation 测试；
+7. 重新训练并晋级使用新 schema 的模型，不能让旧模型静默消费新口径。
 
 ### 新模型或模型晋级
 
@@ -110,7 +134,8 @@ Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会
 3. manifest 固定 artifact path/hash、训练截止日、feature schema 和 release ID；`ArtifactSpec.expected_schema` 必须与 bundle 的 `schema_version` 一致；
 4. required features 必须全部可用；effective features 只用于裁掉确实无贡献的可选源，不能改变模型输入 shape；
 5. 评分产物必须记录目标日、模型 release/hash、输入覆盖和分布；
-6. 添加 checksum、artifact cache、schema 不兼容和目标日门禁测试。
+6. 模型晋级必须使依赖的 feature/score/product 缓存失效；
+7. 添加 checksum、artifact cache、schema 不兼容、目标日门禁和同日晋级失效测试。
 
 ### 新策略或修改策略配置
 
@@ -131,6 +156,8 @@ Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会
 
 ```bash
 PYTHONPATH=src pytest -q \
+  tests/test_selector_ranking.py \
+  tests/test_right_side_unified_shadow.py \
   tests/test_b1_gate.py \
   tests/test_daily_dependencies.py \
   tests/test_daily_dependency_runtime.py \

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -8,27 +9,71 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.factors.technical import KDJ
+from quant.research import similar_patterns as similar_patterns_module
 from quant.research.similar_patterns import (
     SimilarPatternConfig,
     analyze_targets_by_threshold,
     apply_probability_calibration,
-    build_stock_vector_cache,
     build_pattern_vector,
-    build_t1_scenario_plan,
     build_sell_model_plan,
+    build_stock_vector_cache,
+    build_t1_scenario_plan,
     candidate_end_indices,
     classify_forecast_signal,
     fit_probability_calibration,
     latest_snapshot,
     load_stock_vector_cache,
+    normalize_daily_frame,
     optimize_similar_cases,
     select_best_positions_from_contiguous_matches,
-    normalize_daily_frame,
     summarize_forecast,
     summarize_status_probs,
 )
-from quant.data import MarketDataStore, MarketDataStoreConfig
-from quant.data.factors.technical import KDJ
+
+
+def _write_synthetic_vector_cache(
+    cache_dir: Path,
+    config: SimilarPatternConfig,
+    symbol: str,
+    vectors: np.ndarray,
+    indices: list[int],
+    *,
+    source_fingerprint: str | None,
+) -> Path:
+    path = similar_patterns_module.vector_cache_path(cache_dir, symbol, config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = len(indices)
+    values = np.arange(rows, dtype=np.float32)
+    payload = {
+        "symbol": np.array(symbol),
+        "name": np.array(f"name-{symbol}"),
+        "industry": np.array(f"industry-{symbol}"),
+        "indices": np.asarray(indices, dtype=np.int32),
+        "dates": np.asarray(
+            [
+                (pd.Timestamp("2020-01-01") + pd.Timedelta(days=value)).strftime("%Y-%m-%d")
+                for value in indices
+            ]
+        ),
+        "close": values + 10,
+        "vectors": np.asarray(vectors, dtype=np.float32),
+        "source_mtime_ns": np.array(1, dtype=np.int64),
+        "source_size": np.array(2, dtype=np.int64),
+        "fwd_1d": values / 100,
+        "fwd_1d_volume_ratio": values + 1,
+        "fwd_20d": values / 50,
+        "fwd_60d": values / 25,
+        "max_runup_3d": values / 20,
+        "max_drawdown_3d": -values / 20,
+        "max_drawdown_60d": -values / 10,
+        "max_runup_60d": values / 10,
+    }
+    if source_fingerprint is not None:
+        payload["source_fingerprint"] = np.array(source_fingerprint)
+    np.savez(path, **payload)
+    return path
 
 
 def test_normalize_daily_frame_accepts_tushare_schema() -> None:
@@ -204,6 +249,128 @@ def test_select_best_positions_keeps_one_per_contiguous_run() -> None:
     assert selected == [1, 3]
 
 
+def test_matrix_cache_matches_legacy_threshold_scan_and_invalidates(tmp_path: Path) -> None:
+    config = SimilarPatternConfig(
+        similarity_threshold=0.5,
+        candidate_step_days=1,
+    )
+    cache_dir = tmp_path / "vector-cache"
+    just_outside = np.float32(1.0001)
+    _write_synthetic_vector_cache(
+        cache_dir,
+        config,
+        "A.SZ",
+        np.array(
+            [
+                [0.9, 0.0],
+                [0.8, 0.0],
+                [0.85, 0.0],
+                [0.7, 0.0],
+                [1.0, 0.0],
+                [just_outside, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        [10, 11, 12, 20, 30, 40],
+        source_fingerprint="source-v1",
+    )
+    # No source_fingerprint field exercises compatibility with the legacy npz schema.
+    _write_synthetic_vector_cache(
+        cache_dir,
+        config,
+        "B.SZ",
+        np.array(
+            [
+                [3.1, 0.0],
+                [3.2, 0.0],
+                [3.15, 0.0],
+                [5.1, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        [5, 6, 7, 20],
+        source_fingerprint=None,
+    )
+    daily_paths = [tmp_path / "daily/A.SZ.parquet", tmp_path / "daily/B.SZ.parquet"]
+    entries = similar_patterns_module._vector_cache_inventory(daily_paths, cache_dir, config)
+    compiled = similar_patterns_module._ensure_compiled_vector_cache(entries, cache_dir, config)
+    reused = similar_patterns_module._ensure_compiled_vector_cache(entries, cache_dir, config)
+    target_vectors = {
+        "T1.SZ": np.array([0.0, 0.0], dtype=np.float32),
+        "T2.SZ": np.array([4.0, 0.0], dtype=np.float32),
+    }
+
+    actual, scanned = similar_patterns_module._scan_compiled_threshold_cache(
+        compiled,
+        target_vectors,
+        config,
+        {"T1.SZ", "T2.SZ"},
+    )
+
+    expected: dict[str, list[tuple[str, pd.Timestamp, float, float]]] = {
+        symbol: [] for symbol in target_vectors
+    }
+    for entry in entries:
+        cached = load_stock_vector_cache(entry.path)
+        candidate_indices = [int(value) for value in cached["indices"]]
+        matrix = np.asarray(cached["vectors"], dtype=np.float32)
+        for target_symbol, target_vector in target_vectors.items():
+            distances = np.linalg.norm(matrix - target_vector, axis=1)
+            similarities = 1 / (1 + distances)
+            selected = select_best_positions_from_contiguous_matches(
+                candidate_indices,
+                similarities,
+                config.similarity_threshold,
+                config.candidate_step_days,
+            )
+            expected[target_symbol].extend(
+                (
+                    str(cached["symbol"]),
+                    pd.Timestamp(str(cached["dates"][position])),
+                    float(distances[position]),
+                    float(similarities[position]),
+                )
+                for position in selected
+            )
+
+    assert scanned == 10
+    assert reused.generation_dir == compiled.generation_dir
+    for target_symbol, rows in actual.items():
+        observed = [
+            (row["symbol"], row["date"], row["distance"], row["similarity"])
+            for row in rows
+        ]
+        assert observed == expected[target_symbol]
+    assert [row["date"] for row in actual["T1.SZ"]] == [
+        pd.Timestamp("2020-01-12"),
+        pd.Timestamp("2020-01-21"),
+        pd.Timestamp("2020-01-31"),
+    ]
+
+    previous_source_digest = compiled.manifest["source_fingerprint_digest"]
+    _write_synthetic_vector_cache(
+        cache_dir,
+        config,
+        "B.SZ",
+        np.array([[3.0, 0.0], [3.2, 0.0]], dtype=np.float32),
+        [5, 6],
+        source_fingerprint="source-v2",
+    )
+    changed_entries = similar_patterns_module._vector_cache_inventory(daily_paths, cache_dir, config)
+    changed = similar_patterns_module._ensure_compiled_vector_cache(
+        changed_entries,
+        cache_dir,
+        config,
+    )
+
+    assert changed.generation_dir != compiled.generation_dir
+    assert changed.manifest["source_fingerprint_digest"] != previous_source_digest
+    assert similar_patterns_module._vector_cache_inventory_fingerprint(
+        changed_entries,
+        replace(config, cache_schema_version=config.cache_schema_version + 1),
+    ) != changed.manifest["inventory_fingerprint"]
+
+
 def test_stock_vector_cache_roundtrip(tmp_path: Path) -> None:
     dates = pd.bdate_range("2022-01-03", periods=380)
     close = np.linspace(10, 20, len(dates)) + np.sin(np.arange(len(dates)) / 7)
@@ -291,6 +458,125 @@ def test_stock_vector_cache_supports_partitioned_daily_source(tmp_path: Path) ->
     assert load_stock_vector_cache(Path(third["cache_path"]))["source_fingerprint"].startswith(
         "partitioned:"
     )
+
+
+def test_sql_source_fingerprint_invalidates_same_day_revision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state = {
+        "frame": pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ", "000002.SZ"],
+                "trade_date": ["20260812", "20260812"],
+                "name": ["甲", "乙"],
+                "open": [10.0, 20.0],
+                "high": [10.5, 20.5],
+                "low": [9.8, 19.8],
+                "close": [10.2, 20.2],
+                "vol": [1_000.0, 2_000.0],
+                "volume": [1_000.0, 2_000.0],
+                "pct_chg": [2.0, 1.0],
+            }
+        )
+    }
+
+    class _SqlStore:
+        def __init__(self, config):
+            self.config = config
+
+        def _engine(self):
+            raise RuntimeError("schema inspection is unavailable in this test store")
+
+        def _read_sql_range(self, dataset, **kwargs):
+            assert dataset == "daily"
+            return state["frame"].copy()
+
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "sql")
+    monkeypatch.setenv("MARKET_DATA_SQL_URL", "mysql+pymysql://unused")
+    monkeypatch.setenv("MARKET_DATA_MIRROR_PARQUET", "1")
+    monkeypatch.setattr(similar_patterns_module, "MarketDataStore", _SqlStore)
+
+    first = similar_patterns_module.partitioned_daily_source_fingerprint(tmp_path / "daily")
+    state["frame"].loc[0, "close"] = 10.3
+    second = similar_patterns_module.partitioned_daily_source_fingerprint(tmp_path / "daily")
+
+    assert first is not None and first.startswith("sql-semantic:")
+    assert second is not None and second.startswith("sql-semantic:")
+    assert second != first
+
+
+def test_sql_source_fingerprint_ignores_stale_partition_mirror(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mirror = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ"],
+            "trade_date": ["20260811"],
+            "open": [9.8],
+            "high": [10.1],
+            "low": [9.7],
+            "close": [10.0],
+            "vol": [900.0],
+        }
+    )
+    MarketDataStore(MarketDataStoreConfig(backend="parquet", root=tmp_path)).write_market_batch(mirror)
+    sql_frame = mirror.assign(trade_date="20260812", close=10.2, vol=1_000.0)
+
+    class _SqlStore:
+        def __init__(self, config):
+            self.config = config
+
+        def _engine(self):
+            raise RuntimeError("schema inspection is unavailable in this test store")
+
+        def _read_sql_range(self, dataset, **kwargs):
+            return sql_frame.copy()
+
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "sql")
+    monkeypatch.setenv("MARKET_DATA_SQL_URL", "mysql+pymysql://unused")
+    monkeypatch.setenv("MARKET_DATA_MIRROR_PARQUET", "1")
+    monkeypatch.setattr(similar_patterns_module, "MarketDataStore", _SqlStore)
+
+    first = similar_patterns_module.partitioned_daily_source_fingerprint(tmp_path / "daily")
+    mirror.loc[0, "close"] = 1.0
+    MarketDataStore(MarketDataStoreConfig(backend="parquet", root=tmp_path)).write_market_batch(mirror)
+    second = similar_patterns_module.partitioned_daily_source_fingerprint(tmp_path / "daily")
+
+    assert first is not None and first.startswith("sql-semantic:")
+    assert second == first
+
+
+def test_parquet_source_fingerprint_uses_partition_content_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    frame = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ"],
+            "trade_date": ["20260812"],
+            "open": [10.0],
+            "high": [10.5],
+            "low": [9.8],
+            "close": [10.2],
+            "vol": [1_000.0],
+        }
+    )
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=tmp_path))
+    store.write_market_batch(frame)
+
+    first = similar_patterns_module.partitioned_daily_source_fingerprint(tmp_path / "daily")
+    second = similar_patterns_module.partitioned_daily_source_fingerprint(tmp_path / "daily")
+    frame.loc[0, "close"] = 10.3
+    store.write_market_batch(frame)
+    revised = similar_patterns_module.partitioned_daily_source_fingerprint(tmp_path / "daily")
+
+    assert first is not None and first.startswith("partitioned:")
+    assert second == first
+    assert revised != first
 
 
 def test_stock_vector_cache_rebuilds_when_daily_source_changes(tmp_path: Path) -> None:

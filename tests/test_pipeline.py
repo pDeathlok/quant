@@ -486,6 +486,7 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     assert command[command.index("--gate-manifest") + 1] == (
         "data/features/b1/b1_gate_manifest.json"
     )
+    assert "--live-only" in command
     assert "start_new_session" not in kwargs
     assert result["status"] == "success"
 

@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +31,21 @@ ANALYST_FORECAST_PATH = PROJECT_ROOT / "data/raw/analyst_forecasts.parquet"
 INDEX_300_PATH = PROJECT_ROOT / "data/raw/index_000300.SH.parquet"
 REPORT_DIR = PROJECT_ROOT / "reports/long_dividend_quality"
 RESEARCH_CACHE_DIR = PROJECT_ROOT / "data/research/long_dividend_quality"
+
+DAILY_BASIC_FEATURE_COLUMNS = (
+    "ts_code",
+    "trade_date",
+    "turnover_rate",
+    "turnover_rate_f",
+    "pe_ttm",
+    "pb",
+    "ps_ttm",
+    "dv_ratio",
+    "dv_ttm",
+    "total_mv",
+    "circ_mv",
+)
+DAILY_BASIC_PERIOD_CACHE_VERSION = "daily-basic-period-end-v1"
 
 MARKET_REGIME_VARIANTS = {
     "v4_market_regime",
@@ -493,6 +509,224 @@ def filter_daily_basic_point_in_time(daily_basic: pd.DataFrame, config: Backtest
     return frame[mask].copy()
 
 
+def _daily_basic_file_date(path: Path) -> pd.Timestamp | None:
+    date_text = path.stem.removeprefix("tushare_daily_basic_")
+    if len(date_text) != 8 or not date_text.isdigit():
+        return None
+    date = pd.to_datetime(date_text, format="%Y%m%d", errors="coerce")
+    return None if pd.isna(date) else pd.Timestamp(date)
+
+
+def _period_end_daily_basic_candidates(
+    files: list[Path],
+    start: pd.Timestamp,
+    end: pd.Timestamp | None,
+    *,
+    sampling: str,
+) -> tuple[list[tuple[pd.Timestamp, list[Path]]], list[pd.Timestamp]]:
+    """Return newest-first source candidates for each requested rebalance period.
+
+    Filename dates are sufficient to discard non-period-end files before any
+    parquet payload is opened.  A period retains all of its paths, newest
+    first, so the caller can fall back when a late file is unreadable or does
+    not contain a usable daily_basic projection.
+    """
+
+    period_frequency = "M" if sampling == "monthly" else "W-FRI"
+    dated_paths: list[tuple[pd.Timestamp, Path]] = []
+    for path in files:
+        date = _daily_basic_file_date(path)
+        if date is None or date < start or (end is not None and date > end):
+            continue
+        dated_paths.append((date, path))
+
+    by_period: dict[pd.Period, list[tuple[pd.Timestamp, Path]]] = {}
+    for date, path in dated_paths:
+        by_period.setdefault(date.to_period(period_frequency), []).append((date, path))
+    candidates = [
+        (
+            max(date for date, _ in period_paths),
+            [path for _, path in sorted(period_paths, key=lambda item: item[0], reverse=True)],
+        )
+        for _, period_paths in sorted(by_period.items())
+    ]
+    return candidates, sorted({date for date, _ in dated_paths})
+
+
+def _read_daily_basic_period_end(path: Path) -> pd.DataFrame | None:
+    """Read only the columns consumed by the long strategy from one snapshot."""
+
+    try:
+        frame = pd.read_parquet(path, columns=list(DAILY_BASIC_FEATURE_COLUMNS))
+    except Exception:
+        return None
+    if frame.empty or "ts_code" not in frame.columns or frame["ts_code"].notna().sum() == 0:
+        return None
+
+    file_date = _daily_basic_file_date(path)
+    if file_date is None:
+        return None
+    expected_trade_date = file_date.strftime("%Y%m%d")
+    observed_trade_dates = (
+        frame["trade_date"]
+        .dropna()
+        .astype(str)
+        .str.replace("-", "", regex=False)
+        .unique()
+    )
+    if len(observed_trade_dates) == 0 or expected_trade_date not in observed_trade_dates:
+        return None
+    return frame
+
+
+def _daily_basic_source_identity(path: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(path.resolve()),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _daily_basic_period_cache_paths(sampling: str) -> tuple[Path, Path]:
+    prefix = "monthly" if sampling == "monthly" else "weekly"
+    cache_path = RESEARCH_CACHE_DIR / f"daily_basic_{prefix}_period_ends_v1.parquet"
+    return cache_path, cache_path.with_suffix(".manifest.json")
+
+
+def _load_daily_basic_period_cache(
+    sampling: str,
+    source_dir: Path,
+) -> tuple[pd.DataFrame, dict]:
+    cache_path, manifest_path = _daily_basic_period_cache_paths(sampling)
+    if not cache_path.exists() or not manifest_path.exists():
+        return pd.DataFrame(columns=DAILY_BASIC_FEATURE_COLUMNS), {}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("version") != DAILY_BASIC_PERIOD_CACHE_VERSION
+            or manifest.get("sampling") != sampling
+            or manifest.get("source_dir") != str(source_dir.resolve())
+        ):
+            return pd.DataFrame(columns=DAILY_BASIC_FEATURE_COLUMNS), {}
+        cache = pd.read_parquet(cache_path, columns=list(DAILY_BASIC_FEATURE_COLUMNS))
+    except Exception:
+        return pd.DataFrame(columns=DAILY_BASIC_FEATURE_COLUMNS), {}
+    return cache, manifest
+
+
+def _load_period_end_daily_basic_frames(
+    period_candidates: list[tuple[pd.Timestamp, list[Path]]],
+    *,
+    sampling: str,
+    source_dir: Path,
+) -> tuple[list[pd.DataFrame], list[str], dict[str, int]]:
+    """Reuse unchanged period snapshots and refresh only a changed high water."""
+
+    cached, manifest = _load_daily_basic_period_cache(sampling, source_dir)
+    period_manifest = manifest.get("periods", {}) if manifest else {}
+    selected_frames: list[pd.DataFrame] = []
+    selected_dates: list[str] = []
+    refreshed: dict[str, tuple[pd.DataFrame, dict[str, object]]] = {}
+    attempted_files = 0
+    cache_hits = 0
+    cached_by_period: dict[str, pd.DataFrame] = {}
+    if not cached.empty:
+        cached_dates = pd.to_datetime(
+            cached["trade_date"].astype(str).str.replace("-", "", regex=False),
+            format="%Y%m%d",
+            errors="coerce",
+        )
+        cached_periods = cached_dates.dt.to_period(
+            "M" if sampling == "monthly" else "W-FRI"
+        )
+        cached_by_period = {
+            str(period): cached.loc[index]
+            for period, index in cached.groupby(cached_periods, sort=False).groups.items()
+            if not pd.isna(period)
+        }
+
+    for period_end, candidate_paths in period_candidates:
+        period = period_end.to_period("M" if sampling == "monthly" else "W-FRI")
+        period_key = str(period)
+        current_record = period_manifest.get(period_key, {})
+        newest_identity = (
+            _daily_basic_source_identity(candidate_paths[0]) if candidate_paths else {}
+        )
+        period_rows = cached_by_period.get(period_key, cached.iloc[0:0])
+        if (
+            not period_rows.empty
+            and current_record.get("source") == newest_identity
+        ):
+            selected_frames.append(period_rows.copy())
+            selected_dates.append(str(current_record["trade_date"]))
+            cache_hits += 1
+            continue
+
+        for path in candidate_paths:
+            attempted_files += 1
+            frame = _read_daily_basic_period_end(path)
+            if frame is None:
+                continue
+            trade_date = _daily_basic_file_date(path).strftime("%Y%m%d")
+            identity = _daily_basic_source_identity(path)
+            selected_frames.append(frame)
+            selected_dates.append(trade_date)
+            refreshed[period_key] = (frame, {"trade_date": trade_date, "source": identity})
+            break
+
+    if refreshed:
+        replacement_periods = {
+            pd.Period(period_key, freq="M" if sampling == "monthly" else "W-FRI")
+            for period_key in refreshed
+        }
+        if cached.empty:
+            retained = cached
+        else:
+            cached_dates = pd.to_datetime(
+                cached["trade_date"].astype(str).str.replace("-", "", regex=False),
+                format="%Y%m%d",
+                errors="coerce",
+            )
+            cached_periods = cached_dates.dt.to_period(
+                "M" if sampling == "monthly" else "W-FRI"
+            )
+            retained = cached.loc[~cached_periods.isin(replacement_periods)]
+        refreshed_frames: list[pd.DataFrame] = []
+        for period_key, (frame, record) in refreshed.items():
+            refreshed_frames.append(frame)
+            period_manifest[period_key] = record
+        updated = pd.concat([retained, *refreshed_frames], ignore_index=True, sort=False)
+        updated = (
+            updated.sort_values(["trade_date", "ts_code"])
+            .drop_duplicates(["trade_date", "ts_code"], keep="last")
+            .reset_index(drop=True)
+        )
+        cache_path, manifest_path = _daily_basic_period_cache_paths(sampling)
+        atomic_write_parquet(updated, cache_path, index=False)
+        atomic_write_json(
+            {
+                "version": DAILY_BASIC_PERIOD_CACHE_VERSION,
+                "sampling": sampling,
+                "source_dir": str(source_dir.resolve()),
+                "high_water_trade_date": max(selected_dates) if selected_dates else None,
+                "periods": period_manifest,
+            },
+            manifest_path,
+        )
+
+    return selected_frames, selected_dates, {
+        "attempted_files": attempted_files,
+        "cache_hit_periods": cache_hits,
+        "refreshed_periods": len(refreshed),
+    }
+
+
 def load_daily_basic_monthly(
     start: pd.Timestamp,
     end: pd.Timestamp | None,
@@ -508,41 +742,17 @@ def load_daily_basic_monthly(
     if not files:
         return pd.DataFrame(), {"source_dir": str(source_dir), "files": 0}
 
-    frames: list[pd.DataFrame] = []
-    dates: list[str] = []
-    for path in files:
-        date_text = path.stem.replace("tushare_daily_basic_", "")
-        if len(date_text) != 8:
-            date_text = path.stem
-        date = parse_date(date_text)
-        if date is None or date < start or (end is not None and date > end):
-            continue
-        try:
-            df = pd.read_parquet(path)
-        except Exception:
-            continue
-        if df.empty or "ts_code" not in df.columns:
-            continue
-        if "trade_date" not in df.columns:
-            df["trade_date"] = date_text
-        frames.append(
-            df[
-                [
-                    "ts_code",
-                    "trade_date",
-                    "turnover_rate",
-                    "turnover_rate_f",
-                    "pe_ttm",
-                    "pb",
-                    "ps_ttm",
-                    "dv_ratio",
-                    "dv_ttm",
-                    "total_mv",
-                    "circ_mv",
-                ]
-            ].copy()
-        )
-        dates.append(date_text)
+    period_candidates, available_dates = _period_end_daily_basic_candidates(
+        files,
+        start,
+        end,
+        sampling=sampling,
+    )
+    frames, dates, cache_stats = _load_period_end_daily_basic_frames(
+        period_candidates,
+        sampling=sampling,
+        source_dir=source_dir,
+    )
 
     if not frames:
         return pd.DataFrame(), {"source_dir": str(source_dir), "files": len(files)}
@@ -573,9 +783,16 @@ def load_daily_basic_monthly(
     coverage = {
         "source_dir": str(source_dir),
         "files": len(files),
-        "loaded_trade_dates": len(set(dates)),
-        "first_trade_date": min(dates) if dates else None,
-        "last_trade_date": max(dates) if dates else None,
+        # Preserve the legacy coverage meaning without opening every daily
+        # payload: these values describe available source trading dates.
+        "loaded_trade_dates": len(available_dates),
+        "first_trade_date": available_dates[0].strftime("%Y%m%d") if available_dates else None,
+        "last_trade_date": available_dates[-1].strftime("%Y%m%d") if available_dates else None,
+        "read_trade_dates": len(set(dates)),
+        "read_source_files": cache_stats["attempted_files"],
+        "skipped_source_files": max(0, cache_stats["attempted_files"] - cache_stats["refreshed_periods"]),
+        "cache_hit_periods": cache_stats["cache_hit_periods"],
+        "refreshed_periods": cache_stats["refreshed_periods"],
         "monthly_rebalance_dates": int(sampled["date"].nunique()) if sampling == "monthly" else 0,
         "weekly_rebalance_dates": int(sampled["date"].nunique()) if sampling == "weekly" else 0,
         "sampled_rebalance_dates": int(sampled["date"].nunique()),

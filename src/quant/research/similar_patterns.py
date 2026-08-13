@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import json
 import multiprocessing as mp
+import os
+import shutil
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Callable
+from typing import Callable, Iterator
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -21,6 +25,39 @@ from quant.data import (
     read_partitioned_symbol_file,
 )
 from quant.data.factors.technical import KDJ
+
+
+_MATRIX_CACHE_SCHEMA_VERSION = 1
+_MATRIX_CACHE_DIRNAME = "_matrix_cache_v1"
+_MATRIX_CACHE_CHUNK_SYMBOLS = 96
+_MATRIX_CACHE_CHUNK_MAX_SOURCE_BYTES = 64 * 1024 * 1024
+_VECTOR_CACHE_SOURCE_METADATA_FILENAME = "_refresh_metadata.json"
+_VECTOR_SOURCE_COLUMNS = (
+    "ts_code",
+    "trade_date",
+    "name",
+    "open",
+    "high",
+    "low",
+    "close",
+    "vol",
+    "volume",
+    "pct_chg",
+    "pct_change",
+)
+_PARTITION_CONTENT_DIGEST_CACHE: dict[tuple[str, int, int, int], str] = {}
+_PARTITION_CONTENT_DIGEST_CACHE_MAX_ENTRIES = 512
+_MATRIX_CACHE_FLOAT_FIELDS = (
+    "close",
+    "fwd_1d",
+    "fwd_1d_volume_ratio",
+    "fwd_20d",
+    "fwd_60d",
+    "max_runup_3d",
+    "max_drawdown_3d",
+    "max_drawdown_60d",
+    "max_runup_60d",
+)
 
 
 @dataclass(frozen=True)
@@ -173,24 +210,454 @@ def vector_cache_path(cache_dir: Path, symbol: str, config: SimilarPatternConfig
     return cache_dir / vector_cache_key(config) / f"{safe_symbol}.npz"
 
 
-def partitioned_daily_source_fingerprint(daily_dir: Path) -> str | None:
-    """Return a stable fingerprint for the configured canonical daily source."""
+@dataclass(frozen=True)
+class _VectorCacheEntry:
+    symbol: str
+    path: Path
+    size: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
+class _CompiledVectorCache:
+    generation_dir: Path
+    manifest: dict[str, object]
+
+
+def _vector_cache_inventory(
+    daily_paths: list[Path],
+    cache_dir: Path,
+    config: SimilarPatternConfig,
+) -> list[_VectorCacheEntry]:
+    """Resolve the exact legacy cache inputs represented by a matrix generation."""
+    entries: list[_VectorCacheEntry] = []
+    for daily_path in daily_paths:
+        symbol = daily_path.stem
+        path = vector_cache_path(cache_dir, symbol, config)
+        if not path.exists():
+            continue
+        stat = path.stat()
+        entries.append(
+            _VectorCacheEntry(
+                symbol=symbol,
+                path=path,
+                size=int(stat.st_size),
+                mtime_ns=int(stat.st_mtime_ns),
+            )
+        )
+    return entries
+
+
+def _vector_cache_inventory_fingerprint(
+    entries: list[_VectorCacheEntry],
+    config: SimilarPatternConfig,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"matrix-schema:{_MATRIX_CACHE_SCHEMA_VERSION}".encode("ascii"))
+    digest.update(f"vector-config:{vector_cache_key(config)}".encode("ascii"))
+    cache_directories = sorted({entry.path.parent for entry in entries})
+    for cache_directory in cache_directories:
+        metadata_path = cache_directory / _VECTOR_CACHE_SOURCE_METADATA_FILENAME
+        if metadata_path.exists():
+            digest.update(metadata_path.read_bytes())
+    for entry in entries:
+        digest.update(entry.symbol.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(entry.path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(entry.size).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(entry.mtime_ns).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+@contextmanager
+def _matrix_cache_lock(cache_root: Path, *, exclusive: bool) -> Iterator[None]:
+    """Serialize generation replacement while allowing concurrent read scans."""
+    cache_root.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_root / ".lock"
+    with lock_path.open("a+b") as handle:
+        try:
+            import fcntl
+
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fileno(), mode)
+        except (ImportError, OSError):
+            fcntl = None  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+
+def _compiled_manifest_is_valid(
+    generation_dir: Path,
+    *,
+    inventory_fingerprint: str,
+    config: SimilarPatternConfig,
+) -> dict[str, object] | None:
+    manifest_path = generation_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if manifest.get("schema_version") != _MATRIX_CACHE_SCHEMA_VERSION:
+        return None
+    if manifest.get("config_key") != vector_cache_key(config):
+        return None
+    if manifest.get("inventory_fingerprint") != inventory_fingerprint:
+        return None
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return None
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            return None
+        relative = chunk.get("path")
+        if not isinstance(relative, str):
+            return None
+        chunk_dir = generation_dir / relative
+        required_files = (
+            "vectors.npy",
+            "indices.npy",
+            "dates.npy",
+            "segments.json",
+            *(f"{field}.npy" for field in _MATRIX_CACHE_FLOAT_FIELDS),
+        )
+        if any(not (chunk_dir / filename).exists() for filename in required_files):
+            return None
+    return manifest
+
+
+def _save_compiled_chunk(
+    chunk_dir: Path,
+    entries: list[_VectorCacheEntry],
+) -> tuple[dict[str, object], list[str]]:
+    cached_stocks: list[dict[str, object]] = []
+    vector_dim: int | None = None
+    source_fingerprints: list[str] = []
+    for entry in entries:
+        cached = load_stock_vector_cache(entry.path)
+        vectors = np.asarray(cached["vectors"], dtype=np.float32)
+        if vectors.ndim != 2 or vectors.shape[0] == 0:
+            continue
+        if vector_dim is None:
+            vector_dim = int(vectors.shape[1])
+        elif int(vectors.shape[1]) != vector_dim:
+            raise ValueError(
+                f"vector dimension mismatch for {entry.symbol}: "
+                f"expected={vector_dim} actual={vectors.shape[1]}"
+            )
+        row_count = int(vectors.shape[0])
+        if len(cached["indices"]) != row_count:
+            raise ValueError(f"cache row mismatch for {entry.symbol}")
+        cached_stocks.append(cached)
+        source_fingerprints.append(
+            f"{entry.symbol}:{cached.get('source_fingerprint') or 'legacy'}"
+        )
+    if not cached_stocks or vector_dim is None:
+        raise ValueError("compiled vector chunk has no usable rows")
+
+    chunk_dir.mkdir(parents=True, exist_ok=False)
+    segments: list[dict[str, object]] = []
+    offset = 0
+    for cached in cached_stocks:
+        row_count = int(np.asarray(cached["vectors"]).shape[0])
+        segments.append(
+            {
+                "symbol": str(cached["symbol"]),
+                "name": str(cached["name"]),
+                "industry": str(cached["industry"]),
+                "start": offset,
+                "stop": offset + row_count,
+            }
+        )
+        offset += row_count
+
+    np.save(
+        chunk_dir / "vectors.npy",
+        np.concatenate(
+            [np.asarray(cached["vectors"], dtype=np.float32) for cached in cached_stocks],
+            axis=0,
+        ),
+        allow_pickle=False,
+    )
+    np.save(
+        chunk_dir / "indices.npy",
+        np.concatenate(
+            [np.asarray(cached["indices"], dtype=np.int32) for cached in cached_stocks]
+        ),
+        allow_pickle=False,
+    )
+    np.save(
+        chunk_dir / "dates.npy",
+        np.concatenate(
+            [np.asarray(cached["dates"], dtype="U10") for cached in cached_stocks]
+        ),
+        allow_pickle=False,
+    )
+    for field in _MATRIX_CACHE_FLOAT_FIELDS:
+        np.save(
+            chunk_dir / f"{field}.npy",
+            np.concatenate(
+                [np.asarray(cached[field], dtype=np.float32) for cached in cached_stocks]
+            ),
+            allow_pickle=False,
+        )
+    (chunk_dir / "segments.json").write_text(
+        json.dumps(segments, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return (
+        {
+            "path": chunk_dir.name,
+            "rows": offset,
+            "symbols": len(segments),
+            "vector_dim": vector_dim,
+        },
+        source_fingerprints,
+    )
+
+
+def _iter_vector_cache_chunks(
+    entries: list[_VectorCacheEntry],
+) -> Iterator[list[_VectorCacheEntry]]:
+    chunk: list[_VectorCacheEntry] = []
+    chunk_bytes = 0
+    for entry in entries:
+        exceeds_symbol_limit = len(chunk) >= _MATRIX_CACHE_CHUNK_SYMBOLS
+        exceeds_byte_limit = (
+            bool(chunk)
+            and chunk_bytes + entry.size > _MATRIX_CACHE_CHUNK_MAX_SOURCE_BYTES
+        )
+        if exceeds_symbol_limit or exceeds_byte_limit:
+            yield chunk
+            chunk = []
+            chunk_bytes = 0
+        chunk.append(entry)
+        chunk_bytes += entry.size
+    if chunk:
+        yield chunk
+
+
+def _build_compiled_vector_cache(
+    cache_root: Path,
+    generation_dir: Path,
+    entries: list[_VectorCacheEntry],
+    config: SimilarPatternConfig,
+    inventory_fingerprint: str,
+) -> dict[str, object]:
+    temp_dir = cache_root / f".{generation_dir.name}.building-{os.getpid()}-{uuid4().hex[:8]}"
+    temp_dir.mkdir(parents=True, exist_ok=False)
+    chunks: list[dict[str, object]] = []
+    source_fingerprints: list[str] = []
+    vector_dim: int | None = None
+    try:
+        for chunk_number, chunk_entries in enumerate(_iter_vector_cache_chunks(entries)):
+            chunk, chunk_sources = _save_compiled_chunk(
+                temp_dir / f"chunk_{chunk_number:05d}",
+                chunk_entries,
+            )
+            if vector_dim is None:
+                vector_dim = int(chunk["vector_dim"])
+            elif int(chunk["vector_dim"]) != vector_dim:
+                raise ValueError("compiled vector chunks use inconsistent dimensions")
+            chunks.append(chunk)
+            source_fingerprints.extend(chunk_sources)
+        if not chunks or vector_dim is None:
+            raise ValueError("no usable legacy vector caches are available to compile")
+        source_digest = hashlib.sha256("\n".join(source_fingerprints).encode("utf-8")).hexdigest()
+        manifest: dict[str, object] = {
+            "schema_version": _MATRIX_CACHE_SCHEMA_VERSION,
+            "config_key": vector_cache_key(config),
+            "inventory_fingerprint": inventory_fingerprint,
+            "source_fingerprint_digest": source_digest,
+            "inventory_entries": len(entries),
+            "symbols": int(sum(int(chunk["symbols"]) for chunk in chunks)),
+            "rows": int(sum(int(chunk["rows"]) for chunk in chunks)),
+            "vector_dim": vector_dim,
+            "chunks": chunks,
+        }
+        (temp_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        if generation_dir.exists():
+            shutil.rmtree(generation_dir)
+        temp_dir.replace(generation_dir)
+        return manifest
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def _prune_compiled_vector_generations(cache_root: Path, current: Path) -> None:
+    """Remove stale generations while the caller holds the exclusive cache lock."""
+    generations = (
+        path
+        for path in cache_root.iterdir()
+        if path.is_dir() and not path.name.startswith(".") and path != current
+    )
+    for stale in generations:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def _ensure_compiled_vector_cache(
+    entries: list[_VectorCacheEntry],
+    cache_dir: Path,
+    config: SimilarPatternConfig,
+) -> _CompiledVectorCache:
+    if not entries:
+        raise ValueError("no legacy vector caches are available")
+    inventory_fingerprint = _vector_cache_inventory_fingerprint(entries, config)
+    cache_root = cache_dir / vector_cache_key(config) / _MATRIX_CACHE_DIRNAME
+    generation_dir = cache_root / inventory_fingerprint[:24]
+    with _matrix_cache_lock(cache_root, exclusive=True):
+        for abandoned in cache_root.glob(".*.building-*"):
+            if abandoned.is_dir():
+                shutil.rmtree(abandoned, ignore_errors=True)
+        manifest = _compiled_manifest_is_valid(
+            generation_dir,
+            inventory_fingerprint=inventory_fingerprint,
+            config=config,
+        )
+        if manifest is None:
+            manifest = _build_compiled_vector_cache(
+                cache_root,
+                generation_dir,
+                entries,
+                config,
+                inventory_fingerprint,
+            )
+        _prune_compiled_vector_generations(cache_root, generation_dir)
+    return _CompiledVectorCache(generation_dir=generation_dir, manifest=manifest)
+
+
+def _semantic_daily_frame_fingerprint(frame: pd.DataFrame) -> str | None:
+    """Hash the source values that can change a generated pattern vector."""
+    if frame.empty:
+        return None
+    columns = [column for column in _VECTOR_SOURCE_COLUMNS if column in frame.columns]
+    if not {"ts_code", "trade_date", "open", "high", "low", "close"}.issubset(columns):
+        return None
+
+    normalized = frame[columns].copy()
+    normalized["ts_code"] = normalized["ts_code"].fillna("").astype(str)
+    normalized["trade_date"] = pd.to_datetime(
+        normalized["trade_date"].astype(str).str.replace("-", "", regex=False),
+        format="%Y%m%d",
+        errors="coerce",
+    ).dt.strftime("%Y%m%d")
+    if "name" in normalized.columns:
+        normalized["name"] = normalized["name"].fillna("").astype(str)
+    for column in columns:
+        if column not in {"ts_code", "trade_date", "name"}:
+            normalized[column] = pd.to_numeric(normalized[column], errors="coerce").astype("float64")
+    normalized = (
+        normalized.dropna(subset=["trade_date"])
+        .sort_values(["ts_code", "trade_date"], kind="mergesort")
+        .drop_duplicates(["ts_code", "trade_date"], keep="last")
+        .reset_index(drop=True)
+    )
+    if normalized.empty:
+        return None
+
+    digest = hashlib.sha256()
+    digest.update("\0".join(columns).encode("utf-8"))
+    digest.update(
+        pd.util.hash_pandas_object(normalized, index=False, categorize=True)
+        .to_numpy(dtype="uint64", copy=False)
+        .tobytes()
+    )
+    latest = str(normalized["trade_date"].max())
+    return f"{latest}:{len(normalized)}:{digest.hexdigest()}"
+
+
+def _read_sql_vector_source(store: MarketDataStore, dataset: str) -> pd.DataFrame:
+    """Read only columns relevant to vector generation from the SQL canonical source."""
+    selected_columns = list(_VECTOR_SOURCE_COLUMNS)
+    engine = None
+    try:
+        from sqlalchemy import inspect
+
+        engine = store._engine()
+        table_name = store._dataset_table_name(dataset)
+        available = {
+            str(column["name"])
+            for column in inspect(engine).get_columns(table_name)
+        }
+        selected_columns = [column for column in selected_columns if column in available]
+    except Exception:
+        # The range reader remains the authority for whether SQL is usable.  This
+        # fallback also keeps custom/test stores that do not expose inspection usable.
+        selected_columns = list(_VECTOR_SOURCE_COLUMNS)
+    finally:
+        if engine is not None:
+            engine.dispose()
+    frame = store._read_sql_range(dataset, columns=selected_columns)
+    if frame.empty:
+        # If schema inspection raced a migration or lacked metadata privileges,
+        # let the store perform one unprojected SQL read before considering a mirror.
+        frame = store._read_sql_range(dataset)
+    return frame
+
+
+def _partition_content_digest(path: Path) -> str:
+    """Hash one parquet artifact, reusing unchanged partition digests in-process."""
+    source_stat = path.stat()
+    key = (
+        str(path.resolve()),
+        int(source_stat.st_size),
+        int(source_stat.st_mtime_ns),
+        int(source_stat.st_ctime_ns),
+    )
+    cached = _PARTITION_CONTENT_DIGEST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    if len(_PARTITION_CONTENT_DIGEST_CACHE) >= _PARTITION_CONTENT_DIGEST_CACHE_MAX_ENTRIES:
+        _PARTITION_CONTENT_DIGEST_CACHE.clear()
+    _PARTITION_CONTENT_DIGEST_CACHE[key] = value
+    return value
+
+
+def _parquet_daily_source_fingerprint(daily_dir: Path) -> str | None:
     partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
     partition_paths = sorted(partition_root.glob("year_month=*/data.parquet"))
     if not partition_paths:
-        store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
-        latest = store.latest_dataset_trade_date(daily_dir.name)
-        if latest is None:
-            return None
-        symbols = store.list_symbols(daily_dir.name)
-        return f"canonical:{latest.strftime('%Y%m%d')}:{len(symbols)}"
-    digest = hashlib.sha1()
+        return None
+    digest = hashlib.sha256()
     for path in partition_paths:
-        source_stat = path.stat()
         digest.update(path.parent.name.encode("utf-8"))
-        digest.update(str(source_stat.st_mtime_ns).encode("ascii"))
-        digest.update(str(source_stat.st_size).encode("ascii"))
+        digest.update(b":")
+        digest.update(_partition_content_digest(path).encode("ascii"))
+        digest.update(b"\n")
     return f"partitioned:{digest.hexdigest()}"
+
+
+def partitioned_daily_source_fingerprint(daily_dir: Path) -> str | None:
+    """Return an input identity for the backend that canonical reads actually use."""
+    config = MarketDataStoreConfig.from_env(root=daily_dir.parent)
+    store = MarketDataStore(config)
+    if config.backend in {"mysql", "sql"} and config.sql_url:
+        sql_frame = _read_sql_vector_source(store, daily_dir.name)
+        sql_identity = _semantic_daily_frame_fingerprint(sql_frame)
+        if sql_identity is not None:
+            return f"sql-semantic:{sql_identity}"
+        if not config.mirror_parquet:
+            return None
+    return _parquet_daily_source_fingerprint(daily_dir)
 
 
 def save_stock_vector_cache(
@@ -313,12 +780,12 @@ def build_stock_vector_cache(
     cache_path = vector_cache_path(cache_dir, symbol, config)
     source_stat = path.stat() if path.exists() else None
     effective_source_fingerprint = source_fingerprint
+    if effective_source_fingerprint is None:
+        effective_source_fingerprint = partitioned_daily_source_fingerprint(path.parent)
     if effective_source_fingerprint is None and source_stat is not None:
         effective_source_fingerprint = (
             f"file:{source_stat.st_mtime_ns}:{source_stat.st_size}"
         )
-    if effective_source_fingerprint is None:
-        effective_source_fingerprint = partitioned_daily_source_fingerprint(path.parent)
     if cache_path.exists() and not force:
         cached = load_stock_vector_cache(cache_path)
         fingerprint_matches = (
@@ -670,6 +1137,219 @@ def make_cached_candidate_row(
     }
 
 
+def _make_compiled_candidate_row(
+    arrays: dict[str, np.ndarray],
+    segment: dict[str, object],
+    position: int,
+    distance: float,
+    similarity: float,
+) -> dict[str, object]:
+    return {
+        "symbol": str(segment["symbol"]),
+        "name": str(segment["name"]),
+        "industry": str(segment["industry"]),
+        "date": pd.Timestamp(str(arrays["dates"][position])),
+        "close": float(arrays["close"][position]),
+        "fwd_1d": float(arrays["fwd_1d"][position]),
+        "fwd_1d_volume_ratio": float(arrays["fwd_1d_volume_ratio"][position]),
+        "fwd_20d": float(arrays["fwd_20d"][position]),
+        "fwd_60d": float(arrays["fwd_60d"][position]),
+        "max_runup_3d": float(arrays["max_runup_3d"][position]),
+        "max_drawdown_3d": float(arrays["max_drawdown_3d"][position]),
+        "max_drawdown_60d": float(arrays["max_drawdown_60d"][position]),
+        "max_runup_60d": float(arrays["max_runup_60d"][position]),
+        "distance": distance,
+        "similarity": similarity,
+    }
+
+
+def _threshold_screen_mask(
+    vectors: np.ndarray,
+    target_matrix: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Use one BLAS scan to conservatively reject definite non-matches.
+
+    Every cell retained by the screen is recomputed with the legacy subtraction
+    and norm expression.  The error guard is intentionally conservative so a
+    float32 threshold-edge case cannot become a false negative.
+    """
+    if threshold <= 0:
+        return np.ones((len(vectors), len(target_matrix)), dtype=bool)
+    if threshold > 1:
+        return np.zeros((len(vectors), len(target_matrix)), dtype=bool)
+    rows = np.asarray(vectors, dtype=np.float32)
+    targets = np.asarray(target_matrix, dtype=np.float32)
+    row_norm_sq = np.einsum("ij,ij->i", rows, rows, optimize=False)
+    target_norm_sq = np.einsum("ij,ij->i", targets, targets, optimize=False)
+    dots = rows @ targets.T
+    fast_distance_sq = row_norm_sq[:, None] + target_norm_sq[None, :] - np.float32(2.0) * dots
+    np.maximum(fast_distance_sq, np.float32(0.0), out=fast_distance_sq)
+
+    dimension = max(1, int(rows.shape[1]))
+    eps = float(np.finfo(np.float32).eps)
+    gamma = dimension * eps / max(1.0 - dimension * eps, eps)
+    magnitude = (
+        row_norm_sq[:, None]
+        + target_norm_sq[None, :]
+        + np.float32(2.0) * np.abs(dots)
+    )
+    # Covers the dot-product, subtraction/square/reduction and final formula
+    # rounding paths.  Pattern vectors are finite float32 values by contract.
+    guard_sq = np.maximum(np.float32(1e-4), np.float32(32.0 * gamma) * magnitude)
+    cutoff_distance = np.float32(1.0 / threshold - 1.0)
+    cutoff_sq = cutoff_distance * cutoff_distance
+    return fast_distance_sq <= cutoff_sq + guard_sq
+
+
+def _select_compiled_contiguous_positions(
+    passing_positions: np.ndarray,
+    similarities: np.ndarray,
+    candidate_indices: np.ndarray,
+    segment_offsets: np.ndarray,
+    candidate_step_days: int,
+) -> np.ndarray:
+    """Vectorized equivalent of best-per-contiguous-run across many stocks."""
+    if len(passing_positions) == 0:
+        return np.empty(0, dtype=np.int64)
+    positions = np.asarray(passing_positions, dtype=np.int64)
+    values = np.asarray(similarities, dtype=np.float32)
+    segment_ids = np.searchsorted(segment_offsets[1:], positions, side="right")
+    indices = np.asarray(candidate_indices[positions], dtype=np.int64)
+    boundaries = np.ones(len(positions), dtype=bool)
+    if len(positions) > 1:
+        boundaries[1:] = (segment_ids[1:] != segment_ids[:-1]) | (
+            indices[1:] - indices[:-1] > max(1, candidate_step_days)
+        )
+    starts = np.flatnonzero(boundaries)
+    group_ids = np.cumsum(boundaries, dtype=np.int64) - 1
+    maxima = np.maximum.reduceat(values, starts)
+    is_first_max_candidate = values == maxima[group_ids]
+    selected = np.full(len(starts), len(positions), dtype=np.int64)
+    np.minimum.at(
+        selected,
+        group_ids[is_first_max_candidate],
+        np.flatnonzero(is_first_max_candidate),
+    )
+    return positions[selected]
+
+
+def _scan_compiled_threshold_cache(
+    compiled: _CompiledVectorCache,
+    target_vectors: dict[str, np.ndarray],
+    config: SimilarPatternConfig,
+    target_symbol_set: set[str],
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[dict[str, list[dict[str, object]]], int]:
+    threshold = float(config.similarity_threshold or 0.0)
+    target_symbols = list(target_vectors)
+    target_matrix = np.vstack(
+        [np.asarray(target_vectors[symbol], dtype=np.float32) for symbol in target_symbols]
+    )
+    expected_dim = int(compiled.manifest["vector_dim"])
+    if target_matrix.shape[1] != expected_dim:
+        raise ValueError(
+            f"target vector dimension mismatch: expected={expected_dim} actual={target_matrix.shape[1]}"
+        )
+    matches: dict[str, list[dict[str, object]]] = {symbol: [] for symbol in target_symbols}
+    chunks = compiled.manifest["chunks"]
+    if not isinstance(chunks, list):
+        raise ValueError("compiled cache manifest has invalid chunks")
+    scanned_candidates = 0
+    started = perf_counter()
+    with _matrix_cache_lock(compiled.generation_dir.parent, exclusive=False):
+        for chunk_number, chunk in enumerate(chunks, start=1):
+            if not isinstance(chunk, dict) or not isinstance(chunk.get("path"), str):
+                raise ValueError("compiled cache manifest has an invalid chunk")
+            chunk_dir = compiled.generation_dir / str(chunk["path"])
+            segments = json.loads((chunk_dir / "segments.json").read_text(encoding="utf-8"))
+            if not isinstance(segments, list) or not segments:
+                raise ValueError(f"compiled cache chunk has no segments: {chunk_dir}")
+            arrays: dict[str, np.ndarray] = {
+                "vectors": np.load(chunk_dir / "vectors.npy", mmap_mode="r", allow_pickle=False),
+                "indices": np.load(chunk_dir / "indices.npy", mmap_mode="r", allow_pickle=False),
+                "dates": np.load(chunk_dir / "dates.npy", mmap_mode="r", allow_pickle=False),
+            }
+            for field in _MATRIX_CACHE_FLOAT_FIELDS:
+                arrays[field] = np.load(
+                    chunk_dir / f"{field}.npy",
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+            vectors = arrays["vectors"]
+            candidate_indices = arrays["indices"]
+            if len(vectors) != len(candidate_indices):
+                raise ValueError(f"compiled cache chunk row mismatch: {chunk_dir}")
+            segment_offsets = np.array(
+                [int(segment["start"]) for segment in segments] + [int(segments[-1]["stop"])],
+                dtype=np.int64,
+            )
+            eligible = np.ones(len(vectors), dtype=bool)
+            for segment in segments:
+                if str(segment["symbol"]).upper() in target_symbol_set:
+                    eligible[int(segment["start"]) : int(segment["stop"])] = False
+            scanned_candidates += int(np.count_nonzero(eligible))
+
+            screen = _threshold_screen_mask(vectors, target_matrix, threshold)
+            for target_number, target_symbol in enumerate(target_symbols):
+                screened_positions = np.flatnonzero(screen[:, target_number] & eligible)
+                if len(screened_positions) == 0:
+                    continue
+                exact_vectors = np.asarray(vectors[screened_positions], dtype=np.float32)
+                distances = np.linalg.norm(
+                    exact_vectors - target_matrix[target_number],
+                    axis=1,
+                )
+                similarities = np.float32(1.0) / (np.float32(1.0) + distances)
+                passing = similarities >= threshold
+                passing_positions = screened_positions[passing]
+                passing_similarities = similarities[passing]
+                passing_distances = distances[passing]
+                if len(passing_positions) == 0:
+                    continue
+                selected_positions = _select_compiled_contiguous_positions(
+                    passing_positions,
+                    passing_similarities,
+                    candidate_indices,
+                    segment_offsets,
+                    config.candidate_step_days,
+                )
+                passing_offsets = np.searchsorted(passing_positions, selected_positions)
+                selected_segment_ids = np.searchsorted(
+                    segment_offsets[1:],
+                    selected_positions,
+                    side="right",
+                )
+                for position, passing_offset, segment_id in zip(
+                    selected_positions,
+                    passing_offsets,
+                    selected_segment_ids,
+                ):
+                    matches[target_symbol].append(
+                        _make_compiled_candidate_row(
+                            arrays,
+                            segments[int(segment_id)],
+                            int(position),
+                            float(passing_distances[passing_offset]),
+                            float(passing_similarities[passing_offset]),
+                        )
+                    )
+
+            if chunk_number % 10 == 0 or chunk_number == len(chunks):
+                counts = ", ".join(
+                    f"{symbol}={len(rows):,}" for symbol, rows in matches.items()
+                )
+                message = (
+                    f"matrix threshold scan {chunk_number}/{len(chunks)} chunks, "
+                    f"candidates={scanned_candidates:,}, matches: {counts}, "
+                    f"elapsed={perf_counter() - started:.1f}s"
+                )
+                print(f"  {message}", flush=True)
+                if progress_callback:
+                    progress_callback(message)
+    return matches, scanned_candidates
+
+
 def candidate_end_indices(daily: pd.DataFrame, config: SimilarPatternConfig) -> range:
     max_end = len(daily) - min(config.forward_days) - 1
     if max_end < config.min_history_days:
@@ -923,80 +1603,128 @@ def analyze_targets_by_threshold(
     basic_map = basic.set_index("ts_code").to_dict("index") if not basic.empty else {}
     scanned_candidates = 0
     started = perf_counter()
-
-    for n, path in enumerate(files, start=1):
-        symbol = path.stem
-        if symbol.upper() in target_symbol_set:
-            continue
-        cached: dict[str, object] | None = None
-        daily: pd.DataFrame | None = None
-        if vector_cache_dir is not None:
-            cache_path = vector_cache_path(vector_cache_dir, symbol, config)
-            if not cache_path.exists():
-                continue
-            cached = load_stock_vector_cache(cache_path)
-            candidate_indices = [int(value) for value in cached["indices"]]
-            candidate_matrix = cached["vectors"]
-        else:
-            try:
-                daily = load_daily_file(path)
-            except Exception as exc:
-                print(f"skip {path.name}: {exc}", flush=True)
-                continue
-            if len(daily) < config.min_history_days + max(config.forward_days) + 1:
-                continue
-            info = basic_map.get(symbol, {})
-            industry = str(info.get("industry", ""))
-            if info.get("name"):
-                daily["name"] = daily["name"].replace("", np.nan).fillna(str(info["name"]))
-            name = stock_name_from_basic_or_daily(info, daily)
-            if is_excluded_stock(name):
-                continue
-
-            weekly_close, monthly_close = resample_close_series(daily)
-            candidate_indices, candidate_matrix = build_stock_candidate_matrix(daily, config, weekly_close, monthly_close)
-        if len(candidate_indices) == 0:
-            continue
-        scanned_candidates += len(candidate_indices)
-
-        for target_symbol, target_vector in target_vectors.items():
-            deltas = candidate_matrix - target_vector
-            distances = np.linalg.norm(deltas, axis=1)
-            similarities = 1 / (1 + distances)
-            selected_positions = select_best_positions_from_contiguous_matches(
-                candidate_indices,
-                similarities,
-                config.similarity_threshold,
-                config.candidate_step_days,
+    cache_mode = "daily_files"
+    compiled_manifest: dict[str, object] | None = None
+    compiled_scan_complete = False
+    matrix_cache_disabled = os.getenv("SIMILAR_PATTERN_DISABLE_MATRIX_CACHE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if vector_cache_dir is not None and not matrix_cache_disabled:
+        try:
+            inventory = _vector_cache_inventory(files, vector_cache_dir, config)
+            compile_started = perf_counter()
+            compiled = _ensure_compiled_vector_cache(inventory, vector_cache_dir, config)
+            compiled_manifest = compiled.manifest
+            compile_elapsed = perf_counter() - compile_started
+            if compile_elapsed >= 0.5:
+                message = (
+                    f"matrix cache ready: chunks={len(compiled.manifest['chunks'])}, "
+                    f"rows={int(compiled.manifest['rows']):,}, elapsed={compile_elapsed:.1f}s"
+                )
+                print(f"  {message}", flush=True)
+                if progress_callback:
+                    progress_callback(message)
+            target_matches, scanned_candidates = _scan_compiled_threshold_cache(
+                compiled,
+                target_vectors,
+                config,
+                target_symbol_set,
+                progress_callback,
             )
-            for position in selected_positions:
-                if cached is not None:
-                    row = make_cached_candidate_row(
-                        cached,
-                        position,
-                        float(distances[position]),
-                        float(similarities[position]),
-                    )
-                else:
-                    end_idx = candidate_indices[position]
-                    row = make_candidate_row(daily, end_idx, candidate_matrix[position], config, industry)
-                    if row is None:
-                        continue
-                    row.pop("vector", None)
-                    row["distance"] = float(distances[position])
-                    row["similarity"] = float(similarities[position])
-                target_matches[target_symbol].append(row)
-
-        if n % 500 == 0:
-            elapsed = perf_counter() - started
-            counts = ", ".join(f"{symbol}={len(rows):,}" for symbol, rows in target_matches.items())
-            message = (
-                f"threshold scan {n}/{len(files)} files, candidates={scanned_candidates:,}, "
-                f"matches: {counts}, elapsed={elapsed:.1f}s"
-            )
+            cache_mode = "matrix_chunks"
+            compiled_scan_complete = True
+        except Exception as exc:
+            message = f"matrix cache unavailable; falling back to legacy scan: {exc}"
             print(f"  {message}", flush=True)
             if progress_callback:
                 progress_callback(message)
+            target_matches = {symbol: [] for symbol in target_contexts}
+            scanned_candidates = 0
+
+    if not compiled_scan_complete:
+        cache_mode = "legacy_npz" if vector_cache_dir is not None else "daily_files"
+        for n, path in enumerate(files, start=1):
+            symbol = path.stem
+            if symbol.upper() in target_symbol_set:
+                continue
+            cached: dict[str, object] | None = None
+            daily: pd.DataFrame | None = None
+            if vector_cache_dir is not None:
+                cache_path = vector_cache_path(vector_cache_dir, symbol, config)
+                if not cache_path.exists():
+                    continue
+                cached = load_stock_vector_cache(cache_path)
+                candidate_indices = [int(value) for value in cached["indices"]]
+                candidate_matrix = cached["vectors"]
+            else:
+                try:
+                    daily = load_daily_file(path)
+                except Exception as exc:
+                    print(f"skip {path.name}: {exc}", flush=True)
+                    continue
+                if len(daily) < config.min_history_days + max(config.forward_days) + 1:
+                    continue
+                info = basic_map.get(symbol, {})
+                industry = str(info.get("industry", ""))
+                if info.get("name"):
+                    daily["name"] = daily["name"].replace("", np.nan).fillna(str(info["name"]))
+                name = stock_name_from_basic_or_daily(info, daily)
+                if is_excluded_stock(name):
+                    continue
+
+                weekly_close, monthly_close = resample_close_series(daily)
+                candidate_indices, candidate_matrix = build_stock_candidate_matrix(
+                    daily,
+                    config,
+                    weekly_close,
+                    monthly_close,
+                )
+            if len(candidate_indices) == 0:
+                continue
+            scanned_candidates += len(candidate_indices)
+
+            for target_symbol, target_vector in target_vectors.items():
+                deltas = candidate_matrix - target_vector
+                distances = np.linalg.norm(deltas, axis=1)
+                similarities = 1 / (1 + distances)
+                selected_positions = select_best_positions_from_contiguous_matches(
+                    candidate_indices,
+                    similarities,
+                    config.similarity_threshold,
+                    config.candidate_step_days,
+                )
+                for position in selected_positions:
+                    if cached is not None:
+                        row = make_cached_candidate_row(
+                            cached,
+                            position,
+                            float(distances[position]),
+                            float(similarities[position]),
+                        )
+                    else:
+                        end_idx = candidate_indices[position]
+                        row = make_candidate_row(daily, end_idx, candidate_matrix[position], config, industry)
+                        if row is None:
+                            continue
+                        row.pop("vector", None)
+                        row["distance"] = float(distances[position])
+                        row["similarity"] = float(similarities[position])
+                    target_matches[target_symbol].append(row)
+
+            if n % 500 == 0:
+                elapsed = perf_counter() - started
+                counts = ", ".join(
+                    f"{symbol}={len(rows):,}" for symbol, rows in target_matches.items()
+                )
+                message = (
+                    f"threshold scan {n}/{len(files)} files, candidates={scanned_candidates:,}, "
+                    f"matches: {counts}, elapsed={elapsed:.1f}s"
+                )
+                print(f"  {message}", flush=True)
+                if progress_callback:
+                    progress_callback(message)
 
     results: dict[str, SimilarPatternResult] = {}
     for symbol, context in target_contexts.items():
@@ -1040,6 +1768,12 @@ def analyze_targets_by_threshold(
                 "matched_cases": int(len(cases)),
                 "contiguous_dedupe": "best_per_stock_run",
                 "vector_cache": str(vector_cache_dir) if vector_cache_dir else None,
+                "vector_cache_mode": cache_mode,
+                "matrix_cache_fingerprint": (
+                    compiled_manifest.get("inventory_fingerprint")
+                    if compiled_manifest is not None and cache_mode == "matrix_chunks"
+                    else None
+                ),
                 "max_symbols": max_symbols,
             },
         ), config)

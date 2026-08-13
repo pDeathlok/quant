@@ -319,6 +319,7 @@ def test_legal_empty_features_use_completion_manifests_as_date_truth() -> None:
         "data/features/b1/active_candidate_project_features_manifest.json"
         in project.outputs
     )
+    assert "data/features/b1/training_xgb_project_vars.parquet" not in project.outputs
 
 
 @pytest.mark.parametrize(
@@ -474,6 +475,30 @@ def test_plan_reuses_exact_and_ttl_but_polls_event_source_conditionally() -> Non
     assert plan["feature.live"].action == "refresh_if_changed"
     assert plan["feature.live"].dirty.partitions == ("2026-08-12",)
     assert plan["product.live"].action == "refresh_if_changed"
+
+
+def test_short_feature_contracts_cover_their_runtime_implementation_closure() -> None:
+    registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    signal_sources = set(
+        registry.nodes["feature.strategy_signals"].contract_sources
+    )
+    project_sources = set(
+        registry.nodes["feature.project_daily"].contract_sources
+    )
+
+    assert {
+        "scripts/research/analyze_b1_family_rule_backtest.py",
+        "scripts/research/analyze_z_skill_entry_exit_backtest.py",
+        "src/quant/data/factors/data_adapter.py",
+        "src/quant/features/daily_factor_layer.py",
+    } <= signal_sources
+    assert {
+        "scripts/research/refresh_b1_feature_cache.py",
+        "scripts/research/train_b1_tushare_models.py",
+        "src/quant/data/factors/data_adapter.py",
+        "src/quant/features/daily_factor_layer.py",
+        "src/quant/features/project_factor_layer.py",
+    } <= project_sources
 
 
 def test_plan_propagates_stale_exact_partition_and_expired_ttl() -> None:

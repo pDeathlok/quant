@@ -813,6 +813,107 @@ def test_global_refresh_reruns_same_day_early_product_when_contract_is_dirty(
     assert calls == {"cb": 1, "allotment": 0, "byd": 0}
 
 
+def test_successful_same_day_refresh_reuses_all_downstream_after_source_poll(
+    monkeypatch,
+) -> None:
+    """A fresh invocation must poll sources, then reuse an unchanged DAG."""
+
+    from quant.routine import pipeline
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    services._run_latest_refresh_job("all", run_id="initial-success")
+    assert status["status"] == "success"
+    prior_results = dict(status["result"])
+    prior_results["dependency_postflight"] = {
+        "status": "success",
+        "baseline_committed": True,
+        "target_trade_date": "2026-07-23",
+    }
+    prior_status = {
+        **status,
+        "status": "success",
+        "scope": "all",
+        "run_id": "prior-success",
+        "result": prior_results,
+    }
+    status.update({"status": "success", "run_id": None, "result": prior_results})
+    calls = {"source": 0}
+
+    def source_refresh(*args, **kwargs):
+        calls["source"] += 1
+        return {
+            "status": "success",
+            "expected_trade_date": "20260723",
+            "dataset_trade_date": "20260723",
+        }
+
+    monkeypatch.setattr(pipeline, "refresh_data", source_refresh)
+    monkeypatch.setattr(
+        pipeline,
+        "build_features",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged downstream feature node must be reused")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "refresh_strategy_signal_cache",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged downstream signal node must be reused")
+        ),
+    )
+
+    services._run_latest_refresh_job(
+        "all",
+        resume_status=prior_status,
+        run_id="same-day-idempotent-run",
+    )
+
+    assert calls["source"] == 1
+    assert status["status"] == "success"
+    assert status["result"]["dependency_postflight"]["status"] == "success"
+    assert all(
+        step["checkpoint_reused"] is True
+        for step in status["steps"]
+        if step["key"] != "refresh_data"
+    )
+
+
+def test_failed_run_retry_identity_ignores_yesterday_dirty_plan_when_stable() -> None:
+    prior = {
+        "schema_version": "daily_dependency_snapshot_v2",
+        "identity_complete": True,
+        "scope": "all",
+        "target_trade_date": "2026-08-12",
+        "node_contract_hashes": {"feature.strategy_signals": "contract-v1"},
+        "model_contract_hashes": {"score.b1": "model-v1"},
+        "node_state_fingerprints": {
+            "data.market_daily": "market-v1",
+            "data.daily_basic": "basic-v1",
+            "feature.strategy_signals": "signals-v1",
+        },
+        "refresh_node_ids": [
+            "feature.strategy_signals",
+            "feature.project_daily",
+            "product.selector_core",
+        ],
+    }
+    current = {
+        **prior,
+        "node_state_fingerprints": {
+            **prior["node_state_fingerprints"],
+            "feature.strategy_signals": "signals-v2",
+        },
+    }
+
+    assert services._retry_preflight_identity_stable(prior, current) is True
+    current["node_state_fingerprints"]["data.market_daily"] = "market-v2"
+    assert services._retry_preflight_identity_stable(prior, current) is False
+    current["node_state_fingerprints"]["data.market_daily"] = "market-v1"
+    current["node_contract_hashes"] = {"feature.strategy_signals": "contract-v2"}
+    assert services._retry_preflight_identity_stable(prior, current) is False
+
+
 def test_terminal_refresh_writes_immutable_manifest_with_step_timings(
     monkeypatch,
     tmp_path,
@@ -972,6 +1073,40 @@ def test_resumed_refresh_starts_independent_attempt_timing(
         step["checkpoint_reused"] is False
         for step in payload["steps"]
     )
+
+
+def test_start_refresh_passes_successful_same_day_baseline_to_worker(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    status = {
+        "status": "success",
+        "run_id": "prior-success",
+        "scope": "all",
+        "steps": services._progress_steps("all"),
+        "result": {"dependency_postflight": {"baseline_committed": True}},
+    }
+
+    class CapturingThread:
+        def __init__(self, *, target, args, **kwargs) -> None:
+            captured["target"] = target
+            captured["args"] = args
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(services, "_REFRESH_STATUS", status)
+    monkeypatch.setattr(services, "_completed_checkpoint_ready", lambda *args: True)
+    monkeypatch.setattr(services.threading, "Thread", CapturingThread)
+    monkeypatch.setattr(services, "_persist_refresh_status_unlocked", lambda: None)
+
+    payload = services.start_latest_refresh("all")
+
+    assert captured["args"][1]["run_id"] == "prior-success"
+    assert payload["status"] == "queued"
+    assert payload["attempt"] == 1
+    assert payload["resumed_from"] is None
+    assert "增量校验" in payload["message"]
 
 
 def test_input_resume_marks_only_reused_steps_as_checkpoints(

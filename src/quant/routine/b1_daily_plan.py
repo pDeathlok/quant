@@ -23,6 +23,12 @@ from quant.routine.strategies import ExitConfig, StrategyConfig, StrategyRelease
 
 
 FEATURE_PATH = PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet"
+ACTIVE_FEATURE_PATH = (
+    PROJECT_ROOT / "data/features/b1/active_candidate_project_features.parquet"
+)
+ACTIVE_FEATURE_MANIFEST_PATH = (
+    PROJECT_ROOT / "data/features/b1/active_candidate_project_features_manifest.json"
+)
 DAILY_PLAN_PATH = WEB_DATA_DIR / "b1_daily_plan.json"
 
 
@@ -103,6 +109,54 @@ def _release_assets(
             f"B1 compatibility audit has no passing gate for {invalid_strategies}"
         )
     return release, model_dir, model_manifest_path, summary_path, audit_path
+
+
+def _load_candidate_features(
+    feature_path: Path,
+    requested_target: pd.Timestamp | None,
+    *,
+    active_feature_path: Path | None = None,
+    active_manifest_path: Path | None = None,
+) -> tuple[pd.DataFrame, Path, dict[str, Any] | None]:
+    """Prefer the exact-date live inference sidecar over the training table."""
+
+    active_feature_path = active_feature_path or ACTIVE_FEATURE_PATH
+    active_manifest_path = active_manifest_path or ACTIVE_FEATURE_MANIFEST_PATH
+    selected_path = feature_path
+    active_manifest: dict[str, Any] | None = None
+    production_default = feature_path == FEATURE_PATH
+    if production_default and active_feature_path.is_file():
+        try:
+            active_manifest = json.loads(
+                active_manifest_path.read_text(encoding="utf-8")
+            )
+            active_target = pd.to_datetime(
+                active_manifest.get("target_date"), errors="coerce"
+            )
+            if (
+                active_manifest.get("status") == "success"
+                and active_manifest.get("candidate_coverage_status") == "complete"
+                and int(active_manifest.get("factor_count") or 0) == 147
+                and pd.notna(active_target)
+                and (
+                    requested_target is None
+                    or pd.Timestamp(active_target).normalize()
+                    == pd.Timestamp(requested_target).normalize()
+                )
+            ):
+                selected_path = active_feature_path
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            active_manifest = None
+
+    candidates = pd.read_parquet(selected_path)
+    candidates["date"] = pd.to_datetime(candidates["date"], errors="coerce")
+    candidates = candidates.dropna(subset=["date"])
+    if "candidate_source_b1" in candidates.columns:
+        candidates = candidates[
+            candidates["candidate_source_b1"].fillna(False)
+        ].copy()
+    candidates.attrs["production_default"] = production_default
+    return candidates, selected_path, active_manifest
 
 
 def predict_models(
@@ -338,8 +392,9 @@ def build_daily_plan(
     max_rows: int = 500,
     *,
     config_path: Path = CONFIG_PATH,
-    feature_path: Path = FEATURE_PATH,
+    feature_path: Path | None = None,
 ) -> dict[str, Any]:
+    feature_path = feature_path or FEATURE_PATH
     (
         release,
         model_dir,
@@ -348,20 +403,44 @@ def build_daily_plan(
         audit_path,
     ) = _release_assets(config_path)
     metrics = _oot_metrics(summary_path, release.strategies)
-    candidates = pd.read_parquet(feature_path)
-    candidates["date"] = pd.to_datetime(candidates["date"], errors="coerce")
-    candidates = candidates.dropna(subset=["date"])
-    if candidates.empty:
-        raise RuntimeError(f"B1 feature cache is empty: {feature_path}")
-    if signal_date:
-        target_date = pd.to_datetime(signal_date, errors="raise")
-    else:
+    requested_target = (
+        pd.to_datetime(signal_date, errors="raise") if signal_date else None
+    )
+    if requested_target is None:
         daily_dir = PROJECT_ROOT / "data/raw/daily"
         store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
-        target_date = store.latest_dataset_trade_date(daily_dir.name)
-        if target_date is None:
-            target_date = candidates["date"].max()
+        requested_target = store.latest_dataset_trade_date(daily_dir.name)
+    candidates, selected_feature_path, active_manifest = _load_candidate_features(
+        feature_path,
+        requested_target,
+    )
+    production_default = bool(candidates.attrs.get("production_default"))
+    if candidates.empty and selected_feature_path == feature_path:
+        raise RuntimeError(f"B1 feature cache is empty: {selected_feature_path}")
+    if requested_target is not None:
+        target_date = pd.Timestamp(requested_target)
+    else:
+        target_date = candidates["date"].max()
+        if target_date is None or pd.isna(target_date):
+            manifest_target = pd.to_datetime(
+                active_manifest.get("target_date") if active_manifest else None,
+                errors="coerce",
+            )
+            if pd.isna(manifest_target):
+                raise RuntimeError(
+                    f"B1 feature cache has no target date: {selected_feature_path}"
+                )
+            target_date = pd.Timestamp(manifest_target)
     latest = candidates[candidates["date"] == target_date].copy()
+    if (
+        latest.empty
+        and selected_feature_path == feature_path
+        and production_default
+    ):
+        raise RuntimeError(
+            "B1 historical feature cache cannot prove the requested live date: "
+            f"expected={target_date.date().isoformat()} path={selected_feature_path}"
+        )
     if "name" in latest.columns:
         names = latest["name"].fillna("").astype(str)
         latest = latest[
@@ -427,7 +506,12 @@ def build_daily_plan(
         "release_id": release.id,
         "feature_coverage": feature_coverage,
         "source": {
-            "feature_path": str(feature_path),
+            "feature_path": str(selected_feature_path),
+            "feature_role": (
+                "live_active_candidates"
+                if selected_feature_path == ACTIVE_FEATURE_PATH
+                else "historical_training_cache"
+            ),
             "strategy_config_path": str(config_path),
             "model_dir": str(model_dir),
             "model_manifest_path": str(model_manifest_path),

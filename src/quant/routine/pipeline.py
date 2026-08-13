@@ -49,20 +49,10 @@ def _incremental_daily_start(lookback_days: int | None = None) -> str:
 
 
 def _incremental_feature_start() -> str:
-    dataset = PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet"
-    if not dataset.exists():
-        return "20200101"
-    try:
-        frame = pd.read_parquet(dataset, columns=["date"])
-    except Exception:
-        return "20200101"
-    if frame.empty:
-        return "20200101"
-    dates = pd.to_datetime(frame["date"], errors="coerce")
-    latest = dates.max()
-    if pd.isna(latest):
-        return "20200101"
-    return latest.strftime("%Y%m%d")
+    # Daily inference publishes an exact-date active-candidate sidecar.  The
+    # historical training table is maintained outside the latency-sensitive
+    # routine path, so its watermark must not force an old multi-day rebuild.
+    return _incremental_daily_start(lookback_days=0)
 
 
 def _incremental_daily_basic_start() -> str:
@@ -667,6 +657,7 @@ def build_features(progress_callback=None) -> dict:
         "data/features/b1/b1_gate_candidates.parquet",
         "--gate-manifest",
         "data/features/b1/b1_gate_manifest.json",
+        "--live-only",
     ]
     env = {
         **os.environ,
