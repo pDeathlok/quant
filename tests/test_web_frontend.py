@@ -57,14 +57,45 @@ def test_static_assets_use_cache_policy_gzip_and_module_preload() -> None:
     assert '<link rel="modulepreload" href="/core/formatters.js" />' in INDEX_HTML
 
 
-def test_workspace_tabs_use_one_seven_item_contract() -> None:
-    expected_keys = ["short", "chan", "long", "cb", "cbAllotment", "byd", "similar"]
+def test_workspace_tabs_use_one_eight_item_contract() -> None:
+    expected_keys = ["short", "chan", "long", "cb", "cbAllotment", "byd", "similar", "plans"]
 
     assert "const WORKSPACE_TABS = [" in APP_JS
     assert all(f'key: "{key}"' in APP_JS for key in expected_keys)
     assert "ensureWorkspaceTabs" in APP_JS
     assert "ensureChanTabs" not in APP_JS
-    assert "grid-template-columns: repeat(7, minmax(0, 1fr));" in STYLES_CSS
+    assert "grid-template-columns: repeat(8, minmax(0, 1fr));" in STYLES_CSS
+
+
+def test_operation_plans_tab_supports_durable_crud_and_horizon_filters() -> None:
+    assert 'id="plansPage" class="main page-view"' in INDEX_HTML
+    assert 'data-plan-filter="tomorrow"' in INDEX_HTML
+    assert 'data-plan-filter="long_term"' in INDEX_HTML
+    assert 'id="operationPlanForm"' in INDEX_HTML
+    assert 'fetchJson("/operation-plans")' in APP_JS
+    assert 'method: id ? "PUT" : "POST"' in APP_JS
+    assert 'method: "DELETE"' in APP_JS
+
+
+def test_new_tomorrow_operation_plan_defaults_to_next_local_date() -> None:
+    assert "function nextDayDateInputValue(referenceDate = new Date())" in APP_JS
+    assert "nextDay.setDate(nextDay.getDate() + 1);" in APP_JS
+    assert "return localDateInputValue(nextDay);" in APP_JS
+    assert 'dateInput.dataset.defaulted = "true";' in APP_JS
+    assert "setDefaultOperationPlanDate();" in APP_JS
+    assert 'document.querySelector("#operationPlanHorizon")?.addEventListener("change"' in APP_JS
+    assert 'if (event.currentTarget.value === "tomorrow")' in APP_JS
+    assert "if (!dateInput.value) setDefaultOperationPlanDate();" in APP_JS
+    assert APP_JS.rindex("resetOperationPlanForm();") < APP_JS.rindex("loadActivePageData();")
+
+
+def test_refresh_status_uses_one_global_surface_with_readable_progress() -> None:
+    assert INDEX_HTML.count('class="refresh-status') == 1
+    assert INDEX_HTML.count('class="progress-steps') == 1
+    assert "function formatRefreshStatusMessage(status, scopeLabel" in APP_JS
+    assert "正在扫描相似走势" in APP_JS
+    assert "${statusMessage}" in APP_JS
+    assert "20260803-refresh-status-v1" in INDEX_HTML
 
 
 def test_watchlist_is_default_workspace_for_root_url() -> None:
@@ -113,6 +144,49 @@ def test_workspace_grid_children_can_shrink_on_mobile() -> None:
     assert ".chan-performance {\n    grid-template-columns: 1fr;\n  }" in STYLES_CSS
     assert ".chan-performance-item {\n    border-left: 0;" in STYLES_CSS
     assert "20260730-grid-shrink-v2" in INDEX_HTML
+
+
+def test_long_workspace_exposes_blood_chip_daily_iteration_as_sub_strategy() -> None:
+    assert 'data-long-variant="blood_chip"' in INDEX_HTML
+    assert 'id="bloodChipLongContent"' in INDEX_HTML
+    assert 'id="bloodChipCandidateRows"' in INDEX_HTML
+    assert 'id="bloodChipPositionRows"' in INDEX_HTML
+    assert 'id="bloodChipIteration"' in INDEX_HTML
+    assert 'class="long-variant-mobile-control"' in INDEX_HTML
+    assert 'requestedVariant === "blood_chip"' in APP_JS
+    assert '`/long/blood-chip?${query.toString()}`' in APP_JS
+    assert "function renderBloodChipLongPlan()" in APP_JS
+    assert ".blood-chip-summary-grid" in STYLES_CSS
+    assert "首仓 20%" in INDEX_HTML
+    assert "第二段 30%" in INDEX_HTML
+    assert "第三段 50%" in INDEX_HTML
+    assert "row.stage_label" in APP_JS
+    assert "row.next_addition_fraction" in APP_JS
+    assert "iteration.advanced_positions" in APP_JS
+    assert "iteration.ready_additions" in APP_JS
+    assert "fmtRate(row.deployed_fraction" in APP_JS
+    assert "fmtRate(row.next_addition_fraction" in APP_JS
+    assert "fmtRate(row.current_residual_return_3d" in APP_JS
+    assert "fmtRate(validation.total_return" in APP_JS
+    assert ".long-variant-mobile-control" in STYLES_CSS
+
+
+def test_blood_chip_tables_link_each_stock_to_xueqiu_in_a_new_tab() -> None:
+    assert "function bloodChipXueqiuLink(row)" in APP_JS
+    assert "xueqiuStockUrl(row.ts_code)" in APP_JS
+    assert 'data-blood-chip-xueqiu' in APP_JS
+    assert 'target="_blank" rel="noopener noreferrer"' in APP_JS
+    assert "雪球 ↗" in APP_JS
+    assert "20260810-blood-chip-xueqiu-v1" in INDEX_HTML
+
+
+def test_short_strategy_stocks_link_to_xueqiu_in_a_new_tab() -> None:
+    assert "xueqiuStockUrl(item.symbol)" in APP_JS
+    assert 'data-short-xueqiu' in APP_JS
+    assert 'target="_blank" rel="noopener noreferrer"' in APP_JS
+    assert "雪球 ↗" in APP_JS
+    assert "<th>雪球</th>" in INDEX_HTML
+    assert "20260811-short-xueqiu-v1" in INDEX_HTML
 
 
 def test_chan_mobile_toolbar_keeps_refresh_buttons_readable() -> None:
@@ -171,6 +245,22 @@ def test_watchlist_add_starts_debounced_background_analysis_and_score_refresh() 
     assert "if (addButton) addButton.disabled = state.similarLoading;" not in APP_JS
 
 
+def test_watchlist_new_stock_selection_does_not_fall_back_to_another_stock_result() -> None:
+    selected_result = APP_JS.split("function selectedSimilarResult() {", 1)[1].split(
+        "function similarResultForSymbol", 1
+    )[0]
+    loader = APP_JS.split("async function loadSimilarPatternsOnce() {", 1)[1].split(
+        "function loadSimilarPatterns()", 1
+    )[0]
+
+    assert "if (!state.similarSelectedSymbol) return null;" in selected_result
+    assert "|| results[0] || null" not in selected_result
+    assert "watchlistSymbols.has(state.similarSelectedSymbol)" in loader
+    assert "selectedWatchItem.name || selectedWatchItem.symbol" in APP_JS
+    assert "分析结果待更新" in APP_JS
+    assert "等待后台分析结果" in APP_JS
+
+
 def test_selector_filters_coalesce_rapid_clicks_and_ignore_stale_responses() -> None:
     assert "selectorFilterReloadTimer = window.setTimeout" in APP_JS
     assert "}, 150);" in APP_JS
@@ -222,6 +312,13 @@ def test_allotment_refresh_updates_market_inputs_and_exposes_quality() -> None:
     assert 'cbAllotmentRefreshButton: "更新行情与配债"' in APP_JS
     assert 'startLatestDataRefresh("cbAllotment");' in APP_JS
     assert "loadConvertibleBondAllotments({ refresh: true })" not in APP_JS
+    loader = APP_JS.split("async function loadConvertibleBondAllotments", 1)[1].split(
+        "function activeCbPlan", 1
+    )[0]
+    assert 'query.set("limit"' not in loader
+    assert 'query.set("include_listed_days"' not in loader
+    assert 'query.set("stage_scope", "pipeline")' in loader
+    assert "20260809-allotment-cache-contract-v1" in INDEX_HTML
     assert "qualityMetrics.stock_daily_match" in APP_JS
     assert "qualityMetrics.kdj_weekly_j" in APP_JS
     assert "qualityMetrics.kdj_monthly_j" in APP_JS
@@ -273,7 +370,7 @@ def test_watchlist_reuses_selector_buy_and_hold_scores() -> None:
     assert "item.opportunity_score ?? item.buy_score" in APP_JS
     assert "item.holding_score ?? item.hold_score" in APP_JS
     assert 'class="similar-score-cell"' in APP_JS
-    assert 'colspan="10"' in INDEX_HTML
+    assert 'colspan="11"' in INDEX_HTML
 
 
 def test_watchlist_rows_support_persistent_drag_order_and_pin_menu() -> None:
@@ -361,10 +458,20 @@ def test_long_page_focuses_on_good_stocks_and_good_prices() -> None:
     assert "percentile(item.roe_hist_percentile, item.roe_history_points)" in APP_JS
     assert 'item.display_reason || item.reason || "-"' in APP_JS
     assert "<th>推荐程度</th>" in INDEX_HTML
-    assert 'data-long-sort="good_stock_score"' in INDEX_HTML
-    assert 'data-long-sort="price_score"' in INDEX_HTML
+    for sort_key in [
+        "good_stock_score",
+        "price_score",
+        "pe_ttm",
+        "pb",
+        "pr_from_pe",
+        "pr_from_pb",
+    ]:
+        assert f'data-long-sort="{sort_key}"' in INDEX_HTML
+        assert f'data-long-sort-header="{sort_key}"' in INDEX_HTML
     assert "function sortedLongStocks(stocks)" in APP_JS
     assert "function toggleLongSort(key)" in APP_JS
+    assert 'pr_from_pe: "PR-PE"' in APP_JS
+    assert 'pr_from_pb: "PR-PB"' in APP_JS
     assert 'header.setAttribute("aria-sort"' in APP_JS
     assert "metric(item.price_score)" in APP_JS
     assert "个月样本" in APP_JS
@@ -373,10 +480,6 @@ def test_long_page_focuses_on_good_stocks_and_good_prices() -> None:
     assert "好股票 + 价格分 ≥ 60 + 长期价格结构通过" in INDEX_HTML
     for header in [
         "ROE",
-        "PE",
-        "PB",
-        "PR-PE",
-        "PR-PB",
         "当年E EPS / 股价",
         "次年E EPS / 股价",
         "后年E EPS / 股价",
@@ -457,7 +560,6 @@ def test_allotment_workspace_header_uses_compact_layout() -> None:
     assert "border-bottom: 4px solid var(--accent);" in STYLES_CSS
     assert ".cb-allotment-toolbar .eyebrow," in STYLES_CSS
     assert "grid-template-columns: auto auto minmax(0, 1fr) auto;" in STYLES_CSS
-    assert ".cb-allotment-toolbar .refresh-status:not(:has(.refresh-progress-fill.active))" in STYLES_CSS
 
 
 def test_active_workspace_tab_has_stable_red_indicator() -> None:

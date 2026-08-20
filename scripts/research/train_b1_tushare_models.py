@@ -21,6 +21,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -29,7 +30,13 @@ from xgboost import XGBClassifier
 from xgboost.callback import TrainingCallback
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import average_precision_score, classification_report, roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    classification_report,
+    log_loss,
+    roc_auc_score,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -41,6 +48,7 @@ from quant.features.b1_gate import calculate_b1_gate
 from quant.features.daily_factor_layer import attach_daily_base_factors
 from quant.features.project_factor_layer import (
     PROJECT_FACTOR_SCHEMA_VERSION,
+    admit_factors_by_sample,
     calculate_project_market_factors,
 )
 from quant.features.variable_library import (
@@ -53,6 +61,9 @@ from quant.ml.xgb_research import XGBResearchModel
 
 
 B1_FEATURE_COLUMNS = PROJECT_FACTOR_COLUMNS
+B1_LONG_WEEKLY_AVAILABLE = "b1_long_weekly_available"
+B1_LONG_WEEKLY_DATE = "b1_long_weekly_date"
+UNSAFE_POINT_IN_TIME_RULES = {"never_feature", "not_historically_available"}
 
 LABELS = {
     "up5_es": "label_t1_open_max_high_5pct",
@@ -76,12 +87,139 @@ def combine_training_frames(
     factors: pd.DataFrame,
     labels: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Prefer factor-layer columns and keep the training schema unique."""
+    """Combine training inputs while preferring factor-layer price columns.
+
+    The current factor contract intentionally includes causal, continuously
+    adjusted OHLC-derived columns such as ``close`` and ``pct_chg``.  Those
+    names also exist in the raw daily frame.  Keeping the last occurrence
+    preserves the factor-layer value and prevents duplicate Parquet fields.
+    """
 
     combined = pd.concat([daily, factors, labels], axis=1)
     if combined.columns.has_duplicates:
         combined = combined.loc[:, ~combined.columns.duplicated(keep="last")]
     return combined
+
+
+def merge_weekly_enrichment(
+    data: pd.DataFrame,
+    weekly: pd.DataFrame,
+    factor_catalog: pd.DataFrame,
+    *,
+    base_feature_columns: Sequence[str],
+    training_cutoff: str | pd.Timestamp,
+    minimum_coverage: float,
+    minimum_non_null_rows: int,
+) -> tuple[pd.DataFrame, list[str], dict[str, Any]]:
+    """As-of join approved weekly point-in-time factors onto B1 rows.
+
+    The weekly dataset may contain research labels and fields already supplied
+    by the daily factor contract.  Only numeric catalogued factors with a safe
+    point-in-time rule are considered, then coverage/degeneracy admission is
+    evaluated strictly before the OOT boundary.
+    """
+
+    required_data = {"ts_code", "date"}
+    required_catalog = {"factor", "role", "point_in_time_rule"}
+    if not required_data <= set(data.columns):
+        raise ValueError(f"B1 data missing enrichment keys: {sorted(required_data - set(data.columns))}")
+    if not required_data <= set(weekly.columns):
+        raise ValueError(f"weekly enrichment missing keys: {sorted(required_data - set(weekly.columns))}")
+    if not required_catalog <= set(factor_catalog.columns):
+        raise ValueError(
+            "factor catalog missing columns: "
+            f"{sorted(required_catalog - set(factor_catalog.columns))}"
+        )
+    if not 0 <= minimum_coverage <= 1:
+        raise ValueError("minimum_coverage must be between zero and one")
+
+    base = set(base_feature_columns)
+    eligible_catalog = factor_catalog[
+        ~factor_catalog["point_in_time_rule"].fillna("").isin(UNSAFE_POINT_IN_TIME_RULES)
+        & ~factor_catalog["role"].fillna("").str.contains("label", case=False)
+    ].drop_duplicates("factor", keep="last")
+    catalog_by_factor = eligible_catalog.set_index("factor")
+    candidates = [
+        str(factor)
+        for factor in eligible_catalog["factor"]
+        if factor in weekly.columns
+        and factor not in base
+        and pd.api.types.is_numeric_dtype(weekly[factor])
+    ]
+    if not candidates:
+        raise RuntimeError("weekly enrichment has no approved numeric factor columns")
+
+    left = data.copy()
+    left["date"] = pd.to_datetime(left["date"], errors="raise")
+    left["ts_code"] = left["ts_code"].astype(str)
+    left["_b1_row_order"] = np.arange(len(left))
+
+    right = weekly[["ts_code", "date", *candidates]].copy()
+    right["date"] = pd.to_datetime(right["date"], errors="raise")
+    right["ts_code"] = right["ts_code"].astype(str)
+    if right.duplicated(["ts_code", "date"]).any():
+        raise RuntimeError("weekly enrichment contains duplicate symbol/date rows")
+    right = right.rename(columns={"date": B1_LONG_WEEKLY_DATE})
+
+    merged = pd.merge_asof(
+        left.sort_values(["date", "ts_code"]),
+        right.sort_values([B1_LONG_WEEKLY_DATE, "ts_code"]),
+        left_on="date",
+        right_on=B1_LONG_WEEKLY_DATE,
+        by="ts_code",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    future_rows = int(
+        (merged[B1_LONG_WEEKLY_DATE] > merged["date"]).fillna(False).sum()
+    )
+    if future_rows:
+        raise RuntimeError(f"weekly enrichment introduced {future_rows} future rows")
+    merged[B1_LONG_WEEKLY_AVAILABLE] = (
+        merged[B1_LONG_WEEKLY_DATE].notna().astype(float)
+    )
+    merged = (
+        merged.sort_values("_b1_row_order")
+        .drop(columns="_b1_row_order")
+        .reset_index(drop=True)
+    )
+
+    training = merged[merged["date"] < pd.Timestamp(training_cutoff)]
+    admitted, decisions = admit_factors_by_sample(
+        training,
+        candidates,
+        minimum_non_null_rows=minimum_non_null_rows,
+        minimum_coverage=minimum_coverage,
+    )
+    rejected = sorted(set(candidates) - set(admitted))
+    if rejected:
+        merged = merged.drop(columns=rejected)
+    admitted_features = [*admitted, B1_LONG_WEEKLY_AVAILABLE]
+
+    decisions = decisions.merge(
+        eligible_catalog[
+            [column for column in ["factor", "group", "source", "frequency", "role", "point_in_time_rule"] if column in eligible_catalog]
+        ],
+        left_on="factor",
+        right_on="factor",
+        how="left",
+    )
+    metadata = {
+        "enabled": True,
+        "source_rows": int(len(weekly)),
+        "source_symbols": int(weekly["ts_code"].nunique()),
+        "source_date_min": str(pd.to_datetime(weekly["date"]).min().date()),
+        "source_date_max": str(pd.to_datetime(weekly["date"]).max().date()),
+        "matched_rate": float(merged[B1_LONG_WEEKLY_AVAILABLE].mean()),
+        "future_row_count": future_rows,
+        "candidate_feature_count": len(candidates),
+        "admitted_feature_count": len(admitted_features),
+        "minimum_coverage": float(minimum_coverage),
+        "minimum_non_null_rows": int(minimum_non_null_rows),
+        "training_cutoff": str(pd.Timestamp(training_cutoff).date()),
+        "admission": json.loads(decisions.to_json(orient="records")),
+    }
+    return merged, admitted_features, metadata
 
 
 def process_daily_file(args: tuple[str, str]) -> pd.DataFrame | None:
@@ -416,7 +554,7 @@ def resolve_worker_count(
     return min(max_auto_workers, max(16, usable_cores * max(1, worker_multiplier)))
 
 
-def _binary_metrics(y_true: pd.Series, pred: np.ndarray, proba: np.ndarray) -> dict:
+def _binary_metrics(y_true: pd.Series, pred: np.ndarray, proba: np.ndarray) -> dict[str, Any]:
     if len(y_true) == 0:
         return {}
     return {
@@ -424,11 +562,21 @@ def _binary_metrics(y_true: pd.Series, pred: np.ndarray, proba: np.ndarray) -> d
         "positive_rate": float(y_true.mean()),
         "auc": float(roc_auc_score(y_true, proba)) if y_true.nunique() > 1 else float("nan"),
         "pr_auc": float(average_precision_score(y_true, proba)) if y_true.nunique() > 1 else float("nan"),
+        "brier_score": float(brier_score_loss(y_true, proba)),
+        "log_loss": float(log_loss(y_true, proba, labels=[0, 1])),
         "classification_report": classification_report(y_true, pred, output_dict=True, zero_division=0),
     }
 
 
-def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_k: int | None) -> dict:
+def train_models(
+    data: pd.DataFrame,
+    output_dir: Path,
+    report_dir: Path,
+    select_k: int | None,
+    *,
+    feature_columns: Sequence[str] | None = None,
+    dataset_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     reports: dict[str, dict] = {}
@@ -445,8 +593,9 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
         )
     factor_schema_version = next(iter(factor_schemas))
 
+    configured_features = list(dict.fromkeys(feature_columns or B1_FEATURE_COLUMNS))
     for model_name, label_col in LABELS.items():
-        cols = [col for col in B1_FEATURE_COLUMNS if col in data.columns]
+        cols = [col for col in configured_features if col in data.columns]
         subset = data.loc[:, [*cols, label_col, "date", "symbol", "split"]].dropna(subset=[label_col]).copy()
         train = subset[subset["split"] == "train"]
         test = subset[subset["split"] == "test"]
@@ -508,6 +657,16 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
             proba = model.predict_proba(X_split)[:, 1]
             split_reports[split_name] = _binary_metrics(y_split, pred, proba)
 
+        oot_year_reports = {}
+        for year, year_df in oot.groupby(oot["date"].dt.year, sort=True):
+            X_year = year_df[cols]
+            y_year = year_df[label_col].astype(int)
+            oot_year_reports[str(int(year))] = _binary_metrics(
+                y_year,
+                model.predict(X_year),
+                model.predict_proba(X_year)[:, 1],
+            )
+
         importances = classifier.feature_importances_
         top_features = sorted(
             [
@@ -538,6 +697,7 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
             "test_oot_auc_gap": float(split_reports["test"]["auc"] - split_reports["oot"]["auc"]),
             "top_features": top_features,
             "splits": split_reports,
+            "oot_years": oot_year_reports,
         }
         print(
             f"trained {model_name}: "
@@ -546,7 +706,7 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
             flush=True,
         )
 
-    feature_cols = [col for col in B1_FEATURE_COLUMNS if col in data.columns]
+    feature_cols = [col for col in configured_features if col in data.columns]
     reports["dataset"] = {
         "rows": int(len(data)),
         "train_rows": int((data["split"] == "train").sum()),
@@ -557,15 +717,21 @@ def train_models(data: pd.DataFrame, output_dir: Path, report_dir: Path, select_
         "oot_symbols": int(data.loc[data["split"] == "oot", "symbol"].nunique()),
         "date_min": str(data["date"].min().date()),
         "date_max": str(data["date"].max().date()),
-        "configured_feature_count": len(B1_FEATURE_COLUMNS),
+        "configured_feature_count": len(configured_features),
         "available_feature_count": len(feature_cols),
         "feature_missing_rate_top50": {
             col: float(rate)
             for col, rate in data[feature_cols].isna().mean().sort_values(ascending=False).head(50).items()
         },
-        "source_policy": "tushare_only_daily_daily_basic",
+        "source_policy": (
+            "tushare_only_daily_daily_basic+point_in_time_weekly_enrichment"
+            if B1_LONG_WEEKLY_AVAILABLE in feature_cols
+            else "tushare_only_daily_daily_basic"
+        ),
         "model_type": "xgboost",
     }
+    if dataset_metadata:
+        reports["dataset"].update(dataset_metadata)
     report_path = report_dir / "training_report.json"
     report_path.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"training report written: {report_path}", flush=True)
@@ -598,10 +764,34 @@ def main() -> None:
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--dataset-out", type=Path, default=PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet")
     parser.add_argument(
+        "--input-dataset",
+        type=Path,
+        default=None,
+        help="Optional source dataset for --reuse-dataset; dataset-out remains the destination.",
+    )
+    parser.add_argument(
         "--reuse-dataset",
         action="store_true",
         help="Train from dataset-out without rebuilding market features.",
     )
+    parser.add_argument(
+        "--daily-basic-min-match-rate",
+        type=float,
+        default=float(os.getenv("ROUTINE_DAILY_BASIC_MIN_MATCH_RATE", "0.98")),
+    )
+    parser.add_argument(
+        "--weekly-enrichment-dataset",
+        type=Path,
+        default=None,
+        help="Optional point-in-time weekly factor dataset for the enriched B1 variant.",
+    )
+    parser.add_argument(
+        "--factor-catalog",
+        type=Path,
+        default=PROJECT_ROOT / "reports/long_entry_factor_inventory/factor_catalog.csv",
+    )
+    parser.add_argument("--enrichment-min-coverage", type=float, default=0.05)
+    parser.add_argument("--enrichment-min-non-null-rows", type=int, default=500)
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "models/research/b1_xgb_project_vars")
     parser.add_argument("--report-dir", type=Path, default=PROJECT_ROOT / "reports/b1/research/xgb_project_vars")
     parser.add_argument("--select-k", type=int, default=0, help="0 means use all available factors; positive values enable SelectKBest")
@@ -620,11 +810,12 @@ def main() -> None:
         flush=True,
     )
     if args.reuse_dataset:
-        if not args.dataset_out.exists():
-            raise FileNotFoundError(f"Training dataset does not exist: {args.dataset_out}")
-        data = pd.read_parquet(args.dataset_out)
+        input_dataset = args.input_dataset or args.dataset_out
+        if not input_dataset.exists():
+            raise FileNotFoundError(f"Training dataset does not exist: {input_dataset}")
+        data = pd.read_parquet(input_dataset)
         data["date"] = pd.to_datetime(data["date"], errors="coerce")
-        print(f"reusing training dataset: {args.dataset_out} rows={len(data)}", flush=True)
+        print(f"reusing training dataset: {input_dataset} rows={len(data)}", flush=True)
     else:
         data = build_dataset(
             args.daily_dir,
@@ -639,14 +830,55 @@ def main() -> None:
             load_target=args.load_target,
             load_hard_limit=args.load_hard_limit,
         )
-        data = merge_daily_basic_features(data, args.daily_basic_dir)
+        data = merge_daily_basic_features(
+            data,
+            args.daily_basic_dir,
+            min_match_rate=args.daily_basic_min_match_rate,
+        )
+
+    feature_columns = list(B1_FEATURE_COLUMNS)
+    dataset_metadata: dict[str, Any] = {
+        "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+        "base_feature_count": len(B1_FEATURE_COLUMNS),
+    }
+    if args.weekly_enrichment_dataset is not None:
+        if not args.weekly_enrichment_dataset.exists():
+            raise FileNotFoundError(
+                f"Weekly enrichment dataset does not exist: {args.weekly_enrichment_dataset}"
+            )
+        if not args.factor_catalog.exists():
+            raise FileNotFoundError(f"Factor catalog does not exist: {args.factor_catalog}")
+        weekly = pd.read_parquet(args.weekly_enrichment_dataset)
+        factor_catalog = pd.read_csv(args.factor_catalog)
+        data, enrichment_features, enrichment_metadata = merge_weekly_enrichment(
+            data,
+            weekly,
+            factor_catalog,
+            base_feature_columns=feature_columns,
+            training_cutoff=args.oot_start,
+            minimum_coverage=args.enrichment_min_coverage,
+            minimum_non_null_rows=args.enrichment_min_non_null_rows,
+        )
+        feature_columns.extend(enrichment_features)
+        dataset_metadata["weekly_enrichment"] = {
+            **enrichment_metadata,
+            "dataset_path": str(args.weekly_enrichment_dataset),
+            "factor_catalog_path": str(args.factor_catalog),
+        }
     data = assign_symbol_splits(data, args.oot_start, args.test_size, args.random_state)
     validate_label_splits(data)
     args.dataset_out.parent.mkdir(parents=True, exist_ok=True)
     data.to_parquet(args.dataset_out, index=False)
     print(f"training dataset written: {args.dataset_out} rows={len(data)}", flush=True)
     select_k = None if args.select_k == 0 else args.select_k
-    train_models(data, args.model_dir, args.report_dir, select_k=select_k)
+    train_models(
+        data,
+        args.model_dir,
+        args.report_dir,
+        select_k=select_k,
+        feature_columns=feature_columns,
+        dataset_metadata=dataset_metadata,
+    )
 
 
 if __name__ == "__main__":

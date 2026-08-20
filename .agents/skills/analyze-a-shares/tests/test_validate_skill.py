@@ -134,5 +134,43 @@ class SameTickerHistoryContractTests(unittest.TestCase):
         self.assertIn("用户没有主动要求复盘，也不能跳过", review_contract)
 
 
+class MiaoxiangMcpContractTests(unittest.TestCase):
+    def test_skill_declares_miaoxiang_mcp_dependency(self) -> None:
+        metadata = (SKILL_DIR / "agents" / "openai.yaml").read_text(encoding="utf-8")
+
+        self.assertIn('value: "mx-ds-mcp"', metadata)
+        self.assertIn('transport: "streamable_http"', metadata)
+        self.assertIn('url: "https://mxapi.eastmoney.com/mxds/mcp"', metadata)
+        self.assertIn("至少实际调用一次", metadata)
+        self.assertIn("mcp_execution", metadata)
+
+    def test_skill_routes_mcp_through_evidence_policy_and_fallback(self) -> None:
+        skill_text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        source_policy = (
+            SKILL_DIR / "references" / "source-policy.md"
+        ).read_text(encoding="utf-8")
+        mcp_contract = (
+            SKILL_DIR / "references" / "miaoxiang-mcp.md"
+        ).read_text(encoding="utf-8")
+        report_contract = (
+            SKILL_DIR / "references" / "report-template.md"
+        ).read_text(encoding="utf-8")
+        review_contract = (
+            SKILL_DIR / "references" / "review-and-learning.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("执行 **MCP 调用门**", skill_text)
+        self.assertIn("actual_call_count=0", skill_text)
+        self.assertIn("MCP 返回不是法定披露原文", source_policy)
+        self.assertIn("任务模式最小调用矩阵", mcp_contract)
+        self.assertIn("配置文件存在", mcp_contract)
+        self.assertIn("actual_call_count", mcp_contract)
+        self.assertIn("available_at <= analysis_cutoff", mcp_contract)
+        self.assertIn("tool_not_loaded", mcp_contract)
+        self.assertIn("配置启用不等于已调用", report_contract)
+        self.assertIn("data_snapshot.mcp_execution", review_contract)
+        self.assertIn("报告、日志、命令输出和 Git 均不含 API Key", mcp_contract)
+
+
 if __name__ == "__main__":
     unittest.main()

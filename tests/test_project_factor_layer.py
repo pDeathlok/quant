@@ -6,7 +6,24 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from quant.features.factor_registry import FACTOR_REGISTRY, LONG_FACTOR_COLUMNS, validate_registry
+from quant.features.factor_registry import (
+    FACTOR_REGISTRY,
+    LONG_ANNUAL_QUALITY_ASSET_FACTOR_COLUMNS,
+    LONG_ANNUAL_QUALITY_CASHFLOW_FACTOR_COLUMNS,
+    LONG_ANNUAL_QUALITY_FACTOR_COLUMNS,
+    LONG_ANNUAL_QUALITY_PERSISTENCE_FACTOR_COLUMNS,
+    LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS,
+    LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS,
+    LONG_FACTOR_COLUMNS,
+    validate_registry,
+)
+from quant.features.right_side_factor_contract import (
+    RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
+    RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
+    RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+    right_side_shadow_contract_payload,
+)
+from quant.research.right_side_unified_features import RULE_FEATURE_COLUMNS
 from quant.features.long_weekly_factors import build_long_weekly_factor_frame, long_model_candidate_columns
 from quant.features.project_factor_layer import (
     LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
@@ -135,6 +152,57 @@ def test_registry_is_unique_and_covers_daily_and_long_contracts() -> None:
     assert "analyst_forward_y2_price_mean_180d" in names
     assert len(names) == len(FACTOR_REGISTRY)
     assert all(definition.point_in_time for definition in FACTOR_REGISTRY)
+
+
+def test_registry_covers_stable_annual_quality_model_contract() -> None:
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+
+    assert len(LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS) == 23
+    assert len(LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS) == 11
+    assert len(LONG_ANNUAL_QUALITY_FACTOR_COLUMNS) == 34
+    assert set(LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS) == {
+        *LONG_ANNUAL_QUALITY_CASHFLOW_FACTOR_COLUMNS,
+        *LONG_ANNUAL_QUALITY_PERSISTENCE_FACTOR_COLUMNS,
+        *LONG_ANNUAL_QUALITY_ASSET_FACTOR_COLUMNS,
+    }
+    assert set(LONG_ANNUAL_QUALITY_FACTOR_COLUMNS) <= set(LONG_FACTOR_COLUMNS)
+    assert set(LONG_ANNUAL_QUALITY_FACTOR_COLUMNS) <= set(definitions)
+    assert all(
+        definitions[name].frequency == "weekly"
+        and definitions[name].point_in_time
+        and definitions[name].consumers == ("long_entry_quality_shadow",)
+        for name in LONG_ANNUAL_QUALITY_FACTOR_COLUMNS
+    )
+    assert all(
+        "announcement_pit" in definitions[name].source
+        for name in LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS
+    )
+    assert definitions["industry_value_score"].source.endswith("current_industry_mapping")
+
+
+def test_registry_covers_right_side_shadow_118_factor_contract() -> None:
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+    payload = right_side_shadow_contract_payload()
+
+    assert len(RULE_FEATURE_COLUMNS) == 118
+    assert len(RIGHT_SIDE_SHADOW_FACTOR_COLUMNS) == 265
+    assert len(RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS) == 14
+    assert payload["factor_contract_sha256"] == (
+        RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256
+    )
+    assert set(RULE_FEATURE_COLUMNS) <= set(definitions)
+    assert set(RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS) <= set(definitions)
+    assert all(
+        definitions[name].point_in_time
+        and definitions[name].frequency == "daily"
+        and {"right_side_unified_shadow", "right_side_unified"}
+        <= set(definitions[name].consumers)
+        for name in RULE_FEATURE_COLUMNS
+    )
+    assert all(
+        definitions[name].role == "strategy_identity"
+        for name in RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS
+    )
 
 
 def test_weekly_dual_pr_and_history_are_point_in_time() -> None:

@@ -1,0 +1,105 @@
+# Selector ranking-source release contract.
+#
+# The production adapter is registered now, but the active selector source
+# remains the legacy Z-skill path.  Switching to the unified ranker requires
+# one explicit, reviewable config change plus a checksum-pinned production
+# artifact; no research/shadow output is consumed implicitly.
+release:
+  id: right-side-ranking-selector-v1
+  lifecycle: production
+  consumer: quant.webapp.services.selector
+  dependency_nodes:
+    - score.z_skill
+    - feature.right_side_unified
+    - score.right_side_unified
+    - product.right_side_unified_adapter
+    - score.selector
+
+selector:
+  ranking_source: right_side_unified
+  allowed_sources:
+    - legacy_z_skill
+    - right_side_unified
+  failure_policy: fail_closed
+  score_field: ranking_score
+  forbidden_aliases:
+    - pred_up5
+    - pred_up8
+    - pred_down3
+  ranking_policy:
+    probability_calibration: embedded_event_level_platt
+    normalization: frozen_oot_b_quantile_cdf_v1
+    normalized_score_field: ranking_score_normalized
+    production_threshold_mode: none_rank_only
+    selection_policy: downstream_top_n_ordering
+    research_threshold_reference: 0.3490536110991524
+  supported_strategy_keys:
+    - B2
+    - B3
+    - KEY_K
+    - VIOLENCE_K
+    - PINGHANG
+    - DOUBLE_GUN
+    - CHANGAN
+    - KENGQI
+    - VEGAS
+    - TRIPLE_VOLUME_BREAKOUT
+    - GOLDEN_BOWL
+    - ZAIHOU
+    - BREATHING
+    - YUEYUE
+  replaced_signals:
+    - B2
+    - B3
+    - KEY_K
+    - VIOLENCE_K
+    - PINGHANG
+    - DOUBLE_GUN
+    - CHANGAN
+    - KENGQI
+    - VEGAS
+    - TRIPLE_VOLUME_BREAKOUT
+    - GOLDEN_BOWL
+    - ZAIHOU
+    - BREATHING
+    - YUEYUE
+  preserved_legacy_signals:
+    - DUICHEN_VA
+    - NANA
+    - YIDONG_DILIAN
+
+right_side_unified:
+  artifact: models/production/right_side_unified/ranking.joblib
+  artifact_manifest: models/production/right_side_unified/manifest.json
+  artifact_schema_version: right-side-unified-ranking-production-v1
+  feature_output: data/features/right_side_unified/latest_features.parquet
+  feature_manifest: data/features/right_side_unified/feature_manifest.json
+  score_output: data/features/right_side_unified/latest_scores.parquet
+  score_manifest: data/features/right_side_unified/score_manifest.json
+  score_schema_version: right-side-unified-ranking-score-v1
+  project_factor_schema_version: project-v4-causal-price-alpha
+  rule_factor_schema_version: right_side_rule_features_v2_118_20260813
+  factor_contract_sha256: 6fc15ad06252b66b40f890165243f6b17cb74444909019155e12934683cace9c
+  z_signal_cache: data/features/z_skill_daily_candidates.parquet
+  family_signal_cache: data/features/b1/b1_family_rule_candidates.parquet
+  market_data_root: data/raw
+  history_years: 6
+  factor_workers: 8
+
+promotion:
+  # Enabled by the checksum-pinned operator rollout approval.  Rollback is the
+  # inverse two-line change: source=legacy_z_skill and enabled=false.
+  enabled: true
+  approval_manifest: reports/research/right_side_unified_v2_118/production_rollout_approval.json
+  approval_schema_version: right-side-production-rollout-approval-v1
+  approval_field: approve_online
+  required_shadow_schema_version: right-side-unified-ranking-shadow-v1
+  require_ranking_decision_pass: true
+  require_beam_permutation_gate_when_selected: true
+  preserve_rollback_score_node: score.z_skill
+  preserved_legacy_score_node: score.z_skill
+  rollback_observation_cycles: 1
+
+playbook:
+  coupling: independent
+  selector_ranking_does_not_choose_entry_or_exit: true

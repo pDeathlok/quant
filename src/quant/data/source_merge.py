@@ -56,6 +56,15 @@ def normalize_ts_code(symbol: str) -> str:
 
 
 def _normalize_date(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_string_dtype(series.dtype):
+        text = series.astype("string")
+        compact = text.str.replace("-", "", regex=False)
+        canonical = text.isna() | text.str.fullmatch(
+            r"(?:\d{8}|\d{4}-\d{2}-\d{2})",
+            na=False,
+        )
+        if bool(canonical.all()):
+            return compact
     return pd.to_datetime(series).dt.strftime("%Y%m%d")
 
 

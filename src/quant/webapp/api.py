@@ -6,6 +6,12 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from quant.application.workspaces.convertible_bonds import (
+    DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
+    DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
+    DEFAULT_ALLOTMENT_LIMIT,
+    DEFAULT_ALLOTMENT_STAGE_SCOPE,
+)
 from quant.webapp.services import (
     add_similar_pattern_watch_symbol,
     get_byd_daily_strategy,
@@ -15,7 +21,9 @@ from quant.webapp.services import (
     get_convertible_bond_grid_plan,
     get_dashboard,
     get_latest_refresh_status,
+    get_blood_chip_long_plan,
     get_long_stock_pool,
+    get_operation_plans,
     get_selector_calendar,
     get_research_index,
     get_similar_pattern_analysis,
@@ -27,6 +35,8 @@ from quant.webapp.services import (
     refresh_chan_model_strategy_plan,
     refresh_dashboard,
     remove_similar_pattern_watch_symbol,
+    remove_operation_plan,
+    save_operation_plan,
     save_similar_pattern_watch_alerts,
     save_similar_pattern_watch_note,
     set_similar_pattern_watch_pin,
@@ -101,9 +111,47 @@ class SimilarPatternWatchAlertsRequest(BaseModel):
     )
 
 
+class OperationPlanRequest(BaseModel):
+    horizon: Literal["tomorrow", "long_term"] = "tomorrow"
+    title: str = Field(min_length=1, max_length=120)
+    symbol: str = Field(default="", max_length=30)
+    target_date: str = Field(default="", max_length=10)
+    content: str = Field(default="", max_length=20_000)
+    status: Literal["planned", "done", "cancelled"] = "planned"
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "quant-webapp"}
+
+
+@router.get("/operation-plans")
+def operation_plans() -> dict[str, Any]:
+    return get_operation_plans()
+
+
+@router.post("/operation-plans")
+def create_operation_plan(body: OperationPlanRequest) -> dict[str, Any]:
+    try:
+        return save_operation_plan(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/operation-plans/{plan_id}")
+def update_operation_plan(plan_id: str, body: OperationPlanRequest) -> dict[str, Any]:
+    try:
+        return save_operation_plan(body.model_dump(), plan_id=plan_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/operation-plans/{plan_id}")
+def delete_operation_plan(plan_id: str) -> dict[str, Any]:
+    try:
+        return remove_operation_plan(plan_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 def _build_byd_daily_plan(
@@ -243,10 +291,25 @@ def long_stock_pool(
         raise HTTPException(status_code=500, detail=f"长线股票池生成失败: {exc}") from exc
 
 
+@router.get("/long/blood-chip")
+def blood_chip_long_plan(
+    signal_date: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    try:
+        if signal_date:
+            date.fromisoformat(signal_date)
+        return get_blood_chip_long_plan(signal_date=signal_date, refresh=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"带血筹策略参数错误: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"带血筹每日计划生成失败: {exc}") from exc
+
+
 @router.get("/convertible-bonds/plan")
 def convertible_bonds_plan(
     trade_date: str | None = None,
-    limit: int = Query(default=18, ge=1, le=50),
+    limit: int = Query(default=DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT, ge=1, le=50),
     refresh: bool = False,
 ) -> dict[str, Any]:
     try:
@@ -259,10 +322,16 @@ def convertible_bonds_plan(
 
 @router.get("/convertible-bonds/allotments")
 def convertible_bond_allotments(
-    limit: int = Query(default=80, ge=1, le=300),
-    include_listed_days: int = Query(default=90, ge=0, le=2000),
+    limit: int = Query(default=DEFAULT_ALLOTMENT_LIMIT, ge=1, le=300),
+    include_listed_days: int = Query(
+        default=DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
+        ge=0,
+        le=2000,
+    ),
     refresh: bool = False,
-    stage_scope: Literal["pipeline", "all"] = Query(default="pipeline"),
+    stage_scope: Literal["pipeline", "all"] = Query(
+        default=DEFAULT_ALLOTMENT_STAGE_SCOPE
+    ),
 ) -> dict[str, Any]:
     try:
         return get_convertible_bond_allotments(

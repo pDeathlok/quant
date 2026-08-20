@@ -489,6 +489,7 @@ def main() -> None:
         "status": "success",
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "target_date": target_date_text,
+        "scored_signals": sorted(signals),
         "candidate_rows": int(len(data)),
         "excluded_candidate_count": len(excluded_candidates),
         "excluded_candidate_samples": excluded_candidates[:20],

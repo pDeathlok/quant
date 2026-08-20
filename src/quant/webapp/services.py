@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,16 @@ from quant.application.refresh_contracts import (
     REFRESH_STEP_DEFINITIONS,
     build_progress_steps as _progress_steps,
     normalize_refresh_scope as _normalize_refresh_scope,
+)
+from quant.application.selector_ranking import (
+    DEFAULT_SELECTOR_RANKING_CONFIG,
+    SelectorRankingSource,
+    apply_selector_ranking_source,
+)
+from quant.application.blood_chip_long_plan import (
+    BLOOD_CHIP_LONG_SCHEMA_VERSION,
+    build_blood_chip_daily_iteration,
+    build_blood_chip_long_plan,
 )
 from quant.application.workspaces.byd import (
     BydWorkspaceDependencies,
@@ -82,6 +92,7 @@ from quant.research.similar_patterns import (
     vector_cache_key,
 )
 from quant.research.similar_patterns_validation import build_industry_regime, load_market_regime
+from quant.research.blood_chip import load_benchmark, load_canonical_daily
 from quant.strategies.custom.b1_family import add_b1_family_signals
 from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
 from quant.strategies.custom.z_skill_patterns import (
@@ -226,6 +237,9 @@ SELECTOR_SNAPSHOT_TABLE = "selector_snapshots"
 LONG_STOCK_POOL_SCHEMA_VERSION = "qfq_price_snapshot_v12_price_bands_structure_evidence"
 LONG_STOCK_POOL_SNAPSHOT_DIR = PROJECT_ROOT / "data/long_stock_pool_snapshots"
 LONG_STOCK_POOL_SNAPSHOT_TABLE = "long_stock_pool_snapshots"
+BLOOD_CHIP_LONG_SNAPSHOT_DIR = PROJECT_ROOT / "data/blood_chip_long_snapshots"
+BLOOD_CHIP_DAILY_DIR = PROJECT_ROOT / "data/raw/daily_partitioned"
+BLOOD_CHIP_BENCHMARK_PATH = PROJECT_ROOT / "data/raw/index_000300.SH.parquet"
 LONG_PRICE_SCORE_BAND_CONFIG_PATH = PROJECT_ROOT / "config/long_price_score_bands.json"
 LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION = "long-page-v1"
 LONG_FACTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/features/long"
@@ -356,6 +370,7 @@ REFRESH_CHILD_PROCESS_MARKERS = (
 )
 SIMILAR_PATTERN_STATE_DIR = PROJECT_ROOT / "data/research/similar_patterns"
 SIMILAR_PATTERN_WATCHLIST_PATH = SIMILAR_PATTERN_STATE_DIR / "watchlist.json"
+OPERATION_PLANS_PATH = WEB_DATA_DIR / "operation_plans.json"
 SIMILAR_PATTERN_ANALYSIS_PATH = SIMILAR_PATTERN_STATE_DIR / "web_watchlist_analysis.json"
 SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
 SIMILAR_PATTERN_VALIDATION_PATH = PROJECT_ROOT / "reports/similar_patterns/validation_2025/calibration.json"
@@ -3181,6 +3196,140 @@ def get_long_stock_pool(
     return payload
 
 
+def _read_blood_chip_long_snapshot(
+    signal_date: str | None = None,
+    *,
+    strictly_before: bool = False,
+) -> dict[str, Any] | None:
+    requested = (
+        pd.Timestamp(signal_date).normalize().date().isoformat()
+        if signal_date
+        else None
+    )
+    candidates: list[tuple[str, Path]] = []
+    if BLOOD_CHIP_LONG_SNAPSHOT_DIR.exists():
+        for path in BLOOD_CHIP_LONG_SNAPSHOT_DIR.glob("*.json"):
+            try:
+                payload = read_json_file(path)
+            except Exception:
+                continue
+            if payload.get("schema_version") != BLOOD_CHIP_LONG_SCHEMA_VERSION:
+                continue
+            candidate_date = str(payload.get("signal_date") or "")
+            if not candidate_date:
+                continue
+            if requested and (
+                candidate_date > requested
+                or (strictly_before and candidate_date >= requested)
+            ):
+                continue
+            candidates.append((candidate_date, path))
+    if not candidates:
+        return None
+    candidate_date, path = max(candidates, key=lambda item: item[0])
+    payload = read_json_file(path)
+    payload["cache"] = {
+        "hit": True,
+        "backend": "filesystem",
+        "snapshot_key": path.stem,
+        "snapshot_date": candidate_date,
+        "requested_date": requested,
+        "stale": bool(requested and candidate_date != requested),
+    }
+    return payload
+
+
+def _write_blood_chip_long_snapshot(payload: dict[str, Any]) -> Path:
+    signal_date = pd.Timestamp(payload["signal_date"]).strftime("%Y%m%d")
+    target = BLOOD_CHIP_LONG_SNAPSHOT_DIR / f"{signal_date}.json"
+    stored = dict(payload)
+    stored["schema_version"] = BLOOD_CHIP_LONG_SCHEMA_VERSION
+    stored["cache"] = {
+        "hit": False,
+        "backend": "generated",
+        "snapshot_key": target.stem,
+    }
+    return atomic_write_json(stored, target)
+
+
+def _resolve_blood_chip_signal_date(signal_date: str | None) -> str:
+    if signal_date:
+        return pd.Timestamp(signal_date).normalize().date().isoformat()
+    local_date = _local_market_trade_date()
+    if local_date:
+        return pd.Timestamp(local_date).date().isoformat()
+    if not BLOOD_CHIP_BENCHMARK_PATH.exists():
+        raise FileNotFoundError(BLOOD_CHIP_BENCHMARK_PATH)
+    benchmark_dates = pd.read_parquet(
+        BLOOD_CHIP_BENCHMARK_PATH,
+        columns=["trade_date"],
+    )["trade_date"]
+    latest = pd.to_datetime(benchmark_dates.astype(str), errors="coerce").max()
+    if pd.isna(latest):
+        raise ValueError("沪深300基准没有可用交易日")
+    return pd.Timestamp(latest).date().isoformat()
+
+
+def _build_blood_chip_long_plan_live(signal_date: str | None = None) -> dict[str, Any]:
+    requested_date = _resolve_blood_chip_signal_date(signal_date)
+    requested_ts = pd.Timestamp(requested_date)
+    start_date = (requested_ts - pd.Timedelta(days=620)).strftime("%Y%m%d")
+    requested_end = requested_ts.strftime("%Y%m%d")
+    daily = load_canonical_daily(
+        BLOOD_CHIP_DAILY_DIR,
+        start_date,
+        requested_end,
+    )
+    actual_end = pd.to_datetime(
+        daily["trade_date"].astype(str),
+        format="%Y%m%d",
+        errors="coerce",
+    ).max()
+    if pd.isna(actual_end):
+        raise ValueError("规范日线没有可用交易日")
+    actual_date = pd.Timestamp(actual_end).date().isoformat()
+    benchmark = load_benchmark(
+        BLOOD_CHIP_BENCHMARK_PATH,
+        start_date,
+        pd.Timestamp(actual_end).strftime("%Y%m%d"),
+    )
+    stock_basic_path = PROJECT_ROOT / "data/raw/stock_basic.parquet"
+    stock_basic = (
+        pd.read_parquet(stock_basic_path)
+        if stock_basic_path.exists()
+        else pd.DataFrame()
+    )
+    payload = build_blood_chip_long_plan(
+        daily,
+        benchmark,
+        signal_date=actual_date,
+        stock_basic=stock_basic,
+    )
+    previous = _read_blood_chip_long_snapshot(actual_date, strictly_before=True)
+    payload["daily_iteration"] = build_blood_chip_daily_iteration(payload, previous)
+    return payload
+
+
+def get_blood_chip_long_plan(
+    signal_date: str | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Read or regenerate the daily blood-chip medium/long strategy snapshot."""
+
+    if not refresh:
+        cached = _read_blood_chip_long_snapshot(signal_date)
+        if cached is not None:
+            return cached
+    payload = _build_blood_chip_long_plan_live(signal_date)
+    _write_blood_chip_long_snapshot(payload)
+    payload["cache"] = {
+        "hit": False,
+        "backend": "generated",
+        "snapshot_key": pd.Timestamp(payload["signal_date"]).strftime("%Y%m%d"),
+    }
+    return payload
+
+
 def _json_ready(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
@@ -3371,6 +3520,98 @@ def _normalize_watch_alert_config(raw_config: Any, *, strict: bool = False) -> d
         "reminders": reminders,
         "updated_at": updated_at,
     }
+
+
+OPERATION_PLAN_HORIZONS = {"tomorrow", "long_term"}
+OPERATION_PLAN_STATUSES = {"planned", "done", "cancelled"}
+
+
+def _read_operation_plans() -> list[dict[str, Any]]:
+    if not OPERATION_PLANS_PATH.exists():
+        return []
+    try:
+        payload = json.loads(OPERATION_PLANS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rows = payload.get("plans", []) if isinstance(payload, dict) else []
+    return [row for row in rows if isinstance(row, dict) and row.get("id")]
+
+
+def _write_operation_plans(plans: list[dict[str, Any]]) -> None:
+    atomic_write_json(
+        {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "plans": plans,
+        },
+        OPERATION_PLANS_PATH,
+    )
+
+
+def get_operation_plans() -> dict[str, Any]:
+    plans = _read_operation_plans()
+    plans.sort(key=lambda item: (item.get("status") != "planned", item.get("target_date") or "9999-12-31", item.get("created_at") or ""))
+    return {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "plans": plans,
+    }
+
+
+def save_operation_plan(data: dict[str, Any], plan_id: str | None = None) -> dict[str, Any]:
+    title = str(data.get("title") or "").strip()
+    content = str(data.get("content") or "").strip()
+    horizon = str(data.get("horizon") or "tomorrow")
+    status = str(data.get("status") or "planned")
+    target_date = str(data.get("target_date") or "").strip()
+    symbol = str(data.get("symbol") or "").strip().upper()
+    if not title:
+        raise ValueError("计划标题不能为空")
+    if len(title) > 120 or len(content) > 20_000 or len(symbol) > 30:
+        raise ValueError("计划内容超过长度限制")
+    if horizon not in OPERATION_PLAN_HORIZONS:
+        raise ValueError("计划周期无效")
+    if status not in OPERATION_PLAN_STATUSES:
+        raise ValueError("计划状态无效")
+    if target_date:
+        try:
+            date.fromisoformat(target_date)
+        except ValueError as exc:
+            raise ValueError("目标日期格式无效") from exc
+
+    plans = _read_operation_plans()
+    now = datetime.now().isoformat(timespec="seconds")
+    if plan_id:
+        existing = next((item for item in plans if item.get("id") == plan_id), None)
+        if existing is None:
+            raise ValueError("操作计划不存在")
+        created_at = existing.get("created_at") or now
+    else:
+        plan_id = uuid.uuid4().hex
+        created_at = now
+    saved = {
+        "id": plan_id,
+        "horizon": horizon,
+        "title": title,
+        "symbol": symbol,
+        "target_date": target_date,
+        "content": content,
+        "status": status,
+        "created_at": created_at,
+        "updated_at": now,
+    }
+    plans = [saved if item.get("id") == plan_id else item for item in plans]
+    if not any(item.get("id") == plan_id for item in plans):
+        plans.append(saved)
+    _write_operation_plans(plans)
+    return get_operation_plans()
+
+
+def remove_operation_plan(plan_id: str) -> dict[str, Any]:
+    plans = _read_operation_plans()
+    remaining = [item for item in plans if item.get("id") != plan_id]
+    if len(remaining) == len(plans):
+        raise ValueError("操作计划不存在")
+    _write_operation_plans(remaining)
+    return get_operation_plans()
 
 
 def _read_similar_pattern_watchlist_state() -> dict[str, Any]:
@@ -4439,6 +4680,7 @@ def _selector_snapshot_key(
             "strategies": strategy_key,
             "include_extended": include_extended,
             "schema_version": SELECTOR_SNAPSHOT_SCHEMA_VERSION,
+            "ranking_source": DEFAULT_SELECTOR_RANKING_CONFIG.source.value,
         },
         sort_keys=True,
         ensure_ascii=True,
@@ -4448,6 +4690,16 @@ def _selector_snapshot_key(
 
 def _selector_snapshot_path(snapshot_key: str) -> Path:
     return SELECTOR_SNAPSHOT_DIR / f"{snapshot_key}.json"
+
+
+def _selector_snapshot_matches_current_ranking_source(
+    payload: Mapping[str, Any],
+) -> bool:
+    """Reject cache fallback across a selector ranking-source cutover."""
+
+    return str(payload.get("ranking_source") or "") == (
+        DEFAULT_SELECTOR_RANKING_CONFIG.source.value
+    )
 
 
 @lru_cache(maxsize=32)
@@ -4563,6 +4815,8 @@ def _read_selector_snapshot(
     if path.exists():
         try:
             payload = read_json_file(path)
+            if not _selector_snapshot_matches_current_ranking_source(payload):
+                return None
             payload["cache"] = {"hit": True, "backend": "filesystem", "snapshot_key": snapshot_key}
             return payload
         except Exception:
@@ -4600,6 +4854,8 @@ def _read_selector_snapshot(
             if row and row.get("payload_json"):
                 payload = json.loads(row["payload_json"])
                 if not signal_date or str(payload.get("signal_date") or "") == str(signal_date):
+                    if not _selector_snapshot_matches_current_ranking_source(payload):
+                        return None
                     stored_key = str(row.get("snapshot_key") or snapshot_key)
                     if stored_key != snapshot_key and payload.get("selector_snapshot_schema_version") != SELECTOR_SNAPSHOT_SCHEMA_VERSION:
                         return None
@@ -4810,6 +5066,10 @@ def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -
         reverse=True,
     )
     rows = _apply_historical_score_normalization(rows)
+    rows = apply_selector_ranking_source(
+        rows,
+        str(payload.get("signal_date") or "") or None,
+    )
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -4872,13 +5132,17 @@ def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELE
             else original
             for original, rescored in zip(display_rows, rescored_rows)
         ]
-        display_rows = sorted(
-            display_rows,
-            key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
-            reverse=True,
-        )
-        if not (payload.get("snapshot_scope") or {}).get("strategies"):
-            display_rows = _diversify_default_rows(display_rows, len(display_rows))
+    display_rows = apply_selector_ranking_source(
+        display_rows,
+        str(payload.get("signal_date") or "") or None,
+    )
+    display_rows = sorted(
+        display_rows,
+        key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
+        reverse=True,
+    )
+    if not (payload.get("snapshot_scope") or {}).get("strategies"):
+        display_rows = _diversify_default_rows(display_rows, len(display_rows))
     total = len(display_rows)
     display = display_rows[:limit] if limit > 0 else display_rows
     out = dict(payload)
@@ -5533,10 +5797,21 @@ def _model_scored_candidates_for_date(signal_date: str | None = None) -> dict[tu
             df = df[df["date"] == target_date].copy()
         else:
             df = df[df["date"] == df["date"].max()].copy()
-    return {
+    result = {
         (str(row["symbol"]), str(row["signal"])): row
         for _, row in df[df["model_pass"].fillna(False).astype(bool)].iterrows()
     }
+    if (
+        DEFAULT_SELECTOR_RANKING_CONFIG.source
+        == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+    ):
+        preserved = set(DEFAULT_SELECTOR_RANKING_CONFIG.preserved_legacy_signals)
+        result = {
+            key: value
+            for key, value in result.items()
+            if key[1].upper() in preserved
+        }
+    return result
 
 
 def _model_scored_candidates() -> dict[tuple[str, str], pd.Series]:
@@ -7495,6 +7770,29 @@ def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | No
     return ordered
 
 
+def _refresh_long_workspace(
+    variants: list[str],
+    signal_date: str | None,
+) -> dict[str, Any]:
+    """Refresh both long-horizon sub-strategies under one progress step."""
+
+    variant_results = _refresh_long_stock_pool_variants(variants, signal_date)
+    blood_chip = get_blood_chip_long_plan(signal_date=signal_date, refresh=True)
+    if signal_date and str(blood_chip.get("signal_date") or "") != str(signal_date):
+        raise RuntimeError(
+            "带血筹结果日期未更新到最新交易日: "
+            f"expected={signal_date} actual={blood_chip.get('signal_date')}"
+        )
+    return {
+        "variants": variant_results,
+        "blood_chip": {
+            "signal_date": blood_chip.get("signal_date"),
+            "candidates": len(blood_chip.get("candidates") or []),
+            "simulated_positions": len(blood_chip.get("simulated_positions") or []),
+        },
+    }
+
+
 def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[str, Any] | None = None) -> dict[str, Any]:
     refresh_scope = _normalize_refresh_scope(scope)
     step_map = _step_status_map(resume_status)
@@ -7541,7 +7839,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
             lambda: get_chan_model_strategy_plan(20, True, signal_date),
             "缠论模型策略候选生成失败",
         ),
-        ("long_stock_pool", lambda: _refresh_long_stock_pool_variants(long_variants, signal_date), "长线策略股票池生成失败"),
+        ("long_stock_pool", lambda: _refresh_long_workspace(long_variants, signal_date), "长线策略与带血筹计划生成失败"),
         (
             "convertible_bond_plan",
             lambda: get_convertible_bond_grid_plan(
@@ -7595,7 +7893,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                     )
                     raise
                 if step_key == "long_stock_pool":
-                    results[step_key] = {"status": "success", "variants": payload}
+                    results[step_key] = {"status": "success", **payload}
                 elif step_key == "chan_model_strategy":
                     results[step_key] = {
                         "status": "success",
@@ -8277,13 +8575,13 @@ def _run_latest_refresh_job(
             elif refresh_scope == "long":
                 _build_tea_master_stock_pool_cached.cache_clear()
                 _build_long_stock_pool_cached.cache_clear()
-                _set_refresh_progress(step_key="long_stock_pool", message="正在计算长线策略股票池", percent=92)
-                variants = _refresh_long_stock_pool_variants(["tea", "tea_safe", "v44"], signal_date)
-                results["long_stock_pool"] = {"status": "success", "variants": variants}
+                _set_refresh_progress(step_key="long_stock_pool", message="正在计算长线策略与带血筹每日计划", percent=92)
+                long_workspace = _refresh_long_workspace(["tea", "tea_safe", "v44"], signal_date)
+                results["long_stock_pool"] = {"status": "success", **long_workspace}
                 _set_refresh_progress(
                     step_key="long_stock_pool",
                     step_status="success",
-                    message="长线策略股票池生成完成",
+                    message="长线策略与带血筹每日计划生成完成",
                     percent=98,
                     complete_previous=False,
                 )
@@ -8699,6 +8997,49 @@ def _run_latest_refresh_job(
                             percent=72,
                             complete_previous=False,
                         )
+        if (
+            DEFAULT_SELECTOR_RANKING_CONFIG.source
+            == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+        ):
+            from quant.routine.right_side_unified_production import (
+                run_right_side_unified_production,
+            )
+
+            _set_refresh_progress(
+                step_key="right_side_unified_features",
+                message="正在构建右侧统一模型生产因子与排序分",
+                percent=72,
+                complete_previous=False,
+            )
+            unified_ranking = run_right_side_unified_production(
+                expected_signal_date
+            )
+            if unified_ranking.get("status") != "success":
+                raise RuntimeError(
+                    str(unified_ranking.get("error") or "右侧统一生产排序失败")
+                )
+            results["right_side_unified_features"] = {
+                "status": "success",
+                "target_date": unified_ranking.get("target_date"),
+            }
+            results["right_side_unified_scores"] = unified_ranking
+            results["right_side_unified_adapter"] = {
+                **(unified_ranking.get("selector_adapter") or {}),
+                "status": "success",
+            }
+            for step_key, message, percent in (
+                ("right_side_unified_features", "右侧生产因子构建完成", 72),
+                ("right_side_unified_score", "右侧统一排序分计算完成", 76),
+                ("right_side_unified_adapter", "右侧 selector 排序适配校验完成", 78),
+            ):
+                _set_refresh_progress(
+                    step_key=step_key,
+                    step_status="success",
+                    message=message,
+                    percent=percent,
+                    complete_previous=False,
+                )
+
         _clear_selector_caches()
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
@@ -8798,9 +9139,9 @@ def _run_latest_refresh_job(
                     "chan_model_strategy",
                     "缠论模型策略候选生成失败",
                 ),
-                executor.submit(_refresh_long_stock_pool_variants, long_variants, signal_date): (
+                executor.submit(_refresh_long_workspace, long_variants, signal_date): (
                     "long_stock_pool",
-                    "长线策略股票池生成失败",
+                    "长线策略与带血筹计划生成失败",
                 ),
                 executor.submit(_run_similar_pattern_analysis_isolated): (
                     "similar_patterns",
@@ -8816,7 +9157,7 @@ def _run_latest_refresh_job(
                     workspace_failure_step = result_key
                     raise RuntimeError(f"{failure_message}: {exc}") from exc
                 if result_key == "long_stock_pool":
-                    results[result_key] = {"status": "success", "variants": payload}
+                    results[result_key] = {"status": "success", **payload}
                 elif result_key == "chan_model_strategy":
                     if str(payload.get("signal_date") or "") != expected_signal_date:
                         raise RuntimeError(
@@ -9172,6 +9513,13 @@ def get_stock_selector_payload(
         reverse=True,
     )
     rows = _apply_historical_score_normalization(rows)
+    rows = apply_selector_ranking_source(
+        rows,
+        effective_signal_date,
+        require_all_ranked_candidates=bool(
+            full_snapshot and effective_include_extended
+        ),
+    )
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -9183,6 +9531,7 @@ def get_stock_selector_payload(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": effective_signal_date,
         "execution_date": plan.get("execution_date"),
+        "ranking_source": DEFAULT_SELECTOR_RANKING_CONFIG.source.value,
         "available_strategies": [
             {"key": item["key"], "label": item["label"], "status": item["status"], "members": item["members"]}
             for item in STRATEGY_GROUPS

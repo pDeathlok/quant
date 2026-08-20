@@ -88,6 +88,21 @@ def test_z_finite_window_factors_match_existing_formulas() -> None:
     pd.testing.assert_series_equal(actual["z_bbi"], expected_bbi, check_names=False)
 
 
+def test_prepare_daily_reuses_already_normalized_frame(monkeypatch) -> None:
+    daily = _daily()
+    monkeypatch.setattr(
+        layer,
+        "normalize_tushare_daily",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("normalized frame should use the fast path")
+        ),
+    )
+
+    prepared = layer._prepare_daily(daily, "000001.SZ")
+
+    pd.testing.assert_frame_equal(prepared, daily)
+
+
 def test_incremental_refresh_replaces_same_dates_without_duplicates(tmp_path) -> None:
     daily_path = tmp_path / "000001.SZ.parquet"
     factor_root = tmp_path / "factor-cache"

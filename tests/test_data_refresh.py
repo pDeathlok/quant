@@ -7,8 +7,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pandas as pd
 import pytest
 
-from quant.data.source_merge import DailyRefreshAudit, audits_to_frame
+from quant.data.source_merge import (
+    DailyRefreshAudit,
+    audits_to_frame,
+    normalize_tushare_daily,
+)
 from quant.routine import data_refresh
+
+
+@pytest.mark.parametrize("date", ["2026-08-20", "20260820", "2026/08/20"])
+def test_tushare_daily_date_normalization_preserves_supported_strings(
+    date: str,
+) -> None:
+    daily = pd.DataFrame(
+        {
+            "date": pd.Series([date], dtype="string"),
+            "open": [10.0],
+            "high": [10.5],
+            "low": [9.8],
+            "close": [10.2],
+            "volume": [100.0],
+        }
+    )
+
+    normalized = normalize_tushare_daily(daily, "000001.SZ")
+
+    assert normalized.loc[0, "trade_date"] == "20260820"
+    assert normalized.loc[0, "date"] == pd.Timestamp("2026-08-20")
 
 
 def test_retryable_error_classification():

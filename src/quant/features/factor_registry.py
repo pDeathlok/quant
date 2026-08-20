@@ -6,7 +6,11 @@ from dataclasses import asdict, dataclass
 
 import pandas as pd
 
+from quant.features.right_side_factor_contract import (
+    RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+)
 from quant.features.variable_library import DAILY_BASIC_SOURCE_COLUMNS, PROJECT_FACTOR_COLUMNS
+from quant.research.right_side_unified_features import RULE_FEATURE_COLUMNS
 
 
 @dataclass(frozen=True)
@@ -124,6 +128,82 @@ _LONG_INDUSTRY_MEAN_BASES = (
     "pr",
 )
 
+# Stable annual quality factors built from the first locally available annual
+# announcement.  Keeping the model-facing contract here prevents a research
+# script from silently training on fields that are absent from the project
+# registry.
+LONG_ANNUAL_QUALITY_CASHFLOW_FACTOR_COLUMNS = (
+    "annual_cashflow_quality",
+    "annual_fcf_margin",
+    "annual_accruals_to_assets",
+    "cashflow_quality_3y",
+    "free_cashflow_margin_3y",
+    "accruals_to_assets_3y",
+    "cfo_positive_share_5y",
+)
+LONG_ANNUAL_QUALITY_PERSISTENCE_FACTOR_COLUMNS = (
+    "profit_positive_share_5y",
+    "revenue_growth_positive_share_5y",
+    "revenue_cagr_3y",
+    "net_income_cagr_3y",
+    "roe_mean_5y",
+    "roe_std_5y",
+)
+LONG_ANNUAL_QUALITY_ASSET_FACTOR_COLUMNS = (
+    "annual_goodwill_to_assets",
+    "annual_inventory_to_assets",
+    "annual_cash_to_assets",
+    "fina_current_ratio",
+    "fina_quick_ratio",
+    "fina_ar_turn",
+    "fina_inv_turn",
+    "fina_assets_turn",
+    "ar_turn_change_3y",
+    "inv_turn_change_3y",
+)
+LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS = (
+    "annual_cashflow_quality",
+    "annual_fcf_margin",
+    "annual_accruals_to_assets",
+    "cashflow_quality_3y",
+    "free_cashflow_margin_3y",
+    "accruals_to_assets_3y",
+    "profit_positive_share_5y",
+    "cfo_positive_share_5y",
+    "revenue_growth_positive_share_5y",
+    "revenue_cagr_3y",
+    "net_income_cagr_3y",
+    "roe_mean_5y",
+    "roe_std_5y",
+    "annual_goodwill_to_assets",
+    "annual_inventory_to_assets",
+    "annual_cash_to_assets",
+    "fina_current_ratio",
+    "fina_quick_ratio",
+    "fina_ar_turn",
+    "fina_inv_turn",
+    "fina_assets_turn",
+    "ar_turn_change_3y",
+    "inv_turn_change_3y",
+)
+LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS = (
+    "cashflow_quality_score",
+    "cashflow_quality_coverage",
+    "earnings_persistence_score",
+    "earnings_persistence_coverage",
+    "asset_quality_score",
+    "asset_quality_coverage",
+    "enhanced_good_stock_score",
+    "enhanced_quality_coverage",
+    "industry_value_score",
+    "industry_value_coverage",
+    "blended_value_score",
+)
+LONG_ANNUAL_QUALITY_FACTOR_COLUMNS = (
+    *LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS,
+    *LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS,
+)
+
 LONG_FACTOR_COLUMNS = (
     "good_stock_score",
     "profitability_score",
@@ -180,6 +260,60 @@ LONG_FACTOR_COLUMNS = (
     *(f"{base}_industry_pct" for base in _LONG_INDUSTRY_BASES),
     *(f"industry_{base}_mean" for base in _LONG_INDUSTRY_MEAN_BASES),
     *(f"{base}_minus_industry" for base in _LONG_INDUSTRY_MEAN_BASES),
+    *LONG_ANNUAL_QUALITY_FACTOR_COLUMNS,
+)
+
+_EXTRA_DAILY_PROJECT_FACTORS = (
+    "rsi_6",
+    "rsi_24",
+    "williams_r_14",
+    "cmf",
+    "eom",
+    "kdj_k",
+    "kdj_d",
+    "kdj_j",
+    "reversal_20d",
+    "risk_adjusted_momentum",
+    "price_volume_ratio",
+    "limit_up_cnt_3d",
+    "limit_up_cnt_5d",
+    "limit_up_cnt_10d",
+    "limit_up_cnt_20d",
+    "limit_up_cnt_60d",
+    "gt_9p5pct_cnt_3d",
+    "gt_9p5pct_cnt_5d",
+    "gt_9p5pct_cnt_10d",
+    "gt_9p5pct_cnt_20d",
+    "gt_9p5pct_cnt_60d",
+)
+
+_EXTRA_WEEKLY_LONG_FACTORS = (
+    "large_net_amount_ratio",
+    "large_net_3d_ratio",
+    "large_net_5d_ratio",
+    "moneyflow_net_ratio",
+    "small_net_amount_ratio",
+    "medium_net_amount_ratio",
+    "large_flow_persistence_5d",
+    "margin_balance",
+    "margin_balance_change",
+    "margin_buy_ratio_5d",
+    "short_balance",
+    "short_pressure_change_5d",
+    "top_list_count_20d",
+    "top_list_net_ratio_20d",
+    "top_list_positive_days_20d",
+    "top_list_reason_concentration_60d",
+    "holder_net_change_ratio_30d",
+    "holder_net_change_ratio_90d",
+    "holder_buy_event_count_180d",
+    "holder_avg_price_gap",
+    "holder_after_ratio_change_180d",
+    "pledge_ratio",
+    "pledge_ratio_change_13w",
+    "pledge_ratio_change_52w",
+    "pledge_event_count_26w",
+    "pledge_release_ratio_26w",
 )
 
 
@@ -194,6 +328,8 @@ def _daily_family(name: str) -> tuple[str, str]:
         return "volume_liquidity", "tushare_daily_ohlcv"
     if name.startswith(("volatility", "downside", "atr", "amplitude")):
         return "risk", "tushare_daily_ohlcv"
+    if name.startswith(("limit_up_cnt", "gt_9p5pct_cnt", "williams_r", "cmf", "eom", "price_volume_ratio")):
+        return "momentum_timing", "tushare_daily_ohlcv"
     if name.startswith(("return", "momentum", "reversal", "bias", "rsi", "kdj", "macd")):
         return "momentum_timing", "tushare_daily_ohlcv"
     return "price_structure", "tushare_daily_ohlcv"
@@ -210,15 +346,122 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 frequency="daily",
                 source=source,
                 point_in_time=True,
-                consumers=("short_models", "long_entry_weekly"),
+                consumers=(
+                    "short_models",
+                    "long_entry_weekly",
+                    "right_side_unified_shadow",
+                    "right_side_unified",
+                ),
             )
         )
     existing = {definition.name for definition in definitions}
+    for name in RULE_FEATURE_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="right_side_rule",
+                frequency="daily",
+                source="quant.research.right_side_unified_features.compute_right_side_rule_features",
+                point_in_time=True,
+                consumers=("right_side_unified_shadow", "right_side_unified"),
+            )
+        )
+        existing.add(name)
+    for name in RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="right_side_signal_identity",
+                frequency="daily",
+                source="canonical_right_side_signal_cache",
+                point_in_time=True,
+                consumers=("right_side_unified_shadow", "right_side_unified"),
+                role="strategy_identity",
+            )
+        )
+        existing.add(name)
+    for name in _EXTRA_DAILY_PROJECT_FACTORS:
+        if name in existing:
+            continue
+        family, source = _daily_family(name)
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family=family,
+                frequency="daily",
+                source="quant.features.project_factor_layer",
+                point_in_time=True,
+                consumers=("short_models", "long_entry_weekly"),
+            )
+        )
+        existing.add(name)
+    for name in _EXTRA_WEEKLY_LONG_FACTORS:
+        if name in existing:
+            continue
+        if name.startswith(("large_", "moneyflow_")):
+            family, source = "moneyflow", "quant.features.long_external_factors"
+        elif name.startswith("margin_"):
+            family, source = "margin", "quant.features.long_external_factors"
+        elif name.startswith("top_list_"):
+            family, source = "top_list", "quant.features.long_external_factors"
+        elif name.startswith("holder_"):
+            family, source = "holder", "quant.features.long_external_factors"
+        else:
+            family, source = "pledge", "quant.features.long_external_factors"
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family=family,
+                frequency="weekly",
+                source=source,
+                point_in_time=True,
+                consumers=("long_entry_weekly",),
+            )
+        )
+        existing.add(name)
+    cashflow_factors = set(LONG_ANNUAL_QUALITY_CASHFLOW_FACTOR_COLUMNS)
+    persistence_factors = set(LONG_ANNUAL_QUALITY_PERSISTENCE_FACTOR_COLUMNS)
+    asset_factors = set(LONG_ANNUAL_QUALITY_ASSET_FACTOR_COLUMNS)
+    quality_scores = set(LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS)
+    industry_quality_scores = {
+        "industry_value_score",
+        "industry_value_coverage",
+        "blended_value_score",
+    }
     for name in LONG_FACTOR_COLUMNS:
         if name in existing:
             continue
         if name.startswith("analyst_"):
             family, source = "analyst_expectation", "analyst_forecasts"
+        elif name in cashflow_factors:
+            family, source = (
+                "cashflow_quality",
+                "income+cashflow+balancesheet_first_announcement_pit",
+            )
+        elif name in persistence_factors:
+            family, source = (
+                "earnings_persistence",
+                "fina_indicator+income+cashflow_first_announcement_pit",
+            )
+        elif name in asset_factors:
+            family, source = (
+                "asset_quality",
+                "fina_indicator+balancesheet_first_announcement_pit",
+            )
+        elif name in industry_quality_scores:
+            family, source = (
+                "quality_relative_value",
+                "registered_quality+daily_basic+current_industry_mapping",
+            )
+        elif name in quality_scores:
+            family, source = (
+                "long_quality_composite",
+                "registered_annual_quality_factors+weekly_cross_section",
+            )
         elif "hist_percentile" in name or name.startswith(("pr_", "historical_value", "valuation_history")):
             family, source = "valuation_history", "daily_basic+financial_pit"
         elif name in {"roe", "netprofit_margin", "or_yoy", "basic_eps_yoy", "debt_to_assets"}:
@@ -232,7 +475,9 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 frequency="weekly",
                 source=source,
                 point_in_time=True,
-                consumers=("long_entry_weekly",),
+                consumers=("long_entry_quality_shadow",)
+                if name in LONG_ANNUAL_QUALITY_FACTOR_COLUMNS
+                else ("long_entry_weekly",),
             )
         )
     return tuple(definitions)

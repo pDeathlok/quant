@@ -21,12 +21,12 @@ find_python() {
     )
     for candidate in "${candidates[@]}"; do
         if [[ -n "$candidate" && -x "$candidate" ]] &&
-            "$candidate" -c 'import fastapi, pandas, uvicorn' >/dev/null 2>&1; then
+            "$candidate" -c 'import akquant, fastapi, pandas, uvicorn' >/dev/null 2>&1; then
             printf '%s\n' "$candidate"
             return 0
         fi
     done
-    echo "找不到已安装 fastapi、pandas、uvicorn 的 Python；可设置 QUANT_PYTHON=/absolute/path/python" >&2
+    echo "找不到已安装 akquant、fastapi、pandas、uvicorn 的 Python；可设置 QUANT_PYTHON=/absolute/path/python" >&2
     return 1
 }
 

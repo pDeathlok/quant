@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -21,7 +21,7 @@
         </div>
         <div class="sidebar-brief">
             <span>工作区</span>
-          <p>顶部 Tab 切换短线、缠论、长线、可转债、配债股、BYD 做T 与自选池。左侧区域跟随当前工作区显示对应策略选择。</p>
+          <p>顶部 Tab 切换短线、缠论、长线、可转债、配债股、BYD 做T、自选池与操作计划。左侧区域跟随当前工作区显示对应策略选择。</p>
         </div>
         <div class="global-refresh-card">
           <span>全局更新</span>
@@ -41,8 +41,12 @@
               <strong>好股票 · 好价格</strong>
               <span>基本面入池 · 历史估值推荐</span>
             </button>
+            <button class="long-variant-button" type="button" data-long-variant="blood_chip">
+              <strong>带血筹修复</strong>
+              <span>冲击吸收 · 次日观察 · 中期持有</span>
+            </button>
           </div>
-          <button id="longPoolRefresh" class="secondary-button" type="button">刷新股票池</button>
+          <button id="longPoolRefresh" class="secondary-button" type="button">刷新当前子策略</button>
         </div>
         <div id="cbStrategySection" class="side-section hidden">
           <span>可转债策略</span>
@@ -111,8 +115,6 @@
             <button id="reloadButton" type="button">刷新当前日期</button>
             <button id="refreshLatestButton" type="button" data-refresh-scope="short">更新本页</button>
           </div>
-          <div id="refreshStatus" class="refresh-status"></div>
-          <div id="progressSteps" class="progress-steps"></div>
         </section>
 
         <section class="split">
@@ -135,6 +137,7 @@
                     <th>历史均值</th>
                     <th>PF</th>
                     <th>日期</th>
+                    <th>雪球</th>
                   </tr>
                 </thead>
                 <tbody id="stockRows"></tbody>
@@ -205,8 +208,6 @@
             <button id="chanRefreshButton" type="button">刷新计划</button>
             <button id="chanRefreshLatestButton" type="button" data-refresh-scope="chan">更新本页</button>
           </div>
-          <div class="refresh-status"></div>
-          <div class="progress-steps"></div>
         </section>
 
         <section id="chanMetrics" class="chan-performance"></section>
@@ -290,8 +291,8 @@
         <section class="toolbar long-toolbar">
           <div>
             <p class="eyebrow">Long Horizon Strategy</p>
-            <h2>长线好股票与好价格</h2>
-            <p class="subline">只回答两件事：公司是否值得长期观察，当前估值是否进入好价格区</p>
+            <h2 id="longPageTitle">长线好股票与好价格</h2>
+            <p id="longPageSubtitle" class="subline">只回答两件事：公司是否值得长期观察，当前估值是否进入好价格区</p>
           </div>
           <div class="long-toolbar-actions">
             <div id="longDateSlot" class="long-date-slot"></div>
@@ -301,11 +302,20 @@
               <strong id="longSummaryName">好股票 · 价格分</strong>
             </div>
           </div>
-          <div class="refresh-status"></div>
-          <div class="progress-steps"></div>
         </section>
 
-        <section class="long-overview-grid" aria-label="长线策略概览">
+        <div class="long-variant-mobile-control" aria-label="移动端长线策略版本">
+          <button class="long-variant-button active" type="button" data-long-variant="tea">
+            <strong>好股票 · 好价格</strong>
+            <span>基本面与历史估值</span>
+          </button>
+          <button class="long-variant-button" type="button" data-long-variant="blood_chip">
+            <strong>带血筹修复</strong>
+            <span>20% / 30% / 50%</span>
+          </button>
+        </div>
+
+        <section class="long-overview-grid" data-long-default-panel aria-label="长线策略概览">
           <article class="long-hero-panel">
             <span id="longHeroTag" class="tag strong">筛选原则</span>
             <h3 id="longHeroTitle">好股票进入观察，好股票 + 价格分达标才推荐</h3>
@@ -329,7 +339,7 @@
           </aside>
         </section>
 
-        <section class="panel long-pool-panel">
+        <section class="panel long-pool-panel" data-long-default-panel>
           <div class="panel-head">
             <div>
               <h3>好股票观察池</h3>
@@ -355,10 +365,26 @@
                     </button>
                   </th>
                   <th>ROE</th>
-                  <th>PE</th>
-                  <th>PB</th>
-                  <th>PR-PE</th>
-                  <th>PR-PB</th>
+                  <th data-long-sort-header="pe_ttm" aria-sort="none">
+                    <button class="long-sort-button" type="button" data-long-sort="pe_ttm">
+                      PE <span data-long-sort-indicator aria-hidden="true">↕</span>
+                    </button>
+                  </th>
+                  <th data-long-sort-header="pb" aria-sort="none">
+                    <button class="long-sort-button" type="button" data-long-sort="pb">
+                      PB <span data-long-sort-indicator aria-hidden="true">↕</span>
+                    </button>
+                  </th>
+                  <th data-long-sort-header="pr_from_pe" aria-sort="none">
+                    <button class="long-sort-button" type="button" data-long-sort="pr_from_pe">
+                      PR-PE <span data-long-sort-indicator aria-hidden="true">↕</span>
+                    </button>
+                  </th>
+                  <th data-long-sort-header="pr_from_pb" aria-sort="none">
+                    <button class="long-sort-button" type="button" data-long-sort="pr_from_pb">
+                      PR-PB <span data-long-sort-indicator aria-hidden="true">↕</span>
+                    </button>
+                  </th>
                   <th>当年E EPS / 股价</th>
                   <th>次年E EPS / 股价</th>
                   <th>后年E EPS / 股价</th>
@@ -372,7 +398,7 @@
           </div>
         </section>
 
-        <section class="panel long-price-band-panel" aria-labelledby="longPriceBandTitle">
+        <section class="panel long-price-band-panel" data-long-default-panel aria-labelledby="longPriceBandTitle">
           <div class="panel-head">
             <div>
               <h3 id="longPriceBandTitle">价格分分档与历史回测</h3>
@@ -401,6 +427,99 @@
           </div>
           <p id="longPriceBandConclusion" class="long-price-band-conclusion"></p>
         </section>
+
+        <div id="bloodChipLongContent" class="blood-chip-long-content hidden">
+          <section class="panel blood-chip-overview">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Event-driven Medium Horizon</p>
+                <h3>疑似受迫卖出后的修复观察</h3>
+                <span id="bloodChipMeta" aria-live="polite">等待加载</span>
+              </div>
+              <span class="tag positive">当前执行</span>
+            </div>
+            <div class="blood-chip-summary-grid">
+              <article><span>今日新候选</span><strong id="bloodChipMetricCandidates">-</strong></article>
+              <article><span>策略模拟持仓</span><strong id="bloodChipMetricPositions">-</strong></article>
+              <article><span>今日止损</span><strong id="bloodChipMetricStops">-</strong></article>
+              <article><span>新事件再入</span><strong id="bloodChipMetricReentries">-</strong></article>
+            </div>
+            <p class="blood-chip-boundary">量价只能识别“冲击—吸收—卖盘衰竭”的疑似结构，不能证明卖方是大股东、机构或散户。当前直接执行递增加仓：首仓 20% 在信号次日开盘验证；第二段 30% 等待 5 日生存确认；第三段 50% 等待 10 日强势确认。</p>
+          </section>
+
+          <section class="panel blood-chip-candidate-panel">
+            <div class="panel-head">
+              <div>
+                <h3>首仓 20% · 次日开盘候选</h3>
+                <span>第二段 30%：5 日后守住信号价 95% 且残差转正；第三段 50%：10 日后站回信号价且残差为正</span>
+              </div>
+            </div>
+            <div class="table-wrap blood-chip-table-wrap">
+              <table class="blood-chip-table">
+                <thead>
+                  <tr>
+                    <th>排序</th>
+                    <th>股票</th>
+                    <th>动作</th>
+                    <th>冲击 / 吸收分</th>
+                    <th>冲击日 月/周/日 J</th>
+                    <th>60日残差波动</th>
+                    <th>低点反弹</th>
+                    <th>120日涨幅</th>
+                    <th>冲击波动扩张</th>
+                    <th>确认量 / 前期量</th>
+                    <th>次日条件 / 风控</th>
+                  </tr>
+                </thead>
+                <tbody id="bloodChipCandidateRows">
+                  <tr><td colspan="11" class="empty-cell">切换到带血筹修复后加载每日候选</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="blood-chip-state-grid">
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>策略模拟持仓</h3>
+                  <span>目标单股仓位 10%；按 20% / 30% / 50% 逐步建立，不代表真实账户</span>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table class="blood-chip-state-table">
+                  <thead><tr><th>股票</th><th>阶段与部署</th><th>入场</th><th>持有日</th><th>估算收益</th><th>下一步</th><th>止损参考</th><th>再入次数</th></tr></thead>
+                  <tbody id="bloodChipPositionRows"><tr><td colspan="8" class="empty-cell">暂无策略模拟持仓</td></tr></tbody>
+                </table>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>当日退出与再入状态</h3>
+                  <span>止损后不永久拉黑；只有新的冲击事件才允许再次买入</span>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table class="blood-chip-state-table">
+                  <thead><tr><th>股票</th><th>退出原因</th><th>收益</th><th>持有日</th><th>事件</th></tr></thead>
+                  <tbody id="bloodChipExitRows"><tr><td colspan="5" class="empty-cell">今日暂无策略退出</td></tr></tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+
+          <section class="blood-chip-evidence-grid">
+            <article class="panel">
+              <div class="panel-head"><h3>每日迭代</h3><span>与上一交易日快照对比</span></div>
+              <div id="bloodChipIteration" class="blood-chip-iteration">等待加载</div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><h3>回测证据与边界</h3><span>胜率不是唯一目标</span></div>
+              <div id="bloodChipEvidence" class="blood-chip-evidence">等待加载</div>
+            </article>
+          </section>
+        </div>
 
       </main>
 
@@ -442,8 +561,6 @@
             <div id="cbDateSlot"></div>
             <button id="cbRefreshLatestButton" type="button" data-refresh-scope="cb">更新本页</button>
           </div>
-          <div class="refresh-status"></div>
-          <div class="progress-steps"></div>
         </section>
 
         <section id="cbMetrics" class="metrics-grid cb-metrics"></section>
@@ -533,8 +650,6 @@
           <div class="toolbar-actions">
             <button id="cbAllotmentRefreshLatestButton" type="button" data-refresh-scope="cbAllotment">更新本页</button>
           </div>
-          <div class="refresh-status"></div>
-          <div class="progress-steps"></div>
         </section>
 
         <section class="panel allotment-table-panel">
@@ -669,8 +784,6 @@
             <button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页</button>
             <span id="bydHoldingSaveStatus" class="byd-save-status" role="status" aria-live="polite">持仓修改后自动保存</span>
           </div>
-          <div class="refresh-status"></div>
-          <div class="progress-steps"></div>
         </section>
 
         <section class="panel byd-validation-panel">
@@ -779,8 +892,6 @@
             <button type="submit">加入自选</button>
             <button id="similarRefreshButton" type="button" data-refresh-scope="similar">刷新分析</button>
           </form>
-          <div class="refresh-status"></div>
-          <div class="progress-steps"></div>
         </section>
 
         <section id="similarSignalSummary" class="similar-signal-summary" aria-label="自选池策略信号总览"></section>
@@ -882,6 +993,86 @@
           </div>
         </section>
       </main>
+
+      <main id="plansPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区"></nav>
+
+        <section class="toolbar plans-toolbar">
+          <div>
+            <p class="eyebrow">Execution Notebook</p>
+            <h2>操作计划</h2>
+            <p id="plansMeta" class="subline">记录次日执行与长期跟踪计划</p>
+          </div>
+          <div class="plan-view-filters" role="group" aria-label="计划筛选">
+            <button class="active" type="button" data-plan-filter="active">进行中</button>
+            <button type="button" data-plan-filter="tomorrow">次日</button>
+            <button type="button" data-plan-filter="long_term">长期</button>
+            <button type="button" data-plan-filter="done">已完成</button>
+          </div>
+        </section>
+
+        <section class="plans-layout">
+          <form id="operationPlanForm" class="panel plan-editor" autocomplete="off">
+            <div class="panel-head">
+              <div>
+                <h3 id="operationPlanFormTitle">新增计划</h3>
+                <span>执行条件尽量写得具体、可验证</span>
+              </div>
+              <button id="operationPlanReset" class="inline-secondary" type="button">清空</button>
+            </div>
+            <input id="operationPlanId" type="hidden" />
+            <div class="plan-editor-grid">
+              <label>
+                <span>计划周期</span>
+                <select id="operationPlanHorizon">
+                  <option value="tomorrow">次日计划</option>
+                  <option value="long_term">长期计划</option>
+                </select>
+              </label>
+              <label>
+                <span>目标日期（可选）</span>
+                <input id="operationPlanDate" type="date" />
+              </label>
+              <label class="plan-field-wide">
+                <span>标题</span>
+                <input id="operationPlanTitle" maxlength="120" required placeholder="例如：比亚迪回踩 20 日线后的分批计划" />
+              </label>
+              <label>
+                <span>股票 / 标的（可选）</span>
+                <input id="operationPlanSymbol" maxlength="30" autocomplete="off" placeholder="002594.SZ" />
+              </label>
+              <label>
+                <span>状态</span>
+                <select id="operationPlanStatus">
+                  <option value="planned">进行中</option>
+                  <option value="done">已完成</option>
+                  <option value="cancelled">已取消</option>
+                </select>
+              </label>
+              <label class="plan-field-wide">
+                <span>操作条件与执行步骤</span>
+                <textarea id="operationPlanContent" maxlength="20000" rows="9" placeholder="触发条件：&#10;计划动作：&#10;仓位上限：&#10;止损 / 失效条件：&#10;复盘要点："></textarea>
+              </label>
+            </div>
+            <div class="plan-editor-actions">
+              <span id="operationPlanSaveStatus" aria-live="polite"></span>
+              <button id="operationPlanSave" type="submit">保存计划</button>
+            </div>
+          </form>
+
+          <section class="panel plan-list-panel">
+            <div class="panel-head">
+              <div>
+                <h3>计划清单</h3>
+                <span id="operationPlanCount">0 条</span>
+              </div>
+            </div>
+            <div id="operationPlanList" class="operation-plan-list">
+              <div class="empty-state">切到操作计划后加载</div>
+            </div>
+          </section>
+        </section>
+      </main>
     </div>
     <div id="bydTradeToast" class="byd-trade-toast" role="status" aria-live="polite" aria-atomic="true"></div>
     <div id="watchlistContextMenu" class="watchlist-context-menu" role="menu" hidden>
@@ -944,6 +1135,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default"></script>
   </body>
 </html>

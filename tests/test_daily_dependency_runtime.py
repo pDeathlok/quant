@@ -23,7 +23,11 @@ from quant.application.daily_dependencies import (
     IncrementalPolicy,
     Layer,
     Lifecycle,
+    ModelContract,
     NodeState,
+)
+from quant.features.right_side_factor_contract import (
+    RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
 )
 from quant.routine import daily_dependency_runtime as runtime
 
@@ -35,6 +39,36 @@ class _SklearnArtifact:
 
 class _ImportanceModel:
     feature_importances_ = (0.8, 0.0, 0.2)
+
+
+def test_right_side_shadow_catalog_matches_complete_model_input_contract() -> None:
+    features = tuple(RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS)
+    contract = ModelContract(
+        node_id="score.right_side_unified_shadow",
+        artifact_hashes=(("ranking.joblib", "abc"),),
+        features_by_artifact={"ranking.joblib": features},
+        effective_features_by_artifact={"ranking.joblib": features},
+        required_feature_union=features,
+        effective_feature_union=features,
+        combined_hash="abc",
+    )
+    contracts = {"score.right_side_unified_shadow": contract}
+
+    catalogs = runtime._feature_catalogs(contracts)
+    usage = {
+        item.feature_node_id: item
+        for item in runtime.classify_feature_usage(
+            DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+            "rightSideShadow",
+            contracts,
+            catalogs,
+        )
+    }["feature.right_side_unified_shadow"]
+
+    assert catalogs["feature.right_side_unified_shadow"] == features
+    assert usage.required == tuple(sorted(features))
+    assert usage.unknown == ()
+    assert usage.projection_safe is False
 
 
 def _node(

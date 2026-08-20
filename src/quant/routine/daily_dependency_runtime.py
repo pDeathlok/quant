@@ -31,6 +31,9 @@ from quant.application.daily_dependencies import (
 )
 from quant.data.atomic_io import atomic_write_json
 from quant.features.factor_registry import FACTOR_REGISTRY, LONG_FACTOR_COLUMNS
+from quant.features.right_side_factor_contract import (
+    RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
+)
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 
 
@@ -628,6 +631,12 @@ def _feature_catalogs(
         "feature.long_snapshot": tuple(LONG_FACTOR_COLUMNS),
         "feature.selector_live": selector.required_feature_union if selector else (),
         "feature.chan_live": chan.required_feature_union if chan else (),
+        "feature.right_side_unified_shadow": tuple(
+            RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS
+        ),
+        "feature.right_side_unified": tuple(
+            RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS
+        ),
     }
 
 
@@ -816,6 +825,38 @@ def _changed_node_states(
     )
 
 
+def _postflight_result_backed_nodes(
+    registry: DependencyRegistry,
+    states: Mapping[str, NodeState],
+    active_node_ids: Iterable[str],
+    target_date: date,
+) -> set[str]:
+    """Identify fresh, result-backed nodes completed by the current workflow.
+
+    Nodes without standalone output artifacts use the current run result as
+    both freshness evidence and their fingerprint. A changed successful result
+    is therefore proof of completion, not evidence that the node must run a
+    second time during postflight.
+    """
+
+    completed: set[str] = set()
+    for node_id in active_node_ids:
+        node = registry.nodes[node_id]
+        if node.outputs or not any(
+            evidence.adapter == "result" for evidence in node.freshness.evidence
+        ):
+            continue
+        current, _ = state_is_current(
+            node,
+            states.get(node_id),
+            target_date,
+            datetime.now(),
+        )
+        if current:
+            completed.add(node_id)
+    return completed
+
+
 def _identity_is_complete(
     payload: Mapping[str, Any],
     scope: str,
@@ -994,6 +1035,18 @@ def publish_daily_dependency_snapshot(
         for node_id in changed_state_nodes
         if node_id not in expected_preflight_changes
     )
+    if phase == "postflight":
+        result_backed_nodes = _postflight_result_backed_nodes(
+            registry,
+            states,
+            active,
+            target,
+        )
+        changed_state_nodes = tuple(
+            node_id
+            for node_id in changed_state_nodes
+            if node_id not in result_backed_nodes
+        )
     identity_missing_nodes = set(active) if comparison_identity == "missing" else set()
     plan = build_dependency_plan(
         registry,

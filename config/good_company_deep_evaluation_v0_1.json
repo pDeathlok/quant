@@ -1,0 +1,49 @@
+{
+  "schema_version": "good_company_deep_evaluation_v0_1",
+  "analysis_cutoff": "2026-08-09T19:46:24+08:00",
+  "target_date": "2027-08-09",
+  "price_date": "20260807",
+  "gqs": {
+    "module_weights": {
+      "A": 10,
+      "B": 20,
+      "C": 10,
+      "D": 20,
+      "E": 15,
+      "F": 10,
+      "G": 15
+    },
+    "forward_adjustment_cap": 5,
+    "minimum_realized_coverage": 0.6,
+    "quality_company_minimum": 75,
+    "potential_company_minimum": 65
+  },
+  "valuation": {
+    "scenario_earnings_factors": {
+      "standard": {"bear": 0.8, "base": 1.0, "bull": 1.2},
+      "resource_midcycle": {"bear": 0.65, "base": 0.9, "bull": 1.2},
+      "utility_infrastructure": {"bear": 0.88, "base": 1.0, "bull": 1.1}
+    },
+    "multiple_bounds": {
+      "bank_pb_roe": [0.6, 1.8],
+      "resource_midcycle": [6.0, 15.0],
+      "utility_infrastructure": [8.0, 22.0],
+      "real_estate_asset": [6.0, 20.0],
+      "consumer_pe": [12.0, 35.0],
+      "industrial_pe": [12.0, 35.0],
+      "technology_pe": [18.0, 50.0],
+      "medical_pe": [15.0, 40.0],
+      "service_pe": [12.0, 35.0]
+    },
+    "multiple_scenario_factors": {"bear": 0.72, "base": 1.0, "bull": 1.28},
+    "maximum_forward_pe": 60.0,
+    "minimum_forecast_samples": 2
+  },
+  "technical": {
+    "lookback_trade_days": 300,
+    "strong_ma20_gap": 0.03,
+    "weak_ma60_gap": -0.05
+  },
+  "missing_value_policy": "Use null and an explicit missing reason; never synthesize zero, neutral, NaN or Infinity.",
+  "disclaimer": "研究与教育用途，不构成个性化投资建议、收益承诺或交易指令。"
+}

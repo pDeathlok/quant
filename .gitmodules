@@ -1,0 +1,3 @@
+[submodule "luban-ml-skill"]
+	path = luban-ml-skill
+	url = git@git.xiaojukeji.com:lianjunhong_i/luban-ml-skill.git

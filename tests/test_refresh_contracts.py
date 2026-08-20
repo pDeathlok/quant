@@ -20,6 +20,7 @@ from quant.application.refresh_contracts import (
         ("allotment", "cbAllotment"),
         ("convertible_bond", "cb"),
         ("convertible-bond", "cb"),
+        ("rightSideShadow", "rightSideShadow"),
     ],
 )
 def test_normalize_refresh_scope_supports_public_aliases(
@@ -56,3 +57,14 @@ def test_daily_refresh_orders_factor_layer_before_long_page_outputs() -> None:
     assert "统一日频因子层" in REFRESH_STEP_DEFINITIONS["feature_cache"]["label"]
     assert "长线因子截面" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]
     assert "页面股票池" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]
+    assert "带血筹" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]
+
+
+def test_right_side_shadow_has_an_independent_refresh_view() -> None:
+    assert REFRESH_SCOPE_STEPS["rightSideShadow"] == [
+        "refresh_data",
+        "signal_cache",
+        "right_side_shadow_features",
+        "right_side_shadow_score",
+        "right_side_shadow_product",
+    ]

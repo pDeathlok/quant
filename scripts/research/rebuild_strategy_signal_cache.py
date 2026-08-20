@@ -609,10 +609,12 @@ def _build_b1_gate_rows(
     symbol: str,
     frame: pd.DataFrame,
     rebuild_start: str,
+    *,
+    normalized: bool = False,
 ) -> pd.DataFrame:
     start = pd.Timestamp(rebuild_start)
     history_start = start - pd.Timedelta(days=450)
-    daily = normalize_tushare_daily(frame, symbol)
+    daily = frame.copy() if normalized else normalize_tushare_daily(frame, symbol)
     daily = (
         daily[pd.to_datetime(daily["date"], errors="coerce") >= history_start]
         .sort_values("date")
@@ -647,12 +649,14 @@ def _process_symbol(
     """Compute shared factors once, then fan into both signal families."""
 
     try:
+        normalized = normalize_tushare_daily(frame, symbol)
+        normalized["symbol"] = symbol
         gate_rows = _build_b1_gate_rows(
             symbol,
-            frame,
+            normalized,
             rebuild_start,
+            normalized=True,
         )
-        normalized = family_rules.normalize_daily_frame(frame, symbol)
         if "name" in normalized.columns:
             names = normalized["name"].fillna("").astype(str)
             normalized = normalized[

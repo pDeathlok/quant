@@ -1,0 +1,84 @@
+# 右侧统一排序模型的研究影子发布合同。
+#
+# 该配置只注册独立 rightSideShadow 例行链路，不向线上 selector 提供输入。
+# 排序 A/B 门槛通过并显式封装 shadow artifact 后，才允许把 routine.enabled
+# 改为 true。生产 promotion 仍是另一次独立、可回滚的变更。
+release:
+  id: right-side-unified-v2-118-shadow
+  lifecycle: research_only
+  consumer: quant.routine.right_side_unified_shadow
+  dependency_nodes:
+    - feature.right_side_unified_shadow
+    - score.right_side_unified_shadow
+    - product.right_side_unified_shadow
+  scope: rightSideShadow
+  artifact: models/research/right_side_unified_v2_118/shadow/ranking.joblib
+  artifact_manifest: models/research/right_side_unified_v2_118/shadow/manifest.json
+  artifact_schema_version: right-side-unified-ranking-shadow-v1
+  feature_schema_version: right-side-shadow-features-v1-project-v4-rule-v2-118
+  project_factor_schema_version: project-v4-causal-price-alpha
+  rule_factor_schema_version: right_side_rule_features_v2_118_20260813
+  rule_factor_count: 118
+  factor_count: 265
+  factor_contract_sha256: 6fc15ad06252b66b40f890165243f6b17cb74444909019155e12934683cace9c
+  ranking_decision: reports/research/right_side_unified_v2_118/production_replacement_decision_ab.json
+
+routine:
+  # 当前保持关闭：105 已封装为 research-only shadow artifact；
+  # 118 增量与线上 legacy 替换门均未通过，仅允许显式手工 dry-run。
+  enabled: false
+  target_top_n: 50
+  factor_workers: 8
+  production_failure_policy: isolate_shadow
+  feature_output: data/features/right_side_unified_shadow/latest_features.parquet
+  feature_manifest: data/features/right_side_unified_shadow/feature_manifest.json
+  score_output: data/features/right_side_unified_shadow/latest_scores.parquet
+  score_manifest: data/features/right_side_unified_shadow/score_manifest.json
+  product_output: reports/research/right_side_unified_v2_118/shadow/latest_candidates.parquet
+  product_manifest: reports/research/right_side_unified_v2_118/shadow/product_manifest.json
+  run_status: reports/research/right_side_unified_v2_118/shadow/run_status.json
+  z_signal_cache: data/features/z_skill_daily_candidates.parquet
+  family_signal_cache: data/features/b1/b1_family_rule_candidates.parquet
+  market_data_root: data/raw
+  history_years: 6
+
+ranking_gate:
+  enabled: true
+  # Shadow staging consumes the composite decision's research-candidate gate.
+  # Its replace_online field is a separate production authorization and is
+  # currently false; architecture superiority must never be treated as that
+  # authorization.
+  decision_schema_version: right-side-production-replacement-decision-v1
+  decision_field: shadow_candidate
+  accepted_values:
+    - true
+    - pass
+    - passed
+    - replace
+  required_folds:
+    - A
+    - B
+  primary_metric: pr_auc
+  # 不在配置中硬编码获胜臂；以 decision.selected_candidate 为唯一权威。
+  selected_candidate_field: selected_research_candidate
+  eligible_candidates:
+    - unified_long_task_deep_rule105
+    - unified_long_task_deep
+    - unified_long_task_deep_beam
+  production_replacement_field: replace_online
+
+promotion:
+  enabled: false
+  # A/B 排序胜出即可作替换决策；shadow 只做工程验收，不另设统计/收益门槛。
+  requires_new_unseen_shadow_period: false
+  engineering_acceptance:
+    minimum_complete_shadow_runs: 1
+    require_schema_freshness_artifact_final_gate: true
+  production_artifact: models/production/right_side_unified/ranking.joblib
+  production_manifest: models/production/right_side_unified/manifest.json
+  selector_consumer: score.selector
+  selector_source_after_promotion: score.right_side_unified
+  rollback_selector_source: score.z_skill
+  preserve_legacy_artifacts:
+    - models/research/z_skill
+  rollback_observation_cycles: 1

@@ -214,6 +214,7 @@ def test_ensure_local_service_checks_frontend_and_starts_stack(monkeypatch, tmp_
         started["kwargs"] = kwargs
         return FakeProcess()
 
+    monkeypatch.setattr(runner, "resolve_service_python", lambda project_root: Path("/test/python"))
     monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
     config = runner.RefreshRunnerConfig(
         project_root=tmp_path,
@@ -231,6 +232,7 @@ def test_ensure_local_service_checks_frontend_and_starts_stack(monkeypatch, tmp_
 
     assert process is not None
     command = started["args"][0]
+    assert command[0] == "/test/python"
     assert command[1] == "scripts/run_webapp.py"
     assert command[command.index("--log-file") + 1] == str(tmp_path / "service.log")
     assert started["kwargs"]["stdout"] is runner.subprocess.DEVNULL
@@ -276,6 +278,7 @@ def test_ensure_local_service_force_restarts_pid_file_service(monkeypatch, tmp_p
         started["kwargs"] = kwargs
         return FakeProcess()
 
+    monkeypatch.setattr(runner, "resolve_service_python", lambda project_root: Path("/test/python"))
     monkeypatch.setattr(runner.os, "killpg", fake_killpg)
     monkeypatch.setattr(runner, "process_is_running", fake_process_is_running)
     monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
@@ -300,6 +303,43 @@ def test_ensure_local_service_force_restarts_pid_file_service(monkeypatch, tmp_p
     assert pid_path.read_text(encoding="utf-8") == "33333\n"
     assert started["kwargs"]["start_new_session"] is True
     assert any("准备重启常驻 web 服务" in line for line in logs)
+
+
+def test_ensure_local_service_treats_busy_existing_port_as_recoverable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    session = FakeSession([])
+    client = runner.RefreshApiClient("http://127.0.0.1:8088/api", session=session)
+    logs: list[str] = []
+    clock = iter([0.0, 0.1])
+
+    class FakeProcess:
+        pid = 44444
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(runner, "resolve_service_python", lambda project_root: Path("/test/python"))
+    monkeypatch.setattr(runner, "is_service_port_listening", lambda base_url: True)
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    config = runner.RefreshRunnerConfig(
+        project_root=tmp_path,
+        service_log_path=tmp_path / "service.log",
+        service_pid_path=tmp_path / "service.pid",
+        health_timeout_seconds=5,
+    )
+
+    process = runner.ensure_local_service(
+        config=config,
+        client=client,
+        sleep_fn=lambda _: None,
+        monotonic_fn=lambda: next(clock),
+        print_fn=logs.append,
+    )
+
+    assert process is None
+    assert not (tmp_path / "service.pid").exists()
+    assert any("端口仍有服务监听" in line for line in logs)
 
 
 def test_ensure_local_service_restarts_launchd_managed_service(

@@ -34,6 +34,22 @@ class TripleVolumeVariant:
     description: str
 
 
+@dataclass(frozen=True)
+class _TripleVolumeInputs:
+    frame: pd.DataFrame
+    open: pd.Series
+    high: pd.Series
+    low: pd.Series
+    close: pd.Series
+    volume: pd.Series
+    ma5: pd.Series
+    ma10: pd.Series
+    ma20: pd.Series
+    ma60: pd.Series
+    volume_ma5: pd.Series
+    tradable: pd.Series
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 TRIPLE_VOLUME_CONFIG_PATH = (
     PROJECT_ROOT / "configs/strategies/triple_volume_breakout.yaml"
@@ -106,6 +122,43 @@ def _normalize_daily_frame(df: pd.DataFrame) -> pd.DataFrame:
 def _is_risk_name(name: pd.Series) -> pd.Series:
     text = name.fillna("").astype(str).str.upper()
     return text.str.contains("ST", regex=False) | text.str.contains("*", regex=False) | text.str.contains("退", regex=False)
+
+
+def _prepare_triple_volume_inputs(df: pd.DataFrame) -> _TripleVolumeInputs:
+    frame = _normalize_daily_frame(df)
+    price = build_continuous_ohlc(frame)
+    open_ = price["open"].astype(float)
+    high = price["high"].astype(float)
+    low = price["low"].astype(float)
+    close = price["close"].astype(float)
+    volume = frame["volume"].astype(float)
+    ma20 = close.rolling(20).mean()
+    risk_name = (
+        _is_risk_name(frame["name"])
+        if "name" in frame.columns
+        else pd.Series(False, index=frame.index)
+    )
+    return _TripleVolumeInputs(
+        frame=frame,
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        ma5=close.rolling(5).mean(),
+        ma10=close.rolling(10).mean(),
+        ma20=ma20,
+        ma60=close.rolling(60).mean(),
+        volume_ma5=volume.rolling(5).mean(),
+        tradable=open_.notna() & (open_ > 0) & ~risk_name,
+    )
+
+
+def _replace_columns(frame: pd.DataFrame, columns: pd.DataFrame) -> pd.DataFrame:
+    existing = frame.columns.intersection(columns.columns)
+    if len(existing):
+        frame = frame.drop(columns=existing)
+    return pd.concat([frame, columns], axis=1)
 
 
 def _anchor_window_metrics(
@@ -246,58 +299,56 @@ def add_triple_volume_breakout_signals(
     - ``triple_volume_price``: close of the most recent triple-volume bar.
     - ``candidate_score``: interpretable ranking score for crowded signal days.
     """
-    out = _normalize_daily_frame(df)
-    price = build_continuous_ohlc(out)
-    open_ = price["open"].astype(float)
-    high = price["high"].astype(float)
-    low = price["low"].astype(float)
-    close = price["close"].astype(float)
-    volume = out["volume"].astype(float)
+    inputs = _prepare_triple_volume_inputs(df)
+    return _add_triple_volume_signals(inputs, volume_multiple, include_research=False)
 
-    ma5 = close.rolling(5).mean()
-    ma10 = close.rolling(10).mean()
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    volume_ma5 = volume.rolling(5).mean()
 
-    triple_volume = volume.shift(1) >= volume.shift(2) * volume_multiple
+def _add_triple_volume_signals(
+    inputs: _TripleVolumeInputs,
+    volume_multiple: float,
+    *,
+    include_research: bool,
+) -> pd.DataFrame:
+    triple_volume = (
+        inputs.volume.shift(1) >= inputs.volume.shift(2) * volume_multiple
+    )
     anchor_metrics = _anchor_window_metrics(
-        volume.to_numpy(dtype=float),
-        volume_ma5.to_numpy(dtype=float),
-        high.to_numpy(dtype=float),
-        low.to_numpy(dtype=float),
+        inputs.volume.to_numpy(dtype=float),
+        inputs.volume_ma5.to_numpy(dtype=float),
+        inputs.high.to_numpy(dtype=float),
+        inputs.low.to_numpy(dtype=float),
         triple_volume.fillna(False).to_numpy(dtype=bool),
     )
     last_triple_pos = anchor_metrics["anchor_positions"]
     days_since = pd.Series(
         anchor_metrics["days_since"],
-        index=out.index,
+        index=inputs.frame.index,
     )
 
-    triple_price = pd.Series(np.nan, index=out.index, dtype=float)
+    triple_price = pd.Series(np.nan, index=inputs.frame.index, dtype=float)
     valid_last = last_triple_pos >= 0
     if valid_last.any():
-        triple_price.loc[valid_last] = close.iloc[
+        triple_price.loc[valid_last] = inputs.close.iloc[
             last_triple_pos[valid_last]
         ].to_numpy()
 
     shrink_consolidation = pd.Series(
         anchor_metrics["shrink_consolidation"],
-        index=out.index,
+        index=inputs.frame.index,
     )
     consolidation_range = pd.Series(
         anchor_metrics["consolidation_range"],
-        index=out.index,
+        index=inputs.frame.index,
     )
 
-    right_side_bull = (ma5 > ma10) & (ma10 > ma20) & (ma20 > ma60) & (ma20 > ma20.shift(1))
-    breakout = (close > triple_price) & (close > open_)
+    right_side_bull = (
+        (inputs.ma5 > inputs.ma10)
+        & (inputs.ma10 > inputs.ma20)
+        & (inputs.ma20 > inputs.ma60)
+        & (inputs.ma20 > inputs.ma20.shift(1))
+    )
+    breakout = (inputs.close > triple_price) & (inputs.close > inputs.open)
     range_ok = consolidation_range < 1.15
-    if "name" in out.columns:
-        risk_name = _is_risk_name(out["name"])
-    else:
-        risk_name = pd.Series(False, index=out.index)
-    tradable = open_.notna() & (open_ > 0) & ~risk_name
 
     signal = (
         (days_since > 0)
@@ -305,32 +356,84 @@ def add_triple_volume_breakout_signals(
         & shrink_consolidation
         & breakout
         & range_ok
-        & tradable
+        & inputs.tradable
     )
 
-    out["triple_volume_anchor"] = triple_volume.astype(int)
-    out["days_since_triple_volume"] = days_since
-    out["triple_volume_price"] = triple_price
-    out["right_side_bull"] = right_side_bull.astype(int)
-    out["shrink_consolidation"] = shrink_consolidation.astype(int)
-    out["consolidation_range"] = consolidation_range
-    out["breakout_over_triple_price"] = breakout.astype(int)
-    out["signal_triple_volume_breakout"] = signal.fillna(False).astype(int)
-
-    breakout_pct = close / triple_price.replace(0, np.nan) - 1
-    volume_dryness = 1 - volume / volume_ma5.replace(0, np.nan)
+    breakout_pct = inputs.close / triple_price.replace(0, np.nan) - 1
+    volume_dryness = 1 - inputs.volume / inputs.volume_ma5.replace(0, np.nan)
     range_tightness = 1.15 - consolidation_range
-    trend_slope = ma20 / ma20.shift(5).replace(0, np.nan) - 1
-    out["candidate_score"] = (
+    trend_slope = inputs.ma20 / inputs.ma20.shift(5).replace(0, np.nan) - 1
+    candidate_score = (
         0.35 * breakout_pct.rank(pct=True)
         + 0.25 * volume_dryness.rank(pct=True)
         + 0.25 * range_tightness.rank(pct=True)
         + 0.15 * trend_slope.rank(pct=True)
     )
-    out["breakout_pct"] = breakout_pct
-    out["volume_dryness"] = volume_dryness
-    out["ma20_slope_5d"] = trend_slope
-    return out
+    columns: dict[str, pd.Series] = {
+        "triple_volume_anchor": triple_volume.astype(int),
+        "days_since_triple_volume": days_since,
+        "triple_volume_price": triple_price,
+        "right_side_bull": right_side_bull.astype(int),
+        "shrink_consolidation": shrink_consolidation.astype(int),
+        "consolidation_range": consolidation_range,
+        "breakout_over_triple_price": breakout.astype(int),
+        "signal_triple_volume_breakout": signal.fillna(False).astype(int),
+        "candidate_score": candidate_score,
+        "breakout_pct": breakout_pct,
+        "volume_dryness": volume_dryness,
+        "ma20_slope_5d": trend_slope,
+    }
+
+    if include_research:
+        bull_no60 = (
+            (inputs.ma5 > inputs.ma10)
+            & (inputs.ma10 > inputs.ma20)
+            & (inputs.ma20 > inputs.ma20.shift(1))
+        )
+        close_ma20_up = (inputs.close > inputs.ma20) & (
+            inputs.ma20 > inputs.ma20.shift(1)
+        )
+        common = (days_since > 0) & breakout & range_ok
+        pre_shrink = pd.Series(
+            anchor_metrics["pre_shrink"], index=inputs.frame.index
+        )
+        avg_pre_shrink = pd.Series(
+            anchor_metrics["avg_pre_shrink"], index=inputs.frame.index
+        )
+        soft_shrink = pd.Series(
+            anchor_metrics["soft_shrink"], index=inputs.frame.index
+        )
+        columns.update(
+            {
+                "signal_strict": signal.fillna(False).astype(int),
+                "signal_pre_shrink_strict_bull": (
+                    common & right_side_bull & pre_shrink
+                ).astype(int),
+                "signal_soft_shrink_strict_bull": (
+                    common & right_side_bull & soft_shrink
+                ).astype(int),
+                "signal_avg_pre_shrink_strict_bull": (
+                    common & right_side_bull & avg_pre_shrink
+                ).astype(int),
+                "signal_pre_shrink_bull_no60": (
+                    common & bull_no60 & pre_shrink
+                ).astype(int),
+                "signal_avg_pre_shrink_bull_no60": (
+                    common & bull_no60 & avg_pre_shrink
+                ).astype(int),
+                "signal_pre_shrink_close_ma20": (
+                    common & close_ma20_up & pre_shrink
+                ).astype(int),
+                "signal_avg_pre_shrink_close_ma20": (
+                    common & close_ma20_up & avg_pre_shrink
+                ).astype(int),
+                "volume_recovery": inputs.volume
+                / inputs.volume_ma5.replace(0, np.nan),
+            }
+        )
+
+    additions = pd.DataFrame(columns, index=inputs.frame.index)
+    return _replace_columns(inputs.frame, additions)
 
 
 def add_triple_volume_research_signals(
@@ -338,55 +441,8 @@ def add_triple_volume_research_signals(
     volume_multiple: float = 3.0,
 ) -> pd.DataFrame:
     """Add strict and relaxed research signal variants for one volume multiple."""
-    out = add_triple_volume_breakout_signals(df, volume_multiple=volume_multiple)
-    price = build_continuous_ohlc(out)
-    close = price["close"].astype(float)
-    volume = out["volume"].astype(float)
-    ma5 = close.rolling(5).mean()
-    ma10 = close.rolling(10).mean()
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    volume_ma5 = volume.rolling(5).mean()
-
-    strict_bull = (ma5 > ma10) & (ma10 > ma20) & (ma20 > ma60) & (ma20 > ma20.shift(1))
-    bull_no60 = (ma5 > ma10) & (ma10 > ma20) & (ma20 > ma20.shift(1))
-    close_ma20_up = (close > ma20) & (ma20 > ma20.shift(1))
-    common = (
-        (out["days_since_triple_volume"] > 0)
-        & (out["breakout_over_triple_price"] == 1)
-        & (out["consolidation_range"] < 1.15)
-    )
-
-    anchor_metrics = _anchor_window_metrics(
-        volume.to_numpy(dtype=float),
-        volume_ma5.to_numpy(dtype=float),
-        price["high"].to_numpy(dtype=float),
-        price["low"].to_numpy(dtype=float),
-        out["triple_volume_anchor"].fillna(0).to_numpy(dtype=bool),
-    )
-    pre_shrink = pd.Series(
-        anchor_metrics["pre_shrink"],
-        index=out.index,
-    )
-    avg_pre_shrink = pd.Series(
-        anchor_metrics["avg_pre_shrink"],
-        index=out.index,
-    )
-    soft_shrink = pd.Series(
-        anchor_metrics["soft_shrink"],
-        index=out.index,
-    )
-
-    out["signal_strict"] = out["signal_triple_volume_breakout"].astype(int)
-    out["signal_pre_shrink_strict_bull"] = (common & strict_bull & pre_shrink).astype(int)
-    out["signal_soft_shrink_strict_bull"] = (common & strict_bull & soft_shrink).astype(int)
-    out["signal_avg_pre_shrink_strict_bull"] = (common & strict_bull & avg_pre_shrink).astype(int)
-    out["signal_pre_shrink_bull_no60"] = (common & bull_no60 & pre_shrink).astype(int)
-    out["signal_avg_pre_shrink_bull_no60"] = (common & bull_no60 & avg_pre_shrink).astype(int)
-    out["signal_pre_shrink_close_ma20"] = (common & close_ma20_up & pre_shrink).astype(int)
-    out["signal_avg_pre_shrink_close_ma20"] = (common & close_ma20_up & avg_pre_shrink).astype(int)
-    out["volume_recovery"] = volume / volume_ma5.replace(0, np.nan)
-    return out
+    inputs = _prepare_triple_volume_inputs(df)
+    return _add_triple_volume_signals(inputs, volume_multiple, include_research=True)
 
 
 def add_triple_volume_strategy_pool_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -395,8 +451,13 @@ def add_triple_volume_strategy_pool_signals(df: pd.DataFrame) -> pd.DataFrame:
     The expanded 2.5x layer is intentionally a superset candidate pool around
     the conservative 3x layer. When both fire, the conservative plan wins.
     """
+    inputs = _prepare_triple_volume_inputs(df)
     frames = {
-        variant.id: add_triple_volume_research_signals(df, volume_multiple=variant.volume_multiple)
+        variant.id: _add_triple_volume_signals(
+            inputs,
+            variant.volume_multiple,
+            include_research=True,
+        )
         for variant in TRIPLE_VOLUME_VARIANTS
     }
     base = frames[TRIPLE_VOLUME_VARIANTS[0].id].copy()

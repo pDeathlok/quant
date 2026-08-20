@@ -187,6 +187,14 @@ def calculate_legacy_market_factors(
     frame["pre_close"] = frame["close"].shift(1)
     frame["pct_chg"] = frame["close"].pct_change() * 100
     factors = pd.DataFrame(index=frame.index)
+    gt_9p5pct = frame["pct_chg"] > 9.5
+    limit_up = frame["pct_chg"] >= 9.5
+
+    for window in (3, 5, 10, 20, 60):
+        factors[f"limit_up_cnt_{window}d"] = limit_up.rolling(window, min_periods=window).sum()
+        factors[f"gt_9p5pct_cnt_{window}d"] = gt_9p5pct.rolling(
+            window, min_periods=window
+        ).sum()
 
     for window in (5, 10, 20, 60, 120):
         factors[f"ma_{window}"] = MA(window).compute(frame)

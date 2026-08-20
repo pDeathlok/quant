@@ -190,3 +190,55 @@ def test_complete_local_daily_basic_is_validated_without_refetching(
     assert result["status"] == "success"
     assert result["source"] == "local_validated"
     assert result["attempts"] == 0
+
+
+def test_latest_daily_basic_derives_delayed_volume_ratio_from_daily(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    daily_dir = tmp_path / "daily"
+    partition = tmp_path / "daily_partitioned" / "year_month=202607"
+    partition.mkdir(parents=True)
+    rows = []
+    for symbol_index in range(1, 5):
+        symbol = f"00000{symbol_index}.SZ"
+        for day, volume in zip(range(16, 23), (100, 110, 120, 130, 140, 150, 180)):
+            rows.append(
+                {"ts_code": symbol, "trade_date": f"202607{day:02d}", "vol": volume}
+            )
+    pd.DataFrame(rows).to_parquet(partition / "data.parquet", index=False)
+    delayed = _complete_daily_basic()
+    delayed["volume_ratio"] = None
+
+    class DelayedVolumeRatioFetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date: str) -> pd.DataFrame:
+            return delayed
+
+    monkeypatch.setattr(
+        daily_basic_refresh,
+        "TushareDataFetcher",
+        DelayedVolumeRatioFetcher,
+    )
+    output_dir = tmp_path / "daily_basic"
+    output_dir.mkdir()
+
+    result = daily_basic_refresh.fetch_one_trade_date(
+        "20260722",
+        output_dir,
+        tmp_path / "cache",
+        daily_basic_refresh.RequestLimiter(0),
+        retries=0,
+        retry_base_delay=0,
+        retry_max_delay=0,
+        expected_rows=4,
+        minimum_coverage_rate=1.0,
+        daily_dir=daily_dir,
+    )
+
+    assert result["status"] == "success"
+    assert result["derived_features"]["volume_ratio"]["filled_rows"] == 4
+    saved = pd.read_parquet(output_dir / "20260722.parquet")
+    assert saved["volume_ratio"].tolist() == [1.38] * 4

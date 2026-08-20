@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, TextIO
+from urllib.parse import urlparse
 
 import requests
 
@@ -29,6 +31,7 @@ DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_LOG_PATH = PROJECT_ROOT / ".run" / "daily_web_refresh.log"
 DEFAULT_PID_PATH = PROJECT_ROOT / ".run" / "daily_web_refresh.pid"
 DEFAULT_LAUNCHD_LABEL = "com.didi.quant.webapp"
+WEBAPP_REQUIRED_MODULES = ("fastapi", "pandas", "uvicorn", "akquant")
 
 
 @dataclass
@@ -60,6 +63,60 @@ class TradeDayDecision:
 
 class RefreshRunnerBusyError(RuntimeError):
     """Raised when another daily web refresh runner already owns the lock."""
+
+
+def _can_run_webapp(python_path: Path) -> bool:
+    if not python_path.exists() or not os.access(python_path, os.X_OK):
+        return False
+    imports = "; ".join(f"import {module}" for module in WEBAPP_REQUIRED_MODULES)
+    result = subprocess.run(
+        [str(python_path), "-c", imports],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def resolve_service_python(
+    project_root: Path = PROJECT_ROOT,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Pick a Python interpreter that can import the webapp runtime stack."""
+
+    env = environ or os.environ
+    candidates = [
+        env.get("QUANT_PYTHON"),
+        str(project_root / ".venv" / "bin" / "python"),
+        str(Path.home() / "miniforge3" / "bin" / "python"),
+        str(Path.home() / "miniconda3" / "bin" / "python"),
+        sys.executable,
+    ]
+    seen: set[str] = set()
+    for value in candidates:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        candidate = Path(value).expanduser()
+        if _can_run_webapp(candidate):
+            return candidate
+    modules = ", ".join(WEBAPP_REQUIRED_MODULES)
+    raise RuntimeError(
+        "找不到可启动 Quant web 服务的 Python；需要能导入 "
+        f"{modules}。可设置 QUANT_PYTHON=/absolute/path/python"
+    )
+
+
+def is_service_port_listening(base_url: str, timeout_seconds: float = 1.0) -> bool:
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
 
 
 @contextmanager
@@ -353,9 +410,10 @@ def ensure_local_service(
     merged_env["PYTHONPATH"] = str(config.project_root / "src")
     config.service_log_path.parent.mkdir(parents=True, exist_ok=True)
     config.service_pid_path.parent.mkdir(parents=True, exist_ok=True)
+    service_python = resolve_service_python(config.project_root)
     process = subprocess.Popen(
         [
-            sys.executable,
+            str(service_python),
             "scripts/run_webapp.py",
             "--log-file",
             str(config.service_log_path),
@@ -376,6 +434,16 @@ def ensure_local_service(
     deadline = monotonic_fn() + config.health_timeout_seconds
     while monotonic_fn() < deadline:
         if process.poll() is not None:
+            try:
+                config.service_pid_path.unlink()
+            except FileNotFoundError:
+                pass
+            if is_service_port_listening(config.base_url):
+                print_fn(
+                    "[service] 新启动的 web 服务进程已退出，但端口仍有服务监听；"
+                    "按原服务繁忙处理并继续监控"
+                )
+                return None
             raise RuntimeError(
                 f"本地 Quant web 服务启动失败，进程已退出，日志见 {config.service_log_path}"
             )
@@ -526,7 +594,21 @@ def _run_refresh_workflow_locked(
 
     attempts = 0
     while attempts < config.max_attempts:
-        status = client.get_status()
+        try:
+            status = client.get_status()
+        except Exception as exc:
+            print_fn(f"[retry] 读取刷新状态失败: {exc}")
+            ensure_local_service(
+                config=config,
+                client=client,
+                env=env_values,
+                force_restart=False,
+                sleep_fn=sleep_fn,
+                monotonic_fn=monotonic_fn,
+                print_fn=print_fn,
+            )
+            sleep_fn(config.retry_delay_seconds)
+            continue
         if status.get("status") in {"running", "queued"}:
             print_fn("[refresh] 检测到已有运行中的刷新任务，转为接管监控")
         else:

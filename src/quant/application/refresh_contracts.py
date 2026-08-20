@@ -14,6 +14,8 @@ REFRESH_SCOPE_LABELS = {
     "cbAllotment": "配债股",
     "byd": "BYD 做T",
     "similar": "自选池",
+    "rightSideShadow": "右侧统一模型影子",
+    "rightSideRankingCandidate": "右侧统一模型生产候选验收",
 }
 
 # Compatibility export used by the Web progress UI.  The dependency registry
@@ -33,12 +35,18 @@ REFRESH_STEP_DEFINITIONS = {
     "selector_core": {"label": "计算短线核心股票池", "percent": 78},
     "selector_extended": {"label": "计算短线全策略股票池", "percent": 88},
     "chan_model_strategy": {"label": "生成缠论模型策略候选", "percent": 90},
-    "long_stock_pool": {"label": "刷新长线因子截面与页面股票池", "percent": 92},
+    "long_stock_pool": {"label": "刷新长线因子截面、页面股票池与带血筹每日计划", "percent": 92},
     "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
     "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
     "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
     "similar_patterns": {"label": "刷新自选池相似走势", "percent": 97},
     "snapshot": {"label": "写入策略股票池快照", "percent": 98},
+    "right_side_shadow_features": {"label": "构建右侧影子 118 因子", "percent": 80},
+    "right_side_shadow_score": {"label": "计算右侧统一模型影子排序", "percent": 90},
+    "right_side_shadow_product": {"label": "发布右侧影子候选", "percent": 98},
+    "right_side_unified_features": {"label": "构建右侧生产 118 因子", "percent": 72},
+    "right_side_unified_score": {"label": "计算右侧生产统一排序", "percent": 76},
+    "right_side_unified_adapter": {"label": "校验右侧 selector 排序适配", "percent": 78},
 }
 
 

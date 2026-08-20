@@ -9,7 +9,14 @@ from .variable_library import (
     merge_daily_basic_features,
 )
 from .market_regime import classify_market_regime
-from .factor_registry import FACTOR_REGISTRY, LONG_FACTOR_COLUMNS, registry_frame
+from .factor_registry import (
+    FACTOR_REGISTRY,
+    LONG_ANNUAL_QUALITY_FACTOR_COLUMNS,
+    LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS,
+    LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS,
+    LONG_FACTOR_COLUMNS,
+    registry_frame,
+)
 from .project_factor_layer import (
     LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
     PROJECT_FACTOR_SCHEMA_VERSION,
@@ -17,6 +24,16 @@ from .project_factor_layer import (
     calculate_project_factor_frame,
     calculate_project_market_factors,
     resolve_project_factor_schema,
+)
+from .right_side_factor_contract import (
+    RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION,
+    RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
+    RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
+    RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION,
+    RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+    RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
+    right_side_shadow_contract_payload,
+    validate_right_side_shadow_factor_contract,
 )
 
 __all__ = [
@@ -30,10 +47,21 @@ __all__ = [
     "PROJECT_FACTOR_SCHEMA_VERSION",
     "LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION",
     "FACTOR_REGISTRY",
+    "LONG_ANNUAL_QUALITY_FACTOR_COLUMNS",
+    "LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS",
+    "LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS",
     "LONG_FACTOR_COLUMNS",
     "registry_frame",
     "admit_factors_by_sample",
     "calculate_project_factor_frame",
     "calculate_project_market_factors",
     "resolve_project_factor_schema",
+    "RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION",
+    "RIGHT_SIDE_SHADOW_FACTOR_COLUMNS",
+    "RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256",
+    "RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION",
+    "RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS",
+    "RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS",
+    "right_side_shadow_contract_payload",
+    "validate_right_side_shadow_factor_contract",
 ]

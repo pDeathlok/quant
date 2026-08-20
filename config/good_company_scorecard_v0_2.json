@@ -1,0 +1,224 @@
+{
+  "schema_version": "good_company_scorecard_v0_2",
+  "status": "draft_for_alignment",
+  "purpose": "Score long-term company quality independently from valuation, price trend and short-term catalysts",
+  "score_name": "GQS",
+  "score_range": [0, 100],
+  "rating_scale": {
+    "minimum": 0,
+    "maximum": 5,
+    "step": 0.5,
+    "anchors": {
+      "0": "absent, contradicted or severe risk",
+      "1": "seriously weak",
+      "2": "weak or materially mixed",
+      "3": "qualified but not distinctive",
+      "4": "clearly strong",
+      "5": "rare, durable and cycle-tested excellence"
+    }
+  },
+  "formula": {
+    "item_points": "item_weight * item_rating / 5",
+    "realized_gqs": "sum(covered_realized_item_points) / covered_realized_item_weight * 100",
+    "realized_coverage": "covered_realized_item_weight / 100",
+    "forward_item_points_adjustment": "item_weight * forward_rating_adjustment / 5",
+    "forward_adjustment": "clip(sum(forward_item_points_adjustment), -5, 5)",
+    "forward_gqs": "clip(realized_gqs + forward_adjustment, 0, 100)",
+    "missing_data": "unrated; never default to zero or neutral; forward evidence cannot fill realized coverage"
+  },
+  "evidence_tracks": {
+    "realized": {
+      "role": "establish validated historical quality and formal evidence coverage",
+      "preferred_sources": ["statutory_filings", "exchange_or_regulator", "audited_data", "reproducible_project_data", "authoritative_industry_data"]
+    },
+    "forward": {
+      "role": "bounded adjustment to forward quality, never a rewrite of realized quality",
+      "adjustable_items": ["B4", "B5", "C1", "C2", "C3", "C4", "D2", "D3", "D4", "D5", "E1", "E2", "E3", "F4", "G2", "G3"],
+      "aggregate_gqs_adjustment_cap": [-5, 5],
+      "reliability": {
+        "high": {"minimum_independent_forecasts": 3, "maximum_age_days": 180, "maximum_item_rating_adjustment": 0.5, "requires_dispersion_and_revision_direction": true, "requires_operating_driver_cross_check": true},
+        "medium": {"minimum_independent_forecasts": 2, "maximum_age_days": 270, "maximum_item_rating_adjustment": 0.25, "requires_comparable_period_and_basis": true},
+        "low": {"maximum_item_rating_adjustment": 0, "use": "narrative_only"},
+        "unusable": {"maximum_item_rating_adjustment": 0, "use": "exclude"}
+      },
+      "rules": [
+        "forecast_adjustment_requires_an_existing_realized_rating",
+        "forecasts_cannot_clear_red_lines_or_create_adverse_period_evidence",
+        "single_report_cannot_support_rating_4_or_5_or_cross_a_classification_threshold",
+        "same_broker_multiple_reports_count_as_one_independent_sample",
+        "record_period_sample_count_median_range_dispersion_cutoff_revision_direction_and_key_assumptions",
+        "record_actual_vs_forecast_on_each_update",
+        "downgrade_reliability_after_two_consecutive_directional_misses"
+      ]
+    }
+  },
+  "red_line_exclusions": [
+    "adverse_or_disclaimer_audit_opinion",
+    "unresolved_material_financial_fraud_or_major_delisting_risk",
+    "material_going_concern_uncertainty_or_substantive_debt_default",
+    "unresolved_controlling_shareholder_fund_occupation_or_illegal_guarantee",
+    "core_business_legality_or_material_safety_environment_product_event_threatens_continuity",
+    "core_business_consolidation_control_or_financial_authenticity_cannot_be_verified"
+  ],
+  "unrated_conditions": {
+    "minimum_realized_coverage": 0.6,
+    "minimum_critical_module_coverage": 0.5,
+    "critical_modules": ["B", "D", "E", "G"]
+  },
+  "classification_caps": [
+    {"condition": "verifiable_operating_history_under_3_years", "maximum_classification": "potential", "maximum_score_for_classification": 74},
+    {"condition": "history_3_to_5_years_without_adverse_period", "maximum_classification": "quality", "maximum_score_for_classification": 84},
+    {"condition": "roic_below_cost_of_capital_for_most_years_without_credible_improvement", "maximum_classification": "ordinary", "maximum_score_for_classification": 64},
+    {"condition": "positive_cumulative_profit_but_persistently_weak_operating_cash_flow_without_high_return_growth_explanation", "maximum_classification": "ordinary", "maximum_score_for_classification": 64},
+    {"condition": "cyclical_company_only_observed_at_cycle_peak", "maximum_classification": "potential", "maximum_score_for_classification": 74},
+    {"condition": "extreme_single_product_customer_channel_or_key_person_dependency_without_mitigation", "maximum_classification": "quality", "maximum_score_for_classification": 84}
+  ],
+  "modules": [
+    {
+      "id": "A",
+      "name": "customer_value_and_business_model",
+      "weight": 10,
+      "items": [
+        {"id": "A1", "name": "customer_pain_and_willingness_to_pay", "weight": 3},
+        {"id": "A2", "name": "retention_repeat_purchase_and_revenue_repeatability", "weight": 3},
+        {"id": "A3", "name": "unit_economics_and_scalability", "weight": 2},
+        {"id": "A4", "name": "business_model_understandability", "weight": 2}
+      ]
+    },
+    {
+      "id": "B",
+      "name": "monetizable_scarcity_and_moat",
+      "weight": 20,
+      "items": [
+        {"id": "B1", "name": "scarcity_value_and_source", "weight": 4},
+        {"id": "B2", "name": "scarcity_monetization", "weight": 4},
+        {"id": "B3", "name": "replication_and_substitution_difficulty", "weight": 4},
+        {"id": "B4", "name": "competitive_outcome_evidence", "weight": 4},
+        {"id": "B5", "name": "durability_and_shareholder_capture", "weight": 4}
+      ]
+    },
+    {
+      "id": "C",
+      "name": "growth_runway_and_reinvestment",
+      "weight": 10,
+      "items": [
+        {"id": "C1", "name": "structural_demand_and_penetration_runway", "weight": 3},
+        {"id": "C2", "name": "share_gain_and_adjacent_expansion", "weight": 2},
+        {"id": "C3", "name": "density_of_high_return_reinvestment_opportunities", "weight": 3},
+        {"id": "C4", "name": "per_share_value_content_of_growth", "weight": 2}
+      ]
+    },
+    {
+      "id": "D",
+      "name": "capital_returns_and_profitability",
+      "weight": 20,
+      "items": [
+        {"id": "D1", "name": "normalized_roic_spread_over_wacc", "weight": 6},
+        {"id": "D2", "name": "incremental_roic", "weight": 5},
+        {"id": "D3", "name": "margin_and_turnover_efficiency", "weight": 4},
+        {"id": "D4", "name": "earnings_stability_and_adverse_period_performance", "weight": 3},
+        {"id": "D5", "name": "dilution_adjusted_per_share_value_growth", "weight": 2}
+      ]
+    },
+    {
+      "id": "E",
+      "name": "cash_flow_and_accounting_quality",
+      "weight": 15,
+      "items": [
+        {"id": "E1", "name": "cumulative_operating_cash_flow_to_core_profit", "weight": 4},
+        {"id": "E2", "name": "free_cash_flow_conversion", "weight": 4},
+        {"id": "E3", "name": "working_capital_and_accrual_quality", "weight": 3},
+        {"id": "E4", "name": "accounting_conservatism_and_nonrecurring_items", "weight": 2},
+        {"id": "E5", "name": "asset_quality", "weight": 2}
+      ]
+    },
+    {
+      "id": "F",
+      "name": "financial_resilience_and_operating_risk",
+      "weight": 10,
+      "items": [
+        {"id": "F1", "name": "leverage_interest_coverage_and_liquidity", "weight": 4},
+        {"id": "F2", "name": "debt_maturity_and_contingent_liabilities", "weight": 2},
+        {"id": "F3", "name": "concentration_and_supply_chain_resilience", "weight": 2},
+        {"id": "F4", "name": "stress_test_resilience", "weight": 2}
+      ]
+    },
+    {
+      "id": "G",
+      "name": "governance_and_capital_allocation",
+      "weight": 15,
+      "items": [
+        {"id": "G1", "name": "integrity_transparency_and_minority_shareholder_fairness", "weight": 4},
+        {"id": "G2", "name": "reinvestment_and_ma_track_record", "weight": 4},
+        {"id": "G3", "name": "financing_dividend_and_buyback_discipline", "weight": 3},
+        {"id": "G4", "name": "incentives_key_person_and_succession", "weight": 2},
+        {"id": "G5", "name": "related_party_transactions_and_internal_controls", "weight": 2}
+      ]
+    }
+  ],
+  "confidence": {
+    "A": {"minimum_realized_coverage": 0.9, "typical_minimum_history_years": 5, "requires_adverse_period": true, "primary_source_dominant": true},
+    "B": {"minimum_realized_coverage": 0.8, "typical_minimum_history_years": 3, "core_financials_verified": true},
+    "C": {"minimum_realized_coverage": 0.6, "classification_use": "potential_only"},
+    "D": {"maximum_realized_coverage": 0.6, "classification_use": "unrated"}
+  },
+  "classifications": [
+    {"id": "exceptional_compounder_candidate", "minimum_forward_score": 85, "minimum_realized_score": 82, "minimum_realized_coverage": 0.9, "minimum_confidence": "B", "module_minimum_points": {"B": 16, "D": 16, "E": 11, "G": 12}},
+    {"id": "quality_company", "minimum_forward_score": 75, "minimum_realized_score": 70, "minimum_realized_coverage": 0.8, "minimum_confidence": "B", "module_minimum_points": {"B": 14, "D": 14, "E": 9, "G": 10}},
+    {"id": "potential_company", "minimum_forward_score": 65, "minimum_realized_coverage": 0.6, "minimum_confidence": "C"},
+    {"id": "ordinary_company", "minimum_forward_score": 55},
+    {"id": "weak_company", "minimum_forward_score": 0}
+  ],
+  "screening_stage": {
+    "role": "candidate_generation_only",
+    "sector_neutral": true,
+    "winsorization_percentiles": [0.025, 0.975],
+    "candidate_fraction": 0.2,
+    "minimum_within_industry_percentile": 0.8,
+    "nonfinancial_proxy_weights": {
+      "profitability_roic_roe": 0.3,
+      "cash_and_accrual_quality": 0.25,
+      "earnings_and_margin_stability": 0.2,
+      "leverage_and_liquidity": 0.15,
+      "dilution_adjusted_per_share_growth": 0.1
+    },
+    "financial_sector_model_required": true
+  },
+  "separate_overlays": {
+    "valuation": "must_not_enter_gqs",
+    "price_trend": "must_not_enter_gqs",
+    "short_term_catalysts": "must_not_enter_gqs",
+    "investment_return_model": "separate_and_point_in_time_validated"
+  },
+  "output_contract": {
+    "required_fields": [
+      "analysis_cutoff",
+      "company_type",
+      "peer_group",
+      "financial_window",
+      "red_lines",
+      "classification_caps",
+      "item_scores",
+      "module_scores",
+      "realized_gqs",
+      "forward_adjustment",
+      "forward_gqs",
+      "realized_coverage",
+      "forward_coverage",
+      "forward_reliability",
+      "forecast_dependency",
+      "confidence",
+      "classification",
+      "strongest_quality_source",
+      "largest_quality_gap",
+      "counterevidence",
+      "falsifiers",
+      "next_update"
+    ]
+  },
+  "production_policy": {
+    "replaces_existing_good_stock_rule": false,
+    "requires_point_in_time_backtest_before_promotion": true,
+    "requires_forward_validation": true
+  }
+}

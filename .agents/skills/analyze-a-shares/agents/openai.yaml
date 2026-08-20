@@ -1,4 +1,15 @@
 interface:
   display_name: "A股投资分析"
-  short_description: "融合权威信源、三情景估值、量价辅助与历史认知迭代的A股研究助手"
-  default_prompt: "使用 $analyze-a-shares 分析一只A股；若同一标的已有历史，必须先读取旧报告和结构化记录，再逐项更新旧结论、论点与三情景。复用项目行情，给出可复核的投资逻辑、独立量价辅助和认知变更账本；仅在最低证据门通过时给数值目标价，并保存不可变研究记录。"
+  short_description: "融合妙想MCP、权威信源、三情景估值、量价辅助与历史认知迭代的A股研究助手"
+  default_prompt: "使用 $analyze-a-shares 分析一只A股；若同一标的已有历史，必须先读取旧报告和结构化记录。复用项目行情；mx-ds-mcp运行时可用且任务需要外部金融数据时，按任务模式至少实际调用一次并保存mcp_execution审计，以官方原文复核关键事实；MCP不可用时显式降级。给出可复核的投资逻辑、独立量价辅助和认知变更账本；仅在最低证据门通过时给数值目标价，并保存不可变研究记录。"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "mx-ds-mcp"
+      description: "东方财富妙想/Choice专业金融数据 MCP Server"
+      transport: "streamable_http"
+      url: "https://mxapi.eastmoney.com/mxds/mcp"
+
+policy:
+  allow_implicit_invocation: true

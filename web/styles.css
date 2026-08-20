@@ -234,7 +234,7 @@ h3 {
   border-radius: 10px;
   display: grid;
   gap: 4px;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   overflow: hidden;
   padding: 4px;
 }
@@ -2835,6 +2835,200 @@ th {
   .similar-note-dialog-actions > div { justify-content: flex-end; }
 }
 
+.plans-toolbar {
+  grid-template-columns: minmax(280px, 1fr) auto;
+}
+
+.plan-view-filters {
+  display: flex;
+  gap: 6px;
+}
+
+.plan-view-filters button {
+  background: transparent;
+  border-color: var(--line-strong);
+  color: var(--muted);
+}
+
+.plan-view-filters button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.plans-layout {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(320px, 0.82fr) minmax(420px, 1.18fr);
+}
+
+.plan-editor,
+.plan-list-panel {
+  align-self: start;
+  padding: 18px;
+}
+
+.plan-editor-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.plan-editor-grid label {
+  color: var(--muted);
+  display: grid;
+  font-size: 12px;
+  gap: 7px;
+}
+
+.plan-editor-grid input,
+.plan-editor-grid select,
+.plan-editor-grid textarea {
+  background: rgba(255, 254, 251, 0.8);
+  border: 1px solid var(--line-strong);
+  border-radius: 1px;
+  color: var(--ink);
+  font: inherit;
+  width: 100%;
+}
+
+.plan-editor-grid textarea {
+  line-height: 1.65;
+  min-height: 180px;
+  padding: 10px 12px;
+  resize: vertical;
+}
+
+.plan-field-wide {
+  grid-column: 1 / -1;
+}
+
+.plan-editor-actions {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  margin-top: 16px;
+  padding-top: 14px;
+}
+
+#operationPlanSaveStatus {
+  color: var(--good);
+  font-size: 12px;
+}
+
+#operationPlanSaveStatus.error {
+  color: var(--warn);
+}
+
+.operation-plan-list {
+  display: grid;
+  gap: 12px;
+}
+
+.operation-plan-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  padding: 14px 16px;
+}
+
+.operation-plan-card.is-closed {
+  border-left-color: var(--muted);
+  opacity: 0.72;
+}
+
+.operation-plan-card-head,
+.operation-plan-tags,
+.operation-plan-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.operation-plan-card-head {
+  justify-content: space-between;
+}
+
+.operation-plan-tags span,
+.operation-plan-tags time {
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.operation-plan-tags .plan-horizon {
+  border: 1px solid var(--line-strong);
+  color: var(--accent);
+  padding: 2px 6px;
+}
+
+.operation-plan-tags .plan-horizon.long_term {
+  color: #8a5d00;
+}
+
+.operation-plan-actions button {
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  height: auto;
+  padding: 3px 4px;
+}
+
+.operation-plan-actions .plan-delete-button {
+  color: var(--warn);
+}
+
+.operation-plan-card h4 {
+  font-family: Georgia, "Songti SC", "STSong", serif;
+  font-size: 18px;
+  margin: 14px 0 7px;
+}
+
+.operation-plan-symbol {
+  color: var(--accent);
+  display: block;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.operation-plan-card p {
+  line-height: 1.7;
+  margin: 7px 0 12px;
+  white-space: pre-wrap;
+}
+
+.operation-plan-card p.muted,
+.operation-plan-card small {
+  color: var(--muted);
+}
+
+@media (max-width: 980px) {
+  .plans-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 680px) {
+  .plans-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .plan-view-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .plan-editor-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .plan-field-wide {
+    grid-column: auto;
+  }
+}
+
 .watchlist-alert-dialog {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -3154,6 +3348,135 @@ th {
 
   .watchlist-alert-condition-actions {
     padding-top: 22px;
+  }
+}
+
+.blood-chip-long-content {
+  display: grid;
+  gap: 18px;
+}
+
+.blood-chip-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.blood-chip-summary-grid article {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel) 82%, var(--accent-soft));
+}
+
+.blood-chip-summary-grid span,
+.blood-chip-iteration span,
+.blood-chip-evidence span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.blood-chip-summary-grid strong {
+  font-size: 26px;
+  font-variant-numeric: tabular-nums;
+}
+
+.blood-chip-boundary {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  background: rgba(217, 119, 6, 0.08);
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.blood-chip-table-wrap {
+  max-height: 520px;
+}
+
+.blood-chip-table {
+  min-width: 1440px;
+}
+
+.blood-chip-table td:nth-child(2),
+.blood-chip-state-table td:first-child,
+.blood-chip-state-table td:nth-child(2) {
+  min-width: 120px;
+}
+
+.blood-chip-table td:nth-child(2) span,
+.blood-chip-state-table td span,
+.blood-chip-rule-cell span {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.blood-chip-rule-cell {
+  min-width: 310px;
+  white-space: normal;
+  line-height: 1.5;
+}
+
+.blood-chip-state-grid,
+.blood-chip-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.blood-chip-state-table {
+  min-width: 650px;
+}
+
+.blood-chip-iteration,
+.blood-chip-evidence {
+  display: grid;
+  gap: 10px;
+}
+
+.blood-chip-iteration > div,
+.blood-chip-evidence > div {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.blood-chip-iteration strong,
+.blood-chip-evidence strong {
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.blood-chip-evidence p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+@media (max-width: 980px) {
+  .blood-chip-state-grid,
+  .blood-chip-evidence-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .blood-chip-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .blood-chip-summary-grid {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -4497,6 +4820,10 @@ tbody tr.selected-row:hover td {
   }
 }
 
+.long-variant-mobile-control {
+  display: none;
+}
+
 @media (max-width: 1100px) {
   html {
     background: var(--bg);
@@ -4541,6 +4868,17 @@ tbody tr.selected-row:hover td {
   .toolbar {
     min-height: 0;
     padding-block: 20px;
+  }
+
+  .long-variant-mobile-control {
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-bottom: 12px;
+  }
+
+  .long-variant-mobile-control .long-variant-button {
+    min-height: 58px;
   }
 }
 

@@ -134,8 +134,14 @@ def read_simple_quoted_yaml_fields(path: Path) -> tuple[dict[str, str], list[Val
 
     fields: dict[str, str] = {}
     pattern = re.compile(r"^\s+([a-z_]+):\s+\"(.*)\"\s*$")
+    in_interface = False
     for line_number, line in enumerate(lines, start=1):
-        if not line.strip() or line.strip().endswith(":"):
+        if line == "interface:":
+            in_interface = True
+            continue
+        if line and not line[0].isspace():
+            in_interface = False
+        if not in_interface or not line.strip() or line.strip().endswith(":"):
             continue
         match = pattern.match(line)
         if not match:
@@ -181,6 +187,28 @@ def validate_openai_yaml(skill_dir: Path) -> list[ValidationIssue]:
                 f"interface.default_prompt must explicitly mention ${skill_name}.",
             )
         )
+
+    if skill_name == "analyze-a-shares":
+        try:
+            metadata_text = metadata_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            issues.append(issue("error", metadata_file, f"cannot inspect MCP dependency: {exc}"))
+        else:
+            required_mcp_metadata = (
+                'type: "mcp"',
+                'value: "mx-ds-mcp"',
+                'transport: "streamable_http"',
+                'url: "https://mxapi.eastmoney.com/mxds/mcp"',
+            )
+            for expected in required_mcp_metadata:
+                if expected not in metadata_text:
+                    issues.append(
+                        issue(
+                            "error",
+                            metadata_file,
+                            f"missing required Miaoxiang MCP metadata: {expected}.",
+                        )
+                    )
     return issues
 
 

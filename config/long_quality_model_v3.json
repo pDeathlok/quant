@@ -1,0 +1,90 @@
+{
+  "schema_version": "long_quality_model_v3",
+  "status": "frozen_shadow_candidate",
+  "production_model_unchanged": true,
+  "research_candidate": "xgb_quality_scores",
+  "frozen_at": "2026-08-03",
+  "universe": {
+    "gate": "existing_is_good_stock",
+    "cashflow_hard_gate": false,
+    "reason": "三年现金流/净利润不低于0.8的硬门槛在2020—2023四个验证折中改善0折，平均落后当前V2 1.32个百分点",
+    "price_guard": {
+      "field": "historical_value_score_5y",
+      "minimum": 50
+    }
+  },
+  "point_in_time_contract": {
+    "frequency": "weekly_last_trading_day",
+    "annual_financial_values": "first_local_announcement",
+    "availability_rule": "annual_quality_available_at <= signal_date",
+    "later_restatements_backfilled": false,
+    "execution": "next_trading_day"
+  },
+  "quality_subscores": {
+    "cashflow_quality_score": {
+      "cashflow_to_net_income_3y": 0.4,
+      "free_cashflow_margin_3y": 0.25,
+      "positive_cfo_year_share_5y": 0.2,
+      "low_accruals_to_assets_3y": 0.15
+    },
+    "earnings_persistence_score": {
+      "positive_profit_year_share_5y": 0.35,
+      "roe_mean_5y": 0.25,
+      "low_roe_volatility_5y": 0.2,
+      "positive_revenue_growth_year_share_5y": 0.2
+    },
+    "asset_quality_score": {
+      "low_goodwill_to_assets": 0.35,
+      "receivables_turnover": 0.25,
+      "inventory_turnover": 0.2,
+      "low_debt_to_assets": 0.2
+    },
+    "enhanced_good_stock_score": {
+      "profitability": 0.3,
+      "growth": 0.15,
+      "balance_sheet": 0.1,
+      "business_stability": 0.15,
+      "cashflow_quality": 0.15,
+      "earnings_persistence": 0.1,
+      "asset_quality": 0.05
+    },
+    "blended_value_score": {
+      "own_5y_history": 0.7,
+      "industry_relative_pe_pb_pr": 0.3,
+      "industry_value_missing_fallback": "own_5y_history"
+    }
+  },
+  "model_score": {
+    "opportunity_head": {
+      "model": "xgboost_regressor",
+      "target": "label_entry_utility_26w",
+      "features": "v2_core_plus_interpretable_quality_subscores",
+      "cross_section_percentile_weight": 0.6
+    },
+    "risk_head": {
+      "model": "current_v2_pred_downside_safe",
+      "cross_section_percentile_weight": 0.4
+    }
+  },
+  "portfolio": {
+    "rebalance": "monthly_last_week",
+    "top_n": 20,
+    "maximum_per_industry": 3,
+    "buy_cost": 0.001,
+    "sell_cost": 0.002
+  },
+  "validation": {
+    "selection_folds": [2020, 2021, 2022, 2023],
+    "purge_days": 190,
+    "positive_folds_vs_v2": 4,
+    "mean_52w_return_delta_vs_v2": 0.0047,
+    "worst_fold_delta_vs_v2": 0.0033,
+    "mean_52w_return_delta_vs_good_stock_pool": 0.0952,
+    "mean_26w_mae": -0.1318,
+    "full_backtest_annualized_return": 0.028,
+    "full_backtest_max_drawdown": -0.2636,
+    "reused_2024_delta_vs_v2": 0.0038,
+    "reused_2025_delta_vs_v2": -0.008,
+    "promotion_decision": "shadow_only_until_new_forward_data"
+  }
+}

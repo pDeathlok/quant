@@ -46,6 +46,77 @@ DAILY_BASIC_FEATURE_COVERAGE: dict[str, float] = {
 }
 
 
+def _derive_volume_ratio_from_daily(
+    frame: pd.DataFrame,
+    trade_date: str,
+    daily_dir: Path,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Fill delayed Tushare volume_ratio values from canonical daily volume.
+
+    Tushare occasionally publishes the latest daily_basic cross-section before
+    ``volume_ratio`` is populated. Its value is reproducible from the same
+    Tushare daily source as current volume divided by the prior five-session
+    average volume, rounded to the vendor's two-decimal precision.
+    """
+
+    if "volume_ratio" not in frame.columns:
+        return frame, {}
+    missing = pd.to_numeric(frame["volume_ratio"], errors="coerce").isna()
+    if not missing.any():
+        return frame, {}
+
+    target_month = trade_date[:6]
+    partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
+    candidates = sorted(
+        path
+        for path in partition_root.glob("year_month=*/data.parquet")
+        if path.parent.name.removeprefix("year_month=") <= target_month
+    )[-2:]
+    if not candidates:
+        return frame, {}
+
+    history = pd.concat(
+        [pd.read_parquet(path, columns=["ts_code", "trade_date", "vol"]) for path in candidates],
+        ignore_index=True,
+    )
+    history["trade_date"] = (
+        history["trade_date"].astype(str).str.replace("-", "", regex=False)
+    )
+    history["vol"] = pd.to_numeric(history["vol"], errors="coerce")
+    history = history[history["trade_date"] <= trade_date].dropna(
+        subset=["ts_code", "vol"]
+    )
+    history = history.sort_values(["ts_code", "trade_date"]).drop_duplicates(
+        ["ts_code", "trade_date"], keep="last"
+    )
+    prior_average = history.groupby("ts_code", sort=False)["vol"].transform(
+        lambda values: values.shift(1).rolling(5, min_periods=5).mean()
+    )
+    history["derived_volume_ratio"] = (history["vol"] / prior_average).round(2)
+    derived = history.loc[
+        history["trade_date"] == trade_date,
+        ["ts_code", "derived_volume_ratio"],
+    ].dropna(subset=["derived_volume_ratio"])
+    if derived.empty:
+        return frame, {}
+
+    enriched = frame.merge(derived, on="ts_code", how="left")
+    before = pd.to_numeric(enriched["volume_ratio"], errors="coerce").notna()
+    enriched["volume_ratio"] = pd.to_numeric(
+        enriched["volume_ratio"], errors="coerce"
+    ).fillna(enriched.pop("derived_volume_ratio"))
+    filled_rows = int((~before & enriched["volume_ratio"].notna()).sum())
+    if not filled_rows:
+        return enriched, {}
+    return enriched, {
+        "volume_ratio": {
+            "source": "tushare_daily_derived",
+            "formula": "vol / prior_5_session_mean_vol",
+            "filled_rows": filled_rows,
+        }
+    }
+
+
 def load_trade_dates_from_daily(daily_dir: Path, start_date: str, end_date: str | None) -> list[str]:
     return sorted(load_trade_date_symbol_counts(daily_dir, start_date, end_date))
 
@@ -85,6 +156,7 @@ def fetch_one_trade_date(
     minimum_coverage_rate: float = 0.98,
     availability_retry_failures: int = 0,
     availability_retry_interval: float = 60.0,
+    daily_dir: Path = DAILY_DIR,
 ) -> dict:
     attempts = max(1, retries + 1)
     maximum_attempts = attempts + max(0, availability_retry_failures)
@@ -131,8 +203,19 @@ def fetch_one_trade_date(
                     fetcher.get_daily_basic(trade_date),
                     trade_date,
                     minimum_rows=minimum_rows,
+                )
+                df, derived_features = _derive_volume_ratio_from_daily(
+                    df,
+                    trade_date,
+                    daily_dir,
+                )
+                df = validate_daily_basic_frame(
+                    df,
+                    trade_date,
+                    minimum_rows=minimum_rows,
                     required_feature_coverage=DAILY_BASIC_FEATURE_COVERAGE,
                 )
+                df.attrs["derived_features"] = derived_features
             except ValueError:
                 # The fetcher's basic schema check intentionally accepts small
                 # frames. Remove a cross-section cache that fails this
@@ -153,6 +236,7 @@ def fetch_one_trade_date(
                     round(len(df) / expected_rows, 6) if expected_rows else None
                 ),
                 "feature_coverage": df.attrs.get("feature_coverage", {}),
+                "derived_features": df.attrs.get("derived_features", {}),
                 "path": str(output_path),
                 "attempts": attempt,
                 "error": None,
@@ -240,6 +324,7 @@ def refresh_daily_basic(
                 minimum_coverage_rate,
                 availability_retry_failures if trade_date == max(trade_dates) else 0,
                 availability_retry_interval,
+                daily_dir,
             )
             for trade_date in trade_dates
         ]

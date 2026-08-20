@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "name": "A股逐公司Deep研究报告合同",
+  "minimum_characters": 12000,
+  "minimum_lines": 250,
+  "minimum_evidence_rows": 8,
+  "minimum_mcp_actual_calls": 1,
+  "minimum_mcp_successful_calls": 1,
+  "required_headings": [
+    "## 1. 研究快照",
+    "## 2. 结论先行",
+    "## 3. 相对历史基线的认知更新",
+    "## 4. 好公司质量评分（GQS）",
+    "### 4.3 32项逐项审计",
+    "## 5. 三情景价格预期",
+    "## 6. 投资逻辑与反证",
+    "## 7. 业务、行业与经济性同行",
+    "## 8. 财务、会计质量与治理",
+    "## 9. 估值与可复算桥",
+    "## 10. 量价与技术辅助",
+    "## 11. 催化剂、风险与监测",
+    "## 12. 证据账本",
+    "## 13. MCP执行审计、冲突与局限",
+    "## 14. 历史归档"
+  ],
+  "required_score_ids": [
+    "A1", "A2", "A3", "A4",
+    "B1", "B2", "B3", "B4", "B5",
+    "C1", "C2", "C3", "C4",
+    "D1", "D2", "D3", "D4", "D5",
+    "E1", "E2", "E3", "E4", "E5",
+    "F1", "F2", "F3", "F4",
+    "G1", "G2", "G3", "G4", "G5"
+  ],
+  "required_scenarios": ["悲观", "中性", "乐观"],
+  "blocked_placeholders": ["保存后写回本文件", "records/<record_id>/report.md"]
+}

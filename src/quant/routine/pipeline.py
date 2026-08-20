@@ -20,6 +20,10 @@ from quant.application.workspace_refresh import (
     refresh_daily_workspaces,
 )
 from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+from quant.application.selector_ranking import (
+    DEFAULT_SELECTOR_RANKING_CONFIG,
+    SelectorRankingSource,
+)
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_json as publish_json
 from quant.features.market_regime import classify_market_regime
@@ -830,6 +834,47 @@ def publish_daily_dependency_contract(
     )
 
 
+def run_right_side_shadow_routine(
+    target_date: str,
+    *,
+    upstream_results: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the isolated right-side shadow if its release config enables it.
+
+    The production ``run_daily_pipeline`` intentionally does not invoke this
+    function.  A scheduler may call it as a separate research job after the
+    shared market/signal inputs are complete; failures are contained in the
+    rightSideShadow status artifact and cannot fail ``all`` or ``short``.
+    """
+
+    from quant.routine.right_side_unified_shadow import (
+        run_configured_right_side_shadow,
+    )
+
+    return run_configured_right_side_shadow(
+        target_date,
+        upstream_results=upstream_results,
+    )
+
+
+def run_promoted_right_side_ranking(target_date: str) -> dict[str, Any]:
+    """Run the production ranker only after an explicit source promotion."""
+
+    if (
+        DEFAULT_SELECTOR_RANKING_CONFIG.source
+        != SelectorRankingSource.RIGHT_SIDE_UNIFIED
+    ):
+        return {
+            "status": "skipped",
+            "reason": "selector ranking source remains legacy_z_skill",
+        }
+    from quant.routine.right_side_unified_production import (
+        run_right_side_unified_production,
+    )
+
+    return run_right_side_unified_production(target_date)
+
+
 def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> dict:
     started = time.monotonic()
     start_date = _incremental_daily_start()
@@ -936,6 +981,16 @@ def score_latest_models(workers: int = 8) -> dict:
         "--batch-size",
         batch_size,
     ]
+    if (
+        DEFAULT_SELECTOR_RANKING_CONFIG.source
+        == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+    ):
+        command.extend(
+            [
+                "--signals",
+                *DEFAULT_SELECTOR_RANKING_CONFIG.preserved_legacy_signals,
+            ]
+        )
     production_factor_schema = resolve_project_factor_schema(
         os.getenv(
             "ROUTINE_PRODUCTION_FACTOR_SCHEMA",
@@ -1171,6 +1226,14 @@ def run_daily_pipeline(
         # union instead of falling back to an all-market scan.
         results["refresh_strategy_signal_cache"] = refresh_strategy_signal_cache()
         require_complete("refresh_strategy_signal_cache")
+        if (
+            DEFAULT_SELECTOR_RANKING_CONFIG.source
+            == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+        ):
+            results["right_side_unified_ranking"] = run_promoted_right_side_ranking(
+                str(results["refresh_strategy_signal_cache"]["processed_through_date"])
+            )
+            require_complete("right_side_unified_ranking")
         results["build_features"] = build_features()
         require_complete("build_features")
         results["score_latest_models"] = score_latest_models()

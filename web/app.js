@@ -13,6 +13,7 @@ import {
 
 const DEFAULT_WORKSPACE_PAGE = "similar";
 const WORKSPACE_PAGE_BY_HASH = {
+  "#plans": "plans",
   "#similar": "similar",
   "#chan": "chan",
   "#long": "long",
@@ -69,6 +70,10 @@ const state = {
   selectorRequestId: 0,
   directRefreshPromises: new Map(),
   loading: false,
+  operationPlans: [],
+  operationPlansLoading: false,
+  operationPlansLoaded: false,
+  operationPlanFilter: "active",
 };
 
 const API_BASE = "/api";
@@ -99,6 +104,7 @@ const REFRESH_SCOPE_LABELS = {
   cbAllotment: "配债股",
   byd: "BYD",
   similar: "自选池",
+  plans: "操作计划",
 };
 const REFRESH_BUTTON_LABELS = {
   refreshAllButton: "更新全部",
@@ -112,6 +118,14 @@ const REFRESH_BUTTON_LABELS = {
   similarRefreshButton: "刷新分析",
   similarRefreshLatestButton: "更新本页",
 };
+const LONG_SORT_LABELS = {
+  good_stock_score: "股票分",
+  price_score: "价格分",
+  pe_ttm: "PE",
+  pb: "PB",
+  pr_from_pe: "PR-PE",
+  pr_from_pb: "PR-PB",
+};
 
 const WORKSPACE_TABS = [
   { key: "short", label: "短线策略", description: "每日选股 / 交易计划", panelId: "shortPage" },
@@ -121,6 +135,7 @@ const WORKSPACE_TABS = [
   { key: "cbAllotment", label: "配债股", description: "发行流程 / 关键日期", panelId: "cbAllotmentPage" },
   { key: "byd", label: "BYD 做T", description: "盘前计划 / 正T优先", panelId: "bydPage" },
   { key: "similar", label: "自选池", description: "相似走势 / 策略联动", panelId: "similarPage" },
+  { key: "plans", label: "操作计划", description: "次日执行 / 长期跟踪", panelId: "plansPage" },
 ];
 let focusWorkspaceTabAfterRender = false;
 let workspaceTabDragKey = "";
@@ -398,7 +413,7 @@ const formatBuyPlanText = (text) => {
     return `${signalText}${openText}${suffix}`;
   });
 };
-const pageHash = (page) => page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#byd" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
+const pageHash = (page) => page === "plans" ? "#plans" : page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#byd" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
 const currentLongStrategy = () => longStrategies.find((item) => item.key === state.longVariant) || longStrategies[0];
 
 function ensureWorkspaceTabs() {
@@ -464,6 +479,8 @@ function loadActivePageData() {
     loadBydMinuteStrategy().catch(showError);
   } else if (state.activePage === "similar" && !state.similarPayload && !state.similarLoading) {
     loadSimilarPatterns().catch(showError);
+  } else if (state.activePage === "plans" && !state.operationPlansLoading && !state.operationPlansLoaded) {
+    loadOperationPlans().catch(showError);
   } else if (state.activePage === "short" && !state.payload && !state.loading) {
     loadSelector({ latest: true }).catch(showError);
   }
@@ -739,6 +756,51 @@ function setRefreshMessage(message) {
   });
 }
 
+function formatRefreshElapsed(value) {
+  const totalSeconds = Math.max(0, Math.round(Number(value) || 0));
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分钟`;
+}
+
+function formatRefreshTime(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return parsed.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function formatRefreshStatusMessage(status, scopeLabel = "") {
+  const rawMessage = String(status?.message || status?.status || "").trim();
+  const thresholdScan = rawMessage.match(
+    /threshold scan\s+([\d,]+)\/([\d,]+)\s+files.*?elapsed=([\d.]+)s/i,
+  );
+  if (thresholdScan) {
+    return `正在扫描相似走势：${thresholdScan[1]} / ${thresholdScan[2]} 个文件 · 已用时 ${formatRefreshElapsed(thresholdScan[3])}`;
+  }
+  const vectorCache = rawMessage.match(
+    /vector cache\s+([\d,]+)\/([\d,]+)\s+files\s+usable=([\d,]+).*?elapsed=([\d.]+)s/i,
+  );
+  if (vectorCache) {
+    return `正在构建相似走势缓存：${vectorCache[1]} / ${vectorCache[2]} 个文件 · 可用 ${vectorCache[3]} · 已用时 ${formatRefreshElapsed(vectorCache[4])}`;
+  }
+  const libraryScan = rawMessage.match(
+    /library scan\s+([\d,]+)\/([\d,]+)\s+files,\s*candidates=([\d,]+),\s*elapsed=([\d.]+)s/i,
+  );
+  if (libraryScan) {
+    return `正在扫描相似走势库：${libraryScan[1]} / ${libraryScan[2]} 个文件 · 已用时 ${formatRefreshElapsed(libraryScan[4])}`;
+  }
+  if (scopeLabel && rawMessage.startsWith(scopeLabel)) {
+    return rawMessage.slice(scopeLabel.length).replace(/^[·：:\s]+/, "") || rawMessage;
+  }
+  return rawMessage;
+}
+
 function workspaceRequestOptions(options = {}) {
   // Aborting a long refresh only detaches the browser; the server keeps
   // calculating and a retry can start duplicate work. Keep refresh requests
@@ -893,11 +955,18 @@ async function loadSimilarPatternsOnce() {
     );
     state.similarPayload = mergeSimilarPayloadWithWatchlist(analysisPayload, latestWatchlist);
     const results = state.similarPayload.results || [];
-    if (!state.similarSelectedSymbol && results.length) {
-      state.similarSelectedSymbol = results[0].target?.symbol || null;
+    const watchlistSymbols = new Set(
+      (state.similarPayload.watchlist || []).map((item) => item.symbol),
+    );
+    if (!state.similarSelectedSymbol) {
+      state.similarSelectedSymbol = results[0]?.target?.symbol
+        || state.similarPayload.watchlist?.[0]?.symbol
+        || null;
     }
-    if (state.similarSelectedSymbol && !results.some((item) => item.target?.symbol === state.similarSelectedSymbol)) {
-      state.similarSelectedSymbol = results[0]?.target?.symbol || null;
+    if (state.similarSelectedSymbol && !watchlistSymbols.has(state.similarSelectedSymbol)) {
+      state.similarSelectedSymbol = results[0]?.target?.symbol
+        || state.similarPayload.watchlist?.[0]?.symbol
+        || null;
     }
   } catch (error) {
     state.similarError = error.message || "自选池分析加载失败";
@@ -1031,6 +1100,11 @@ function applySimilarWatchlistPayload(payload, options = {}) {
   const symbols = new Set(state.similarPayload.watchlist.map((item) => item.symbol));
   if (state.similarSelectedSymbol && !symbols.has(state.similarSelectedSymbol)) {
     state.similarSelectedSymbol = null;
+  }
+  if (!state.similarSelectedSymbol) {
+    state.similarSelectedSymbol = state.similarPayload.results?.[0]?.target?.symbol
+      || state.similarPayload.watchlist[0]?.symbol
+      || null;
   }
   renderSimilarPatternsPage();
 }
@@ -1187,7 +1261,8 @@ function similarForecastLabel(horizon) {
 
 function selectedSimilarResult() {
   const results = state.similarPayload?.results || [];
-  return results.find((item) => item.target?.symbol === state.similarSelectedSymbol) || results[0] || null;
+  if (!state.similarSelectedSymbol) return null;
+  return results.find((item) => item.target?.symbol === state.similarSelectedSymbol) || null;
 }
 
 function similarResultForSymbol(symbol) {
@@ -1485,6 +1560,7 @@ function renderSimilarPatternsPage() {
     `;
   }).join("") || `<tr><td colspan="10" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
 
+  const selectedWatchItem = similarWatchItem(state.similarSelectedSymbol);
   const selected = selectedSimilarResult();
   overview.innerHTML = selected ? (() => {
     const item = selected;
@@ -1535,14 +1611,33 @@ function renderSimilarPatternsPage() {
         </div>
       </article>
     `;
-  })() : `<article class="panel"><p class="subline">暂无分析结果，点击刷新分析</p></article>`;
+  })() : selectedWatchItem ? `
+    <article class="similar-card active">
+      <div class="similar-card-head">
+        <div>
+          <span class="similar-detail-kicker">当前选择</span>
+          <strong>${escapeHtml(selectedWatchItem.name || selectedWatchItem.symbol)}</strong>
+          <span>${escapeHtml(selectedWatchItem.symbol)} · ${escapeHtml(selectedWatchItem.industry || "-")}</span>
+        </div>
+      </div>
+      <div class="similar-decision-banner">
+        <strong>分析结果待更新</strong>
+        <span>新加入自选池，后台分析完成后将在这里显示量价情景</span>
+      </div>
+    </article>
+  ` : `<article class="panel"><p class="subline">暂无分析结果，点击刷新分析</p></article>`;
 
   if (!selected) {
-    if (detailTitle) detailTitle.textContent = "选择股票";
-    if (detailMeta) detailMeta.textContent = "查看 T+1 量价情景";
-    scenarioRows.innerHTML = `<tr><td colspan="7" class="empty-cell">暂无数据</td></tr>`;
-    modelList.innerHTML = `<p class="subline">暂无模型结果</p>`;
-    topRows.innerHTML = `<tr><td colspan="8" class="empty-cell">暂无数据</td></tr>`;
+    if (detailTitle) detailTitle.textContent = selectedWatchItem
+      ? `${selectedWatchItem.name || selectedWatchItem.symbol} 分析待更新`
+      : "选择股票";
+    if (detailMeta) detailMeta.textContent = selectedWatchItem
+      ? `${selectedWatchItem.symbol} · 暂无相似走势结果`
+      : "查看 T+1 量价情景";
+    const emptyMessage = selectedWatchItem ? "等待后台分析结果" : "暂无数据";
+    scenarioRows.innerHTML = `<tr><td colspan="7" class="empty-cell">${emptyMessage}</td></tr>`;
+    modelList.innerHTML = `<p class="subline">${selectedWatchItem ? "等待后台模型结果" : "暂无模型结果"}</p>`;
+    topRows.innerHTML = `<tr><td colspan="8" class="empty-cell">${emptyMessage}</td></tr>`;
     return;
   }
 
@@ -1627,13 +1722,16 @@ async function loadLongStockPool(options = {}) {
   state.longError = "";
   renderLongStockPool();
   const query = new URLSearchParams();
-  query.set("variant", requestedVariant);
+  if (requestedVariant !== "blood_chip") query.set("variant", requestedVariant);
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
   try {
     const requestOptions = workspaceRequestOptions(options);
     if (!options.refresh) requestOptions.timeoutMs = 120000;
-    const payload = await fetchJson(`/long/stock-pool?${query.toString()}`, requestOptions);
+    const endpoint = requestedVariant === "blood_chip"
+      ? `/long/blood-chip?${query.toString()}`
+      : `/long/stock-pool?${query.toString()}`;
+    const payload = await fetchJson(endpoint, requestOptions);
     if (state.longVariant === requestedVariant) {
       state.longPayload = payload;
       state.longError = "";
@@ -1710,8 +1808,6 @@ async function loadConvertibleBondAllotments(options = {}) {
   state.cbAllotmentError = "";
   renderConvertibleBondAllotments();
   const query = new URLSearchParams();
-  query.set("limit", "120");
-  query.set("include_listed_days", "180");
   query.set("stage_scope", "pipeline");
   try {
     state.cbAllotmentPayload = await fetchJson(
@@ -2052,7 +2148,9 @@ function renderHeader() {
   const dateText = requestedDate && actualDate && requestedDate !== actualDate
     ? `选择 ${requestedDate}，实际使用本地最新可用 ${actualDate} 收盘后选股`
     : (actualDate ? `${actualDate} 收盘后选股` : "");
-  document.querySelector("#generatedAt").textContent = state.loading ? "正在加载" : (state.payload ? `更新于 ${state.payload.generated_at}` : "加载中");
+  document.querySelector("#generatedAt").textContent = state.activePage === "plans"
+    ? (state.operationPlansLoading ? "加载计划中" : "计划本已就绪")
+    : state.loading ? "正在加载" : (state.payload ? `更新于 ${state.payload.generated_at}` : "加载中");
   document.querySelector("#signalDate").textContent = state.payload ? dateText : "";
   document.querySelector("#executionDate").textContent = state.payload?.execution_date || "";
   if (state.loading) {
@@ -2227,16 +2325,18 @@ function renderStockRows() {
   const rows = filteredStocks();
   const body = document.querySelector("#stockRows");
   if (state.loading) {
-    body.innerHTML = `<tr><td colspan="10" class="empty-cell">正在加载股票池...</td></tr>`;
+    body.innerHTML = `<tr><td colspan="11" class="empty-cell">正在加载股票池...</td></tr>`;
     document.querySelector("#stockCount").textContent = "加载中";
     return;
   }
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="10" class="empty-cell">当前筛选条件下没有股票</td></tr>`;
+    body.innerHTML = `<tr><td colspan="11" class="empty-cell">当前筛选条件下没有股票</td></tr>`;
     document.querySelector("#stockCount").textContent = "0 只股票";
     return;
   }
-  body.innerHTML = rows.map((item) => `
+  body.innerHTML = rows.map((item) => {
+    const xueqiuUrl = xueqiuStockUrl(item.symbol);
+    return `
     <tr class="${item.symbol === state.selectedSymbol ? "selected-row" : ""}" data-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(item.date || state.payload?.signal_date, `触发 ${(item.matched_families || []).join(" / ")} 策略`))}" tabindex="0">
       <td>
         <strong class="copyable-symbol">${item.symbol}</strong>
@@ -2261,10 +2361,19 @@ function renderStockRows() {
       <td>${fmtPct(item.best_avg_return_pct)}</td>
       <td>${Number(item.best_profit_factor || 0).toFixed(2)}</td>
       <td>${item.date || ""}</td>
+      <td class="similar-xueqiu-cell">
+        ${xueqiuUrl ? `
+          <a class="xueqiu-stock-link" data-short-xueqiu href="${escapeHtml(xueqiuUrl)}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(item.name || item.symbol)}">
+            雪球 ↗
+          </a>
+        ` : `<span class="xueqiu-stock-unavailable">—</span>`}
+      </td>
     </tr>
-  `).join("");
+  `;
+  }).join("");
   body.querySelectorAll("tr[data-symbol]").forEach((row) => {
     row.addEventListener("click", (event) => {
+      if (event.target.closest("[data-short-xueqiu]")) return;
       const selection = window.getSelection?.().toString();
       if (selection) return;
       state.selectedSymbol = row.dataset.symbol;
@@ -2330,6 +2439,139 @@ function renderNotes() {
   document.querySelector("#notes").innerHTML = (state.payload?.notes || []).map((item) => `<li>${item}</li>`).join("");
 }
 
+function filteredOperationPlans() {
+  const plans = state.operationPlans || [];
+  if (state.operationPlanFilter === "tomorrow") return plans.filter((item) => item.horizon === "tomorrow" && item.status === "planned");
+  if (state.operationPlanFilter === "long_term") return plans.filter((item) => item.horizon === "long_term" && item.status === "planned");
+  if (state.operationPlanFilter === "done") return plans.filter((item) => item.status !== "planned");
+  return plans.filter((item) => item.status === "planned");
+}
+
+function renderOperationPlans() {
+  const list = document.querySelector("#operationPlanList");
+  if (!list) return;
+  const plans = filteredOperationPlans();
+  if (state.activePage === "plans") {
+    const generatedAt = document.querySelector("#generatedAt");
+    if (generatedAt) generatedAt.textContent = state.operationPlansLoading ? "加载计划中" : "计划本已就绪";
+  }
+  document.querySelector("#operationPlanCount").textContent = `${plans.length} 条`;
+  document.querySelector("#plansMeta").textContent = state.operationPlansLoading
+    ? "正在加载计划"
+    : `共 ${state.operationPlans.length} 条计划 · 数据已持久保存`;
+  document.querySelectorAll("[data-plan-filter]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.planFilter === state.operationPlanFilter);
+  });
+  if (state.operationPlansLoading) {
+    list.innerHTML = '<div class="empty-state">正在加载操作计划…</div>';
+    return;
+  }
+  if (!plans.length) {
+    list.innerHTML = '<div class="empty-state">当前分类还没有计划，可从左侧新增。</div>';
+    return;
+  }
+  const horizonLabel = { tomorrow: "次日", long_term: "长期" };
+  const statusLabel = { planned: "进行中", done: "已完成", cancelled: "已取消" };
+  list.innerHTML = plans.map((item) => `
+    <article class="operation-plan-card ${item.status !== "planned" ? "is-closed" : ""}" data-operation-plan-id="${item.id}">
+      <div class="operation-plan-card-head">
+        <div class="operation-plan-tags">
+          <span class="plan-horizon ${item.horizon}">${horizonLabel[item.horizon] || item.horizon}</span>
+          <span>${statusLabel[item.status] || item.status}</span>
+          ${item.target_date ? `<time datetime="${escapeHtml(item.target_date)}">${escapeHtml(item.target_date)}</time>` : ""}
+        </div>
+        <div class="operation-plan-actions">
+          ${item.status === "planned" ? `<button type="button" data-operation-plan-complete="${item.id}">完成</button>` : ""}
+          <button type="button" data-operation-plan-edit="${item.id}">编辑</button>
+          <button class="plan-delete-button" type="button" data-operation-plan-delete="${item.id}">删除</button>
+        </div>
+      </div>
+      <h4>${escapeHtml(item.title)}</h4>
+      ${item.symbol ? `<strong class="operation-plan-symbol">${escapeHtml(item.symbol)}</strong>` : ""}
+      ${item.content ? `<p>${escapeHtml(item.content)}</p>` : '<p class="muted">尚未填写执行步骤</p>'}
+      <small>更新于 ${escapeHtml(item.updated_at || item.created_at || "")}</small>
+    </article>
+  `).join("");
+}
+
+async function loadOperationPlans() {
+  state.operationPlansLoading = true;
+  renderOperationPlans();
+  try {
+    const payload = await fetchJson("/operation-plans");
+    state.operationPlans = payload.plans || [];
+    state.operationPlansLoaded = true;
+  } finally {
+    state.operationPlansLoading = false;
+    renderOperationPlans();
+  }
+}
+
+function localDateInputValue(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function nextDayDateInputValue(referenceDate = new Date()) {
+  const nextDay = new Date(referenceDate);
+  nextDay.setDate(nextDay.getDate() + 1);
+  return localDateInputValue(nextDay);
+}
+
+function setDefaultOperationPlanDate() {
+  const dateInput = document.querySelector("#operationPlanDate");
+  dateInput.value = nextDayDateInputValue();
+  dateInput.dataset.defaulted = "true";
+}
+
+function resetOperationPlanForm() {
+  const form = document.querySelector("#operationPlanForm");
+  form?.reset();
+  document.querySelector("#operationPlanId").value = "";
+  document.querySelector("#operationPlanHorizon").value = "tomorrow";
+  setDefaultOperationPlanDate();
+  document.querySelector("#operationPlanTitle").value = "";
+  document.querySelector("#operationPlanSymbol").value = "";
+  document.querySelector("#operationPlanStatus").value = "planned";
+  document.querySelector("#operationPlanContent").value = "";
+  document.querySelector("#operationPlanFormTitle").textContent = "新增计划";
+  document.querySelector("#operationPlanSave").textContent = "保存计划";
+  document.querySelector("#operationPlanSaveStatus").textContent = "";
+  document.querySelector("#operationPlanSaveStatus").classList.remove("error");
+}
+
+function operationPlanPayload(overrides = {}) {
+  return {
+    horizon: document.querySelector("#operationPlanHorizon").value,
+    title: document.querySelector("#operationPlanTitle").value.trim(),
+    symbol: document.querySelector("#operationPlanSymbol").value.trim(),
+    target_date: document.querySelector("#operationPlanDate").value,
+    content: document.querySelector("#operationPlanContent").value.trim(),
+    status: document.querySelector("#operationPlanStatus").value,
+    ...overrides,
+  };
+}
+
+function editOperationPlan(planId) {
+  const item = state.operationPlans.find((plan) => plan.id === planId);
+  if (!item) return;
+  document.querySelector("#operationPlanId").value = item.id;
+  document.querySelector("#operationPlanHorizon").value = item.horizon;
+  const dateInput = document.querySelector("#operationPlanDate");
+  dateInput.value = item.target_date || "";
+  dateInput.dataset.defaulted = "false";
+  document.querySelector("#operationPlanTitle").value = item.title || "";
+  document.querySelector("#operationPlanSymbol").value = item.symbol || "";
+  document.querySelector("#operationPlanStatus").value = item.status || "planned";
+  document.querySelector("#operationPlanContent").value = item.content || "";
+  document.querySelector("#operationPlanFormTitle").textContent = "编辑计划";
+  document.querySelector("#operationPlanSave").textContent = "更新计划";
+  document.querySelector("#operationPlanTitle").focus();
+  document.querySelector("#operationPlanForm").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
 function renderPageShell() {
   ensureWorkspaceTabs();
   const shortPage = document.querySelector("#shortPage");
@@ -2339,6 +2581,7 @@ function renderPageShell() {
   const similarPage = document.querySelector("#similarPage");
   const cbPage = document.querySelector("#cbPage");
   const cbAllotmentPage = document.querySelector("#cbAllotmentPage");
+  const plansPage = document.querySelector("#plansPage");
   const filterSection = document.querySelector("#strategyFilterSection");
   const longStrategySection = document.querySelector("#longStrategySection");
   const cbStrategySection = document.querySelector("#cbStrategySection");
@@ -2356,6 +2599,7 @@ function renderPageShell() {
   similarPage?.classList.toggle("active", state.activePage === "similar");
   cbPage?.classList.toggle("active", state.activePage === "cb");
   cbAllotmentPage?.classList.toggle("active", state.activePage === "cbAllotment");
+  plansPage?.classList.toggle("active", state.activePage === "plans");
   filterSection?.classList.toggle("hidden", state.activePage !== "short");
   clearButton?.classList.toggle("hidden", state.activePage !== "short");
   longStrategySection?.classList.toggle("hidden", state.activePage !== "long");
@@ -2391,7 +2635,21 @@ function renderPageShell() {
   });
 }
 
+function syncLongStrategyPanels() {
+  const bloodChipActive = state.longVariant === "blood_chip";
+  document.querySelectorAll("[data-long-default-panel]").forEach((panel) => {
+    panel.classList.toggle("hidden", bloodChipActive);
+  });
+  document.querySelector("#bloodChipLongContent")?.classList.toggle("hidden", !bloodChipActive);
+  document.querySelectorAll(".long-variant-button").forEach((button) => {
+    const active = button.dataset.longVariant === state.longVariant;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
 function renderLongOverview() {
+  syncLongStrategyPanels();
   const summary = state.longPayload?.quality_price_summary || {};
   const title = document.querySelector("#longHeroTitle");
   const description = document.querySelector("#longHeroDescription");
@@ -2399,6 +2657,17 @@ function renderLongOverview() {
   const note = document.querySelector("#longHeroNote");
   const summaryLabel = document.querySelector("#longSummaryLabel");
   const summaryName = document.querySelector("#longSummaryName");
+  const pageTitle = document.querySelector("#longPageTitle");
+  const pageSubtitle = document.querySelector("#longPageSubtitle");
+  if (state.longVariant === "blood_chip") {
+    if (pageTitle) pageTitle.textContent = "中长线 · 带血筹修复";
+    if (pageSubtitle) pageSubtitle.textContent = "卖盘衰竭后首仓 20%，通过 5 日与 10 日生存确认后递增至 50% 与 100%";
+    if (summaryLabel) summaryLabel.textContent = "事件型卫星策略";
+    if (summaryName) summaryName.textContent = "带血筹修复 · 每日迭代";
+    return;
+  }
+  if (pageTitle) pageTitle.textContent = "长线好股票与好价格";
+  if (pageSubtitle) pageSubtitle.textContent = "只回答两件事：公司是否值得长期观察，当前估值是否进入好价格区";
   if (tag) tag.textContent = "筛选原则";
   if (title) title.textContent = "好股票进入观察，好股票 + 价格分达标才推荐";
   if (description) description.textContent = "卖出、减仓与持仓管理移至自选池；本页不再输出仓位和卖点。";
@@ -2421,6 +2690,7 @@ function renderLongOverview() {
 function renderLongStrategies() {
   const body = document.querySelector("#longStrategyRows");
   if (!body) return;
+  if (state.longVariant === "blood_chip") return;
   const strategy = currentLongStrategy();
   const head = document.querySelector(".long-table thead");
   if (head) {
@@ -2447,6 +2717,148 @@ function renderLongStrategies() {
   }).join("");
 }
 
+function bloodChipXueqiuLink(row) {
+  const xueqiuUrl = xueqiuStockUrl(row.ts_code);
+  if (!xueqiuUrl) return `<span class="xueqiu-stock-unavailable">—</span>`;
+  return `
+    <a class="xueqiu-stock-link long-xueqiu-link" data-blood-chip-xueqiu href="${escapeHtml(xueqiuUrl)}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(row.name || row.ts_code)}">
+      雪球 ↗
+    </a>
+  `;
+}
+
+function renderBloodChipLongPlan() {
+  const meta = document.querySelector("#bloodChipMeta");
+  const candidateRows = document.querySelector("#bloodChipCandidateRows");
+  const positionRows = document.querySelector("#bloodChipPositionRows");
+  const exitRows = document.querySelector("#bloodChipExitRows");
+  const iterationNode = document.querySelector("#bloodChipIteration");
+  const evidenceNode = document.querySelector("#bloodChipEvidence");
+  if (!meta || !candidateRows || !positionRows || !exitRows || !iterationNode || !evidenceNode) return;
+
+  if (state.longLoading) {
+    meta.textContent = "正在重建冲击、吸收、止损与新事件再入状态...";
+    candidateRows.innerHTML = `<tr><td colspan="11" class="empty-cell">正在计算每日候选...</td></tr>`;
+    positionRows.innerHTML = `<tr><td colspan="8" class="empty-cell">正在重建分批阶段与模拟持仓...</td></tr>`;
+    exitRows.innerHTML = `<tr><td colspan="5" class="empty-cell">正在核对当日退出...</td></tr>`;
+    iterationNode.textContent = "正在对比上一交易日快照...";
+    evidenceNode.textContent = "正在读取回测证据...";
+    return;
+  }
+  if (state.longError) {
+    meta.textContent = state.longError;
+    candidateRows.innerHTML = `<tr><td colspan="11" class="empty-cell">带血筹每日计划加载失败</td></tr>`;
+    positionRows.innerHTML = `<tr><td colspan="8" class="empty-cell">暂无模拟持仓数据</td></tr>`;
+    exitRows.innerHTML = `<tr><td colspan="5" class="empty-cell">暂无退出数据</td></tr>`;
+    iterationNode.textContent = "每日迭代加载失败";
+    evidenceNode.textContent = "回测证据加载失败";
+    return;
+  }
+
+  const payload = state.longPayload || {};
+  const summary = payload.summary || {};
+  const cacheLabel = payload.cache?.hit ? "快照" : "本次生成";
+  meta.textContent = `${payload.signal_date || "-"} · ${cacheLabel} · 当前执行 20% / 30% / 50% · 最长持有 ${payload.strategy?.maximum_holding_sessions || 120} 个交易日`;
+  const metrics = [
+    summary.new_candidates,
+    summary.simulated_active_positions,
+    summary.stopped_today,
+    summary.reentry_candidates,
+  ];
+  ["#bloodChipMetricCandidates", "#bloodChipMetricPositions", "#bloodChipMetricStops", "#bloodChipMetricReentries"]
+    .forEach((selector, index) => {
+      const node = document.querySelector(selector);
+      if (node) node.textContent = metrics[index] == null ? "-" : String(metrics[index]);
+    });
+
+  const candidates = payload.candidates || [];
+  candidateRows.innerHTML = candidates.map((row) => {
+    const action = row.action === "NEW_EVENT_REENTRY_WATCH" ? "新事件再入观察" : "次日开盘观察";
+    const score = `${Number(row.shock_score || 0).toFixed(2)} / ${Number(row.absorption_score || 0).toFixed(2)}`;
+    const expansion = row.shock_volatility_expansion_ratio == null ? "-" : `${Number(row.shock_volatility_expansion_ratio).toFixed(2)}×`;
+    const amountRatio = row.confirmation_amount_vs_prior_ratio == null ? "-" : `${Number(row.confirmation_amount_vs_prior_ratio).toFixed(2)}×`;
+    const kdj = [row.shock_kdj_monthly_j, row.shock_kdj_weekly_j, row.shock_kdj_daily_j]
+      .map((value) => value == null ? "-" : Number(value).toFixed(1))
+      .join(" / ");
+    return `
+      <tr>
+        <td><strong>${row.rank || "-"}</strong></td>
+        <td><strong>${escapeHtml(row.name || row.ts_code || "-")}</strong><span>${escapeHtml(row.ts_code || "")} · ${escapeHtml(row.industry || "-")}</span>${bloodChipXueqiuLink(row)}</td>
+        <td><span class="state-pill ${row.action === "NEW_EVENT_REENTRY_WATCH" ? "BUILDING" : "WATCH"}">${action}</span><span>${escapeHtml(row.blood_chip_subtype || "带血筹")}</span></td>
+        <td>${score}</td>
+        <td><strong>${kdj}</strong><span>月 / 周 / 日</span></td>
+        <td>${fmtRate(row.volatility_60d, 2)}</td>
+        <td>${fmtRate(row.rebound_from_event_low, 2)}</td>
+        <td>${fmtRate(row.return_120d, 2)}</td>
+        <td>${expansion}</td>
+        <td>${amountRatio}</td>
+        <td class="blood-chip-rule-cell"><strong>${escapeHtml(row.execution_rule || "-")}</strong><span>${escapeHtml(row.risk_rule || "-")}</span></td>
+      </tr>
+    `;
+  }).join("") || `<tr><td colspan="11" class="empty-cell">今日没有满足冲击—吸收与路径过滤的次日候选</td></tr>`;
+
+  const positions = payload.simulated_positions || [];
+  positionRows.innerHTML = positions.map((row) => {
+    const nextFraction = row.next_addition_fraction == null ? null : fmtRate(row.next_addition_fraction, 0);
+    const nextAction = row.next_stage_ready
+      ? `条件满足 · 次日加仓 ${nextFraction}`
+      : (nextFraction ? `等待加仓 ${nextFraction}` : "三段建仓完成");
+    return `
+      <tr>
+        <td><strong>${escapeHtml(row.name || row.ts_code || "-")}</strong><span>${escapeHtml(row.ts_code || "")}</span>${bloodChipXueqiuLink(row)}</td>
+        <td><strong>${escapeHtml(row.stage_label || "-")}</strong><span>已部署 ${fmtRate(row.deployed_fraction, 1)}</span></td>
+        <td>${escapeHtml(row.entry_date || "-")}<span>均价 ${fmtPrice(row.entry_fill)}</span></td>
+        <td>${row.holding_sessions ?? "-"}<span>残差 ${fmtRate(row.current_residual_return_3d, 2)}</span></td>
+        <td class="${Number(row.estimated_net_return || 0) >= 0 ? "positive" : "negative"}">${fmtRate(row.estimated_net_return, 2)}</td>
+        <td class="blood-chip-rule-cell"><strong>${escapeHtml(nextAction)}</strong><span>${escapeHtml(row.next_trigger || "-")}</span></td>
+        <td>${fmtPrice(row.stop_price)}<span>首仓固定止损</span></td>
+        <td>${row.reentry_number || 0}</td>
+      </tr>
+    `;
+  }).join("") || `<tr><td colspan="8" class="empty-cell">当前没有策略模拟持仓</td></tr>`;
+
+  const exits = payload.recent_exits || [];
+  const reasonLabels = { stop_loss: "止损", time_exit: "到期退出" };
+  exitRows.innerHTML = exits.map((row) => `
+    <tr>
+      <td><strong>${escapeHtml(row.name || row.ts_code || "-")}</strong><span>${escapeHtml(row.ts_code || "")}</span>${bloodChipXueqiuLink(row)}</td>
+      <td>${reasonLabels[row.exit_reason] || escapeHtml(row.exit_reason || "-")}</td>
+      <td class="${Number(row.net_return || 0) >= 0 ? "positive" : "negative"}">${fmtRate(row.net_return, 2)}</td>
+      <td>${row.holding_sessions ?? "-"}</td>
+      <td>#${row.shock_event_id || "-"}${row.reentry_number ? ` · 再入${row.reentry_number}` : ""}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="5" class="empty-cell">今日暂无止损或到期退出</td></tr>`;
+
+  const iteration = payload.daily_iteration || {};
+  const symbolList = (items) => (items || []).map((item) => escapeHtml(item)).join("、") || "无";
+  const stageChanges = (iteration.advanced_positions || []).map((item) => (
+    `${escapeHtml(item.ts_code)} ${item.from_stage}→${item.to_stage} 段`
+  )).join("、") || "无";
+  iterationNode.innerHTML = `
+    <div><span>对比日期</span><strong>${escapeHtml(iteration.previous_signal_date || "首次快照")}</strong></div>
+    <div><span>新增候选</span><strong>${symbolList(iteration.added_candidates)}</strong></div>
+    <div><span>移出候选</span><strong>${symbolList(iteration.removed_candidates)}</strong></div>
+    <div><span>连续候选</span><strong>${symbolList(iteration.continued_candidates)}</strong></div>
+    <div><span>新建首仓</span><strong>${symbolList(iteration.new_positions)}</strong></div>
+    <div><span>加仓阶段推进</span><strong>${stageChanges}</strong></div>
+    <div><span>待次日加仓</span><strong>${symbolList(iteration.ready_additions)}</strong></div>
+    <div><span>本日退出</span><strong>${symbolList(iteration.closed_positions)}</strong></div>
+  `;
+
+  const evidence = payload.research_evidence || {};
+  const development = evidence.development_2014_2019 || {};
+  const validation = evidence.iteration_2020_2022 || {};
+  const diagnostic = evidence.seen_diagnostic_2023_2026 || {};
+  const kdjOverlay = evidence.kdj_overlay || {};
+  evidenceNode.innerHTML = `
+    <div><span>2014–2019 研发</span><strong>${development.trades || 0} 笔 · 总收益 ${fmtRate(development.total_return, 2)} · 资金PF ${development.capital_profit_factor || "-"}</strong></div>
+    <div><span>2020–2022 迭代</span><strong>${validation.trades || 0} 笔 · 总收益 ${fmtRate(validation.total_return, 2)} · 回撤 ${fmtRate(validation.maximum_drawdown, 2)}</strong></div>
+    <div><span>2023–2026 已见诊断</span><strong>${diagnostic.trades || 0} 笔 · 总收益 ${fmtRate(diagnostic.total_return, 2)} · 沪深300 ${fmtRate(diagnostic.benchmark_total_return, 2)}</strong></div>
+    <div><span>KDJ路径层</span><strong>${kdjOverlay.deployment === "annotation_only" ? "仅标注，不参与排序" : "参与排序"} · ${escapeHtml(kdjOverlay.reason || "")}</strong></div>
+    <p>${escapeHtml(evidence.warning || "")}</p>
+  `;
+}
+
 function stateLabel(stateName) {
   const labels = {
     RECOMMENDED: "推荐",
@@ -2468,6 +2880,11 @@ function renderLongStockPool() {
   const meta = document.querySelector("#longPoolMeta");
   const counts = document.querySelector("#longStateCounts");
   if (!body || !meta || !counts) return;
+  syncLongStrategyPanels();
+  if (state.longVariant === "blood_chip") {
+    renderBloodChipLongPlan();
+    return;
+  }
   syncLongSortHeaders();
   renderLongPriceScoreBacktest();
   document.querySelectorAll(".long-variant-button").forEach((button) => {
@@ -2495,11 +2912,10 @@ function renderLongStockPool() {
     return;
   }
   const totalGoodStocks = payload.quality_price_summary?.good_stock_count ?? payload.stocks.length;
-  const sortLabel = state.longSort.key === "good_stock_score"
-    ? ` · 股票分${state.longSort.direction === "asc" ? "升序" : "降序"}`
-    : state.longSort.key === "price_score"
-      ? ` · 价格分${state.longSort.direction === "asc" ? "升序" : "降序"}`
-      : "";
+  const activeSortLabel = LONG_SORT_LABELS[state.longSort.key];
+  const sortLabel = activeSortLabel
+    ? ` · ${activeSortLabel}${state.longSort.direction === "asc" ? "升序" : "降序"}`
+    : "";
   meta.textContent = `信号日 ${payload.signal_date} · 展示 ${payload.stocks.length}/${totalGoodStocks} 只好股票 · 预测仅展示${sortLabel}`;
   const recommendationCounts = payload.state_counts || {};
   counts.innerHTML = Object.entries(recommendationCounts).map(([key, value]) => (
@@ -3298,10 +3714,11 @@ function setRefreshStatus(status) {
   const time = status.finished_at || status.started_at || "";
   const percent = Number(status.percent || 0);
   const scopeLabel = status.scope_label || REFRESH_SCOPE_LABELS[status.scope] || "";
+  const statusMessage = formatRefreshStatusMessage(status, scopeLabel);
   localStorage.setItem(REFRESH_STATUS_STORAGE_KEY, JSON.stringify(status));
   const statusHtml = `
     <div class="refresh-status-line">
-      <span>${scopeLabel ? `${scopeLabel} · ` : ""}${status.message || status.status}${time ? ` · ${time}` : ""}</span>
+      <span>${scopeLabel ? `${scopeLabel} · ` : ""}${statusMessage}${time ? ` · ${formatRefreshTime(time)}` : ""}</span>
       <strong>${percent}%</strong>
     </div>
     <div class="refresh-progress-track">
@@ -3598,7 +4015,7 @@ document.querySelector("#longPoolRefresh").addEventListener("click", async () =>
     showError(error);
   } finally {
     button.disabled = false;
-    button.textContent = "刷新股票池";
+    button.textContent = "刷新当前子策略";
   }
 });
 
@@ -4303,9 +4720,96 @@ document.querySelector("#chanPage")?.addEventListener("click", (event) => {
   renderChanModelPage();
 });
 
+document.querySelector("#plansPage")?.addEventListener("click", async (event) => {
+  const filterButton = event.target.closest("[data-plan-filter]");
+  if (filterButton) {
+    state.operationPlanFilter = filterButton.dataset.planFilter || "active";
+    renderOperationPlans();
+    return;
+  }
+  const editButton = event.target.closest("[data-operation-plan-edit]");
+  if (editButton) {
+    editOperationPlan(editButton.dataset.operationPlanEdit);
+    return;
+  }
+  const completeButton = event.target.closest("[data-operation-plan-complete]");
+  if (completeButton) {
+    const item = state.operationPlans.find((plan) => plan.id === completeButton.dataset.operationPlanComplete);
+    if (!item) return;
+    completeButton.disabled = true;
+    try {
+      const payload = await fetchJson(`/operation-plans/${encodeURIComponent(item.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ ...item, status: "done" }),
+      });
+      state.operationPlans = payload.plans || [];
+      renderOperationPlans();
+    } catch (error) {
+      showError(error);
+      completeButton.disabled = false;
+    }
+    return;
+  }
+  const deleteButton = event.target.closest("[data-operation-plan-delete]");
+  if (!deleteButton) return;
+  const item = state.operationPlans.find((plan) => plan.id === deleteButton.dataset.operationPlanDelete);
+  if (!item || !window.confirm(`确认删除“${item.title}”？`)) return;
+  deleteButton.disabled = true;
+  try {
+    const payload = await fetchJson(`/operation-plans/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+    state.operationPlans = payload.plans || [];
+    resetOperationPlanForm();
+    renderOperationPlans();
+  } catch (error) {
+    showError(error);
+    deleteButton.disabled = false;
+  }
+});
+
+document.querySelector("#operationPlanReset")?.addEventListener("click", resetOperationPlanForm);
+document.querySelector("#operationPlanDate")?.addEventListener("input", (event) => {
+  event.currentTarget.dataset.defaulted = "false";
+});
+document.querySelector("#operationPlanHorizon")?.addEventListener("change", (event) => {
+  if (document.querySelector("#operationPlanId").value) return;
+  const dateInput = document.querySelector("#operationPlanDate");
+  if (event.currentTarget.value === "tomorrow") {
+    if (!dateInput.value) setDefaultOperationPlanDate();
+  } else if (dateInput.dataset.defaulted === "true") {
+    dateInput.value = "";
+    dateInput.dataset.defaulted = "false";
+  }
+});
+document.querySelector("#operationPlanForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const id = document.querySelector("#operationPlanId").value;
+  const button = document.querySelector("#operationPlanSave");
+  const status = document.querySelector("#operationPlanSaveStatus");
+  button.disabled = true;
+  button.textContent = "保存中";
+  status.textContent = "";
+  try {
+    const payload = await fetchJson(id ? `/operation-plans/${encodeURIComponent(id)}` : "/operation-plans", {
+      method: id ? "PUT" : "POST",
+      body: JSON.stringify(operationPlanPayload()),
+    });
+    state.operationPlans = payload.plans || [];
+    resetOperationPlanForm();
+    status.textContent = id ? "计划已更新" : "计划已保存";
+    renderOperationPlans();
+  } catch (error) {
+    status.textContent = error.message || "保存失败";
+    status.classList.add("error");
+  } finally {
+    button.disabled = false;
+    button.textContent = document.querySelector("#operationPlanId").value ? "更新计划" : "保存计划";
+  }
+});
+
 const initialDateInput = document.querySelector("#signalDateInput");
 if (initialDateInput) initialDateInput.value = "";
 state.signalDate = "";
+resetOperationPlanForm();
 restoreBydHoldingInputs();
 renderPageShell();
 renderLongStrategies();

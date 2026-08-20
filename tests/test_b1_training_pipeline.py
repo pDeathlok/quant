@@ -14,7 +14,12 @@ if str(RESEARCH_SCRIPTS) not in sys.path:
 import refresh_b1_feature_cache as b1_refresh  # noqa: E402
 import train_b1_tushare_models as b1_training  # noqa: E402
 from quant.ml.feature_coverage import RequiredFeatureCoverageError  # noqa: E402
-from train_b1_tushare_models import combine_training_frames  # noqa: E402
+from train_b1_tushare_models import (  # noqa: E402
+    B1_LONG_WEEKLY_AVAILABLE,
+    B1_LONG_WEEKLY_DATE,
+    combine_training_frames,
+    merge_weekly_enrichment,
+)
 
 
 def test_b1_incremental_build_reads_six_years_of_history(monkeypatch, tmp_path) -> None:
@@ -243,3 +248,49 @@ def test_combine_training_frames_prefers_causal_factor_price_columns() -> None:
     assert combined.loc[0, "close"] == 9.5
     assert combined.loc[0, "pct_chg"] == 0.5
     assert combined.loc[0, "factor_schema_version"] == "project-v4-causal-price-alpha"
+
+
+def test_merge_weekly_enrichment_is_point_in_time_and_excludes_labels() -> None:
+    data = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000001.SZ", "000001.SZ", "000002.SZ"],
+            "date": pd.to_datetime(["2024-01-02", "2024-01-08", "2025-01-03", "2024-01-08"]),
+        }
+    )
+    weekly = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000001.SZ", "000001.SZ"],
+            "date": pd.to_datetime(["2023-12-29", "2024-01-05", "2025-01-03"]),
+            "quality_factor": [0.5, 1.0, 2.0],
+            "future_label": [98.0, 99.0, 100.0],
+        }
+    )
+    catalog = pd.DataFrame(
+        {
+            "factor": ["quality_factor", "future_label"],
+            "group": ["quality", "label"],
+            "source": ["financial", "research"],
+            "frequency": ["weekly", "weekly"],
+            "role": ["quality_context", "label"],
+            "point_in_time_rule": ["ann_date_lte_signal_date", "never_feature"],
+        }
+    )
+
+    merged, features, metadata = merge_weekly_enrichment(
+        data,
+        weekly,
+        catalog,
+        base_feature_columns=[],
+        training_cutoff="2025-01-01",
+        minimum_coverage=0.0,
+        minimum_non_null_rows=1,
+    )
+
+    assert features == ["quality_factor", B1_LONG_WEEKLY_AVAILABLE]
+    assert "future_label" not in merged
+    assert merged.loc[0, "quality_factor"] == 0.5
+    assert merged.loc[1, "quality_factor"] == 1.0
+    assert merged.loc[2, "quality_factor"] == 2.0
+    assert pd.isna(merged.loc[3, "quality_factor"])
+    assert (merged[B1_LONG_WEEKLY_DATE].dropna() <= merged.loc[merged[B1_LONG_WEEKLY_DATE].notna(), "date"]).all()
+    assert metadata["future_row_count"] == 0

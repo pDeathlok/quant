@@ -143,6 +143,7 @@ PYTHONPATH=src python -m quant.research.a_share_history template \
 - `thesis`：稳定论点 ID、反方与证伪条件。
 - `scenarios`：悲观、中性、乐观。
 - `monitoring`、`evidence_ledger`、`report_markdown`。
+- `data_snapshot.mcp_execution`：至少保存运行时是否加载、是否尝试、实际/成功调用次数、采用与复核字段、状态/失败分类和降级路径；没有调用也不能省略。
 
 更新记录另填：
 

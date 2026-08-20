@@ -2,6 +2,7 @@ import io
 import threading
 import time
 import json
+from dataclasses import replace
 
 import pandas as pd
 import pytest
@@ -642,7 +643,7 @@ def test_model_scoring_uses_batched_processes_and_exposes_manifest(
 
     result = pipeline.score_latest_models(workers=4)
 
-    assert captured[-8:] == [
+    assert captured[2:10] == [
         "--target-date",
         "2026-08-12",
         "--workers",
@@ -651,6 +652,12 @@ def test_model_scoring_uses_batched_processes_and_exposes_manifest(
         "processes",
         "--batch-size",
         "8",
+    ]
+    assert captured[10:] == [
+        "--signals",
+        "DUICHEN_VA",
+        "NANA",
+        "YIDONG_DILIAN",
     ]
     assert result["status"] == "success"
     assert result["executor_type"] == "processes"
@@ -682,6 +689,46 @@ def test_model_scoring_rejects_a_stale_success_manifest(monkeypatch) -> None:
     assert result["scored_trade_date"] == "2026-08-11"
 
 
+def test_promoted_model_scoring_runs_only_preserved_legacy_signals(
+    monkeypatch,
+) -> None:
+    captured: list[str] = []
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "status": "success",
+                "target_date": "2026-08-12",
+                "scored_signals": ["DUICHEN_VA", "NANA", "YIDONG_DILIAN"],
+            }
+        )
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured.extend(command)
+        return Result()
+
+    promoted = replace(
+        pipeline.DEFAULT_SELECTOR_RANKING_CONFIG,
+        source=pipeline.SelectorRankingSource.RIGHT_SIDE_UNIFIED,
+        promotion_enabled=True,
+    )
+    monkeypatch.setattr(pipeline, "DEFAULT_SELECTOR_RANKING_CONFIG", promoted)
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260812")
+
+    result = pipeline.score_latest_models(workers=1)
+
+    signals_index = captured.index("--signals")
+    assert captured[signals_index + 1 :] == [
+        "DUICHEN_VA",
+        "NANA",
+        "YIDONG_DILIAN",
+    ]
+    assert result["status"] == "success"
+
+
 def test_run_selected_strategies_uses_packaged_module(monkeypatch) -> None:
     captured: list[str] = []
 
@@ -709,6 +756,7 @@ def test_run_selected_strategies_uses_packaged_module(monkeypatch) -> None:
 def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, tmp_path) -> None:
     active = 0
     max_active = 0
+    shadow_called = False
     call_order: list[str] = []
     lock = threading.Lock()
 
@@ -762,9 +810,39 @@ def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, 
         lambda: {"status": "success"},
     )
     monkeypatch.setattr(pipeline, "build_features", parallel_step)
-    monkeypatch.setattr(pipeline, "refresh_strategy_signal_cache", parallel_step)
+
+    def refresh_strategy_signals() -> dict:
+        result = parallel_step()
+        result["processed_through_date"] = "2026-08-13"
+        return result
+
+    monkeypatch.setattr(
+        pipeline,
+        "refresh_strategy_signal_cache",
+        refresh_strategy_signals,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "run_promoted_right_side_ranking",
+        lambda target_date: {
+            "status": "success",
+            "target_date": target_date,
+            "checkpoint_reused": True,
+        },
+    )
     monkeypatch.setattr(pipeline, "score_latest_models", lambda: {"status": "success"})
     monkeypatch.setattr(pipeline, "refresh_chan_model_scores", lambda: {"status": "success"})
+
+    def shadow_must_remain_separate(*args, **kwargs):
+        nonlocal shadow_called
+        shadow_called = True
+        raise AssertionError("production daily pipeline invoked research shadow")
+
+    monkeypatch.setattr(
+        pipeline,
+        "run_right_side_shadow_routine",
+        shadow_must_remain_separate,
+    )
     monkeypatch.setattr(pipeline, "generate_daily_plan", parallel_step)
     monkeypatch.setattr(pipeline, "generate_dashboard", lambda **kwargs: parallel_step())
     monkeypatch.setattr(pipeline, "write_run_manifest", lambda results, strategies: tmp_path / "manifest.json")
@@ -777,6 +855,7 @@ def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, 
     assert result["steps"]["build_features"]["status"] == "success"
     assert result["steps"]["generate_dashboard"]["status"] == "success"
     assert result["steps"]["refresh_daily_web_workspaces"]["status"] == "skipped"
+    assert shadow_called is False
 
 
 def test_daily_pipeline_stops_before_features_when_source_refresh_is_incomplete(monkeypatch, tmp_path) -> None:

@@ -20,6 +20,39 @@ from quant.webapp import api as webapp_api
 client = TestClient(app)
 
 
+def test_operation_plan_crud_persists_tomorrow_and_long_term(monkeypatch, tmp_path) -> None:
+    plan_path = tmp_path / "operation_plans.json"
+    monkeypatch.setattr(services, "OPERATION_PLANS_PATH", plan_path)
+
+    created = client.post(
+        "/api/operation-plans",
+        json={
+            "horizon": "tomorrow",
+            "title": "次日回踩计划",
+            "symbol": "002594.SZ",
+            "target_date": "2026-08-13",
+            "content": "缩量回踩后分批执行",
+            "status": "planned",
+        },
+    )
+    assert created.status_code == 200
+    plan = created.json()["plans"][0]
+    assert plan["horizon"] == "tomorrow"
+    assert plan_path.exists()
+
+    updated = client.put(
+        f"/api/operation-plans/{plan['id']}",
+        json={**plan, "horizon": "long_term", "status": "done"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["plans"][0]["horizon"] == "long_term"
+    assert updated.json()["plans"][0]["status"] == "done"
+
+    deleted = client.delete(f"/api/operation-plans/{plan['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["plans"] == []
+
+
 def _stub_successful_global_refresh(
     monkeypatch,
     *,
@@ -33,6 +66,7 @@ def _stub_successful_global_refresh(
     byd_daily_plan=None,
 ):
     from quant.routine import pipeline
+    from quant.routine import right_side_unified_production
 
     status = {
         "status": "idle",
@@ -102,6 +136,19 @@ def _stub_successful_global_refresh(
     )
     monkeypatch.setattr(pipeline, "build_features", build_features or success)
     monkeypatch.setattr(pipeline, "refresh_strategy_signal_cache", success)
+    monkeypatch.setattr(
+        right_side_unified_production,
+        "run_right_side_unified_production",
+        lambda target_date: {
+            "status": "success",
+            "target_date": target_date,
+            "checkpoint_reused": True,
+            "selector_adapter": {
+                "status": "success",
+                "target_date": target_date,
+            },
+        },
+    )
     monkeypatch.setattr(pipeline, "generate_daily_plan", generate_daily_plan or success)
     monkeypatch.setattr(pipeline, "generate_dashboard", generate_dashboard or success)
     monkeypatch.setattr(pipeline, "score_latest_models", score_latest_models or success)
@@ -151,6 +198,15 @@ def _stub_successful_global_refresh(
             {"variant": variant, "signal_date": signal_date, "stocks": 0}
             for variant in variants
         ],
+    )
+    monkeypatch.setattr(
+        services,
+        "get_blood_chip_long_plan",
+        lambda **kwargs: {
+            "signal_date": kwargs.get("signal_date") or "2026-07-23",
+            "candidates": [],
+            "simulated_positions": [],
+        },
     )
     monkeypatch.setattr(
         services,
@@ -1353,6 +1409,29 @@ def test_byd_daily_plan_only_forwards_permanent_holding(monkeypatch) -> None:
     assert set(captured) == {"shares", "cost", "refresh"}
 
 
+def test_blood_chip_long_plan_endpoint_forwards_daily_iteration_parameters(monkeypatch) -> None:
+    captured = {}
+
+    def fake_plan(**kwargs):
+        captured.update(kwargs)
+        return {
+            "signal_date": "2026-08-07",
+            "variant": "blood_chip",
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(webapp_api, "get_blood_chip_long_plan", fake_plan)
+
+    response = client.get(
+        "/api/long/blood-chip",
+        params={"signal_date": "2026-08-07", "refresh": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["variant"] == "blood_chip"
+    assert captured == {"signal_date": "2026-08-07", "refresh": True}
+
+
 def test_refresh_endpoint_rejects_unknown_scope() -> None:
     response = client.post("/api/selector/refresh-latest", json={"scope": "unknown"})
 
@@ -1530,6 +1609,35 @@ def test_long_stock_pool_variants_run_in_parallel_and_keep_order(monkeypatch) ->
     assert ("max_workers", 3) in observed
     assert [item["variant"] for item in result] == ["tea", "tea_safe", "v44"]
     assert [item["signal_date"] for item in result] == ["2026-07-20"] * 3
+
+
+def test_long_workspace_refresh_includes_blood_chip_daily_plan(monkeypatch) -> None:
+    monkeypatch.setattr(
+        services,
+        "_refresh_long_stock_pool_variants",
+        lambda variants, signal_date: [
+            {"variant": variant, "signal_date": signal_date, "stocks": 0}
+            for variant in variants
+        ],
+    )
+    monkeypatch.setattr(
+        services,
+        "get_blood_chip_long_plan",
+        lambda **kwargs: {
+            "signal_date": kwargs["signal_date"],
+            "candidates": [{"ts_code": "000001.SZ"}],
+            "simulated_positions": [],
+        },
+    )
+
+    result = services._refresh_long_workspace(["tea"], "2026-08-07")
+
+    assert result["variants"][0]["variant"] == "tea"
+    assert result["blood_chip"] == {
+        "signal_date": "2026-08-07",
+        "candidates": 1,
+        "simulated_positions": 0,
+    }
 
 
 def test_long_research_module_waits_for_concurrent_import(monkeypatch) -> None:
@@ -2836,6 +2944,11 @@ def test_watchlist_strategy_hits_merge_only_strategy_workspaces(monkeypatch) -> 
                 },
             ],
         },
+    )
+    monkeypatch.setattr(
+        services,
+        "apply_selector_ranking_source",
+        lambda rows, *args, **kwargs: rows,
     )
     monkeypatch.setattr(
         services,

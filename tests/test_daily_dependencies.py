@@ -163,6 +163,75 @@ def test_default_scope_closure_contains_only_required_production_branches() -> N
     assert "feature.selector_live" not in similar
 
 
+def test_right_side_shadow_is_a_separate_four_layer_research_closure() -> None:
+    registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    shadow = registry.required_node_ids("rightSideShadow")
+
+    assert shadow == (
+        "data.market_daily",
+        "feature.strategy_signals",
+        "feature.right_side_unified_shadow",
+        "score.right_side_unified_shadow",
+        "product.right_side_unified_shadow",
+    )
+    assert registry.nodes["feature.right_side_unified_shadow"].lifecycle == (
+        Lifecycle.RESEARCH_ONLY
+    )
+    assert registry.nodes["score.right_side_unified_shadow"].lifecycle == (
+        Lifecycle.RESEARCH_ONLY
+    )
+    assert registry.nodes["product.right_side_unified_shadow"].lifecycle == (
+        Lifecycle.RESEARCH_ONLY
+    )
+    assert {
+        registry.nodes[node_id].layer
+        for node_id in shadow
+    } == {
+        Layer.DATA_SOURCE,
+        Layer.FEATURE,
+        Layer.MODEL_SCORE,
+        Layer.PRODUCT,
+    }
+    assert "score.selector" not in shadow
+    assert "score.right_side_unified_shadow" not in set(
+        registry.required_node_ids("short")
+    )
+    assert "score.right_side_unified_shadow" not in set(
+        registry.required_node_ids("all")
+    )
+
+
+def test_right_side_shadow_model_change_dirties_only_shadow_score_and_product() -> None:
+    registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    target = date(2026, 8, 12)
+    active = registry.required_node_ids("rightSideShadow")
+    states = {
+        node_id: NodeState(
+            node_id,
+            watermark=target,
+            output_fingerprint=f"stable-{node_id}",
+        )
+        for node_id in active
+    }
+
+    entries = _entries_by_id(
+        build_dependency_plan(
+            registry,
+            "rightSideShadow",
+            target,
+            states,
+            changed_nodes=("score.right_side_unified_shadow",),
+            include_unused=False,
+        )
+    )
+
+    assert entries["data.market_daily"].action == "reuse"
+    assert entries["feature.strategy_signals"].action == "reuse"
+    assert entries["feature.right_side_unified_shadow"].action == "reuse"
+    assert entries["score.right_side_unified_shadow"].action == "refresh"
+    assert entries["product.right_side_unified_shadow"].action == "refresh"
+
+
 def test_all_production_strategy_configs_and_calculators_are_registered() -> None:
     project_root = Path(__file__).resolve().parents[1]
     registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
@@ -179,7 +248,7 @@ def test_all_production_strategy_configs_and_calculators_are_registered() -> Non
     assert missing_files == []
 
     production_configs: set[str] = set()
-    research_configs: set[str] = set()
+    unregistered_research_configs: set[str] = set()
     for path in sorted((project_root / "configs/strategies").glob("*.yaml")):
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         release = payload.get("release") or {}
@@ -208,13 +277,20 @@ def test_all_production_strategy_configs_and_calculators_are_registered() -> Non
                     f"{relative} -> {node_id}"
                 )
         elif lifecycle == "research_only":
-            research_configs.add(relative)
-            assert dependency_nodes == [], (
-                f"research-only strategy must not enter the production DAG: {relative}"
-            )
+            if not dependency_nodes:
+                unregistered_research_configs.add(relative)
+                continue
+            for node_id in dependency_nodes:
+                assert node_id in registry.nodes, (
+                    f"research strategy references unknown dependency node: "
+                    f"{relative} -> {node_id}"
+                )
+                node = registry.nodes[node_id]
+                assert node.lifecycle == Lifecycle.RESEARCH_ONLY
+                assert relative in node.contract_sources
 
     assert production_configs <= registered_sources
-    assert research_configs.isdisjoint(registered_sources)
+    assert unregistered_research_configs.isdisjoint(registered_sources)
 
     unversioned_live_nodes = sorted(
         node.node_id
@@ -391,6 +467,28 @@ def test_event_sources_use_independent_successful_poll_watermarks() -> None:
         evidence = registry.nodes[node_id].freshness.evidence
         assert len(evidence) == 1
         assert (evidence[0].locator, evidence[0].date_field) == locator
+
+
+def test_postflight_result_backed_nodes_do_not_request_second_refresh() -> None:
+    from datetime import date
+
+    from quant.application.daily_dependencies import NodeState
+    from quant.routine.daily_dependency_runtime import _postflight_result_backed_nodes
+
+    target = date(2026, 8, 13)
+    states = {
+        node_id: NodeState(node_id=node_id, watermark=target)
+        for node_id in ("data.cb_daily", "feature.cb_grid", "product.cb_grid")
+    }
+
+    completed = _postflight_result_backed_nodes(
+        DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+        states,
+        states,
+        target,
+    )
+
+    assert completed == {"data.cb_daily", "feature.cb_grid", "product.cb_grid"}
 
 
 def test_chan_effective_artifact_features_prune_unused_top_list_source() -> None:

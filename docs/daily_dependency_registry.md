@@ -63,7 +63,7 @@ data_source -> feature -> model_score -> product
 
 Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会把它们标成 `production_consumed_from_research_path` 技术债，但仍按生产模型严格编译特征和哈希。下一次晋级必须迁入 `models/production`，补齐正式 release manifest 后才能删除这项豁免。
 
-右侧统一排序的生产节点已预注册但默认 dormant。`configs/strategies/right_side_ranking_selector.yaml` 是 `score.selector` 排序上游的唯一显式 source 开关：默认消费 `score.z_skill`；只有 `promotion.enabled=true` 且 source 同时为 `right_side_unified` 时，`short/all` DAG 才切换到 `feature.right_side_unified -> score.right_side_unified`。独立 `rightSideRankingCandidate` scope 用于晋级前验证生产 artifact/schema/checksum/日期/覆盖。旧 `score.z_skill` 节点和工件保留为回滚源。统一模型只发布 `ranking_score`，不能伪装成旧的 up/down 概率；买卖策略层不在该模型合同内。
+右侧统一排序的生产节点已预注册但默认 dormant。`configs/strategies/right_side_ranking_selector.yaml` 是 `score.selector` 排序上游的唯一显式 source 开关：默认只消费现有 `score.z_skill`；只有 composite approval 同时给出 `replace_online=true`、`legacy_online_artifact_gate.passed=true`，并且 `promotion.enabled=true`、source 为 `right_side_unified` 时，`short/all` DAG 才加入 `feature.right_side_unified -> score.right_side_unified`。架构对照胜出或 research shadow 通过均不能单独授权生产替换。晋级态不是整节点替换，而是双源、按信号互斥路由：14 个右侧/混合成员只消费新的 `ranking_score`，`DUICHEN_VA/NANA/YIDONG_DILIAN` 仍消费旧 Z 分数；同一右侧成员不能混用两源。旧 Z 的 7 个被接管成员共 21 份 artifact 仅作 rollback 保留，3 个低吸成员共 9 份 artifact 继续进入活动合同。独立 `rightSideRankingCandidate` scope 用于晋级前验证 production artifact/schema/checksum/日期/覆盖。统一模型不能伪装成旧的 up/down 概率，买卖策略层也不在该模型合同内。
 
 因子字段的采样频率与生产物化频率是两个概念。例如财务字段按公告到达，长线选股截面仍要在每个交易日以 PIT 方式重新物化。当前长线节点读取 8 年估值上下文和 450 个自然日价格上下文，但只发布目标日分区。
 

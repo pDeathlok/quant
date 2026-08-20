@@ -108,7 +108,14 @@ SIGNAL_SOURCE_COLUMNS = [
 
 
 def _prepare_daily(daily: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
-    out = normalize_tushare_daily(daily, symbol)
+    prepared_columns = {"trade_date", "date", "symbol", "volume"}
+    already_prepared = prepared_columns.issubset(
+        daily.columns
+    ) and pd.api.types.is_datetime64_any_dtype(daily["date"].dtype)
+    if already_prepared:
+        out = daily.copy()
+    else:
+        out = normalize_tushare_daily(daily, symbol)
     out = out.sort_values("date").drop_duplicates("trade_date", keep="last").reset_index(drop=True)
     if "volume" not in out.columns and "vol" in out.columns:
         out["volume"] = out["vol"]
