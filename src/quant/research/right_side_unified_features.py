@@ -11,6 +11,7 @@ and earlier rows after sorting by date.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable, Sequence
 import hashlib
 
@@ -275,12 +276,12 @@ def _kengqi_event_state(frame: pd.DataFrame, vol_ratio_prev: pd.Series) -> dict[
 
     index = frame.index
     output = {
-        "depth": pd.Series(np.nan, index=index, dtype=float),
-        "recent": pd.Series(False, index=index, dtype=bool),
-        "days_since": pd.Series(np.nan, index=index, dtype=float),
-        "fill": pd.Series(np.nan, index=index, dtype=float),
-        "post_to_pre_volume": pd.Series(np.nan, index=index, dtype=float),
-        "pit_vol_ratio_prev": pd.Series(np.nan, index=index, dtype=float),
+        "depth": np.full(len(frame), np.nan, dtype=float),
+        "recent": np.zeros(len(frame), dtype=bool),
+        "days_since": np.full(len(frame), np.nan, dtype=float),
+        "fill": np.full(len(frame), np.nan, dtype=float),
+        "post_to_pre_volume": np.full(len(frame), np.nan, dtype=float),
+        "pit_vol_ratio_prev": np.full(len(frame), np.nan, dtype=float),
     }
     high = frame["high"].to_numpy(dtype=float)
     low = frame["low"].to_numpy(dtype=float)
@@ -303,17 +304,17 @@ def _kengqi_event_state(frame: pd.DataFrame, vol_ratio_prev: pd.Series) -> dict[
         post_slice = slice(pit + 1, post_end)
         pre_volume = float(np.nanmean(volume[pre_slice]))
         post_volume = float(np.nanmean(volume[post_slice])) if post_end > pit + 1 else np.nan
-        output["depth"].iat[position] = (pre_high - pit_low) / pre_high
-        output["recent"].iat[position] = bool(
+        output["depth"][position] = (pre_high - pit_low) / pre_high
+        output["recent"][position] = bool(
             close[pit] < open_[pit] and ratio[pit] >= 1.25
         )
-        output["days_since"].iat[position] = float(position - pit)
-        output["fill"].iat[position] = (close[position] - pit_low) / (pre_high - pit_low)
-        output["post_to_pre_volume"].iat[position] = (
+        output["days_since"][position] = float(position - pit)
+        output["fill"][position] = (close[position] - pit_low) / (pre_high - pit_low)
+        output["post_to_pre_volume"][position] = (
             post_volume / pre_volume if pre_volume > 0 else np.nan
         )
-        output["pit_vol_ratio_prev"].iat[position] = ratio[pit]
-    return output
+        output["pit_vol_ratio_prev"][position] = ratio[pit]
+    return {name: pd.Series(values, index=index) for name, values in output.items()}
 
 
 def _zaihou_event_state(
@@ -324,28 +325,37 @@ def _zaihou_event_state(
 
     index = frame.index
     output = {
-        "recent": pd.Series(False, index=index, dtype=bool),
-        "days_since": pd.Series(np.nan, index=index, dtype=float),
-        "reference_volume": pd.Series(np.nan, index=index, dtype=float),
+        "recent": np.zeros(len(frame), dtype=bool),
+        "days_since": np.full(len(frame), np.nan, dtype=float),
+        "reference_volume": np.full(len(frame), np.nan, dtype=float),
     }
     volume = frame["volume"].to_numpy(dtype=float)
     pct = pct_chg.to_numpy(dtype=float)
+    prior_mean = (
+        pd.Series(volume)
+        .shift(1)
+        .rolling(5, min_periods=1)
+        .mean()
+        .to_numpy(dtype=float)
+    )
+    qualifying = (pct > 5.0) & (volume > prior_mean * 1.5)
+    active_anchors: deque[int] = deque()
     for position in range(len(frame)):
-        start = max(0, position - 14)
-        anchor: int | None = None
+        previous = position - 1
+        if previous >= 5 and qualifying[previous]:
+            active_anchors.append(previous)
+        lower_bound = max(5, position - 9)
+        while active_anchors and active_anchors[0] < lower_bound:
+            active_anchors.popleft()
         # Live detector scans the 15-bar window from oldest to newest, excludes
         # the current bar, and requires five prior bars inside the same window.
-        for candidate in range(start + 5, position):
-            prior_mean = float(np.nanmean(volume[candidate - 5 : candidate]))
-            if pct[candidate] > 5.0 and volume[candidate] > prior_mean * 1.5:
-                anchor = candidate
-                break
-        if anchor is None:
+        if not active_anchors:
             continue
-        output["recent"].iat[position] = True
-        output["days_since"].iat[position] = float(position - anchor)
-        output["reference_volume"].iat[position] = volume[anchor]
-    return output
+        anchor = active_anchors[0]
+        output["recent"][position] = True
+        output["days_since"][position] = float(position - anchor)
+        output["reference_volume"][position] = volume[anchor]
+    return {name: pd.Series(values, index=index) for name, values in output.items()}
 
 
 def _parse_dates(values: pd.Series) -> pd.Series:
@@ -408,18 +418,21 @@ def _two_yang_state(
 ) -> dict[str, pd.Series]:
     index = frame.index
     output = {
-        "rs_two_yang_gap_days": pd.Series(np.nan, index=index, dtype=float),
-        "rs_mid_bar_count": pd.Series(np.nan, index=index, dtype=float),
-        "rs_mid_yin_share": pd.Series(np.nan, index=index, dtype=float),
-        "rs_first_vol_to_mid_max": pd.Series(np.nan, index=index, dtype=float),
-        "rs_second_vol_to_mid_max": pd.Series(np.nan, index=index, dtype=float),
-        "rs_second_to_first_vol": pd.Series(np.nan, index=index, dtype=float),
-        "rs_second_yang_pct": pd.Series(np.nan, index=index, dtype=float),
-        "rs_mid_avg_vol_ratio_prev": pd.Series(np.nan, index=index, dtype=float),
-        "rs_pre_second_kdj_j": pd.Series(np.nan, index=index, dtype=float),
-        "rs_second_vol_ratio_prev": pd.Series(np.nan, index=index, dtype=float),
-        "rs_days_since_second_yang": pd.Series(np.nan, index=index, dtype=float),
-        "rs_close_to_second_low_pct": pd.Series(np.nan, index=index, dtype=float),
+        name: np.full(len(frame), np.nan, dtype=float)
+        for name in (
+            "rs_two_yang_gap_days",
+            "rs_mid_bar_count",
+            "rs_mid_yin_share",
+            "rs_first_vol_to_mid_max",
+            "rs_second_vol_to_mid_max",
+            "rs_second_to_first_vol",
+            "rs_second_yang_pct",
+            "rs_mid_avg_vol_ratio_prev",
+            "rs_pre_second_kdj_j",
+            "rs_second_vol_ratio_prev",
+            "rs_days_since_second_yang",
+            "rs_close_to_second_low_pct",
+        )
     }
     event_positions: list[int] = []
     volume = frame["volume"].to_numpy(dtype=float)
@@ -430,6 +443,8 @@ def _two_yang_state(
     j_values = kdj_j.to_numpy(dtype=float)
     pct_values = pct_chg.to_numpy(dtype=float)
     events = strong_yang.fillna(False).to_numpy(dtype=bool)
+    cached_pair: tuple[int, int] | None = None
+    pair_values: dict[str, float] = {}
 
     for position in range(len(frame)):
         if events[position]:
@@ -437,44 +452,72 @@ def _two_yang_state(
         if len(event_positions) < 2:
             continue
         first, second = event_positions[-2:]
-        middle = slice(first + 1, second)
-        middle_count = second - first - 1
-        first_volume = volume[first]
-        second_volume = volume[second]
+        pair = (first, second)
+        if pair != cached_pair:
+            middle = slice(first + 1, second)
+            middle_count = second - first - 1
+            first_volume = volume[first]
+            second_volume = volume[second]
+            pair_values = {
+                "gap": float(second - first),
+                "middle_count": float(middle_count),
+                "second_pct": pct_values[second],
+                "second_ratio": ratio[second],
+                "pre_second_j": (
+                    j_values[second - 1] if second > 0 else np.nan
+                ),
+                "second_to_first": (
+                    second_volume / first_volume if first_volume else np.nan
+                ),
+                "mid_yin_share": np.nan,
+                "first_to_mid_max": np.nan,
+                "second_to_mid_max": np.nan,
+                "mid_avg_ratio": np.nan,
+            }
+            if middle_count > 0:
+                middle_volume = volume[middle]
+                middle_max = float(np.nanmax(middle_volume))
+                pair_values.update(
+                    {
+                        "mid_yin_share": float(
+                            np.mean(close[middle] <= open_[middle])
+                        ),
+                        "first_to_mid_max": (
+                            first_volume / middle_max if middle_max else np.nan
+                        ),
+                        "second_to_mid_max": (
+                            second_volume / middle_max if middle_max else np.nan
+                        ),
+                        "mid_avg_ratio": float(np.nanmean(ratio[middle])),
+                    }
+                )
+            cached_pair = pair
 
-        output["rs_two_yang_gap_days"].iat[position] = second - first
-        output["rs_mid_bar_count"].iat[position] = middle_count
-        output["rs_second_yang_pct"].iat[position] = pct_values[second]
-        output["rs_second_vol_ratio_prev"].iat[position] = ratio[second]
-        output["rs_days_since_second_yang"].iat[position] = position - second
-        output["rs_pre_second_kdj_j"].iat[position] = (
-            j_values[second - 1] if second > 0 else np.nan
-        )
-        output["rs_second_to_first_vol"].iat[position] = (
-            second_volume / first_volume if first_volume else np.nan
-        )
-        output["rs_close_to_second_low_pct"].iat[position] = (
+        output["rs_two_yang_gap_days"][position] = pair_values["gap"]
+        output["rs_mid_bar_count"][position] = pair_values["middle_count"]
+        output["rs_second_yang_pct"][position] = pair_values["second_pct"]
+        output["rs_second_vol_ratio_prev"][position] = pair_values["second_ratio"]
+        output["rs_days_since_second_yang"][position] = position - second
+        output["rs_pre_second_kdj_j"][position] = pair_values["pre_second_j"]
+        output["rs_second_to_first_vol"][position] = pair_values[
+            "second_to_first"
+        ]
+        output["rs_close_to_second_low_pct"][position] = (
             (close[position] / low[second] - 1.0) * 100.0
             if low[second]
             else np.nan
         )
-        if middle_count <= 0:
-            continue
-        middle_volume = volume[middle]
-        middle_max = float(np.nanmax(middle_volume))
-        output["rs_mid_yin_share"].iat[position] = float(
-            np.mean(close[middle] <= open_[middle])
-        )
-        output["rs_first_vol_to_mid_max"].iat[position] = (
-            first_volume / middle_max if middle_max else np.nan
-        )
-        output["rs_second_vol_to_mid_max"].iat[position] = (
-            second_volume / middle_max if middle_max else np.nan
-        )
-        output["rs_mid_avg_vol_ratio_prev"].iat[position] = float(
-            np.nanmean(ratio[middle])
-        )
-    return output
+        output["rs_mid_yin_share"][position] = pair_values["mid_yin_share"]
+        output["rs_first_vol_to_mid_max"][position] = pair_values[
+            "first_to_mid_max"
+        ]
+        output["rs_second_vol_to_mid_max"][position] = pair_values[
+            "second_to_mid_max"
+        ]
+        output["rs_mid_avg_vol_ratio_prev"][position] = pair_values[
+            "mid_avg_ratio"
+        ]
+    return {name: pd.Series(values, index=index) for name, values in output.items()}
 
 
 def _double_gun_state(
@@ -501,8 +544,11 @@ def _double_gun_state(
         "rs_double_gun_days_since_second",
         "rs_double_gun_close_to_second_low_pct",
     )
-    output = {name: pd.Series(np.nan, index=index, dtype=float) for name in names}
-    output["rs_double_gun_active"] = pd.Series(False, index=index, dtype=bool)
+    output = {
+        name: np.full(len(frame), np.nan, dtype=float)
+        for name in names
+    }
+    output["rs_double_gun_active"] = np.zeros(len(frame), dtype=bool)
 
     open_ = frame["open"].to_numpy(dtype=float)
     close = frame["close"].to_numpy(dtype=float)
@@ -534,14 +580,14 @@ def _double_gun_state(
         close_to_second_low = (
             (close[position] / low[second] - 1.0) * 100.0 if low[second] else np.nan
         )
-        output["rs_double_gun_gap_days"].iat[position] = gap
-        output["rs_double_gun_mid_avg_vol_ratio_prev"].iat[position] = mid_average
-        output["rs_double_gun_pre_second_kdj_j"].iat[position] = pre_second_j
-        output["rs_double_gun_first_vol_ratio_prev"].iat[position] = ratio[first]
-        output["rs_double_gun_second_vol_ratio_prev"].iat[position] = ratio[second]
-        output["rs_double_gun_days_since_second"].iat[position] = position - second
-        output["rs_double_gun_close_to_second_low_pct"].iat[position] = close_to_second_low
-        output["rs_double_gun_active"].iat[position] = bool(
+        output["rs_double_gun_gap_days"][position] = gap
+        output["rs_double_gun_mid_avg_vol_ratio_prev"][position] = mid_average
+        output["rs_double_gun_pre_second_kdj_j"][position] = pre_second_j
+        output["rs_double_gun_first_vol_ratio_prev"][position] = ratio[first]
+        output["rs_double_gun_second_vol_ratio_prev"][position] = ratio[second]
+        output["rs_double_gun_days_since_second"][position] = position - second
+        output["rs_double_gun_close_to_second_low_pct"][position] = close_to_second_low
+        output["rs_double_gun_active"][position] = bool(
             np.isfinite(mid_average)
             and mid_average < 1.2
             and np.isfinite(pre_second_j)
@@ -549,7 +595,7 @@ def _double_gun_state(
             and 3 <= gap <= 10
             and close[position] >= low[second]
         )
-    return output
+    return {name: pd.Series(values, index=index) for name, values in output.items()}
 
 
 def _tvb_anchor_state(
@@ -558,10 +604,10 @@ def _tvb_anchor_state(
     volume_ma5: pd.Series,
 ) -> dict[str, pd.Series]:
     index = frame.index
-    days_since = pd.Series(np.nan, index=index, dtype=float)
-    anchor_price = pd.Series(np.nan, index=index, dtype=float)
-    consolidation_range = pd.Series(np.nan, index=index, dtype=float)
-    avg_pre_shrink = pd.Series(False, index=index, dtype=bool)
+    days_since = np.full(len(frame), np.nan, dtype=float)
+    anchor_price = np.full(len(frame), np.nan, dtype=float)
+    consolidation_range = np.full(len(frame), np.nan, dtype=float)
+    avg_pre_shrink = np.zeros(len(frame), dtype=bool)
 
     close = frame["close"].to_numpy(dtype=float)
     high = frame["high"].to_numpy(dtype=float)
@@ -569,6 +615,16 @@ def _tvb_anchor_state(
     volume = frame["volume"].to_numpy(dtype=float)
     volume_ma = volume_ma5.to_numpy(dtype=float)
     anchor_values = anchor.fillna(False).to_numpy(dtype=bool)
+    volume_valid = np.isfinite(volume)
+    volume_ma_valid = np.isfinite(volume_ma)
+    volume_sum = np.concatenate(
+        ([0.0], np.cumsum(np.where(volume_valid, volume, 0.0)))
+    )
+    volume_count = np.concatenate(([0], np.cumsum(volume_valid)))
+    volume_ma_sum = np.concatenate(
+        ([0.0], np.cumsum(np.where(volume_ma_valid, volume_ma, 0.0)))
+    )
+    volume_ma_count = np.concatenate(([0], np.cumsum(volume_ma_valid)))
     last_anchor = -1
     running_high = np.nan
     running_low = np.nan
@@ -581,8 +637,8 @@ def _tvb_anchor_state(
         if last_anchor < 0:
             continue
         distance = position - last_anchor
-        days_since.iat[position] = float(distance)
-        anchor_price.iat[position] = close[last_anchor]
+        days_since[position] = float(distance)
+        anchor_price[position] = close[last_anchor]
         if distance <= 0:
             continue
         running_high = (
@@ -591,27 +647,39 @@ def _tvb_anchor_state(
             else max(running_high, high[position])
         )
         running_low = low[position] if np.isnan(running_low) else min(running_low, low[position])
-        consolidation_range.iat[position] = (
+        consolidation_range[position] = (
             running_high / running_low if running_low else np.nan
         )
         if last_anchor < 1:
             continue
         prior_start = last_anchor + 1
         prior_end = position if position > prior_start else position + 1
-        prior_volume = volume[prior_start:prior_end]
-        prior_ma = volume_ma[prior_start:prior_end]
-        avg_pre_shrink.iat[position] = bool(
+        prior_volume_count = volume_count[prior_end] - volume_count[prior_start]
+        prior_ma_count = volume_ma_count[prior_end] - volume_ma_count[prior_start]
+        prior_volume_mean = (
+            (volume_sum[prior_end] - volume_sum[prior_start])
+            / prior_volume_count
+            if prior_volume_count
+            else np.nan
+        )
+        prior_ma_mean = (
+            (volume_ma_sum[prior_end] - volume_ma_sum[prior_start])
+            / prior_ma_count
+            if prior_ma_count
+            else np.nan
+        )
+        avg_pre_shrink[position] = bool(
             volume[position] < volume[last_anchor - 1]
-            and len(prior_volume)
-            and np.isfinite(prior_volume).any()
-            and np.isfinite(prior_ma).any()
-            and np.nanmean(prior_volume) < np.nanmean(prior_ma)
+            and prior_end > prior_start
+            and prior_volume_count
+            and prior_ma_count
+            and prior_volume_mean < prior_ma_mean
         )
     return {
-        "days_since": days_since,
-        "anchor_price": anchor_price,
-        "consolidation_range": consolidation_range,
-        "avg_pre_shrink": avg_pre_shrink,
+        "days_since": pd.Series(days_since, index=index),
+        "anchor_price": pd.Series(anchor_price, index=index),
+        "consolidation_range": pd.Series(consolidation_range, index=index),
+        "avg_pre_shrink": pd.Series(avg_pre_shrink, index=index),
     }
 
 

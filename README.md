@@ -96,6 +96,7 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 | `ROUTINE_MARKET_REGIME_LOOKBACK_DAYS` | `252` | 每日市场状态读取正式行情的自然日回看窗口，最小 90 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
 | `ROUTINE_MODEL_SCORE_WORKERS` | `4` | Web 每日更新中策略模型评分的 worker 数；与缠论评分并行时上限为 4 |
+| `ROUTINE_RIGHT_SIDE_WORKERS` | `6` | 右侧统一因子 worker 数；等待模型评分完成后与缠论 4 workers 并行，总上限为 10 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | 特征计算执行器；CPU 密集计算默认使用多进程 |
 | `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量特征与 `daily_basic` 的最低匹配率；低于阈值阻断发布 |
 | `B1_FEATURE_MAX_SYMBOL_ERROR_RATE` | `0.001` | B1 特征构建单股异常率上限；超过即阻断发布 |

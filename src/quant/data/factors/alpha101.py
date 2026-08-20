@@ -36,6 +36,15 @@ def _causal_rank(
     )
 
 
+def _last_percentile_rank(values: np.ndarray) -> float:
+    """Match ``Series.rank(pct=True).iloc[-1]`` without allocating a Series."""
+
+    last = values[-1]
+    less = np.count_nonzero(values < last)
+    equal = np.count_nonzero(values == last)
+    return float(less + (equal + 1) / 2) / len(values)
+
+
 class Alpha001Factor(RollingFactor):
     """Alpha001: 基于标准差和价格的非线性变换"""
     
@@ -55,7 +64,10 @@ class Alpha001Factor(RollingFactor):
         value_sq = value ** 2
         
         # 5天内的最大值位置
-        argmax_5 = pd.Series(value_sq, index=df.index).rolling(5).apply(np.argmax)
+        argmax_5 = pd.Series(value_sq, index=df.index).rolling(5).apply(
+            np.argmax,
+            raw=True,
+        )
         
         # 排名并减0.5
         result = _causal_rank(argmax_5) - 0.5
@@ -126,11 +138,17 @@ class Alpha004Factor(Factor):
     def compute(self, df: pd.DataFrame) -> pd.Series:
         """(rank(ts_rank(volume, 3) * ts_rank((-1 * delta(close, 1)), 3)))"""
         # 3天内成交量的时序排名（使用标准字段 volume）
-        ts_rank_vol = df['volume'].rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
+        ts_rank_vol = df['volume'].rolling(3).apply(
+            _last_percentile_rank,
+            raw=True,
+        )
         
         # 3天内负收益的时序排名
         neg_ret = -df['close'].diff(1)
-        ts_rank_ret = neg_ret.rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
+        ts_rank_ret = neg_ret.rolling(3).apply(
+            _last_percentile_rank,
+            raw=True,
+        )
         
         # 乘积并排名
         return _causal_rank(ts_rank_vol * ts_rank_ret)
@@ -238,7 +256,10 @@ class Alpha010Factor(Factor):
         """((-1) * Ts_Rank(rank(volume), 3))"""
         # 使用标准字段 volume
         rank_vol = _causal_rank(df['volume'])
-        ts_rank = rank_vol.rolling(3).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
+        ts_rank = rank_vol.rolling(3).apply(
+            _last_percentile_rank,
+            raw=True,
+        )
         return -ts_rank
 
 

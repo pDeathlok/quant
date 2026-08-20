@@ -644,10 +644,15 @@ def run_right_side_unified_production(
     *,
     project_root: Path = PROJECT_ROOT,
     config: SelectorRankingConfig | None = None,
+    factor_workers: int | None = None,
 ) -> dict[str, Any]:
     """Build and publish one exact-date score, reusing an unchanged checkpoint."""
 
     config = config or load_selector_ranking_config(project_root)
+    if factor_workers is not None:
+        if not 1 <= factor_workers <= 32:
+            raise ValueError("right-side production factor_workers must be in [1, 32]")
+        config = replace(config, factor_workers=factor_workers)
     validate_production_ranking_artifact(config, project_root=project_root)
     target = pd.to_datetime(target_date, errors="raise").normalize()
     input_fingerprint, input_snapshot = _production_input_snapshot(

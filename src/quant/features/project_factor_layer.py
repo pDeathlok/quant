@@ -90,6 +90,15 @@ LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION = "project-v1-latest-scale-global-rank"
 KEY_COLUMNS = ("ts_code", "symbol", "trade_date", "date")
 
 
+def _last_percentile_rank(values: np.ndarray) -> float:
+    """Match pandas' average percentile rank for the last rolling value."""
+
+    last = values[-1]
+    less = np.count_nonzero(values < last)
+    equal = np.count_nonzero(values == last)
+    return float(less + (equal + 1) / 2) / len(values)
+
+
 def resolve_project_factor_schema(requested: str | None = None) -> str:
     mode = requested or os.getenv("PROJECT_FACTOR_COMPATIBILITY_MODE", "")
     if mode in {"legacy", "legacy-production", LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION}:
@@ -131,7 +140,9 @@ def _calculate_legacy_alpha101(frame: pd.DataFrame) -> pd.DataFrame:
         np.where(returns < 0, standard_deviation, frame["close"]),
         index=frame.index,
     ).pow(2)
-    out["alpha001"] = alpha001_value.rolling(5).apply(np.argmax).rank(pct=True) - 0.5
+    out["alpha001"] = (
+        alpha001_value.rolling(5).apply(np.argmax, raw=True).rank(pct=True) - 0.5
+    )
     log_volume_delta = np.log(frame["volume"]).diff(2)
     open_return = (frame["close"] - frame["open"]) / frame["open"]
     out["alpha002"] = -log_volume_delta.rank(pct=True).rolling(6).corr(open_return.rank(pct=True))
@@ -142,10 +153,12 @@ def _calculate_legacy_alpha101(frame: pd.DataFrame) -> pd.DataFrame:
     covariance_values.index = covariance_values.index.droplevel(1)
     out["alpha003"] = -covariance_values.rank(pct=True)
     volume_rank_3 = frame["volume"].rolling(3).apply(
-        lambda values: pd.Series(values).rank(pct=True).iloc[-1]
+        _last_percentile_rank,
+        raw=True,
     )
     negative_return_rank_3 = (-frame["close"].diff()).rolling(3).apply(
-        lambda values: pd.Series(values).rank(pct=True).iloc[-1]
+        _last_percentile_rank,
+        raw=True,
     )
     out["alpha004"] = (volume_rank_3 * negative_return_rank_3).rank(pct=True)
     vwap = (frame["high"] + frame["low"] + frame["close"]) / 3.0
@@ -161,7 +174,8 @@ def _calculate_legacy_alpha101(frame: pd.DataFrame) -> pd.DataFrame:
     negative_close_delta = -frame["close"].diff()
     out["alpha009"] = -(volume_delta.rank(pct=True) * negative_close_delta.rank(pct=True)).rank(pct=True)
     out["alpha010"] = -rank_volume.rolling(3).apply(
-        lambda values: pd.Series(values).rank(pct=True).iloc[-1]
+        _last_percentile_rank,
+        raw=True,
     )
     return out
 

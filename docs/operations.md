@@ -302,6 +302,7 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_DAILY_BASIC_MIN_MATCH_RATE` | `0.98` | B1 增量候选与 `daily_basic` 匹配率门禁；不建议调低 |
 | `B1_FEATURE_MAX_SYMBOL_ERROR_RATE` | `0.001` | B1 特征构建允许的单股异常比例；超过即失败 |
 | `ROUTINE_CHAN_WORKERS` | `4` | 缠论增量候选扫描并发数；Web 每日更新并行阶段上限为 4 |
+| `ROUTINE_RIGHT_SIDE_WORKERS` | `6` | 右侧统一因子并发数；等待模型评分释放资源后与缠论并行，持续 CPU 总预算不超过 10 workers |
 | `ROUTINE_WEB_WORKSPACE_WORKERS` | `6` | 下游接口限频或机器负载高时降低 |
 | `SIMILAR_PATTERN_CACHE_WORKERS` | `4` | 相似向量计算占用高时降低 |
 | `SIMILAR_PATTERN_FORCE_VECTOR_CACHE` | 空 | 设为 `1` 可在下一次相似走势刷新时强制重建全市场参考库；正常每日任务无需设置 |

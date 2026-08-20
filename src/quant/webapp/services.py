@@ -171,6 +171,7 @@ MODEL_SIGNAL_LABELS = {
 _LONG_RESEARCH_MODULE_LOCK = threading.Lock()
 _TEA_MASTER_MODULE_LOCK = threading.Lock()
 _LONG_LIVE_DATA_LOCK = threading.Lock()
+_TEA_MASTER_LIVE_SCORE_LOCK = threading.Lock()
 _SELECTOR_SNAPSHOT_SCHEMA_LOCK = threading.Lock()
 _SELECTOR_SNAPSHOT_SCHEMA_READY_URLS: set[str] = set()
 STRATEGY_GROUPS = [
@@ -1394,6 +1395,36 @@ def _prepare_tea_master_live_data(
     merged = merged.merge(market_regime, on="date", how="left")
     merged["market_regime"] = merged["market_regime"].fillna("neutral")
     return merged, stock_basic, coverage
+
+
+@lru_cache(maxsize=2)
+def _tea_master_live_scores_cached(
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build the shared Tea/Tea-safe score frame once per decision date."""
+
+    module = _tea_master_research_module()
+    merged, _, coverage = _prepare_tea_master_live_data(module, signal_date)
+    scored = module.build_tea_scores(
+        merged,
+        valuation_window_months=LONG_VALUATION_WINDOW_MONTHS,
+        valuation_minimum_months=LONG_VALUATION_MINIMUM_MONTHS,
+    )
+    return scored, dict(coverage)
+
+
+def _tea_master_live_scores(
+    signal_date: str | None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    normalized_date = (
+        pd.to_datetime(signal_date).date().isoformat() if signal_date else None
+    )
+    # functools.lru_cache is coherent but does not deduplicate concurrent
+    # misses. Tea and Tea-safe start together, so serialize only the first
+    # expensive build and let the second caller take the completed cache hit.
+    with _TEA_MASTER_LIVE_SCORE_LOCK:
+        scored, coverage = _tea_master_live_scores_cached(normalized_date)
+    return scored, dict(coverage)
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -2905,12 +2936,7 @@ def _build_tea_master_stock_pool_cached(variant_key: str, signal_date: str | Non
     config = next((item for item in module.CONFIGS if item.name == config_name), None)
     if config is None:
         raise ValueError(f"未知茶大长线策略版本: {variant_key}")
-    merged, _, coverage = _prepare_tea_master_live_data(module, signal_date)
-    scored = module.build_tea_scores(
-        merged,
-        valuation_window_months=LONG_VALUATION_WINDOW_MONTHS,
-        valuation_minimum_months=LONG_VALUATION_MINIMUM_MONTHS,
-    )
+    scored, coverage = _tea_master_live_scores(signal_date)
     eligible_scored = scored.copy()
     if signal_date:
         eligible_scored = eligible_scored[eligible_scored["date"] <= pd.to_datetime(signal_date)].copy()
@@ -3184,6 +3210,7 @@ def get_long_stock_pool(
     if variant_key in TEA_LONG_VARIANTS:
         if refresh:
             _build_tea_master_stock_pool_cached.cache_clear()
+            _tea_master_live_scores_cached.cache_clear()
         payload = _build_tea_master_stock_pool_cached(variant_key, signal_date)
         _write_long_stock_pool_snapshot(payload, variant_key, signal_date, write_sql=refresh)
         payload["cache"] = {"hit": False, "backend": "generated"}
@@ -7609,6 +7636,7 @@ def _clear_selector_caches() -> None:
         _latest_extended_signals,
         _load_live_long_base_cached,
         _load_live_long_base_full_cached,
+        _tea_master_live_scores_cached,
         _selector_buy_hold_score_artifact,
         _selector_score_calibration,
         _selector_buy_hold_models,
@@ -8881,8 +8909,10 @@ def _run_latest_refresh_job(
             )
 
         # Generate independent outputs together after both upstream caches are
-        # complete. Model and Chan scoring are capped at four workers each so
-        # their combined CPU budget fits the 10-core production host.
+        # complete. Model and Chan scoring are capped at four workers each.
+        # The right-side build waits for the short-lived model score to release
+        # its workers, then overlaps its six workers with Chan's four so the
+        # sustained CPU budget still fits the 10-core production host.
         _set_refresh_progress(
             step_key="daily_plan",
             message="正在并行生成每日计划、Dashboard、模型分与缠论评分",
@@ -8927,7 +8957,64 @@ def _run_latest_refresh_job(
             4,
             max(1, int(os.getenv("ROUTINE_CHAN_WORKERS", "4"))),
         )
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="quant-daily-output") as executor:
+        right_side_enabled = (
+            DEFAULT_SELECTOR_RANKING_CONFIG.source
+            == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+        )
+        right_side_workers = min(
+            6,
+            max(1, int(os.getenv("ROUTINE_RIGHT_SIDE_WORKERS", "6"))),
+        )
+        model_score_gate = threading.Event()
+        model_score_failures: list[BaseException] = []
+        if model_score_ready:
+            model_score_gate.set()
+
+        def score_models_then_release_workers() -> dict[str, Any]:
+            try:
+                payload = score_latest_models(workers=model_score_workers)
+                if payload.get("status") == "failed":
+                    model_score_failures.append(
+                        RuntimeError(
+                            payload.get("stderr_tail")
+                            or "当日策略模型分计算失败"
+                        )
+                    )
+                return payload
+            except BaseException as exc:
+                model_score_failures.append(exc)
+                raise
+            finally:
+                model_score_gate.set()
+
+        def build_right_side_after_model_score() -> dict[str, Any]:
+            model_score_gate.wait()
+            if model_score_failures:
+                return {
+                    "status": "cancelled",
+                    "reason": "策略模型分失败，取消右侧统一因子构建",
+                }
+            from quant.routine.right_side_unified_production import (
+                run_right_side_unified_production,
+            )
+
+            return run_right_side_unified_production(
+                expected_signal_date,
+                factor_workers=right_side_workers,
+            )
+
+        if right_side_enabled:
+            _set_refresh_progress(
+                step_key="right_side_unified_features",
+                message="等待模型评分释放资源后，并行构建右侧统一因子",
+                percent=72,
+                complete_previous=False,
+            )
+
+        with ThreadPoolExecutor(
+            max_workers=5 if right_side_enabled else 4,
+            thread_name_prefix="quant-daily-output",
+        ) as executor:
             output_futures = {
                 executor.submit(generate_daily_plan): (
                     "generate_daily_plan",
@@ -8950,16 +9037,63 @@ def _run_latest_refresh_job(
             }
             if not model_score_ready:
                 output_futures[
-                    executor.submit(score_latest_models, workers=model_score_workers)
+                    executor.submit(score_models_then_release_workers)
                 ] = ("model_score", "当日策略模型分计算失败")
+            if right_side_enabled:
+                output_futures[
+                    executor.submit(build_right_side_after_model_score)
+                ] = ("right_side_unified", "右侧统一生产排序失败")
 
             completed_daily_outputs: set[str] = set()
             for future in as_completed(output_futures):
                 result_key, failure_message = output_futures[future]
                 payload = future.result()
-                results[result_key] = payload
                 if payload.get("status") == "failed":
-                    raise RuntimeError(payload.get("stderr_tail") or failure_message)
+                    raise RuntimeError(
+                        payload.get("stderr_tail")
+                        or payload.get("error")
+                        or failure_message
+                    )
+                if result_key == "right_side_unified":
+                    if payload.get("status") == "cancelled":
+                        continue
+                    results["right_side_unified_features"] = {
+                        "status": "success",
+                        "target_date": payload.get("target_date"),
+                        "factor_workers": right_side_workers,
+                    }
+                    results["right_side_unified_scores"] = payload
+                    results["right_side_unified_adapter"] = {
+                        **(payload.get("selector_adapter") or {}),
+                        "status": "success",
+                    }
+                    for step_key, message, percent in (
+                        (
+                            "right_side_unified_features",
+                            "右侧生产因子构建完成",
+                            72,
+                        ),
+                        (
+                            "right_side_unified_score",
+                            "右侧统一排序分计算完成",
+                            76,
+                        ),
+                        (
+                            "right_side_unified_adapter",
+                            "右侧 selector 排序适配校验完成",
+                            78,
+                        ),
+                    ):
+                        _set_refresh_progress(
+                            step_key=step_key,
+                            step_status="success",
+                            message=message,
+                            percent=percent,
+                            complete_previous=False,
+                        )
+                    continue
+
+                results[result_key] = payload
                 if result_key == "model_score":
                     _set_refresh_progress(
                         step_key="model_score",
@@ -8997,49 +9131,6 @@ def _run_latest_refresh_job(
                             percent=72,
                             complete_previous=False,
                         )
-        if (
-            DEFAULT_SELECTOR_RANKING_CONFIG.source
-            == SelectorRankingSource.RIGHT_SIDE_UNIFIED
-        ):
-            from quant.routine.right_side_unified_production import (
-                run_right_side_unified_production,
-            )
-
-            _set_refresh_progress(
-                step_key="right_side_unified_features",
-                message="正在构建右侧统一模型生产因子与排序分",
-                percent=72,
-                complete_previous=False,
-            )
-            unified_ranking = run_right_side_unified_production(
-                expected_signal_date
-            )
-            if unified_ranking.get("status") != "success":
-                raise RuntimeError(
-                    str(unified_ranking.get("error") or "右侧统一生产排序失败")
-                )
-            results["right_side_unified_features"] = {
-                "status": "success",
-                "target_date": unified_ranking.get("target_date"),
-            }
-            results["right_side_unified_scores"] = unified_ranking
-            results["right_side_unified_adapter"] = {
-                **(unified_ranking.get("selector_adapter") or {}),
-                "status": "success",
-            }
-            for step_key, message, percent in (
-                ("right_side_unified_features", "右侧生产因子构建完成", 72),
-                ("right_side_unified_score", "右侧统一排序分计算完成", 76),
-                ("right_side_unified_adapter", "右侧 selector 排序适配校验完成", 78),
-            ):
-                _set_refresh_progress(
-                    step_key=step_key,
-                    step_status="success",
-                    message=message,
-                    percent=percent,
-                    complete_previous=False,
-                )
-
         _clear_selector_caches()
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)

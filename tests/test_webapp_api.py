@@ -1,6 +1,7 @@
 import json
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from datetime import date, datetime
 from pathlib import Path
@@ -139,7 +140,7 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(
         right_side_unified_production,
         "run_right_side_unified_production",
-        lambda target_date: {
+        lambda target_date, **kwargs: {
             "status": "success",
             "target_date": target_date,
             "checkpoint_reused": True,
@@ -682,6 +683,90 @@ def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -
     assert status["result"]["generate_dashboard"]["status"] == "success"
     assert status["result"]["model_score"]["status"] == "success"
     assert status["result"]["refresh_chan_model_scores"]["status"] == "success"
+
+
+def test_global_refresh_overlaps_right_side_with_chan_after_model_score(
+    monkeypatch,
+) -> None:
+    from quant.routine import right_side_unified_production
+
+    model_finished = threading.Event()
+    right_side_started = threading.Event()
+    worker_args: dict[str, int] = {}
+
+    def score(*, workers: int):
+        worker_args["model"] = workers
+        model_finished.set()
+        return {"status": "success"}
+
+    def chan(*, progress_callback, workers: int):
+        worker_args["chan"] = workers
+        assert right_side_started.wait(timeout=3)
+        return {"status": "success"}
+
+    def right_side(target_date: str, *, factor_workers: int):
+        assert model_finished.is_set()
+        worker_args["right_side"] = factor_workers
+        right_side_started.set()
+        return {
+            "status": "success",
+            "target_date": target_date,
+            "selector_adapter": {"status": "success"},
+        }
+
+    monkeypatch.setenv("ROUTINE_RIGHT_SIDE_WORKERS", "99")
+    status = _stub_successful_global_refresh(
+        monkeypatch,
+        score_latest_models=score,
+        refresh_chan_model_scores=chan,
+    )
+    monkeypatch.setattr(
+        right_side_unified_production,
+        "run_right_side_unified_production",
+        right_side,
+    )
+
+    services._run_latest_refresh_job("all", run_id="parallel-right-side")
+
+    assert status["status"] == "success", status.get("error")
+    assert worker_args == {"model": 4, "chan": 4, "right_side": 6}
+    assert status["result"]["right_side_unified_features"] == {
+        "status": "success",
+        "target_date": "2026-07-23",
+        "factor_workers": 6,
+    }
+
+
+def test_global_refresh_cancels_right_side_when_model_score_fails(
+    monkeypatch,
+) -> None:
+    from quant.routine import right_side_unified_production
+
+    right_side_calls = 0
+
+    def right_side(*args, **kwargs):
+        nonlocal right_side_calls
+        right_side_calls += 1
+        return {"status": "success"}
+
+    status = _stub_successful_global_refresh(
+        monkeypatch,
+        score_latest_models=lambda **kwargs: {
+            "status": "failed",
+            "stderr_tail": "model score failed",
+        },
+    )
+    monkeypatch.setattr(
+        right_side_unified_production,
+        "run_right_side_unified_production",
+        right_side,
+    )
+
+    services._run_latest_refresh_job("all", run_id="model-failure-cancels-right")
+
+    assert status["status"] == "failed"
+    assert right_side_calls == 0
+    assert "model score failed" in status["error"]
 
 
 def test_global_refresh_propagates_early_workspace_failure(monkeypatch) -> None:
@@ -1578,6 +1663,52 @@ def test_latest_extended_signals_reuses_candidate_parquet(monkeypatch, tmp_path)
     assert set(signals) == {"000002.SZ"}
     assert signals["000002.SZ"]["industry"] == "地产"
     assert signals["000002.SZ"]["signals"][0]["strategy_key"] == "NANA"
+
+
+def test_tea_variants_share_one_concurrent_live_score_build(monkeypatch) -> None:
+    build_started = threading.Event()
+    allow_build_to_finish = threading.Event()
+    calls = {"prepare": 0, "score": 0}
+
+    def prepare(module, signal_date):
+        calls["prepare"] += 1
+        build_started.set()
+        assert allow_build_to_finish.wait(timeout=3)
+        return pd.DataFrame({"date": [pd.Timestamp(signal_date)]}), pd.DataFrame(), {
+            "source": "test"
+        }
+
+    def build_scores(frame, **kwargs):
+        calls["score"] += 1
+        return frame.assign(score=1.0)
+
+    monkeypatch.setattr(
+        services,
+        "_tea_master_research_module",
+        lambda: SimpleNamespace(build_tea_scores=build_scores),
+    )
+    monkeypatch.setattr(services, "_prepare_tea_master_live_data", prepare)
+    services._tea_master_live_scores_cached.cache_clear()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                services._tea_master_live_scores,
+                "2026-07-30",
+            )
+            assert build_started.wait(timeout=3)
+            second = executor.submit(
+                services._tea_master_live_scores,
+                "20260730",
+            )
+            allow_build_to_finish.set()
+            first_result = first.result(timeout=3)
+            second_result = second.result(timeout=3)
+    finally:
+        services._tea_master_live_scores_cached.cache_clear()
+
+    assert calls == {"prepare": 1, "score": 1}
+    pd.testing.assert_frame_equal(first_result[0], second_result[0])
+    assert first_result[1] == second_result[1] == {"source": "test"}
 
 
 def test_long_stock_pool_variants_run_in_parallel_and_keep_order(monkeypatch) -> None:

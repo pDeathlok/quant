@@ -433,22 +433,17 @@ class OBV(Factor):
     
     def compute(self, data: pd.DataFrame) -> pd.Series:
         """计算能量潮指标"""
-        close = data["close"]
-        volume = data["volume"]
-        prev_close = close.shift(1)
-        
-        # 根据涨跌方向累加成交量
-        obv = pd.Series(0.0, index=data.index)
-        
-        for i in range(1, len(data)):
-            if close.iloc[i] > prev_close.iloc[i]:
-                obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
-            elif close.iloc[i] < prev_close.iloc[i]:
-                obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
-            else:
-                obv.iloc[i] = obv.iloc[i-1]
-        
-        return obv
+        close = pd.to_numeric(data["close"], errors="coerce").to_numpy(dtype=float)
+        volume = pd.to_numeric(data["volume"], errors="coerce").to_numpy(dtype=float)
+        signed_volume = np.zeros(len(data), dtype=float)
+        if len(data) > 1:
+            delta = close[1:] - close[:-1]
+            signed_volume[1:] = np.where(
+                delta > 0.0,
+                volume[1:],
+                np.where(delta < 0.0, -volume[1:], 0.0),
+            )
+        return pd.Series(np.cumsum(signed_volume), index=data.index)
 
 
 class CCI(RollingFactor):
@@ -475,10 +470,10 @@ class CCI(RollingFactor):
         tp_ma = tp.rolling(window=self.window).mean()
         
         # 计算平均绝对偏差（手动实现，兼容新版本 pandas）
-        def mad_func(x):
-            return abs(x - x.mean()).mean()
-        
-        mad = tp.rolling(window=self.window).apply(mad_func)
+        def mad_func(values: np.ndarray) -> float:
+            return float(np.abs(values - values.mean()).mean())
+
+        mad = tp.rolling(window=self.window).apply(mad_func, raw=True)
         
         # 计算 CCI
         cci = (tp - tp_ma) / (0.015 * mad)
