@@ -29,33 +29,31 @@ def test_adjusted_incremental_refresh_restarts_from_first_stored_date():
     assert data_refresh._symbol_refresh_start(existing, "20240104", adjust=None) == "20240104"
 
 
-def test_completed_market_end_date_caps_at_latest_publishable_calendar_date(monkeypatch):
-    monkeypatch.delenv("ROUTINE_MARKET_DATA_READY_TIME", raising=False)
-
-    before_ready = data_refresh._completed_market_end_date(
+def test_market_end_date_is_not_capped_by_an_intraday_clock_time():
+    before_close = data_refresh._bounded_market_end_date(
         "20260813",
         now=datetime(2026, 8, 13, 13, 0),
     )
-    after_ready = data_refresh._completed_market_end_date(
+    after_close = data_refresh._bounded_market_end_date(
         "20260813",
         now=datetime(2026, 8, 13, 16, 0),
     )
-    historical = data_refresh._completed_market_end_date(
+    historical = data_refresh._bounded_market_end_date(
         "20260812",
         now=datetime(2026, 8, 13, 13, 0),
     )
-    future = data_refresh._completed_market_end_date(
+    future = data_refresh._bounded_market_end_date(
         "20260814",
         now=datetime(2026, 8, 13, 16, 0),
     )
 
-    assert before_ready == ("20260812", True)
-    assert after_ready == ("20260813", False)
+    assert before_close == ("20260813", False)
+    assert after_close == ("20260813", False)
     assert historical == ("20260812", False)
     assert future == ("20260813", True)
 
 
-def test_refresh_daily_data_does_not_probe_unfinished_current_session(monkeypatch):
+def test_refresh_daily_data_probes_current_open_session_before_close(monkeypatch):
     real_datetime = datetime
 
     class FrozenDateTime(datetime):
@@ -83,13 +81,12 @@ def test_refresh_daily_data_does_not_probe_unfinished_current_session(monkeypatc
 
     def fake_open_trade_dates(fetcher, start_date, end_date):
         calendar_ranges.append((start_date, end_date))
-        return {"20260812"}
+        return {"20260812", "20260813"}
 
     def stop_at_availability_probe(fetcher, trade_date, symbols, **kwargs):
         probed_dates.append(trade_date)
         raise ProbeReached
 
-    monkeypatch.delenv("ROUTINE_MARKET_DATA_READY_TIME", raising=False)
     monkeypatch.setattr(data_refresh, "datetime", FrozenDateTime)
     monkeypatch.setattr(data_refresh, "TushareDataFetcher", DummyTushareFetcher)
     monkeypatch.setattr(
@@ -107,8 +104,8 @@ def test_refresh_daily_data_does_not_probe_unfinished_current_session(monkeypatc
     with pytest.raises(ProbeReached):
         data_refresh.refresh_daily_data(start_date="20260812", sleep_between=0)
 
-    assert calendar_ranges == [("20260812", "20260812")]
-    assert probed_dates == ["20260812"]
+    assert calendar_ranges == [("20260812", "20260813")]
+    assert probed_dates == ["20260813"]
 
 
 def test_market_daily_availability_allows_twelve_failures_before_final_probe():
@@ -322,8 +319,9 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
         {"trade_date": "20260605"},
     ]
     assert manifest["refresh_mode"] == "batch_by_trade_date"
-    assert manifest["end_date_adjusted_before_market_ready"] is False
-    assert manifest["availability_policy"] == "probe_latest_completed_open_trade_date"
+    assert manifest["end_date_capped_to_today"] is False
+    assert manifest["availability_policy"] == "probe_latest_open_trade_date_until_available"
+    assert "market_data_ready_time" not in manifest
     assert manifest["availability_probe"]["trade_date"] == "20260606"
     assert manifest["availability_probe"]["attempts"] == 1
     assert manifest["market_daily_requests"] == 2

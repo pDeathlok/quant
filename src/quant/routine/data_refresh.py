@@ -60,7 +60,6 @@ DEFAULT_BATCH_MIN_COVERAGE_RATE = 0.995
 DEFAULT_AVAILABILITY_RETRIES = 12
 DEFAULT_AVAILABILITY_RETRY_INTERVAL_SECONDS = 300.0
 MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
-DEFAULT_MARKET_DATA_READY_TIME = "16:00"
 
 
 class MarketBatchCoverageError(RuntimeError):
@@ -208,26 +207,16 @@ def _format_trade_date(value: pd.Timestamp) -> str:
     return value.strftime("%Y%m%d")
 
 
-def _market_data_ready_time() -> tuple[int, int]:
-    raw = os.getenv("ROUTINE_MARKET_DATA_READY_TIME", DEFAULT_MARKET_DATA_READY_TIME)
-    try:
-        parsed = datetime.strptime(raw, "%H:%M")
-    except ValueError as exc:
-        raise ValueError(
-            "ROUTINE_MARKET_DATA_READY_TIME must use HH:MM format"
-        ) from exc
-    return parsed.hour, parsed.minute
-
-
-def _completed_market_end_date(
+def _bounded_market_end_date(
     requested_end_date: str,
     *,
     now: datetime | None = None,
 ) -> tuple[str, bool]:
-    """Cap a request at the latest calendar date whose daily bar is publishable.
+    """Cap future requests at today's China-market calendar date.
 
-    The trade calendar is applied afterwards, so weekends and exchange holidays
-    naturally resolve to the most recent completed open session.
+    The exchange calendar selects the latest open session afterwards, and the
+    availability probe decides whether that session's daily data is usable.
+    There is deliberately no fixed intraday publication cutoff.
     """
 
     current = now or datetime.now(MARKET_TIMEZONE)
@@ -239,14 +228,9 @@ def _completed_market_end_date(
     if requested is None:
         raise ValueError(f"invalid end_date: {requested_end_date}")
 
-    hour, minute = _market_data_ready_time()
-    ready_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    latest_publishable = pd.Timestamp(current.date())
-    if current < ready_at:
-        latest_publishable -= pd.Timedelta(days=1)
-
-    completed_end = min(requested, latest_publishable)
-    return _format_trade_date(completed_end), completed_end != requested
+    latest_requestable = pd.Timestamp(current.date())
+    bounded_end = min(requested, latest_requestable)
+    return _format_trade_date(bounded_end), bounded_end != requested
 
 
 def _symbol_refresh_start(
@@ -921,7 +905,7 @@ def refresh_daily_data(
 ) -> dict:
     market_now = datetime.now(MARKET_TIMEZONE)
     requested_end_date = end_date or market_now.strftime("%Y%m%d")
-    end_date, end_date_adjusted = _completed_market_end_date(
+    end_date, end_date_capped = _bounded_market_end_date(
         requested_end_date,
         now=market_now,
     )
@@ -1061,12 +1045,8 @@ def refresh_daily_data(
         "start_date": start_date,
         "requested_end_date": requested_end_date,
         "end_date": end_date,
-        "end_date_adjusted_before_market_ready": end_date_adjusted,
-        "market_data_ready_time": os.getenv(
-            "ROUTINE_MARKET_DATA_READY_TIME",
-            DEFAULT_MARKET_DATA_READY_TIME,
-        ),
-        "availability_policy": "probe_latest_completed_open_trade_date",
+        "end_date_capped_to_today": end_date_capped,
+        "availability_policy": "probe_latest_open_trade_date_until_available",
         "availability_probe": availability_probe,
         "expected_trade_date": expected_trade_date,
         "dataset_trade_date": dataset_trade_date,

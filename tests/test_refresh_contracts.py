@@ -44,6 +44,11 @@ def test_build_progress_steps_returns_fresh_mutable_records() -> None:
     assert second[0]["status"] == "pending"
 
 
+@pytest.mark.parametrize("scope", sorted(REFRESH_SCOPE_STEPS))
+def test_every_page_refresh_starts_from_shared_market_daily_data(scope: str) -> None:
+    assert REFRESH_SCOPE_STEPS[scope][0] == "refresh_data"
+
+
 def test_daily_refresh_orders_factor_layer_before_long_page_outputs() -> None:
     steps = REFRESH_SCOPE_STEPS["all"]
 
