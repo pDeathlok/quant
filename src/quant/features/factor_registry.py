@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 
 import pandas as pd
 
+from quant.features.long_external_factors import LONG_EXTERNAL_FACTOR_COLUMNS
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
 )
@@ -22,6 +23,16 @@ class FactorDefinition:
     point_in_time: bool
     consumers: tuple[str, ...]
     role: str = "feature"
+    canonical_name: str = ""
+    layer: str = ""
+    calculation_entrypoint: str = ""
+    calculation_version: str = ""
+    refresh_cadence: str = "on_demand"
+    lifecycle: str = "research_candidate"
+
+
+FACTOR_REGISTRY_SCHEMA_VERSION = "factor_registry_v2_governed"
+LONG_PRODUCTION_FACTOR_SCHEMA_VERSION = "long-page-v2-governed-82"
 
 
 _ANALYST_FACTOR_COLUMNS = (
@@ -263,7 +274,27 @@ LONG_FACTOR_COLUMNS = (
     *LONG_ANNUAL_QUALITY_FACTOR_COLUMNS,
 )
 
+# The long page currently and deterministically produces this exact contract.
+# The remaining long factors stay registered as research candidates until their
+# calculators are wired into the production snapshot and pass daily coverage.
+LONG_PRODUCTION_FACTOR_COLUMNS = (
+    *LONG_FACTOR_COLUMNS[:29],
+    *(
+        name
+        for name in _ANALYST_FACTOR_COLUMNS
+        if name != "analyst_eps_3y_dispersion_180d"
+    ),
+    *_LONG_ENGINEERED_COLUMNS[:7],
+)
+LONG_RESEARCH_FACTOR_COLUMNS = tuple(
+    name for name in LONG_FACTOR_COLUMNS if name not in set(LONG_PRODUCTION_FACTOR_COLUMNS)
+)
+
 _EXTRA_DAILY_PROJECT_FACTORS = (
+    "psy_12",
+    "vr_6",
+    "vr_12",
+    "vr_24",
     "rsi_6",
     "rsi_24",
     "williams_r_14",
@@ -287,33 +318,133 @@ _EXTRA_DAILY_PROJECT_FACTORS = (
     "gt_9p5pct_cnt_60d",
 )
 
-_EXTRA_WEEKLY_LONG_FACTORS = (
-    "large_net_amount_ratio",
-    "large_net_3d_ratio",
-    "large_net_5d_ratio",
-    "moneyflow_net_ratio",
-    "small_net_amount_ratio",
-    "medium_net_amount_ratio",
-    "large_flow_persistence_5d",
-    "margin_balance",
-    "margin_balance_change",
-    "margin_buy_ratio_5d",
-    "short_balance",
-    "short_pressure_change_5d",
-    "top_list_count_20d",
-    "top_list_net_ratio_20d",
-    "top_list_positive_days_20d",
-    "top_list_reason_concentration_60d",
-    "holder_net_change_ratio_30d",
-    "holder_net_change_ratio_90d",
-    "holder_buy_event_count_180d",
-    "holder_avg_price_gap",
-    "holder_after_ratio_change_180d",
-    "pledge_ratio",
-    "pledge_ratio_change_13w",
-    "pledge_ratio_change_52w",
-    "pledge_event_count_26w",
-    "pledge_release_ratio_26w",
+_EXTRA_WEEKLY_LONG_FACTORS = LONG_EXTERNAL_FACTOR_COLUMNS
+
+FACTOR_ALIAS_TARGETS = {
+    "price_level": "close",
+    "bb_middle": "ma_20",
+    "kdj_k": "kdj_d_k",
+    "kdj_d": "kdj_d_d",
+    "kdj_j": "kdj_d_j",
+    "rs_pct_chg_1d": "pct_chg",
+    "rs_amplitude_pct": "amplitude_1",
+    "rs_vol_ratio_5_inclusive": "volume_relative_5d",
+    "rs_vol_ratio_20_inclusive": "volume_relative_20d",
+    "rs_family_kdj_j": "kdj_d_j",
+}
+
+SELECTOR_LIVE_FACTOR_COLUMNS = (
+    "group__B2",
+    "group__B3",
+    "group__CHANGAN",
+    "group__DOUBLE_YANG",
+    "group__KENGQI",
+    "group__LOW_PULLBACK",
+    "group__RHYTHM_PLATFORM",
+    "group__SB1",
+    "group__STRONG_K",
+    "group__SUPER_B1",
+    "group__SUPPORT_PULLBACK",
+    "group__TRIPLE_VOLUME_BREAKOUT",
+    "group__VEGAS",
+    "matched_count",
+    "selector_amplitude_1d",
+    "selector_close_pos",
+    "selector_excess_return_1d",
+    "selector_gap_1d",
+    "selector_high_1d",
+    "selector_low_1d",
+    "selector_market_dispersion_1d",
+    "selector_market_down5_ratio_1d",
+    "selector_market_mean_1d",
+    "selector_market_mean_20d",
+    "selector_market_mean_5d",
+    "selector_market_median_1d",
+    "selector_market_up5_ratio_1d",
+    "selector_market_up_ratio_1d",
+    "selector_market_up_ratio_20d",
+    "selector_market_up_ratio_5d",
+    "selector_positive_ratio_10d",
+    "selector_positive_ratio_20d",
+    "selector_positive_ratio_5d",
+    "selector_return_10d",
+    "selector_return_1d",
+    "selector_return_20d",
+    "selector_return_3d",
+    "selector_return_5d",
+    "selector_return_60d",
+    "selector_turnover_relative_20d",
+    "selector_turnover_relative_5d",
+    "selector_volatility_10d",
+    "selector_volatility_20d",
+    "selector_volatility_5d",
+    "selector_volatility_60d",
+    "selector_volume_relative_10d",
+    "selector_volume_relative_20d",
+    "selector_volume_relative_5d",
+    "selector_volume_relative_60d",
+)
+
+CHAN_LIVE_FACTOR_COLUMNS = (
+    "amount_rel20",
+    "chan_center_width",
+    "chan_score",
+    "close_pos_20",
+    "db_circ_mv_log",
+    "db_float_mv_ratio",
+    "db_free_float_share_ratio",
+    "db_pb_inv",
+    "db_pb_pct_rank",
+    "db_pe_ttm_inv",
+    "db_ps_ttm_inv",
+    "db_total_mv_log",
+    "db_total_mv_pct_rank",
+    "db_turnover_rate",
+    "db_turnover_rate_f",
+    "db_turnover_rate_pct_rank",
+    "db_volume_ratio",
+    "db_volume_ratio_pct_rank",
+    "limit_down_ratio_proxy",
+    "limit_up_count_proxy",
+    "limit_up_ratio_proxy",
+    "ma10_dist",
+    "ma20_dist",
+    "ma20_slope_5d",
+    "ma5_dist",
+    "ma60_dist",
+    "market_median_ret_1d",
+    "market_panic_5d",
+    "market_sentiment_5d",
+    "market_up_ratio",
+    "ret_10d",
+    "ret_1d",
+    "ret_20d",
+    "ret_3d",
+    "ret_5d",
+    "strong_up_ratio_proxy",
+    "top_list_count",
+    "top_net_amount_ratio",
+    "top_net_rate",
+    "turnover_rate",
+    "turnover_rate_ma20",
+    "turnover_rate_rel20",
+    "volatility_20d",
+    "volume_rel20",
+    "volume_rel5",
+    "volume_z20",
+)
+
+PRODUCTION_REGISTRY_COLUMNS = tuple(
+    dict.fromkeys(
+        (
+            *PROJECT_FACTOR_COLUMNS,
+            *RULE_FEATURE_COLUMNS,
+            *RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+            *SELECTOR_LIVE_FACTOR_COLUMNS,
+            *CHAN_LIVE_FACTOR_COLUMNS,
+            *LONG_PRODUCTION_FACTOR_COLUMNS,
+        )
+    )
 )
 
 
@@ -328,7 +459,18 @@ def _daily_family(name: str) -> tuple[str, str]:
         return "volume_liquidity", "tushare_daily_ohlcv"
     if name.startswith(("volatility", "downside", "atr", "amplitude")):
         return "risk", "tushare_daily_ohlcv"
-    if name.startswith(("limit_up_cnt", "gt_9p5pct_cnt", "williams_r", "cmf", "eom", "price_volume_ratio")):
+    if name.startswith(
+        (
+            "limit_up_cnt",
+            "gt_9p5pct_cnt",
+            "williams_r",
+            "cmf",
+            "eom",
+            "price_volume_ratio",
+            "psy_",
+            "vr_",
+        )
+    ):
         return "momentum_timing", "tushare_daily_ohlcv"
     if name.startswith(("return", "momentum", "reversal", "bias", "rsi", "kdj", "macd")):
         return "momentum_timing", "tushare_daily_ohlcv"
@@ -339,6 +481,15 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
     definitions: list[FactorDefinition] = []
     for name in PROJECT_FACTOR_COLUMNS:
         family, source = _daily_family(name)
+        consumers = [
+            "short_models",
+            "long_entry_weekly",
+            "right_side_unified_shadow",
+            "right_side_unified",
+        ]
+        if name in CHAN_LIVE_FACTOR_COLUMNS:
+            consumers.append("score.chan")
+        canonical_name = FACTOR_ALIAS_TARGETS.get(name, name)
         definitions.append(
             FactorDefinition(
                 name=name,
@@ -346,11 +497,17 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 frequency="daily",
                 source=source,
                 point_in_time=True,
-                consumers=(
-                    "short_models",
-                    "long_entry_weekly",
-                    "right_side_unified_shadow",
-                    "right_side_unified",
+                consumers=tuple(consumers),
+                role=("compatibility_alias" if canonical_name != name else "feature"),
+                canonical_name=canonical_name,
+                layer="project_daily",
+                calculation_entrypoint=(
+                    "quant.features.project_factor_layer.calculate_project_factor_frame"
+                ),
+                calculation_version="schema_resolved_at_runtime",
+                refresh_cadence="trade_daily",
+                lifecycle=(
+                    "compatibility_alias" if canonical_name != name else "production_model"
                 ),
             )
         )
@@ -358,6 +515,7 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
     for name in RULE_FEATURE_COLUMNS:
         if name in existing:
             continue
+        canonical_name = FACTOR_ALIAS_TARGETS.get(name, name)
         definitions.append(
             FactorDefinition(
                 name=name,
@@ -366,6 +524,19 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 source="quant.research.right_side_unified_features.compute_right_side_rule_features",
                 point_in_time=True,
                 consumers=("right_side_unified_shadow", "right_side_unified"),
+                role=("compatibility_alias" if canonical_name != name else "feature"),
+                canonical_name=canonical_name,
+                layer="right_side_rule",
+                calculation_entrypoint=(
+                    "quant.research.right_side_unified_features.compute_right_side_rule_features"
+                ),
+                calculation_version="right_side_rule_features_v2_118_20260813",
+                refresh_cadence="trade_daily",
+                lifecycle=(
+                    "compatibility_alias"
+                    if canonical_name != name
+                    else "production_materialized"
+                ),
             )
         )
         existing.add(name)
@@ -381,6 +552,52 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 point_in_time=True,
                 consumers=("right_side_unified_shadow", "right_side_unified"),
                 role="strategy_identity",
+                canonical_name=name,
+                layer="right_side_identity",
+                calculation_entrypoint="canonical_right_side_signal_cache",
+                calculation_version="right_side_unified_signal_v1_live_z_20260813",
+                refresh_cadence="trade_daily",
+                lifecycle="strategy_identity",
+            )
+        )
+        existing.add(name)
+    for name in SELECTOR_LIVE_FACTOR_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="selector_live",
+                frequency="daily",
+                source="market_daily+daily_basic+strategy_signal_groups",
+                point_in_time=True,
+                consumers=("score.selector",),
+                canonical_name=name,
+                layer="selector_live",
+                calculation_entrypoint="quant.webapp.services._selector_live_feature_rows",
+                calculation_version="active_model_artifact_contract",
+                refresh_cadence="trade_daily",
+                lifecycle="production_model",
+            )
+        )
+        existing.add(name)
+    for name in CHAN_LIVE_FACTOR_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="chan_live",
+                frequency="daily",
+                source="market_daily+daily_basic+top_list+market_cross_section",
+                point_in_time=True,
+                consumers=("score.chan",),
+                canonical_name=name,
+                layer="chan_live",
+                calculation_entrypoint="scripts.research.refresh_chan_model_live_scores",
+                calculation_version="active_model_artifact_contract",
+                refresh_cadence="trade_daily",
+                lifecycle="production_model",
             )
         )
         existing.add(name)
@@ -388,6 +605,7 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
         if name in existing:
             continue
         family, source = _daily_family(name)
+        canonical_name = FACTOR_ALIAS_TARGETS.get(name, name)
         definitions.append(
             FactorDefinition(
                 name=name,
@@ -395,16 +613,27 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 frequency="daily",
                 source="quant.features.project_factor_layer",
                 point_in_time=True,
-                consumers=("short_models", "long_entry_weekly"),
+                consumers=(),
+                role=("compatibility_alias" if canonical_name != name else "feature"),
+                canonical_name=canonical_name,
+                layer="project_daily_candidate",
+                calculation_entrypoint=(
+                    "quant.features.project_factor_layer.calculate_legacy_market_factors"
+                ),
+                calculation_version="project-v4-causal-price-alpha",
+                refresh_cadence="on_demand",
+                lifecycle=(
+                    "compatibility_alias" if canonical_name != name else "research_candidate"
+                ),
             )
         )
         existing.add(name)
     for name in _EXTRA_WEEKLY_LONG_FACTORS:
         if name in existing:
             continue
-        if name.startswith(("large_", "moneyflow_")):
+        if name.startswith(("large_", "moneyflow_", "small_", "medium_")):
             family, source = "moneyflow", "quant.features.long_external_factors"
-        elif name.startswith("margin_"):
+        elif name.startswith(("margin_", "short_")):
             family, source = "margin", "quant.features.long_external_factors"
         elif name.startswith("top_list_"):
             family, source = "top_list", "quant.features.long_external_factors"
@@ -419,7 +648,15 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 frequency="weekly",
                 source=source,
                 point_in_time=True,
-                consumers=("long_entry_weekly",),
+                consumers=(),
+                canonical_name=name,
+                layer="long_external_candidate",
+                calculation_entrypoint=(
+                    "quant.features.long_external_factors.build_weekly_external_factor_cache"
+                ),
+                calculation_version="long-external-v1-pit",
+                refresh_cadence="on_demand",
+                lifecycle="research_candidate",
             )
         )
         existing.add(name)
@@ -468,6 +705,7 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
             family, source = "fundamental_quality", "financial_ann_date_pit"
         else:
             family, source = "good_stock_quality", "financial_ann_date_pit"
+        is_production = name in LONG_PRODUCTION_FACTOR_COLUMNS
         definitions.append(
             FactorDefinition(
                 name=name,
@@ -475,9 +713,21 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 frequency="weekly",
                 source=source,
                 point_in_time=True,
-                consumers=("long_entry_quality_shadow",)
-                if name in LONG_ANNUAL_QUALITY_FACTOR_COLUMNS
-                else ("long_entry_weekly",),
+                consumers=("long_entry_weekly",)
+                if is_production
+                else ("long_entry_quality_shadow",),
+                canonical_name=name,
+                layer="long_snapshot" if is_production else "long_research",
+                calculation_entrypoint=(
+                    "quant.webapp.services._tea_master_live_scores"
+                    if is_production
+                    else "quant.features.long_weekly_factors.build_long_weekly_factor_frame"
+                ),
+                calculation_version=(
+                    LONG_PRODUCTION_FACTOR_SCHEMA_VERSION if is_production else "research"
+                ),
+                refresh_cadence="trade_daily" if is_production else "on_demand",
+                lifecycle="production_materialized" if is_production else "research_candidate",
             )
         )
     return tuple(definitions)
@@ -498,3 +748,39 @@ def validate_registry() -> None:
     unsafe = [definition.name for definition in FACTOR_REGISTRY if not definition.point_in_time]
     if unsafe:
         raise ValueError(f"non-point-in-time factors cannot enter the production registry: {unsafe}")
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+    aliases = [
+        definition for definition in FACTOR_REGISTRY if definition.role == "compatibility_alias"
+    ]
+    invalid_aliases = sorted(
+        definition.name
+        for definition in aliases
+        if not definition.canonical_name
+        or definition.canonical_name == definition.name
+        or definition.canonical_name not in definitions
+    )
+    if invalid_aliases:
+        raise ValueError(f"invalid compatibility aliases: {invalid_aliases}")
+    invalid_canonical = sorted(
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.role == "feature" and definition.canonical_name != definition.name
+    )
+    if invalid_canonical:
+        raise ValueError(f"canonical factors must self-reference: {invalid_canonical}")
+    missing_production = sorted(set(PRODUCTION_REGISTRY_COLUMNS) - set(definitions))
+    if missing_production:
+        raise ValueError(f"production factors missing from registry: {missing_production}")
+    if len(LONG_PRODUCTION_FACTOR_COLUMNS) != 82:
+        raise ValueError("long production factor contract must contain 82 columns")
+    invalid_metadata = sorted(
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if not definition.layer
+        or not definition.calculation_entrypoint
+        or not definition.calculation_version
+        or not definition.refresh_cadence
+        or not definition.lifecycle
+    )
+    if invalid_metadata:
+        raise ValueError(f"factor governance metadata is incomplete: {invalid_metadata}")

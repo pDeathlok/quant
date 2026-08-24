@@ -67,6 +67,10 @@ from quant.data.atomic_io import (
 from quant.data.source_merge import normalize_ts_code
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
+from quant.features.factor_registry import (
+    LONG_PRODUCTION_FACTOR_COLUMNS,
+    LONG_PRODUCTION_FACTOR_SCHEMA_VERSION,
+)
 from quant.infrastructure.workspace_snapshots import (
     WorkspaceSnapshotRepository,
     canonical_snapshot_date,
@@ -242,7 +246,7 @@ BLOOD_CHIP_LONG_SNAPSHOT_DIR = PROJECT_ROOT / "data/blood_chip_long_snapshots"
 BLOOD_CHIP_DAILY_DIR = PROJECT_ROOT / "data/raw/daily_partitioned"
 BLOOD_CHIP_BENCHMARK_PATH = PROJECT_ROOT / "data/raw/index_000300.SH.parquet"
 LONG_PRICE_SCORE_BAND_CONFIG_PATH = PROJECT_ROOT / "config/long_price_score_bands.json"
-LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION = "long-page-v1"
+LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION = LONG_PRODUCTION_FACTOR_SCHEMA_VERSION
 LONG_FACTOR_SNAPSHOT_DIR = PROJECT_ROOT / "data/features/long"
 LONG_FACTOR_REQUIRED_COLUMNS = (
     "date",
@@ -2089,13 +2093,12 @@ def _attach_analyst_forecast_for_display(frame: pd.DataFrame) -> pd.DataFrame:
 def _publish_long_factor_snapshot(frame: pd.DataFrame, signal_ts: pd.Timestamp) -> dict[str, Any]:
     """Publish the exact point-in-time factor cross-section used by the long page."""
 
-    # Keep the complete factor calculator out of Web application startup. The
-    # registry is only needed when the daily long snapshot is materialized.
-    from quant.features.factor_registry import LONG_FACTOR_COLUMNS
-
     if frame.empty:
         raise RuntimeError("长线因子截面为空，拒绝发布页面股票池")
-    missing = [column for column in LONG_FACTOR_REQUIRED_COLUMNS if column not in frame.columns]
+    required_columns = tuple(
+        dict.fromkeys((*LONG_FACTOR_REQUIRED_COLUMNS, *LONG_PRODUCTION_FACTOR_COLUMNS))
+    )
+    missing = [column for column in required_columns if column not in frame.columns]
     if missing:
         raise RuntimeError(f"长线因子截面缺少必需字段: {', '.join(missing)}")
 
@@ -2109,7 +2112,7 @@ def _publish_long_factor_snapshot(frame: pd.DataFrame, signal_ts: pd.Timestamp) 
         raise RuntimeError(f"长线因子截面存在重复股票: {signal_date}")
 
     identity_columns = ["date", "ts_code", "name", "industry", "close"]
-    factor_columns = [column for column in LONG_FACTOR_COLUMNS if column in snapshot.columns]
+    factor_columns = list(LONG_PRODUCTION_FACTOR_COLUMNS)
     columns = list(dict.fromkeys([*identity_columns, *factor_columns]))
     snapshot = snapshot[[column for column in columns if column in snapshot.columns]].copy()
     snapshot["factor_schema_version"] = LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION
@@ -2126,6 +2129,9 @@ def _publish_long_factor_snapshot(frame: pd.DataFrame, signal_ts: pd.Timestamp) 
         "signal_date": signal_date,
         "rows": int(len(snapshot)),
         "factor_count": int(len(factor_columns)),
+        "expected_factor_count": int(len(LONG_PRODUCTION_FACTOR_COLUMNS)),
+        "missing_factors": [],
+        "coverage_status": "complete",
         "source": "long_page_point_in_time_cross_section",
         "dated_path": str(dated_path),
         "latest_path": str(latest_path),

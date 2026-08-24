@@ -18,6 +18,34 @@ import pandas as pd
 
 
 EXTERNAL_FACTOR_VERSION = "long-external-v1-pit"
+LONG_EXTERNAL_FACTOR_COLUMNS = (
+    "large_net_amount_ratio",
+    "large_net_3d_ratio",
+    "large_net_5d_ratio",
+    "moneyflow_net_ratio",
+    "small_net_amount_ratio",
+    "medium_net_amount_ratio",
+    "large_flow_persistence_5d",
+    "margin_balance",
+    "margin_balance_change",
+    "margin_buy_ratio_5d",
+    "short_balance",
+    "short_pressure_change_5d",
+    "top_list_count_20d",
+    "top_list_net_ratio_20d",
+    "top_list_positive_days_20d",
+    "top_list_reason_concentration_60d",
+    "holder_net_change_ratio_30d",
+    "holder_net_change_ratio_90d",
+    "holder_buy_event_count_180d",
+    "holder_avg_price_gap",
+    "holder_after_ratio_change_180d",
+    "pledge_ratio",
+    "pledge_ratio_change_13w",
+    "pledge_ratio_change_52w",
+    "pledge_event_count_26w",
+    "pledge_release_ratio_26w",
+)
 
 
 def _numeric(frame: pd.DataFrame, columns: Iterable[str]) -> None:
@@ -403,7 +431,11 @@ def build_weekly_external_factor_cache(
     temporary = cache_path.with_suffix(f".{os.getpid()}.tmp.parquet")
     result.to_parquet(temporary, index=False)
     os.replace(temporary, cache_path)
-    factor_columns = [column for column in result.columns if column not in {"date", "ts_code"}]
+    missing = sorted(set(LONG_EXTERNAL_FACTOR_COLUMNS) - set(result.columns))
+    if missing:
+        raise RuntimeError(f"weekly external factor cache is missing columns: {missing}")
+    factor_columns = list(LONG_EXTERNAL_FACTOR_COLUMNS)
+    result = result[["date", "ts_code", *factor_columns]]
     coverage = {column: float(result[column].notna().mean()) for column in factor_columns}
     manifest: dict[str, object] = {
         "status": "success",

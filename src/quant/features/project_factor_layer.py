@@ -130,6 +130,58 @@ def _prepare_daily(daily: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
     return out
 
 
+def _round_half_up_to_cent(values: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    return np.floor(numeric * 100.0 + 0.50000001) / 100.0
+
+
+def calculate_limit_up_flags(frame: pd.DataFrame) -> pd.Series:
+    """Return board-, date-, and ST-aware A-share limit-up closes.
+
+    Prefer an exchange-provided ``up_limit`` column when available. The local
+    fallback covers ordinary continuous-trading days; rows without a usable
+    previous close remain false instead of fabricating an IPO limit.
+    """
+
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    pre_close = pd.to_numeric(
+        frame.get("pre_close", close.shift(1)),
+        errors="coerce",
+    )
+    if "up_limit" in frame.columns:
+        provided = pd.to_numeric(frame["up_limit"], errors="coerce")
+    else:
+        provided = pd.Series(np.nan, index=frame.index, dtype=float)
+
+    code_source = frame.get("ts_code", frame.get("symbol", ""))
+    if isinstance(code_source, pd.Series):
+        codes = code_source.fillna("").astype(str).str.upper()
+    else:
+        codes = pd.Series(str(code_source).upper(), index=frame.index)
+    names = frame.get("name", pd.Series("", index=frame.index))
+    if not isinstance(names, pd.Series):
+        names = pd.Series(str(names), index=frame.index)
+    names = names.fillna("").astype(str).str.upper()
+    dates = pd.to_datetime(frame.get("date"), errors="coerce")
+
+    is_beijing = codes.str.endswith(".BJ") | codes.str.match(r"^(4|8|92)")
+    is_star = codes.str.match(r"^(688|689)")
+    is_chinext = codes.str.match(r"^(300|301)")
+    chinext_reform = is_chinext & dates.ge(pd.Timestamp("2020-08-24"))
+    is_main_st = names.str.contains("ST", regex=False) & ~(
+        is_beijing | is_star | chinext_reform
+    )
+
+    ratio = pd.Series(0.10, index=frame.index, dtype=float)
+    ratio.loc[is_main_st] = 0.05
+    ratio.loc[is_star | chinext_reform] = 0.20
+    ratio.loc[is_beijing] = 0.30
+    fallback = _round_half_up_to_cent(pre_close * (1.0 + ratio))
+    limit_price = provided.combine_first(fallback)
+    valid = close.notna() & pre_close.gt(0) & limit_price.notna()
+    return (valid & close.ge(limit_price - 1e-8)).astype(bool)
+
+
 def _calculate_legacy_alpha101(frame: pd.DataFrame) -> pd.DataFrame:
     """Exact pre-v4 single-symbol Alpha101 semantics for pinned models only."""
 
@@ -187,8 +239,8 @@ def calculate_legacy_market_factors(
 ) -> pd.DataFrame:
     """Calculate the historical B1 factor family without strategy-local code."""
 
-    frame = daily.sort_values("date").reset_index(drop=True)
-    frame = frame.copy()
+    frame = daily.sort_values("date").reset_index(drop=True).copy()
+    limit_up = calculate_limit_up_flags(frame)
     schema = resolve_project_factor_schema(factor_schema_version)
     price_builder = (
         build_latest_scale_ohlc
@@ -202,7 +254,6 @@ def calculate_legacy_market_factors(
     frame["pct_chg"] = frame["close"].pct_change() * 100
     factors = pd.DataFrame(index=frame.index)
     gt_9p5pct = frame["pct_chg"] > 9.5
-    limit_up = frame["pct_chg"] >= 9.5
 
     for window in (3, 5, 10, 20, 60):
         factors[f"limit_up_cnt_{window}d"] = limit_up.rolling(window, min_periods=window).sum()
@@ -222,7 +273,7 @@ def calculate_legacy_market_factors(
     bands = BollingerBands().compute(frame)
     if isinstance(bands, pd.DataFrame):
         factors["bb_upper"] = bands.iloc[:, 0]
-        factors["bb_middle"] = bands.iloc[:, 1]
+        factors["bb_middle"] = factors["ma_20"]
         factors["bb_lower"] = bands.iloc[:, 2]
     else:
         factors["bb_middle"] = bands

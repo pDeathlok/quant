@@ -7,7 +7,9 @@ import pandas as pd
 import pytest
 
 from quant.features.factor_registry import (
+    CHAN_LIVE_FACTOR_COLUMNS,
     FACTOR_REGISTRY,
+    FACTOR_ALIAS_TARGETS,
     LONG_ANNUAL_QUALITY_ASSET_FACTOR_COLUMNS,
     LONG_ANNUAL_QUALITY_CASHFLOW_FACTOR_COLUMNS,
     LONG_ANNUAL_QUALITY_FACTOR_COLUMNS,
@@ -15,6 +17,10 @@ from quant.features.factor_registry import (
     LONG_ANNUAL_QUALITY_RAW_FACTOR_COLUMNS,
     LONG_ANNUAL_QUALITY_SCORE_FACTOR_COLUMNS,
     LONG_FACTOR_COLUMNS,
+    LONG_PRODUCTION_FACTOR_COLUMNS,
+    LONG_RESEARCH_FACTOR_COLUMNS,
+    PRODUCTION_REGISTRY_COLUMNS,
+    SELECTOR_LIVE_FACTOR_COLUMNS,
     validate_registry,
 )
 from quant.features.right_side_factor_contract import (
@@ -30,6 +36,8 @@ from quant.features.project_factor_layer import (
     PROJECT_FACTOR_SCHEMA_VERSION,
     admit_factors_by_sample,
     calculate_project_factor_frame,
+    calculate_legacy_market_factors,
+    calculate_limit_up_flags,
     calculate_project_market_factors,
 )
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
@@ -154,6 +162,81 @@ def test_registry_is_unique_and_covers_daily_and_long_contracts() -> None:
     assert all(definition.point_in_time for definition in FACTOR_REGISTRY)
 
 
+def test_registry_governance_separates_canonical_alias_and_lifecycle() -> None:
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+    role_counts = pd.Series([definition.role for definition in FACTOR_REGISTRY]).value_counts()
+
+    assert len(FACTOR_REGISTRY) == 607
+    assert role_counts.to_dict() == {
+        "feature": 583,
+        "strategy_identity": 14,
+        "compatibility_alias": 10,
+    }
+    assert set(PRODUCTION_REGISTRY_COLUMNS) <= set(definitions)
+    assert set(SELECTOR_LIVE_FACTOR_COLUMNS) <= set(definitions)
+    assert set(CHAN_LIVE_FACTOR_COLUMNS) <= set(definitions)
+    assert len(LONG_PRODUCTION_FACTOR_COLUMNS) == 82
+    assert len(LONG_RESEARCH_FACTOR_COLUMNS) == 108
+    assert not set(LONG_PRODUCTION_FACTOR_COLUMNS) & set(LONG_RESEARCH_FACTOR_COLUMNS)
+    assert definitions["rsi_6"].lifecycle == "research_candidate"
+    assert definitions["selector_return_1d"].lifecycle == "production_model"
+    assert definitions["short_balance"].family == "margin"
+    assert definitions["small_net_amount_ratio"].family == "moneyflow"
+    for alias, canonical in FACTOR_ALIAS_TARGETS.items():
+        assert definitions[alias].role == "compatibility_alias"
+        assert definitions[alias].canonical_name == canonical
+
+
+def test_registry_includes_computable_psy_and_vr_candidates() -> None:
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+
+    for name in ("psy_12", "vr_6", "vr_12", "vr_24"):
+        assert definitions[name].lifecycle == "research_candidate"
+        assert definitions[name].calculation_entrypoint.endswith(
+            "calculate_legacy_market_factors"
+        )
+
+
+def test_exact_compatibility_aliases_share_values() -> None:
+    legacy = calculate_legacy_market_factors(_daily())
+    project = calculate_project_market_factors(_daily())
+
+    pd.testing.assert_series_equal(
+        project["close"], project["price_level"], check_names=False
+    )
+    pd.testing.assert_series_equal(
+        project["ma_20"], project["bb_middle"], check_names=False
+    )
+    for alias, canonical in {
+        "kdj_k": "kdj_d_k",
+        "kdj_d": "kdj_d_d",
+        "kdj_j": "kdj_d_j",
+    }.items():
+        pd.testing.assert_series_equal(
+            legacy[alias], project[canonical], check_names=False
+        )
+
+
+def test_limit_up_flags_respect_board_st_and_exchange_limit_prices() -> None:
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                ["2026-08-21", "2026-08-21", "2026-08-21", "2026-08-21"]
+            ),
+            "ts_code": ["600000.SH", "600001.SH", "300001.SZ", "430001.BJ"],
+            "name": ["主板", "ST测试", "创业板", "北交所"],
+            "pre_close": [10.0, 10.0, 10.0, 10.0],
+            "close": [11.0, 10.5, 11.0, 13.0],
+        }
+    )
+
+    assert calculate_limit_up_flags(frame).tolist() == [True, True, False, True]
+
+    frame.loc[2, "close"] = 12.0
+    frame["up_limit"] = [11.0, 10.5, 12.0, 13.0]
+    assert calculate_limit_up_flags(frame).all()
+
+
 def test_registry_covers_stable_annual_quality_model_contract() -> None:
     definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
 
@@ -248,6 +331,9 @@ def test_pipeline_publishes_factor_registry_snapshot(monkeypatch, tmp_path) -> N
     assert result["status"] == "success"
     payload = json.loads((tmp_path / "data/features/factor_registry/latest.json").read_text())
     assert payload["factor_count"] == len(FACTOR_REGISTRY)
+    assert payload["canonical_factor_count"] == 583
+    assert payload["compatibility_alias_count"] == 10
+    assert payload["strategy_identity_count"] == 14
     assert payload["point_in_time_factor_count"] == payload["factor_count"]
 
 

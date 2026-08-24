@@ -27,7 +27,11 @@ from quant.application.selector_ranking import (
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_json as publish_json
 from quant.features.market_regime import classify_market_regime
-from quant.features.factor_registry import registry_frame, validate_registry
+from quant.features.factor_registry import (
+    FACTOR_REGISTRY_SCHEMA_VERSION,
+    registry_frame,
+    validate_registry,
+)
 from quant.features.project_factor_layer import (
     LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
     PROJECT_FACTOR_SCHEMA_VERSION,
@@ -743,6 +747,22 @@ def refresh_factor_registry_snapshot() -> dict:
             str(key): int(value)
             for key, value in registry["frequency"].value_counts().sort_index().items()
         }
+        role_counts = {
+            str(key): int(value)
+            for key, value in registry["role"].value_counts().sort_index().items()
+        }
+        lifecycle_counts = {
+            str(key): int(value)
+            for key, value in registry["lifecycle"].value_counts().sort_index().items()
+        }
+        factor_layer_counts = {
+            str(key): int(value)
+            for key, value in registry["layer"].value_counts().sort_index().items()
+        }
+        refresh_cadence_counts = {
+            str(key): int(value)
+            for key, value in registry["refresh_cadence"].value_counts().sort_index().items()
+        }
         dependency_summary = {
             "schema_version": DEFAULT_DAILY_DEPENDENCY_REGISTRY.schema_version,
             "node_count": len(DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes),
@@ -758,6 +778,7 @@ def refresh_factor_registry_snapshot() -> dict:
             "runtime_snapshot": "data/contracts/daily_dependencies/latest.json",
         }
         contract_body = {
+            "registry_schema_version": FACTOR_REGISTRY_SCHEMA_VERSION,
             "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
             "factors": registry.to_dict(orient="records"),
             "daily_dependency_registry": dependency_summary,
@@ -771,14 +792,26 @@ def refresh_factor_registry_snapshot() -> dict:
             existing = {}
         payload = {
             "status": "success",
+            "registry_schema_version": FACTOR_REGISTRY_SCHEMA_VERSION,
             "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "contract_hash": contract_hash,
             "factor_count": int(len(registry)),
+            "canonical_factor_count": int(registry["role"].eq("feature").sum()),
+            "compatibility_alias_count": int(
+                registry["role"].eq("compatibility_alias").sum()
+            ),
+            "strategy_identity_count": int(
+                registry["role"].eq("strategy_identity").sum()
+            ),
             "family_counts": family_counts,
             "frequency_counts": frequency_counts,
+            "role_counts": role_counts,
+            "lifecycle_counts": lifecycle_counts,
+            "factor_layer_counts": factor_layer_counts,
+            "refresh_cadence_counts": refresh_cadence_counts,
             "point_in_time_factor_count": int(registry["point_in_time"].sum()),
-            "calculation_entrypoint": "quant.features.project_factor_layer.calculate_project_factor_frame",
+            "calculation_entrypoint": "multiple; see factors[].calculation_entrypoint",
             "applications": {
                 "short_daily_current": "gate first, then complete current causal project factors",
                 "short_daily_released": (

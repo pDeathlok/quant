@@ -2,14 +2,16 @@
 
 项目现在把“因子定义、计算、刷新、应用”拆成同一契约下的四层，而不是继续把 B1 候选缓存当作项目因子层：
 
-- `factor_registry.py`：机器可读注册表，当前登记 147 个日频项目因子和 190 个长线因子字段；其中新增 23 个首次公告日点时年度质量字段和 11 个质量/覆盖/相对价值子分；
+- `factor_registry.py`：机器可读治理注册表，当前共 607 条记录，包括 583 个规范因子、10 个兼容别名和 14 个策略身份字段；每条记录均声明规范名称、计算层、计算入口、计算版本、刷新节奏和生命周期；
 - `project_factor_layer.py`：完整日频因子唯一计算入口，市场因子与 `daily_basic` 合并后严格输出 147 列；
 - `daily_factor_layer.py`：门控和多策略共用的轻量滚动缓存，保留快速日刷能力；
-- `long_weekly_factors.py`：公告日/报告日点时的长线周频估值、双 PR、历史分位、行业相对和研报因子。
+- `long_weekly_factors.py`：公告日/报告日点时的长线周频估值、双 PR、历史分位、行业相对和研报因子；长线注册池为 190 个字段，其中生产快照合同固定 82 个，另外 108 个保留为按需研究候选。
+
+注册表还登记 25 个日频研究候选和 26 个长线外部候选。登记不等于上线：只有生命周期为 `production_model` 或 `production_materialized`，并进入活动每日依赖闭包的因子，才承诺生产日更。完整口径、迁移规则和清单分别见[因子治理与生命周期](factor_governance.md)和[完整因子目录](factor_catalog.md)。
 
 跨数据源、特征、模型分和最终产物的执行依赖由
 `src/quant/application/daily_dependencies.py` 统一登记；维护规则见
-[每日依赖注册表](daily_dependency_registry.md)。`factor_registry.py` 只负责字段元数据，不能替代执行 DAG。
+[每日依赖注册表](daily_dependency_registry.md)。`factor_registry.py` 负责字段治理和生命周期，不能替代执行 DAG；执行 DAG 也不得引用未注册的生产字段。
 
 每日 Web 刷新还会把长线页面实际使用的点时截面原子发布到
 `data/features/long/YYYYMMDD.parquet` 与 `latest.parquet`，最后再写页面股票池快照。
@@ -78,8 +80,10 @@ PYTHONPATH=src python scripts/research/audit_long_factor_sources.py
 
 修改公式时必须：
 
-1. 增加对应 schema/materialization version；
-2. 添加旧公式与新统一层的逐字段一致性测试；
-3. 将计算器或配置文件加入相应 `feature.*.contract_sources`，并核对回看单位；
-4. 先预热新版本，再切换消费者；
-5. 运行 `tests/test_daily_dependencies.py`，确保生产策略、模型和最终产物没有漏登记。
+1. 先以 `research_candidate` 登记规范名称、来源、计算入口、版本和点时属性；
+2. 增加对应 schema/materialization version；
+3. 添加旧公式与新统一层的逐字段一致性测试；
+4. 将计算器或配置文件加入相应 `feature.*.contract_sources`，并核对回看单位；
+5. 先预热新版本，再按[因子治理与生命周期](factor_governance.md)的晋级门禁切换消费者；
+6. 运行 `PYTHONPATH=src python scripts/generate_factor_catalog.py` 更新完整目录；
+7. 运行 `tests/test_daily_dependencies.py`，确保生产策略、模型和最终产物没有漏登记。

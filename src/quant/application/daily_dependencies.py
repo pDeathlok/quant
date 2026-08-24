@@ -18,9 +18,13 @@ from quant.application.selector_ranking import (
     RIGHT_SIDE_PRODUCTION_SCORE_SCHEMA_VERSION,
     SelectorRankingSource,
 )
+from quant.features.factor_registry import (
+    LONG_PRODUCTION_FACTOR_COLUMNS,
+    LONG_PRODUCTION_FACTOR_SCHEMA_VERSION,
+)
 
 
-REGISTRY_SCHEMA_VERSION = "daily_dependency_registry_v1"
+REGISTRY_SCHEMA_VERSION = "daily_dependency_registry_v2_factor_governance"
 PRODUCTION_PROJECT_FACTOR_SCHEMA = "project-v1-latest-scale-global-rank"
 RIGHT_SIDE_SHADOW_PROJECT_FACTOR_SCHEMA = "project-v4-causal-price-alpha"
 RIGHT_SIDE_SHADOW_RULE_FACTOR_SCHEMA = "right_side_rule_features_v2_118_20260813"
@@ -1050,8 +1054,27 @@ def build_default_daily_dependency_registry(
             (_edge("data.market_daily"), _edge("data.daily_basic"), _edge("data.csi300_daily"),
              _edge("data.stock_basic"), _edge("data.financial_pit"), _edge("data.analyst_pit"),
              _edge("feature.market_regime")),
-            _exact(_json("data/features/long/latest.json", "signal_date"),
-                   _result("long_stock_pool.variants.0", "signal_date", required=False)),
+            _exact(
+                _json(
+                    "data/features/long/latest.json",
+                    "signal_date",
+                    predicate_field="factor_count",
+                    expected_value=len(LONG_PRODUCTION_FACTOR_COLUMNS),
+                ),
+                _json(
+                    "data/features/long/latest.json",
+                    "signal_date",
+                    predicate_field="factor_schema_version",
+                    expected_value=LONG_PRODUCTION_FACTOR_SCHEMA_VERSION,
+                ),
+                _json(
+                    "data/features/long/latest.json",
+                    "signal_date",
+                    predicate_field="coverage_status",
+                    expected_value="complete",
+                ),
+                _result("long_stock_pool.variants.0", "signal_date", required=False),
+            ),
             _daily_incremental(
                 calendar_days=450,
                 years=8,
@@ -1060,6 +1083,7 @@ def build_default_daily_dependency_registry(
             "refresh_long_factor_snapshot",
             contract_sources=(
                 "src/quant/webapp/services.py",
+                "src/quant/features/factor_registry.py",
                 "configs/strategies/tea_master_long.yaml",
                 "configs/strategies/long_dividend_quality.yaml",
             ),

@@ -1950,7 +1950,13 @@ def test_long_stock_pool_worker_does_not_redirect_process_stdout(monkeypatch) ->
 def test_long_factor_snapshot_publishes_dated_latest_and_manifest(monkeypatch, tmp_path) -> None:
     rows = []
     for symbol, close in [("000001.SZ", 10.0), ("600000.SH", 12.0)]:
-        row = {column: 1.0 for column in services.LONG_FACTOR_REQUIRED_COLUMNS}
+        row = {
+            column: 1.0
+            for column in (
+                *services.LONG_FACTOR_REQUIRED_COLUMNS,
+                *services.LONG_PRODUCTION_FACTOR_COLUMNS,
+            )
+        }
         row.update(
             {
                 "date": pd.Timestamp("2026-07-30"),
@@ -1972,11 +1978,25 @@ def test_long_factor_snapshot_publishes_dated_latest_and_manifest(monkeypatch, t
     manifest = json.loads((tmp_path / "long/latest.json").read_text(encoding="utf-8"))
     assert result["signal_date"] == "2026-07-30"
     assert result["rows"] == 2
-    assert result["factor_count"] > 0
+    assert result["factor_count"] == len(services.LONG_PRODUCTION_FACTOR_COLUMNS)
+    assert result["coverage_status"] == "complete"
     assert (tmp_path / "long/20260730.parquet").is_file()
     assert latest["ts_code"].tolist() == ["000001.SZ", "600000.SH"]
     assert latest["factor_schema_version"].eq(services.LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION).all()
     assert manifest["latest_path"] == str(tmp_path / "long/latest.parquet")
+
+
+def test_long_factor_snapshot_rejects_incomplete_production_contract(tmp_path) -> None:
+    frame = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-07-30")],
+            "ts_code": ["000001.SZ"],
+            "good_stock_score": [80.0],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="长线因子截面缺少必需字段"):
+        services._publish_long_factor_snapshot(frame, pd.Timestamp("2026-07-30"))
 
 
 def test_long_refresh_publishes_factor_result_before_page_snapshot(monkeypatch) -> None:

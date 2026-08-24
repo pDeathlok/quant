@@ -30,7 +30,10 @@ from quant.application.daily_dependencies import (
     state_is_current,
 )
 from quant.data.atomic_io import atomic_write_json
-from quant.features.factor_registry import FACTOR_REGISTRY, LONG_FACTOR_COLUMNS
+from quant.features.factor_registry import (
+    FACTOR_REGISTRY,
+    LONG_PRODUCTION_FACTOR_COLUMNS,
+)
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
 )
@@ -38,7 +41,7 @@ from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 
 
 MODEL_CACHE_SCHEMA_VERSION = "daily_model_contract_cache_v1"
-SNAPSHOT_SCHEMA_VERSION = "daily_dependency_snapshot_v2"
+SNAPSHOT_SCHEMA_VERSION = "daily_dependency_snapshot_v3_factor_governance"
 DEFAULT_CONTRACT_DIR = Path("data/contracts/daily_dependencies")
 
 
@@ -628,7 +631,7 @@ def _feature_catalogs(
     chan = contracts.get("score.chan")
     return {
         "feature.project_daily": tuple(PROJECT_FACTOR_COLUMNS),
-        "feature.long_snapshot": tuple(LONG_FACTOR_COLUMNS),
+        "feature.long_snapshot": tuple(LONG_PRODUCTION_FACTOR_COLUMNS),
         "feature.selector_live": selector.required_feature_union if selector else (),
         "feature.chan_live": chan.required_feature_union if chan else (),
         "feature.right_side_unified_shadow": tuple(
@@ -1071,6 +1074,31 @@ def publish_daily_dependency_snapshot(
         }
     )
     registered = {definition.name for definition in FACTOR_REGISTRY}
+    registered_canonical = {
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.role == "feature"
+    }
+    registered_aliases = {
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.role == "compatibility_alias"
+    }
+    production_registered = {
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.lifecycle.startswith("production")
+        or definition.lifecycle == "strategy_identity"
+        or (
+            definition.lifecycle == "compatibility_alias"
+            and definition.refresh_cadence == "trade_daily"
+        )
+    }
+    research_registered = {
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.lifecycle == "research_candidate"
+    }
     freshness_audit = audit_required_freshness(
         registry,
         scope,
@@ -1161,6 +1189,10 @@ def publish_daily_dependency_snapshot(
         },
         "feature_inventory": {
             "registered_factor_count": len(registered),
+            "registered_canonical_factor_count": len(registered_canonical),
+            "registered_compatibility_alias_count": len(registered_aliases),
+            "registered_production_record_count": len(production_registered),
+            "registered_research_candidate_count": len(research_registered),
             "active_model_required_union_count": len(live_model_features),
             "active_model_features_not_in_factor_registry": sorted(
                 set(live_model_features) - registered

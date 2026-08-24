@@ -6,7 +6,7 @@
 
 项目保留三类职责不同的注册信息：
 
-1. `src/quant/features/factor_registry.py` 登记因子字段的名称、采样频率、来源、点时属性和描述性消费者，是字段目录，不负责编排；是否属于当前版本、是否需要日更只能以活动 DAG 与 artifact 合同为准。
+1. `src/quant/features/factor_registry.py` 是因子字段治理事实源，登记规范名称、兼容别名、计算层、计算入口、版本、来源、点时属性、刷新节奏、生命周期和消费者；完整规则见[因子治理与生命周期](factor_governance.md)，全部记录见[完整因子目录](factor_catalog.md)。注册表不负责编排，是否需要日更仍以活动 DAG 与 artifact 合同为准。
 2. `src/quant/application/daily_dependencies.py` 是生产日更的可执行四层 DAG，固定节点依赖、生命周期、频率、新鲜度、增量键、回看窗口、配置/计算器来源和最终门禁。
 3. 当前晋级模型 artifact 是模型输入列的事实来源。`src/quant/routine/daily_dependency_runtime.py` 只在 artifact 文件变化时加载模型，编译逐模型 required/effective features、SHA256 和活动产品闭包。
 
@@ -119,13 +119,14 @@ Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会
 
 ### 新因子或修改公式
 
-1. 通用字段先登记到 `factor_registry.py`，策略私有字段使用稳定前缀；
+1. 通用字段先以 `research_candidate` 登记到 `factor_registry.py`，策略私有字段使用稳定前缀；
 2. 更新唯一计算入口和 schema/materialization version；
 3. 将计算器/配置文件加入对应 `feature.*.contract_sources`；
 4. 声明真实回看单位：`context_lookback_sessions`、`context_lookback_calendar_days` 或 `context_lookback_years`；
 5. 添加目标日、缺列、全空、覆盖率和历史修订的测试；
 6. 添加 full-vs-incremental golden parity、重复运行幂等和 cache invalidation 测试；
-7. 重新训练并晋级使用新 schema 的模型，不能让旧模型静默消费新口径。
+7. 按治理门禁迁移到 `production_materialized`，或重新训练并晋级使用新 schema 的模型后迁移到 `production_model`；不能让旧模型静默消费新口径；
+8. 运行 `PYTHONPATH=src python scripts/generate_factor_catalog.py`，并将目录更新放入同一提交。
 
 ### 新模型或模型晋级
 
@@ -148,7 +149,7 @@ Z/Chan 目前仍从 `models/research` 路径被生产日更消费，注册表会
 
 ### 删除或停用
 
-先把所有生产消费者移出活动闭包，再将节点标为 `research_only` 或 `retired`。只有反向闭包中没有生产消费者的整节点，才可以停止日更。不要仅凭“未出现在某个模型 artifact”删除规则策略或页面使用的字段。
+先把所有生产消费者移出活动闭包，再把因子生命周期降为 `research_candidate`，把节点标为 `research_only` 或 `retired`。只有反向闭包中没有生产消费者的整节点，才可以停止日更。重复字段先迁移为指向规范字段的 `compatibility_alias`，经过至少一个生产发布周期且消费者归零后才允许删除。不要仅凭“未出现在某个模型 artifact”删除规则策略或页面使用的字段。
 
 ## 发布前验证
 
@@ -190,7 +191,7 @@ python -m json.tool data/contracts/daily_dependencies/latest.json
 python -m json.tool data/routine/latest_refresh_status.json
 ```
 
-`latest.json` 必须满足根字段 `schema_version == "daily_dependency_snapshot_v2"`、`identity_complete == true`、`baseline_committed == true`、`phase == "postflight"`、`status == "success"`、`freshness_audit.status == "success"`，且 `refresh_node_ids` 为空；`latest_refresh_status.json` 必须满足根字段 `status == "success"`、`result.dependency_postflight.status == "success"`、`result.dependency_postflight.baseline_committed == true`，且 `result.dependency_postflight.refresh_node_ids` 为空。若 exact-date 上游失败，任务必须保持 failed；断点续跑不能跳过陈旧源直接补尾段产品。
+`latest.json` 必须满足根字段 `schema_version == "daily_dependency_snapshot_v3_factor_governance"`、`identity_complete == true`、`baseline_committed == true`、`phase == "postflight"`、`status == "success"`、`freshness_audit.status == "success"`，且 `refresh_node_ids` 为空；`latest_refresh_status.json` 必须满足根字段 `status == "success"`、`result.dependency_postflight.status == "success"`、`result.dependency_postflight.baseline_committed == true`，且 `result.dependency_postflight.refresh_node_ids` 为空。若 exact-date 上游失败，任务必须保持 failed；断点续跑不能跳过陈旧源直接补尾段产品。
 
 ## 2026-08-13 验证基线
 

@@ -20,6 +20,9 @@
 
 ## 因子与变量
 
+- [因子治理与生命周期](factor_governance.md)：统一注册表、计算层、生产日更边界、生命周期状态机、迁移门禁和维护流程。
+- [完整因子目录](factor_catalog.md)：从机器注册表自动生成的全部因子、兼容别名和身份字段清单。
+- [每日统一因子层](daily_factor_layer.md)：日频项目因子、轻量缓存和长线快照的计算与物化边界。
 - [Tushare 因子体系](factor_tushare_factor_system.md)
 - [变量字典](factor_variable_dictionary.md)
 - [变量实现矩阵](factor_variable_implementation_matrix.md)
@@ -44,3 +47,4 @@
 3. 策略行为变化时，先更新策略档案，再更新生产配置和代码。
 4. 历史研究文档不覆盖重写；新增结论使用新文档或明确标注“已废弃/已替代”。
 5. 文档中的命令应从仓库根目录可执行，路径使用仓库相对路径。
+6. 修改因子注册表时必须在同一提交运行 `PYTHONPATH=src python scripts/generate_factor_catalog.py`，保证完整目录与代码一致。
