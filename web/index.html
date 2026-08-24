@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -346,6 +346,12 @@
               <span id="longPoolMeta" aria-live="polite">等待加载</span>
             </div>
             <div id="longStateCounts" class="state-counts"></div>
+          </div>
+          <div class="long-price-signal-legend" aria-label="好价格颜色提醒图例">
+            <span class="long-price-signal price-score">价格分</span>
+            <span class="long-price-signal pr-under-one">PR</span>
+            <span class="long-price-signal percentile-20">历史分位</span>
+            <span class="long-price-signal percentile-10">历史分位</span>
           </div>
           <div class="table-wrap long-pool-table-wrap">
             <table class="long-pool-table">
@@ -1053,6 +1059,16 @@
                 <span>操作条件与执行步骤</span>
                 <textarea id="operationPlanContent" maxlength="20000" rows="9" placeholder="触发条件：&#10;计划动作：&#10;仓位上限：&#10;止损 / 失效条件：&#10;复盘要点："></textarea>
               </label>
+              <div class="plan-field-wide plan-checklist-editor">
+                <div class="plan-checklist-editor-head">
+                  <div>
+                    <span>可勾选的操作条件与执行步骤</span>
+                    <small>每项可在计划清单中单独点击完成</small>
+                  </div>
+                  <button id="operationPlanChecklistAdd" class="inline-secondary" type="button">添加一项</button>
+                </div>
+                <div id="operationPlanChecklist" class="plan-checklist-editor-list"></div>
+              </div>
             </div>
             <div class="plan-editor-actions">
               <span id="operationPlanSaveStatus" aria-live="polite"></span>
@@ -1135,6 +1151,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1"></script>
   </body>
 </html>

@@ -3551,6 +3551,60 @@ def _normalize_watch_alert_config(raw_config: Any, *, strict: bool = False) -> d
 
 OPERATION_PLAN_HORIZONS = {"tomorrow", "long_term"}
 OPERATION_PLAN_STATUSES = {"planned", "done", "cancelled"}
+OPERATION_PLAN_CHECKLIST_MAX_ITEMS = 100
+OPERATION_PLAN_CHECKLIST_TEXT_MAX_LENGTH = 500
+
+
+def _normalize_operation_plan_checklist(
+    raw_checklist: Any,
+    *,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    if raw_checklist is None:
+        return []
+    if not isinstance(raw_checklist, list):
+        if strict:
+            raise ValueError("计划清单格式无效")
+        return []
+    if len(raw_checklist) > OPERATION_PLAN_CHECKLIST_MAX_ITEMS:
+        if strict:
+            raise ValueError(f"每个计划最多添加 {OPERATION_PLAN_CHECKLIST_MAX_ITEMS} 条清单")
+        raw_checklist = raw_checklist[:OPERATION_PLAN_CHECKLIST_MAX_ITEMS]
+
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw_item in enumerate(raw_checklist):
+        if not isinstance(raw_item, dict):
+            if strict:
+                raise ValueError("计划清单项格式无效")
+            continue
+        text = str(raw_item.get("text") or "").strip()
+        if not text:
+            if strict:
+                raise ValueError("计划清单内容不能为空")
+            continue
+        if len(text) > OPERATION_PLAN_CHECKLIST_TEXT_MAX_LENGTH:
+            if strict:
+                raise ValueError(
+                    f"计划清单单项不能超过 {OPERATION_PLAN_CHECKLIST_TEXT_MAX_LENGTH} 个字符"
+                )
+            text = text[:OPERATION_PLAN_CHECKLIST_TEXT_MAX_LENGTH]
+        item_id = str(raw_item.get("id") or f"check-{index + 1}").strip()[:64]
+        if not item_id or item_id in seen_ids:
+            if strict:
+                raise ValueError("计划清单项标识无效或重复")
+            item_id = f"check-{index + 1}"
+            while item_id in seen_ids:
+                item_id = f"{item_id}-next"
+        seen_ids.add(item_id)
+        normalized.append(
+            {
+                "id": item_id,
+                "text": text,
+                "completed": bool(raw_item.get("completed", False)),
+            }
+        )
+    return normalized
 
 
 def _read_operation_plans() -> list[dict[str, Any]]:
@@ -3561,7 +3615,16 @@ def _read_operation_plans() -> list[dict[str, Any]]:
     except Exception:
         return []
     rows = payload.get("plans", []) if isinstance(payload, dict) else []
-    return [row for row in rows if isinstance(row, dict) and row.get("id")]
+    plans: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        normalized = dict(row)
+        normalized["checklist"] = _normalize_operation_plan_checklist(
+            row.get("checklist", []),
+        )
+        plans.append(normalized)
+    return plans
 
 
 def _write_operation_plans(plans: list[dict[str, Any]]) -> None:
@@ -3576,7 +3639,13 @@ def _write_operation_plans(plans: list[dict[str, Any]]) -> None:
 
 def get_operation_plans() -> dict[str, Any]:
     plans = _read_operation_plans()
-    plans.sort(key=lambda item: (item.get("status") != "planned", item.get("target_date") or "9999-12-31", item.get("created_at") or ""))
+    plans.sort(
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("updated_at") or ""),
+        ),
+        reverse=True,
+    )
     return {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "plans": plans,
@@ -3590,6 +3659,10 @@ def save_operation_plan(data: dict[str, Any], plan_id: str | None = None) -> dic
     status = str(data.get("status") or "planned")
     target_date = str(data.get("target_date") or "").strip()
     symbol = str(data.get("symbol") or "").strip().upper()
+    checklist = _normalize_operation_plan_checklist(
+        data.get("checklist", []),
+        strict=True,
+    )
     if not title:
         raise ValueError("计划标题不能为空")
     if len(title) > 120 or len(content) > 20_000 or len(symbol) > 30:
@@ -3621,6 +3694,7 @@ def save_operation_plan(data: dict[str, Any], plan_id: str | None = None) -> dic
         "symbol": symbol,
         "target_date": target_date,
         "content": content,
+        "checklist": checklist,
         "status": status,
         "created_at": created_at,
         "updated_at": now,
@@ -8355,6 +8429,22 @@ def _run_latest_refresh_job(
         planned_refresh_nodes = set(
             dependency_preflight.get("refresh_node_ids") or []
         )
+        daily_basic_repair_dates = sorted(
+            str(value)
+            for value in (
+                (results.get("refresh_daily_basic") or {}).get(
+                    "downstream_refresh_dates"
+                )
+                or []
+            )
+            if str(value)
+        )
+        daily_basic_repair_start = (
+            daily_basic_repair_dates[0] if daily_basic_repair_dates else None
+        )
+        dependency_preflight["daily_basic_repair_dates"] = (
+            daily_basic_repair_dates
+        )
         prior_attempt_preflight = (
             ((resume_status or {}).get("result") or {}).get(
                 "dependency_preflight"
@@ -8801,6 +8891,7 @@ def _run_latest_refresh_job(
         reusable_checkpoints = resume_inputs or reuse_completed
         feature_ready = (
             reusable_checkpoints
+            and daily_basic_repair_start is None
             and "feature.project_daily" not in planned_refresh_nodes
             and (results.get("feature_cache") or {}).get("status") == "success"
             and active_feature_sidecar_current()
@@ -8888,6 +8979,7 @@ def _run_latest_refresh_job(
                 complete_previous=False,
             )
             results["feature_cache"] = build_features(
+                incremental_start_date=daily_basic_repair_start,
                 progress_callback=lambda percent, message: _set_refresh_progress(
                     step_key="feature_cache",
                     message=message,

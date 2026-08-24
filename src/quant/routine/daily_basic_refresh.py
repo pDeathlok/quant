@@ -45,6 +45,283 @@ DAILY_BASIC_FEATURE_COVERAGE: dict[str, float] = {
     "circ_mv": 0.98,
 }
 
+DELAYED_DAILY_BASIC_COLUMNS: frozenset[str] = frozenset(
+    {"turnover_rate_f", "dv_ratio", "dv_ttm", "free_share"}
+)
+
+
+def _daily_basic_provenance_path(output_path: Path) -> Path:
+    return output_path.with_suffix(".provenance.json")
+
+
+def _read_source_refresh_marker(output_path: Path) -> dict[str, object] | None:
+    provenance_path = _daily_basic_provenance_path(output_path)
+    try:
+        payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "requires_source_refresh": True,
+            "reason": "invalid_repair_marker",
+            "marker_error": str(exc),
+        }
+    if not isinstance(payload, dict):
+        return {
+            "requires_source_refresh": True,
+            "reason": "invalid_repair_marker",
+            "marker_error": "marker payload is not an object",
+        }
+    return payload
+
+
+def _requires_source_refresh(output_path: Path) -> bool:
+    payload = _read_source_refresh_marker(output_path)
+    return bool(payload and payload.get("requires_source_refresh") is True)
+
+
+def list_pending_daily_basic_repairs(output_dir: Path) -> list[str]:
+    """Return every durable source-repair marker, regardless of its age."""
+
+    pending: list[str] = []
+    for marker_path in output_dir.glob("????????.provenance.json"):
+        trade_date = marker_path.name.removesuffix(".provenance.json")
+        output_path = output_dir / f"{trade_date}.parquet"
+        if trade_date.isdigit() and _requires_source_refresh(output_path):
+            pending.append(trade_date)
+    return sorted(set(pending))
+
+
+def _write_source_refresh_marker(
+    output_path: Path,
+    trade_date: str,
+    *,
+    reason: str,
+    estimated_features: dict[str, dict[str, object]] | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    now = datetime.now().isoformat(timespec="seconds")
+    previous = _read_source_refresh_marker(output_path) or {}
+    previous_attempts = int(previous.get("source_refresh_attempts") or 0)
+    payload: dict[str, object] = {
+        "marker_version": 1,
+        "trade_date": trade_date,
+        "status": "pending_source_repair",
+        "requires_source_refresh": True,
+        "reason": reason,
+        "first_detected_at": previous.get("first_detected_at") or now,
+        "last_attempt_at": now,
+        "source_refresh_attempts": previous_attempts + 1,
+    }
+    if estimated_features:
+        payload["estimated_features"] = estimated_features
+    elif isinstance(previous.get("estimated_features"), dict):
+        payload["estimated_features"] = previous["estimated_features"]
+    if error:
+        payload["last_error"] = error
+    atomic_write_json(payload, _daily_basic_provenance_path(output_path))
+    return payload
+
+
+def _source_refresh_failure_reason(error: str) -> str:
+    if "feature coverage" in error:
+        return "source_feature_coverage_incomplete"
+    if "returned 0 rows" in error or "empty" in error.lower():
+        return "source_data_unavailable"
+    return "source_refresh_failed"
+
+
+def _repair_diff(
+    previous_frame: pd.DataFrame | None,
+    official_frame: pd.DataFrame,
+    marker: dict[str, object],
+) -> tuple[int, list[str]]:
+    """Compare a provisional snapshot with its official replacement."""
+
+    if previous_frame is None or "ts_code" not in previous_frame.columns:
+        changed_columns = sorted(
+            column
+            for column in official_frame.columns
+            if column not in {"ts_code", "trade_date"}
+        )
+        return len(official_frame), changed_columns
+
+    estimated = marker.get("estimated_features")
+    candidate_columns = (
+        set(estimated)
+        if isinstance(estimated, dict) and estimated
+        else set(previous_frame.columns) & set(official_frame.columns)
+    )
+    candidate_columns -= {"ts_code", "trade_date"}
+    previous = previous_frame.drop_duplicates("ts_code", keep="last").set_index(
+        "ts_code"
+    )
+    official = official_frame.drop_duplicates("ts_code", keep="last").set_index(
+        "ts_code"
+    )
+    symbols = previous.index.union(official.index)
+    changed_symbols = set(previous.index.symmetric_difference(official.index))
+    changed_columns: list[str] = []
+    for column in sorted(candidate_columns):
+        left = previous[column].reindex(symbols)
+        right = official[column].reindex(symbols)
+        same = left.eq(right) | (left.isna() & right.isna())
+        changed = same.index[~same.fillna(False)]
+        if len(changed):
+            changed_columns.append(column)
+            changed_symbols.update(changed.astype(str))
+    return len(changed_symbols), changed_columns
+
+
+def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(float("nan"), index=frame.index, dtype="float64")
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def _load_previous_official_daily_basic(
+    output_dir: Path,
+    trade_date: str,
+) -> tuple[str, pd.DataFrame] | None:
+    candidates = sorted(
+        path
+        for path in output_dir.glob("????????.parquet")
+        if path.stem.isdigit() and path.stem < trade_date
+    )
+    for path in reversed(candidates):
+        if _requires_source_refresh(path):
+            continue
+        try:
+            frame = validate_daily_basic_frame(
+                pd.read_parquet(path),
+                path.stem,
+                required_feature_coverage=DAILY_BASIC_FEATURE_COVERAGE,
+            )
+        except Exception:
+            continue
+        return path.stem, frame
+    return None
+
+
+def _derive_delayed_daily_basic_features(
+    frame: pd.DataFrame,
+    trade_date: str,
+    output_dir: Path,
+) -> tuple[pd.DataFrame, dict[str, dict[str, object]]]:
+    """Estimate latest fields while Tushare's daily batch is incomplete.
+
+    Only the four fields known to arrive late are eligible. The previous input
+    must be an official, fully validated local cross-section so estimates never
+    cascade from one delayed day into the next.
+    """
+
+    delayed = {
+        column
+        for column in DELAYED_DAILY_BASIC_COLUMNS
+        if column in frame
+        and pd.to_numeric(frame[column], errors="coerce").isna().any()
+    }
+    if not delayed:
+        return frame, {}
+
+    previous = _load_previous_official_daily_basic(output_dir, trade_date)
+    if previous is None:
+        return frame, {}
+    previous_trade_date, previous_frame = previous
+    previous_columns = [
+        "ts_code",
+        "free_share",
+        "float_share",
+        "total_share",
+        "total_mv",
+        "dv_ratio",
+        "dv_ttm",
+    ]
+    available_previous = [
+        column for column in previous_columns if column in previous_frame.columns
+    ]
+    previous_values = previous_frame[available_previous].rename(
+        columns={
+            column: f"previous_{column}"
+            for column in available_previous
+            if column != "ts_code"
+        }
+    )
+    enriched = frame.merge(previous_values, on="ts_code", how="left")
+    derived: dict[str, dict[str, object]] = {}
+
+    if "free_share" in delayed:
+        current = _numeric_column(enriched, "free_share")
+        previous_free = _numeric_column(enriched, "previous_free_share")
+        current_float = _numeric_column(enriched, "float_share")
+        previous_float = _numeric_column(
+            enriched, "previous_float_share"
+        ).replace(0, float("nan"))
+        estimate = previous_free * current_float / previous_float
+        estimate = estimate.fillna(previous_free)
+        filled = current.isna() & estimate.notna()
+        enriched["free_share"] = current.fillna(estimate)
+        if filled.any():
+            derived["free_share"] = {
+                "source": "previous_official_daily_basic",
+                "previous_trade_date": previous_trade_date,
+                "formula": "previous_free_share * float_share / previous_float_share",
+                "quality": "estimated",
+                "filled_rows": int(filled.sum()),
+            }
+
+    if "turnover_rate_f" in delayed:
+        current = _numeric_column(enriched, "turnover_rate_f")
+        free_share = _numeric_column(enriched, "free_share").replace(
+            0, float("nan")
+        )
+        turnover_rate = _numeric_column(enriched, "turnover_rate")
+        float_share = _numeric_column(enriched, "float_share")
+        estimate = turnover_rate * float_share / free_share
+        filled = current.isna() & estimate.notna()
+        enriched["turnover_rate_f"] = current.fillna(estimate)
+        if filled.any():
+            derived["turnover_rate_f"] = {
+                "source": "tushare_daily_basic_derived",
+                "formula": "turnover_rate * float_share / free_share",
+                "quality": "derived",
+                "filled_rows": int(filled.sum()),
+            }
+
+    previous_price = (
+        _numeric_column(enriched, "previous_total_mv")
+        / _numeric_column(enriched, "previous_total_share").replace(0, float("nan"))
+    )
+    current_price = (
+        _numeric_column(enriched, "total_mv")
+        / _numeric_column(enriched, "total_share").replace(0, float("nan"))
+    )
+    price_ratio = previous_price / current_price.replace(0, float("nan"))
+    for column in ("dv_ratio", "dv_ttm"):
+        if column not in delayed:
+            continue
+        current = _numeric_column(enriched, column)
+        previous_yield = _numeric_column(enriched, f"previous_{column}")
+        estimate = previous_yield * price_ratio
+        filled = current.isna() & estimate.notna()
+        enriched[column] = current.fillna(estimate)
+        if filled.any():
+            derived[column] = {
+                "source": "previous_official_daily_basic",
+                "previous_trade_date": previous_trade_date,
+                "formula": (
+                    f"previous_{column} * previous_close / current_close "
+                    "(close inferred from total_mv / total_share)"
+                ),
+                "quality": "estimated",
+                "filled_rows": int(filled.sum()),
+            }
+
+    previous_value_columns = [
+        column for column in enriched.columns if column.startswith("previous_")
+    ]
+    return enriched.drop(columns=previous_value_columns), derived
+
 
 def _derive_volume_ratio_from_daily(
     frame: pd.DataFrame,
@@ -162,11 +439,24 @@ def fetch_one_trade_date(
     maximum_attempts = attempts + max(0, availability_retry_failures)
     last_error = ""
     output_path = output_dir / f"{trade_date}.parquet"
+    provenance_path = _daily_basic_provenance_path(output_path)
+    cache_path = cache_dir / f"tushare_daily_basic_{trade_date}.parquet"
+    repair_marker = _read_source_refresh_marker(output_path)
+    repair_requested = bool(
+        repair_marker
+        and repair_marker.get("requires_source_refresh") is True
+    )
+    repair_frame: pd.DataFrame | None = None
+    if repair_requested and output_path.exists():
+        try:
+            repair_frame = pd.read_parquet(output_path)
+        except Exception:
+            repair_frame = None
     minimum_rows = max(
         1,
         math.ceil((expected_rows or 1) * minimum_coverage_rate),
     )
-    if output_path.exists():
+    if output_path.exists() and not _requires_source_refresh(output_path):
         try:
             local = validate_daily_basic_frame(
                 pd.read_parquet(output_path),
@@ -192,6 +482,9 @@ def fetch_one_trade_date(
                 "feature_coverage": local.attrs.get("feature_coverage", {}),
                 "path": str(output_path),
                 "attempts": 0,
+                "repair_requested": False,
+                "repair_status": "not_required",
+                "requires_source_refresh": False,
                 "error": None,
             }
     for attempt in range(1, maximum_attempts + 1):
@@ -209,6 +502,13 @@ def fetch_one_trade_date(
                     trade_date,
                     daily_dir,
                 )
+                if availability_retry_failures > 0 and attempt == maximum_attempts:
+                    df, delayed_features = _derive_delayed_daily_basic_features(
+                        df,
+                        trade_date,
+                        output_dir,
+                    )
+                    derived_features.update(delayed_features)
                 df = validate_daily_basic_frame(
                     df,
                     trade_date,
@@ -220,14 +520,43 @@ def fetch_one_trade_date(
                 # The fetcher's basic schema check intentionally accepts small
                 # frames. Remove a cross-section cache that fails this
                 # market-relative coverage gate so the retry reaches Tushare.
-                (cache_dir / f"tushare_daily_basic_{trade_date}.parquet").unlink(
-                    missing_ok=True
-                )
+                cache_path.unlink(missing_ok=True)
                 raise
+            estimated_features = {
+                column: metadata
+                for column, metadata in derived_features.items()
+                if column in DELAYED_DAILY_BASIC_COLUMNS
+            }
+            current_marker: dict[str, object] = {}
+            if estimated_features:
+                current_marker = _write_source_refresh_marker(
+                    output_path,
+                    trade_date,
+                    reason="estimated_fallback",
+                    estimated_features=estimated_features,
+                )
             atomic_write_parquet(df, output_path, index=False)
+            if estimated_features:
+                # Do not allow an incomplete request cache to prevent a later
+                # same-day retry from replacing estimates with official data.
+                cache_path.unlink(missing_ok=True)
+            else:
+                provenance_path.unlink(missing_ok=True)
+            repair_changed_rows = 0
+            repair_changed_columns: list[str] = []
+            if repair_requested and not estimated_features:
+                repair_changed_rows, repair_changed_columns = _repair_diff(
+                    repair_frame,
+                    df,
+                    repair_marker or {},
+                )
             return {
                 "trade_date": trade_date,
-                "source": "tushare",
+                "source": (
+                    "tushare_with_estimated_fallback"
+                    if estimated_features
+                    else "tushare"
+                ),
                 "status": "success",
                 "rows": len(df),
                 "expected_rows": expected_rows,
@@ -239,6 +568,20 @@ def fetch_one_trade_date(
                 "derived_features": df.attrs.get("derived_features", {}),
                 "path": str(output_path),
                 "attempts": attempt,
+                "repair_requested": repair_requested,
+                "repair_status": (
+                    "pending"
+                    if estimated_features
+                    else "repaired" if repair_requested else "not_required"
+                ),
+                "repair_reason": (
+                    (repair_marker or {}).get("reason")
+                    if repair_requested
+                    else current_marker.get("reason")
+                ),
+                "repair_changed_rows": repair_changed_rows,
+                "repair_changed_columns": repair_changed_columns,
+                "requires_source_refresh": bool(estimated_features),
                 "error": None,
             }
         except Exception as exc:
@@ -249,6 +592,13 @@ def fetch_one_trade_date(
                 and attempt <= availability_retry_failures
             )
             if attempt >= maximum_attempts or (not retryable and not availability_retry):
+                repair_reason = _source_refresh_failure_reason(last_error)
+                _write_source_refresh_marker(
+                    output_path,
+                    trade_date,
+                    reason=repair_reason,
+                    error=last_error,
+                )
                 return {
                     "trade_date": trade_date,
                     "source": "tushare",
@@ -256,12 +606,25 @@ def fetch_one_trade_date(
                     "rows": 0,
                     "path": str(output_path),
                     "attempts": attempt,
+                    "repair_requested": repair_requested,
+                    "repair_status": "pending",
+                    "repair_reason": repair_reason,
+                    "repair_changed_rows": 0,
+                    "repair_changed_columns": [],
+                    "requires_source_refresh": True,
                     "error": last_error,
                 }
             if availability_retry:
                 time.sleep(max(0.0, availability_retry_interval))
             else:
                 time.sleep(min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1))))
+    repair_reason = _source_refresh_failure_reason(last_error or "unknown error")
+    _write_source_refresh_marker(
+        output_path,
+        trade_date,
+        reason=repair_reason,
+        error=last_error or "unknown error",
+    )
     return {
         "trade_date": trade_date,
         "source": "tushare",
@@ -269,6 +632,12 @@ def fetch_one_trade_date(
         "rows": 0,
         "path": str(output_path),
         "attempts": maximum_attempts,
+        "repair_requested": repair_requested,
+        "repair_status": "pending",
+        "repair_reason": repair_reason,
+        "repair_changed_rows": 0,
+        "repair_changed_columns": [],
+        "requires_source_refresh": True,
         "error": last_error or "unknown error",
     }
 
@@ -340,6 +709,23 @@ def refresh_daily_basic(
     audit_path = audit_dir / "daily_basic_audit.csv"
     audit_df = pd.DataFrame(audits)
     atomic_write_csv(audit_df, audit_path, index=False)
+    repair_requested_dates = sorted(
+        str(audit["trade_date"])
+        for audit in audits
+        if audit.get("repair_requested")
+    )
+    repaired_dates = sorted(
+        str(audit["trade_date"])
+        for audit in audits
+        if audit.get("repair_status") == "repaired"
+    )
+    newly_flagged_dates = sorted(
+        str(audit["trade_date"])
+        for audit in audits
+        if audit.get("requires_source_refresh")
+        and not audit.get("repair_requested")
+    )
+    pending_repair_dates = list_pending_daily_basic_repairs(output_dir)
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_policy": "tushare_only_daily_basic",
@@ -354,6 +740,15 @@ def refresh_daily_basic(
         "required_feature_coverage": DAILY_BASIC_FEATURE_COVERAGE,
         "availability_retry_failures": availability_retry_failures,
         "availability_retry_interval_seconds": availability_retry_interval,
+        "repair_requested_dates": repair_requested_dates,
+        "repaired_dates": repaired_dates,
+        "downstream_refresh_dates": repaired_dates,
+        "newly_flagged_dates": newly_flagged_dates,
+        "pending_repair_dates": pending_repair_dates,
+        "repair_queue_size": len(pending_repair_dates),
+        "data_quality_status": (
+            "provisional" if pending_repair_dates else "official"
+        ),
         "success": int((audit_df["status"] == "success").sum()),
         "failed": int((audit_df["status"] == "failed").sum()),
         "workers": workers,

@@ -61,20 +61,24 @@ def _incremental_feature_start() -> str:
 
 def _incremental_daily_basic_start() -> str:
     daily_basic_dir = PROJECT_ROOT / "data/raw/daily_basic"
+    from quant.routine.daily_basic_refresh import list_pending_daily_basic_repairs
+
+    pending_repairs = list_pending_daily_basic_repairs(daily_basic_dir)
     dates = [
         path.stem
         for path in daily_basic_dir.glob("*.parquet")
         if path.stem.isdigit() and len(path.stem) == 8
     ]
     if not dates:
-        return _incremental_daily_start()
+        return min([_incremental_daily_start(), *pending_repairs])
     # Rolling model factors depend on the preceding 20 trading sessions.  A
     # previously cached cross-section may have complete rows but incomplete
     # feature columns, so revalidate a calendar window wide enough to cover
     # that dependency on every routine run. Complete local dates are skipped
     # without a network request by daily_basic_refresh.
     latest = pd.to_datetime(max(dates), format="%Y%m%d")
-    return (latest - pd.Timedelta(days=45)).strftime("%Y%m%d")
+    rolling_start = (latest - pd.Timedelta(days=45)).strftime("%Y%m%d")
+    return min([rolling_start, *pending_repairs])
 
 
 def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
@@ -639,9 +643,13 @@ def _refresh_analyst_forecast_snapshot() -> dict:
     }
 
 
-def build_features(progress_callback=None) -> dict:
+def build_features(
+    progress_callback=None,
+    *,
+    incremental_start_date: str | None = None,
+) -> dict:
     started = time.monotonic()
-    start_date = _incremental_feature_start()
+    start_date = incremental_start_date or _incremental_feature_start()
     production_factor_mode = os.getenv(
         "ROUTINE_PRODUCTION_FACTOR_SCHEMA",
         LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,

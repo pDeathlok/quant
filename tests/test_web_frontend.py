@@ -77,6 +77,16 @@ def test_operation_plans_tab_supports_durable_crud_and_horizon_filters() -> None
     assert 'method: "DELETE"' in APP_JS
 
 
+def test_operation_plans_support_editable_persistent_checklists() -> None:
+    assert 'id="operationPlanChecklist"' in INDEX_HTML
+    assert 'id="operationPlanChecklistAdd"' in INDEX_HTML
+    assert "function renderOperationPlanChecklistEditor(items = [])" in APP_JS
+    assert 'data-operation-plan-checklist-toggle' in APP_JS
+    assert 'checklist: operationPlanChecklistItemsFromForm()' in APP_JS
+    assert 'class="operation-plan-checklist"' in APP_JS
+    assert ".operation-plan-checklist-item.is-completed" in STYLES_CSS
+
+
 def test_new_tomorrow_operation_plan_defaults_to_next_local_date() -> None:
     assert "function nextDayDateInputValue(referenceDate = new Date())" in APP_JS
     assert "nextDay.setDate(nextDay.getDate() + 1);" in APP_JS
@@ -423,6 +433,20 @@ def test_watchlist_context_menu_opens_multi_condition_alert_dialog() -> None:
     assert "watchlist-alerts-v4" in INDEX_HTML
 
 
+def test_triggered_watchlist_alert_highlights_matching_condition_rows_only() -> None:
+    assert 'id="watchlistAlertHitSummary"' not in INDEX_HTML
+    assert "matchedConditionIndexes" not in APP_JS
+    assert "watchlistAlertMatchedLineLabel(reminder)" not in APP_JS
+    assert 'data-alert-condition-status="${presentation.tone}"' in APP_JS
+    assert "第 ${index + 1} 行" in APP_JS
+    assert 'label: "命中"' in APP_JS
+    assert "命中条件行会用橙色高亮" in APP_JS
+    assert ".watchlist-alert-hit-summary" not in STYLES_CSS
+    assert ".watchlist-alert-reminder.is-triggered" not in STYLES_CSS
+    assert ".watchlist-alert-condition.is-hit" in STYLES_CSS
+    assert "watchlist-alert-hit-lines-v3" in INDEX_HTML
+
+
 def test_similar_cases_explain_and_display_forecast_weight_ranking() -> None:
     assert "综合相似度、行业与市场匹配和时间衰减；按预测权重降序，采用全局统一尺度" in INDEX_HTML
     assert "<th>原始相似度</th>" not in INDEX_HTML
@@ -489,6 +513,28 @@ def test_long_page_focuses_on_good_stocks_and_good_prices() -> None:
     assert "xueqiuStockUrl(item.ts_code)" in APP_JS
     assert "雪球 ↗" in APP_JS
     assert 'target="_blank" rel="noopener noreferrer"' in APP_JS
+
+
+def test_long_page_highlights_good_price_thresholds() -> None:
+    assert "function longSignalClass(kind, value)" in APP_JS
+    assert 'kind === "price-score" && numeric >= 80' in APP_JS
+    assert 'kind === "pr" && numeric < 1' in APP_JS
+    assert "numeric <= 10" in APP_JS
+    assert "numeric <= 20" in APP_JS
+    assert 'longSignalClass("price-score", item.price_score)' in APP_JS
+    assert 'longSignalClass("pr", item.pr_from_pe)' in APP_JS
+    assert 'longSignalClass("pr", item.pr_from_pb)' in APP_JS
+    for percentile_key in [
+        "pe_hist_percentile",
+        "pb_hist_percentile",
+        "pr_pe_hist_percentile",
+        "pr_pb_hist_percentile",
+    ]:
+        assert f'longSignalClass("valuation-percentile", item.{percentile_key})' in APP_JS
+    assert 'class="long-price-signal-legend"' in INDEX_HTML
+    for signal_class in ["price-score", "pr-under-one", "percentile-20", "percentile-10"]:
+        assert f".long-price-signal.{signal_class}" in STYLES_CSS
+    assert "long-value-alerts-v1" in INDEX_HTML
 
 
 def test_long_page_explains_price_score_bands_with_backtest_evidence() -> None:

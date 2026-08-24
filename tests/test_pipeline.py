@@ -22,6 +22,22 @@ def test_daily_basic_incremental_start_revalidates_rolling_window(
     assert pipeline._incremental_daily_basic_start() == "20260628"
 
 
+def test_daily_basic_incremental_start_includes_oldest_pending_repair(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    daily_basic_dir = tmp_path / "data/raw/daily_basic"
+    daily_basic_dir.mkdir(parents=True)
+    (daily_basic_dir / "20260812.parquet").touch()
+    (daily_basic_dir / "20260105.provenance.json").write_text(
+        '{"requires_source_refresh": true}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+
+    assert pipeline._incremental_daily_basic_start() == "20260105"
+
+
 def test_refresh_daily_basic_reports_partial_failure(monkeypatch) -> None:
     monkeypatch.setattr(pipeline, "_incremental_daily_basic_start", lambda: "20260720")
     monkeypatch.setattr(
@@ -489,6 +505,34 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     )
     assert "--live-only" in command
     assert "start_new_session" not in kwargs
+    assert result["status"] == "success"
+
+
+def test_build_features_accepts_daily_basic_repair_start(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs) -> None:
+            captured["command"] = command
+            self.stdout = io.StringIO(
+                json.dumps(
+                    {
+                        "status": "success",
+                        "source_latest_trade_date": "2026-07-22",
+                    }
+                )
+            )
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260722")
+
+    result = pipeline.build_features(incremental_start_date="20260718")
+
+    command = captured["command"]
+    assert command[command.index("--incremental-start-date") + 1] == "20260718"
     assert result["status"] == "success"
 
 

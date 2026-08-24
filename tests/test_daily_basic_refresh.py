@@ -118,6 +118,8 @@ def test_fetch_one_trade_date_preserves_last_good_file_on_empty_response(
 
     assert result["status"] == "failed"
     pd.testing.assert_frame_equal(pd.read_parquet(output_path), old)
+    assert result["requires_source_refresh"] is True
+    assert daily_basic_refresh._daily_basic_provenance_path(output_path).exists()
 
 
 def test_latest_daily_basic_waits_for_complete_model_fields(
@@ -242,3 +244,198 @@ def test_latest_daily_basic_derives_delayed_volume_ratio_from_daily(
     assert result["derived_features"]["volume_ratio"]["filled_rows"] == 4
     saved = pd.read_parquet(output_dir / "20260722.parquet")
     assert saved["volume_ratio"].tolist() == [1.38] * 4
+
+
+def test_latest_daily_basic_estimates_delayed_vendor_fields_on_final_attempt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "daily_basic"
+    output_dir.mkdir()
+    previous = _complete_daily_basic("20260721")
+    previous.to_parquet(output_dir / "20260721.parquet", index=False)
+    delayed = _complete_daily_basic()
+    delayed["float_share"] = 88.0
+    for column in daily_basic_refresh.DELAYED_DAILY_BASIC_COLUMNS:
+        delayed[column] = None
+
+    class DelayedVendorFetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date: str) -> pd.DataFrame:
+            return delayed.copy()
+
+    monkeypatch.setattr(
+        daily_basic_refresh,
+        "TushareDataFetcher",
+        DelayedVendorFetcher,
+    )
+    monkeypatch.setattr(daily_basic_refresh.time, "sleep", lambda _seconds: None)
+
+    result = daily_basic_refresh.fetch_one_trade_date(
+        "20260722",
+        output_dir,
+        tmp_path / "cache",
+        daily_basic_refresh.RequestLimiter(0),
+        retries=0,
+        retry_base_delay=0,
+        retry_max_delay=0,
+        expected_rows=4,
+        minimum_coverage_rate=1.0,
+        availability_retry_failures=1,
+        availability_retry_interval=0,
+    )
+
+    assert result["status"] == "success"
+    assert result["source"] == "tushare_with_estimated_fallback"
+    assert result["repair_status"] == "pending"
+    assert result["requires_source_refresh"] is True
+    assert set(result["derived_features"]) == {
+        "free_share",
+        "turnover_rate_f",
+        "dv_ratio",
+        "dv_ttm",
+    }
+    assert result["derived_features"]["free_share"]["filled_rows"] == 4
+    saved = pd.read_parquet(output_dir / "20260722.parquet")
+    assert saved["free_share"].tolist() == [77.0] * 4
+    assert saved["turnover_rate_f"].tolist() == pytest.approx(
+        [88.0 / 77.0] * 4
+    )
+    provenance = daily_basic_refresh._daily_basic_provenance_path(
+        output_dir / "20260722.parquet"
+    )
+    assert provenance.exists()
+    marker = daily_basic_refresh._read_source_refresh_marker(
+        output_dir / "20260722.parquet"
+    )
+    assert set(marker["estimated_features"]) == {
+        "free_share",
+        "turnover_rate_f",
+        "dv_ratio",
+        "dv_ttm",
+    }
+
+
+def test_estimated_latest_daily_basic_is_replaced_by_official_source(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "daily_basic"
+    output_dir.mkdir()
+    output_path = output_dir / "20260722.parquet"
+    estimated = _complete_daily_basic()
+    estimated["free_share"] = 69.0
+    estimated.to_parquet(output_path, index=False)
+    provenance = daily_basic_refresh._daily_basic_provenance_path(output_path)
+    provenance.write_text(
+        '{"requires_source_refresh": true}',
+        encoding="utf-8",
+    )
+
+    class OfficialVendorFetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date: str) -> pd.DataFrame:
+            return _complete_daily_basic()
+
+    monkeypatch.setattr(
+        daily_basic_refresh,
+        "TushareDataFetcher",
+        OfficialVendorFetcher,
+    )
+
+    result = daily_basic_refresh.fetch_one_trade_date(
+        "20260722",
+        output_dir,
+        tmp_path / "cache",
+        daily_basic_refresh.RequestLimiter(0),
+        retries=0,
+        retry_base_delay=0,
+        retry_max_delay=0,
+        expected_rows=4,
+        minimum_coverage_rate=1.0,
+    )
+
+    assert result["source"] == "tushare"
+    assert result["repair_status"] == "repaired"
+    assert result["repair_changed_rows"] == 4
+    assert result["repair_changed_columns"] == ["free_share"]
+    assert result["requires_source_refresh"] is False
+    assert pd.read_parquet(output_path)["free_share"].tolist() == [70.0] * 4
+    assert not provenance.exists()
+
+
+def test_invalid_provenance_is_treated_as_requiring_source_refresh(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "20260722.parquet"
+    provenance = daily_basic_refresh._daily_basic_provenance_path(output_path)
+    provenance.write_text("not-json", encoding="utf-8")
+
+    assert daily_basic_refresh._requires_source_refresh(output_path) is True
+
+
+def test_refresh_manifest_exposes_durable_repair_queue(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "daily_basic"
+    output_dir.mkdir()
+    pending_path = output_dir / "20260721.parquet"
+    daily_basic_refresh._write_source_refresh_marker(
+        pending_path,
+        "20260721",
+        reason="source_feature_coverage_incomplete",
+    )
+
+    monkeypatch.setattr(
+        daily_basic_refresh,
+        "load_trade_date_symbol_counts",
+        lambda *_args, **_kwargs: {"20260721": 4, "20260722": 4},
+    )
+
+    def fake_fetch(trade_date: str, *_args, **_kwargs) -> dict:
+        if trade_date == "20260721":
+            daily_basic_refresh._daily_basic_provenance_path(
+                output_dir / f"{trade_date}.parquet"
+            ).unlink()
+            return {
+                "trade_date": trade_date,
+                "status": "success",
+                "repair_requested": True,
+                "repair_status": "repaired",
+                "requires_source_refresh": False,
+            }
+        daily_basic_refresh._write_source_refresh_marker(
+            output_dir / f"{trade_date}.parquet",
+            trade_date,
+            reason="estimated_fallback",
+        )
+        return {
+            "trade_date": trade_date,
+            "status": "success",
+            "repair_requested": False,
+            "repair_status": "pending",
+            "requires_source_refresh": True,
+        }
+
+    monkeypatch.setattr(daily_basic_refresh, "fetch_one_trade_date", fake_fetch)
+    monkeypatch.setattr(daily_basic_refresh, "AUDIT_ROOT", tmp_path / "audit")
+
+    manifest = daily_basic_refresh.refresh_daily_basic(
+        start_date="20260721",
+        daily_dir=tmp_path / "daily",
+        output_dir=output_dir,
+        workers=1,
+    )
+
+    assert manifest["repair_requested_dates"] == ["20260721"]
+    assert manifest["repaired_dates"] == ["20260721"]
+    assert manifest["downstream_refresh_dates"] == ["20260721"]
+    assert manifest["newly_flagged_dates"] == ["20260722"]
+    assert manifest["pending_repair_dates"] == ["20260722"]
+    assert manifest["repair_queue_size"] == 1
+    assert manifest["data_quality_status"] == "provisional"

@@ -111,12 +111,22 @@ class SimilarPatternWatchAlertsRequest(BaseModel):
     )
 
 
+class OperationPlanChecklistItemRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    text: str = Field(min_length=1, max_length=500)
+    completed: bool = False
+
+
 class OperationPlanRequest(BaseModel):
     horizon: Literal["tomorrow", "long_term"] = "tomorrow"
     title: str = Field(min_length=1, max_length=120)
     symbol: str = Field(default="", max_length=30)
     target_date: str = Field(default="", max_length=10)
     content: str = Field(default="", max_length=20_000)
+    checklist: list[OperationPlanChecklistItemRequest] = Field(
+        default_factory=list,
+        max_length=100,
+    )
     status: Literal["planned", "done", "cancelled"] = "planned"
 
 

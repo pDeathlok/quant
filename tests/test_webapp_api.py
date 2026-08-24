@@ -33,25 +33,80 @@ def test_operation_plan_crud_persists_tomorrow_and_long_term(monkeypatch, tmp_pa
             "symbol": "002594.SZ",
             "target_date": "2026-08-13",
             "content": "缩量回踩后分批执行",
+            "checklist": [
+                {
+                    "id": "check-volume",
+                    "text": "确认成交量缩小",
+                    "completed": False,
+                }
+            ],
             "status": "planned",
         },
     )
     assert created.status_code == 200
     plan = created.json()["plans"][0]
     assert plan["horizon"] == "tomorrow"
+    assert plan["checklist"] == [
+        {
+            "id": "check-volume",
+            "text": "确认成交量缩小",
+            "completed": False,
+        }
+    ]
     assert plan_path.exists()
 
     updated = client.put(
         f"/api/operation-plans/{plan['id']}",
-        json={**plan, "horizon": "long_term", "status": "done"},
+        json={
+            **plan,
+            "horizon": "long_term",
+            "status": "done",
+            "checklist": [{**plan["checklist"][0], "completed": True}],
+        },
     )
     assert updated.status_code == 200
     assert updated.json()["plans"][0]["horizon"] == "long_term"
     assert updated.json()["plans"][0]["status"] == "done"
+    assert updated.json()["plans"][0]["checklist"][0]["completed"] is True
 
     deleted = client.delete(f"/api/operation-plans/{plan['id']}")
     assert deleted.status_code == 200
     assert deleted.json()["plans"] == []
+
+
+def test_operation_plans_return_newest_created_plan_first(monkeypatch, tmp_path) -> None:
+    plan_path = tmp_path / "operation_plans.json"
+    monkeypatch.setattr(services, "OPERATION_PLANS_PATH", plan_path)
+    plan_path.write_text(
+        json.dumps(
+            {
+                "plans": [
+                    {
+                        "id": "older",
+                        "horizon": "tomorrow",
+                        "title": "较早计划",
+                        "status": "planned",
+                        "created_at": "2026-08-20T09:00:00",
+                    },
+                    {
+                        "id": "newest",
+                        "horizon": "long_term",
+                        "title": "最新计划",
+                        "status": "planned",
+                        "created_at": "2026-08-24T09:00:00",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/operation-plans")
+
+    assert response.status_code == 200
+    assert [plan["id"] for plan in response.json()["plans"]] == ["newest", "older"]
+    assert response.json()["plans"][0]["checklist"] == []
 
 
 def _stub_successful_global_refresh(

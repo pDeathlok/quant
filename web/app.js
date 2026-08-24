@@ -1185,15 +1185,22 @@ function evaluateWatchlistReminder(item, result, reminder) {
     if (!andGroups.length || (index > 0 && condition.conjunction === "or")) {
       andGroups.push([]);
     }
+    condition.groupIndex = andGroups.length - 1;
     andGroups[andGroups.length - 1].push(condition);
   });
+  const matchedGroups = andGroups.map((group) => (
+    group.length > 0 && group.every((condition) => condition.triggered)
+  ));
+  const evaluatedConditions = conditions.map((condition) => ({
+    ...condition,
+    matched: Boolean(matchedGroups[condition.groupIndex] && condition.triggered),
+  }));
   return {
     ...reminder,
-    configured: conditions.length > 0,
-    availableCount: conditions.filter((condition) => condition.available).length,
-    triggered: andGroups.length > 0
-      && andGroups.some((group) => group.every((condition) => condition.triggered)),
-    conditions,
+    configured: evaluatedConditions.length > 0,
+    availableCount: evaluatedConditions.filter((condition) => condition.available).length,
+    triggered: matchedGroups.some(Boolean),
+    conditions: evaluatedConditions,
   };
 }
 
@@ -1229,13 +1236,14 @@ function watchlistAlertBell(item, alertState) {
       ? (alertState.enabled ? `已设置 ${alertState.count} 个提醒` : "提醒已停用")
       : "尚未设置提醒";
   const name = item?.name || item?.symbol || "股票";
+  const action = alertState.triggered ? "点击查看命中策略行" : "点击设置提醒";
   return `
     <button
       type="button"
       class="watchlist-alert-bell ${className}"
       data-watchlist-alert-bell="${escapeHtml(item?.symbol || "")}"
-      aria-label="${escapeHtml(`${name}：${status}，点击设置提醒`)}"
-      title="${escapeHtml(`${status}，点击设置`)}"
+      aria-label="${escapeHtml(`${name}：${status}，${action}`)}"
+      title="${escapeHtml(`${status}，${action}`)}"
     >
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path class="watchlist-alert-bell-body" d="M6 9a6 6 0 0 1 12 0v3.5c0 1.8.7 3.5 2 4.8l.7.7H3.3l.7-.7c1.3-1.3 2-3 2-4.8V9Z"></path>
@@ -2447,6 +2455,92 @@ function filteredOperationPlans() {
   return plans.filter((item) => item.status === "planned");
 }
 
+function operationPlanChecklistId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `check-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function operationPlanChecklistItemsFromForm() {
+  return [...document.querySelectorAll("[data-operation-plan-checklist-item]")]
+    .map((row) => ({
+      id: row.dataset.operationPlanChecklistItem || operationPlanChecklistId(),
+      text: row.querySelector("[data-operation-plan-checklist-text]")?.value.trim() || "",
+      completed: Boolean(row.querySelector("[data-operation-plan-checklist-completed]")?.checked),
+    }))
+    .filter((item) => item.text);
+}
+
+function renderOperationPlanChecklistEditor(items = []) {
+  const container = document.querySelector("#operationPlanChecklist");
+  if (!container) return;
+  if (!items.length) {
+    container.innerHTML = '<div class="plan-checklist-editor-empty">暂无清单项，点击“添加一项”开始记录。</div>';
+    return;
+  }
+  container.innerHTML = items.map((item) => `
+    <div
+      class="plan-checklist-editor-item ${item.completed ? "is-completed" : ""}"
+      data-operation-plan-checklist-item="${escapeHtml(item.id || operationPlanChecklistId())}"
+    >
+      <input
+        type="checkbox"
+        data-operation-plan-checklist-completed
+        aria-label="标记清单项为完成"
+        ${item.completed ? "checked" : ""}
+      />
+      <input
+        type="text"
+        maxlength="500"
+        data-operation-plan-checklist-text
+        aria-label="清单内容"
+        placeholder="例如：缩量回踩 20 日线后再执行"
+        value="${escapeHtml(item.text || "")}"
+      />
+      <button type="button" data-operation-plan-checklist-remove aria-label="删除这条清单">删除</button>
+    </div>
+  `).join("");
+}
+
+function operationPlanRequestPayload(item, overrides = {}) {
+  return {
+    horizon: item.horizon || "tomorrow",
+    title: item.title || "",
+    symbol: item.symbol || "",
+    target_date: item.target_date || "",
+    content: item.content || "",
+    checklist: Array.isArray(item.checklist) ? item.checklist : [],
+    status: item.status || "planned",
+    ...overrides,
+  };
+}
+
+function renderOperationPlanCardChecklist(item) {
+  const checklist = Array.isArray(item.checklist) ? item.checklist : [];
+  if (!checklist.length) return "";
+  const completedCount = checklist.filter((checkItem) => checkItem.completed).length;
+  return `
+    <div class="operation-plan-checklist">
+      <div class="operation-plan-checklist-head">
+        <span>执行清单</span>
+        <strong>${completedCount} / ${checklist.length}</strong>
+      </div>
+      ${checklist.map((checkItem) => `
+        <label class="operation-plan-checklist-item ${checkItem.completed ? "is-completed" : ""}">
+          <input
+            type="checkbox"
+            data-operation-plan-checklist-toggle="${escapeHtml(item.id)}"
+            data-operation-plan-checklist-item-id="${escapeHtml(checkItem.id)}"
+            ${checkItem.completed ? "checked" : ""}
+          />
+          <span>${escapeHtml(checkItem.text)}</span>
+        </label>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderOperationPlans() {
   const list = document.querySelector("#operationPlanList");
   if (!list) return;
@@ -2488,7 +2582,10 @@ function renderOperationPlans() {
       </div>
       <h4>${escapeHtml(item.title)}</h4>
       ${item.symbol ? `<strong class="operation-plan-symbol">${escapeHtml(item.symbol)}</strong>` : ""}
-      ${item.content ? `<p>${escapeHtml(item.content)}</p>` : '<p class="muted">尚未填写执行步骤</p>'}
+      ${item.content
+        ? `<p>${escapeHtml(item.content)}</p>`
+        : ((item.checklist || []).length ? "" : '<p class="muted">尚未填写执行步骤</p>')}
+      ${renderOperationPlanCardChecklist(item)}
       <small>更新于 ${escapeHtml(item.updated_at || item.created_at || "")}</small>
     </article>
   `).join("");
@@ -2536,6 +2633,7 @@ function resetOperationPlanForm() {
   document.querySelector("#operationPlanSymbol").value = "";
   document.querySelector("#operationPlanStatus").value = "planned";
   document.querySelector("#operationPlanContent").value = "";
+  renderOperationPlanChecklistEditor();
   document.querySelector("#operationPlanFormTitle").textContent = "新增计划";
   document.querySelector("#operationPlanSave").textContent = "保存计划";
   document.querySelector("#operationPlanSaveStatus").textContent = "";
@@ -2549,6 +2647,7 @@ function operationPlanPayload(overrides = {}) {
     symbol: document.querySelector("#operationPlanSymbol").value.trim(),
     target_date: document.querySelector("#operationPlanDate").value,
     content: document.querySelector("#operationPlanContent").value.trim(),
+    checklist: operationPlanChecklistItemsFromForm(),
     status: document.querySelector("#operationPlanStatus").value,
     ...overrides,
   };
@@ -2566,6 +2665,7 @@ function editOperationPlan(planId) {
   document.querySelector("#operationPlanSymbol").value = item.symbol || "";
   document.querySelector("#operationPlanStatus").value = item.status || "planned";
   document.querySelector("#operationPlanContent").value = item.content || "";
+  renderOperationPlanChecklistEditor(item.checklist || []);
   document.querySelector("#operationPlanFormTitle").textContent = "编辑计划";
   document.querySelector("#operationPlanSave").textContent = "更新计划";
   document.querySelector("#operationPlanTitle").focus();
@@ -2875,6 +2975,19 @@ function stateLabel(stateName) {
   return labels[stateName] || stateName || "-";
 }
 
+function longSignalClass(kind, value) {
+  if (value == null || value === "") return "";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "";
+  if (kind === "price-score" && numeric >= 80) return " long-price-signal price-score";
+  if (kind === "pr" && numeric < 1) return " long-price-signal pr-under-one";
+  if (kind === "valuation-percentile") {
+    if (numeric <= 10) return " long-price-signal percentile-10";
+    if (numeric <= 20) return " long-price-signal percentile-20";
+  }
+  return "";
+}
+
 function renderLongStockPool() {
   const body = document.querySelector("#longStockRows");
   const meta = document.querySelector("#longPoolMeta");
@@ -2963,7 +3076,7 @@ function renderLongStockPool() {
       </td>
       <td>
         <span class="score-stack left">
-          <strong>${metric(item.price_score)} 分</strong>
+          <strong class="long-signal-value${longSignalClass("price-score", item.price_score)}">${metric(item.price_score)} 分</strong>
           <em>${escapeHtml(priceScoreDetail(item))}</em>
         </span>
       </td>
@@ -2976,26 +3089,26 @@ function renderLongStockPool() {
       <td>
         <span class="score-stack metric-stack">
           <strong>${metric(item.pe_ttm, 2)}</strong>
-          <em>${percentile(item.pe_hist_percentile, item.valuation_history_points)}</em>
+          <em class="long-signal-value${longSignalClass("valuation-percentile", item.pe_hist_percentile)}">${percentile(item.pe_hist_percentile, item.valuation_history_points)}</em>
         </span>
       </td>
       <td>
         <span class="score-stack metric-stack">
           <strong>${metric(item.pb, 2)}</strong>
-          <em>${percentile(item.pb_hist_percentile, item.valuation_history_points)}</em>
+          <em class="long-signal-value${longSignalClass("valuation-percentile", item.pb_hist_percentile)}">${percentile(item.pb_hist_percentile, item.valuation_history_points)}</em>
         </span>
       </td>
       <td>
         <span class="score-stack metric-stack">
-          <strong>${metric(item.pr_from_pe, 3)}</strong>
-          <em>${percentile(item.pr_pe_hist_percentile, item.valuation_history_points)}</em>
+          <strong class="long-signal-value${longSignalClass("pr", item.pr_from_pe)}">${metric(item.pr_from_pe, 3)}</strong>
+          <em class="long-signal-value${longSignalClass("valuation-percentile", item.pr_pe_hist_percentile)}">${percentile(item.pr_pe_hist_percentile, item.valuation_history_points)}</em>
           <em>权重 ${Math.round(Number(item.pr_pe_weight || 0) * 100)}%</em>
         </span>
       </td>
       <td>
         <span class="score-stack metric-stack">
-          <strong>${metric(item.pr_from_pb, 3)}</strong>
-          <em>${percentile(item.pr_pb_hist_percentile, item.valuation_history_points)}</em>
+          <strong class="long-signal-value${longSignalClass("pr", item.pr_from_pb)}">${metric(item.pr_from_pb, 3)}</strong>
+          <em class="long-signal-value${longSignalClass("valuation-percentile", item.pr_pb_hist_percentile)}">${percentile(item.pr_pb_hist_percentile, item.valuation_history_points)}</em>
           <em>权重 ${Math.round(Number(item.pr_pb_weight || 0) * 100)}%</em>
         </span>
       </td>
@@ -4205,6 +4318,13 @@ function formatWatchlistAlertCurrent(value, kind, indicator = "") {
   return `当前值：${numeric.toFixed(digits)}${definition.unit || ""}`;
 }
 
+function watchlistAlertConditionPresentation(condition, alertEnabled) {
+  if (!condition.available) return { tone: "pending", label: "等待数据" };
+  if (alertEnabled && condition.matched) return { tone: "hit", label: "命中" };
+  if (condition.triggered) return { tone: "true", label: "条件成立" };
+  return { tone: "miss", label: "未命中" };
+}
+
 function syncWatchlistAlertDraftFromForm() {
   if (!watchlistAlertDraft) return;
   watchlistAlertDraft.enabled = Boolean(document.querySelector("#watchlistAlertEnabled")?.checked);
@@ -4235,21 +4355,34 @@ function defaultWatchlistAlertCondition() {
   };
 }
 
-function renderWatchlistAlertCondition(item, result, condition, index) {
-  const currentValue = condition.kind === "indicator"
-    ? watchlistAlertMetricValue(item, result, condition.indicator)
-    : result?.latest_snapshot?.close;
-  const currentLabel = formatWatchlistAlertCurrent(currentValue, condition.kind, condition.indicator);
+function renderWatchlistAlertCondition(condition, index, alertEnabled) {
+  const currentLabel = formatWatchlistAlertCurrent(
+    condition.currentValue,
+    condition.kind,
+    condition.indicator,
+  );
+  const presentation = watchlistAlertConditionPresentation(condition, alertEnabled);
   return `
-    <div class="watchlist-alert-condition" data-watchlist-alert-condition data-alert-condition-id="${escapeHtml(condition.id)}">
-      ${index === 0 ? `
-        <div class="watchlist-alert-join-first">当</div>
-      ` : `
-        <label class="watchlist-alert-join">
-          <span>关系</span>
-          <select data-alert-condition-conjunction>${watchlistAlertConjunctionOptions(condition.conjunction)}</select>
-        </label>
-      `}
+    <div
+      class="watchlist-alert-condition is-${presentation.tone}"
+      data-watchlist-alert-condition
+      data-alert-condition-id="${escapeHtml(condition.id)}"
+      data-alert-condition-status="${presentation.tone}"
+    >
+      <div class="watchlist-alert-condition-lead">
+        <div class="watchlist-alert-line-status is-${presentation.tone}">
+          <span>第 ${index + 1} 行</span>
+          <strong>${presentation.label}</strong>
+        </div>
+        ${index === 0 ? `
+          <div class="watchlist-alert-join-first">当</div>
+        ` : `
+          <label class="watchlist-alert-join">
+            <span>关系</span>
+            <select data-alert-condition-conjunction>${watchlistAlertConjunctionOptions(condition.conjunction)}</select>
+          </label>
+        `}
+      </div>
       <label class="watchlist-alert-condition-type">
         <span>类型</span>
         <select data-alert-condition-kind>
@@ -4294,12 +4427,17 @@ function renderWatchlistAlertDraft() {
   const enabled = document.querySelector("#watchlistAlertEnabled");
   if (!reminders || !enabled) return;
   enabled.checked = watchlistAlertDraft.enabled;
-  reminders.innerHTML = watchlistAlertDraft.reminders.map((reminder, reminderIndex) => `
+  const evaluatedReminders = watchlistAlertDraft.reminders.map((reminder, reminderIndex) => ({
+    ...evaluateWatchlistReminder(item, result, reminder),
+    reminderIndex,
+  }));
+  reminders.innerHTML = evaluatedReminders.map((reminder, reminderIndex) => {
+    return `
     <section class="watchlist-alert-reminder" data-watchlist-alert-reminder data-alert-reminder-id="${escapeHtml(reminder.id)}">
       <div class="watchlist-alert-reminder-head">
         <div>
           <h4>提醒 ${reminderIndex + 1}</h4>
-          <span>${reminder.conditions.length} 条条件</span>
+          <span class="watchlist-alert-condition-count">${reminder.conditions.length} 条条件</span>
         </div>
         <button type="button" data-alert-reminder-remove>删除提醒</button>
       </div>
@@ -4314,10 +4452,11 @@ function renderWatchlistAlertDraft() {
         />
       </label>
       <div class="watchlist-alert-conditions">
-        ${reminder.conditions.map((condition, index) => renderWatchlistAlertCondition(item, result, condition, index)).join("")}
+        ${reminder.conditions.map((condition, index) => renderWatchlistAlertCondition(condition, index, watchlistAlertDraft.enabled)).join("")}
       </div>
     </section>
-  `).join("") || `
+  `;
+  }).join("") || `
     <div class="watchlist-alert-empty">
       <strong>还没有提醒</strong>
       <span>点击“添加提醒”创建提醒 1，并设置价格或指标条件。</span>
@@ -4341,7 +4480,7 @@ function openWatchlistAlertDialog(symbol) {
     })),
   };
   document.querySelector("#watchlistAlertTitle").textContent = `${watchlistAlertDraft.name} · 提醒设置`;
-  document.querySelector("#watchlistAlertMeta").textContent = `${symbol} · 每个提醒独立判断，可填写自己的备注`;
+  document.querySelector("#watchlistAlertMeta").textContent = `${symbol} · 命中条件行会用橙色高亮，可直接核对或修改`;
   renderWatchlistAlertDraft();
   dialog.showModal();
   const focusSelector = watchlistAlertDraft.reminders.length
@@ -4430,7 +4569,18 @@ document.querySelector("#watchlistAlertDialog")?.addEventListener("click", (even
 });
 
 document.querySelector("#watchlistAlertReminders")?.addEventListener("change", (event) => {
-  if (!event.target.matches("[data-alert-condition-kind], [data-alert-condition-indicator]")) return;
+  if (!event.target.matches([
+    "[data-alert-condition-kind]",
+    "[data-alert-condition-indicator]",
+    "[data-alert-condition-conjunction]",
+    "[data-alert-condition-operator]",
+    "[data-alert-condition-value]",
+  ].join(", "))) return;
+  syncWatchlistAlertDraftFromForm();
+  renderWatchlistAlertDraft();
+});
+
+document.querySelector("#watchlistAlertEnabled")?.addEventListener("change", () => {
   syncWatchlistAlertDraftFromForm();
   renderWatchlistAlertDraft();
 });
@@ -4721,6 +4871,35 @@ document.querySelector("#chanPage")?.addEventListener("click", (event) => {
 });
 
 document.querySelector("#plansPage")?.addEventListener("click", async (event) => {
+  const checklistToggle = event.target.closest("[data-operation-plan-checklist-toggle]");
+  if (checklistToggle) {
+    const item = state.operationPlans.find(
+      (plan) => plan.id === checklistToggle.dataset.operationPlanChecklistToggle,
+    );
+    const checklistItemId = checklistToggle.dataset.operationPlanChecklistItemId;
+    const checklistItem = item?.checklist?.find((entry) => entry.id === checklistItemId);
+    if (!item || !checklistItem) return;
+    const previousCompleted = Boolean(checklistItem.completed);
+    const checklist = item.checklist.map((entry) => (
+      entry.id === checklistItemId
+        ? { ...entry, completed: checklistToggle.checked }
+        : entry
+    ));
+    checklistToggle.disabled = true;
+    try {
+      const payload = await fetchJson(`/operation-plans/${encodeURIComponent(item.id)}`, {
+        method: "PUT",
+        body: JSON.stringify(operationPlanRequestPayload(item, { checklist })),
+      });
+      state.operationPlans = payload.plans || [];
+      renderOperationPlans();
+    } catch (error) {
+      checklistToggle.checked = previousCompleted;
+      checklistToggle.disabled = false;
+      showError(error);
+    }
+    return;
+  }
   const filterButton = event.target.closest("[data-plan-filter]");
   if (filterButton) {
     state.operationPlanFilter = filterButton.dataset.planFilter || "active";
@@ -4740,7 +4919,7 @@ document.querySelector("#plansPage")?.addEventListener("click", async (event) =>
     try {
       const payload = await fetchJson(`/operation-plans/${encodeURIComponent(item.id)}`, {
         method: "PUT",
-        body: JSON.stringify({ ...item, status: "done" }),
+        body: JSON.stringify(operationPlanRequestPayload(item, { status: "done" })),
       });
       state.operationPlans = payload.plans || [];
       renderOperationPlans();
@@ -4767,6 +4946,25 @@ document.querySelector("#plansPage")?.addEventListener("click", async (event) =>
 });
 
 document.querySelector("#operationPlanReset")?.addEventListener("click", resetOperationPlanForm);
+document.querySelector("#operationPlanChecklistAdd")?.addEventListener("click", () => {
+  const items = operationPlanChecklistItemsFromForm();
+  items.push({ id: operationPlanChecklistId(), text: "", completed: false });
+  renderOperationPlanChecklistEditor(items);
+  document.querySelector("[data-operation-plan-checklist-item]:last-child [data-operation-plan-checklist-text]")?.focus();
+});
+document.querySelector("#operationPlanChecklist")?.addEventListener("click", (event) => {
+  const removeButton = event.target.closest("[data-operation-plan-checklist-remove]");
+  if (!removeButton) return;
+  removeButton.closest("[data-operation-plan-checklist-item]")?.remove();
+  if (!document.querySelector("[data-operation-plan-checklist-item]")) {
+    renderOperationPlanChecklistEditor();
+  }
+});
+document.querySelector("#operationPlanChecklist")?.addEventListener("change", (event) => {
+  if (!event.target.matches("[data-operation-plan-checklist-completed]")) return;
+  event.target.closest("[data-operation-plan-checklist-item]")
+    ?.classList.toggle("is-completed", event.target.checked);
+});
 document.querySelector("#operationPlanDate")?.addEventListener("input", (event) => {
   event.currentTarget.dataset.defaulted = "false";
 });
