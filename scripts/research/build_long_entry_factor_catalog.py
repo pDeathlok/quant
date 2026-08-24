@@ -155,7 +155,7 @@ def project_factor_group(factor: str) -> str:
         return "size_float_structure"
     if factor.startswith(("yidong", "strong_yidong", "days_since", "b2_", "s1_", "sell_score")):
         return "technical_pattern"
-    if factor in {"open", "high", "low", "close", "pre_close", "change", "price_level", "price_log"}:
+    if factor in {"open", "high", "low", "close", "pre_close", "change", "price_log"}:
         return "raw_price_scale"
     return "technical_trend_momentum"
 
@@ -179,7 +179,6 @@ RAW_SCALE_FACTORS = {
     "close",
     "pre_close",
     "change",
-    "price_level",
     "price_log",
     "obv",
     "total_share",

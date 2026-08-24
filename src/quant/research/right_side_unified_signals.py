@@ -23,7 +23,12 @@ import pandas as pd
 
 from quant.features.variable_library import build_continuous_ohlc
 from quant.research.right_side_unified_features import (
+    compute_right_side_project_requirements,
     compute_right_side_rule_features,
+)
+from quant.research.short_side_groups import (
+    RIGHT_WITH_MIXED_GROUPS,
+    aggregate_strategy_group_flags,
 )
 
 
@@ -58,6 +63,7 @@ CANONICAL_RIGHT_SIDE_SIGNALS: tuple[str, ...] = (
     "BREATHING",
     "YUEYUE",
 )
+CANONICAL_RIGHT_MODEL_GROUPS: tuple[str, ...] = RIGHT_WITH_MIXED_GROUPS
 
 B2_FAMILY_SOURCE_COLUMNS: tuple[str, ...] = (
     "b2_any_pchg4_vol15",
@@ -146,7 +152,7 @@ def _pinghang_flags(frame: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
     volume = frame["volume"].to_numpy(dtype=float)
     open_ = frame["open"].to_numpy(dtype=float)
     close = frame["close"].to_numpy(dtype=float)
-    pct = features["rs_pct_chg_1d"].to_numpy(dtype=float)
+    pct = features["pct_chg"].to_numpy(dtype=float)
     kdj_j = features["rs_kdj_j"].to_numpy(dtype=float)
 
     for position in range(11, len(frame)):
@@ -174,7 +180,7 @@ def _pinghang_flags(frame: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
 
 def _double_gun_flags(frame: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
     flags = np.zeros(len(frame), dtype=bool)
-    pct = features["rs_pct_chg_1d"].to_numpy(dtype=float)
+    pct = features["pct_chg"].to_numpy(dtype=float)
     is_rise = features["rs_is_rise"].fillna(False).to_numpy(dtype=bool)
     vol_ratio_prev = features["rs_vol_ratio_prev"].to_numpy(dtype=float)
     kdj_j = features["rs_kdj_j"].to_numpy(dtype=float)
@@ -221,7 +227,7 @@ def _kengqi_flags(frame: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
     open_ = frame["open"].to_numpy(dtype=float)
     close = frame["close"].to_numpy(dtype=float)
     volume = frame["volume"].to_numpy(dtype=float)
-    pct = features["rs_pct_chg_1d"].to_numpy(dtype=float)
+    pct = features["pct_chg"].to_numpy(dtype=float)
     vol_ratio_prev = features["rs_vol_ratio_prev"].to_numpy(dtype=float)
 
     for position in range(24, len(frame)):
@@ -260,7 +266,7 @@ def _zaihou_flags(frame: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
     flags = np.zeros(len(frame), dtype=bool)
     volume = frame["volume"].to_numpy(dtype=float)
     close = frame["close"].to_numpy(dtype=float)
-    pct = features["rs_pct_chg_1d"].to_numpy(dtype=float)
+    pct = features["pct_chg"].to_numpy(dtype=float)
     bbi_distance = features["rs_bbi_distance_pct"].to_numpy(dtype=float)
     bbi_slope = features["rs_bbi_slope_5d_pct"].to_numpy(dtype=float)
 
@@ -325,21 +331,23 @@ def compute_canonical_z_signal_flags(
     """
 
     frame = _prepare_daily(daily)
-    features = (
+    rules = (
         compute_right_side_rule_features(frame).reset_index(drop=True)
         if rule_features is None
         else rule_features.reset_index(drop=True).copy()
     )
-    if len(features) != len(frame):
+    if len(rules) != len(frame):
         raise ValueError("rule_features must align one-to-one with daily rows")
+    project = compute_right_side_project_requirements(frame).reset_index(drop=True)
+    features = pd.concat([project, rules], axis=1)
     required_feature_columns = {
-        "rs_pct_chg_1d",
+        "pct_chg",
         "rs_is_rise",
         "rs_vol_ratio_prev5",
         "rs_vol_ratio_prev",
         "rs_kdj_j",
         "rs_close_pos",
-        "rs_amplitude_pct",
+        "amplitude_1",
         "rs_zg_white",
         "rs_dg_yellow",
         "rs_bbi_distance_pct",
@@ -353,13 +361,13 @@ def compute_canonical_z_signal_flags(
         )
     positions = pd.Series(np.arange(len(frame)), index=frame.index)
 
-    pct = features["rs_pct_chg_1d"]
+    pct = features["pct_chg"]
     is_rise = features["rs_is_rise"].fillna(False).astype(bool)
     vol_ratio_5 = features["rs_vol_ratio_prev5"]
     vol_ratio_prev = features["rs_vol_ratio_prev"]
     kdj_j = features["rs_kdj_j"]
     close_pos = features["rs_close_pos"]
-    amplitude = features["rs_amplitude_pct"]
+    amplitude = features["amplitude_1"]
     body_pct = (frame["close"] - frame["open"]).abs().div(
         frame["pre_close"].clip(lower=1.0)
     ) * 100.0
@@ -542,14 +550,32 @@ def merge_canonical_signal_flags(
     )
 
 
+def aggregate_canonical_right_group_flags(
+    raw_flags: pd.DataFrame,
+) -> pd.DataFrame:
+    """Aggregate the 14 raw right/mixed detectors into 10 model groups."""
+
+    keys = [column for column in ("symbol", "date") if column in raw_flags]
+    groups = aggregate_strategy_group_flags(
+        raw_flags,
+        groups=CANONICAL_RIGHT_MODEL_GROUPS,
+    )
+    return pd.concat(
+        [raw_flags[keys].reset_index(drop=True), groups.reset_index(drop=True)],
+        axis=1,
+    )
+
+
 __all__ = [
     "B2_FAMILY_SOURCE_COLUMNS",
     "B3_FAMILY_SOURCE_COLUMNS",
     "CANONICAL_RIGHT_SIDE_SIGNALS",
+    "CANONICAL_RIGHT_MODEL_GROUPS",
     "CANONICAL_SIGNAL_SCHEMA_VERSION",
     "CANONICAL_Z_SIGNALS",
     "FAMILY_DIRECT_SOURCE_COLUMNS",
     "SIGNAL_CONTRACT_NOTES",
     "compute_canonical_z_signal_flags",
+    "aggregate_canonical_right_group_flags",
     "merge_canonical_signal_flags",
 ]

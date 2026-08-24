@@ -26,6 +26,11 @@ import yaml
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.canonical_factor_names import (
+    assert_no_forbidden_factor_names,
+    find_forbidden_aliases_in_payload,
+    stable_canonical_feature_union,
+)
 from quant.features.project_factor_layer import (
     PROJECT_FACTOR_SCHEMA_VERSION,
     calculate_project_market_factors,
@@ -42,14 +47,7 @@ from quant.features.right_side_factor_contract import (
 )
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 from quant.research.right_side_unified import load_signal_universe
-from quant.research.right_side_beam_feature_selection import (
-    BEAM_SCHEMA_VERSION,
-    feature_columns_sha256 as beam_feature_columns_sha256,
-)
 from quant.research.right_side_unified_features import (
-    ADDED_RULE_FEATURE_COLUMNS_V2,
-    LEGACY_RULE_FEATURE_COLUMNS_V1,
-    LEGACY_RULE_FEATURE_SCHEMA_VERSION_V1,
     RULE_FEATURE_COLUMNS,
     RULE_FEATURE_COLUMNS_SHA256,
     RULE_FEATURE_SCHEMA_VERSION,
@@ -186,11 +184,7 @@ def load_shadow_release_config(
     eligible_candidates = tuple(
         str(value) for value in (gate.get("eligible_candidates") or ())
     )
-    supported_candidates = {
-        "unified_long_task_deep_rule105",
-        "unified_long_task_deep",
-        "unified_long_task_deep_beam",
-    }
+    supported_candidates = {"unified_long_task_deep"}
     if not selected_candidate_field or not eligible_candidates:
         raise ValueError("right-side shadow ranking gate must declare selected candidates")
     if not set(eligible_candidates) <= supported_candidates:
@@ -285,14 +279,10 @@ def _accepted_ranking_decision(
         raise RuntimeError(
             f"right-side ranking selected an ineligible shadow candidate: {selected}"
         )
-    if selected == "unified_long_task_deep_rule105" and (
-        _lookup(payload, "architecture_gate.passed") is not True
-    ):
-        raise RuntimeError("105 unified shadow candidate has not passed architecture gate")
     if selected == "unified_long_task_deep" and (
-        _lookup(payload, "full_118_factor_increment_gate.passed") is not True
+        _lookup(payload, "canonical_factor_gate.passed") is not True
     ):
-        raise RuntimeError("118-factor shadow candidate has not passed increment gate")
+        raise RuntimeError("canonical unified shadow candidate has not passed factor gate")
     online_authorized = _lookup(payload, config.production_replacement_field)
     if not isinstance(online_authorized, bool):
         raise RuntimeError("composite decision has no explicit production authorization")
@@ -307,96 +297,18 @@ def _load_source_training_manifest(source: Path) -> dict[str, Any]:
     return payload
 
 
-def _validated_beam_search_contract(
-    value: object,
-    *,
-    error_type: type[Exception] = ValueError,
-) -> tuple[str, ...]:
-    """Validate the frozen full-depth Beam Residual v3 adaptation manifest."""
-
-    def fail(message: str) -> None:
-        raise error_type(message)
-
-    if not isinstance(value, Mapping):
-        fail("Beam manifest has no search contract")
-    beam = value
-    if beam.get("schema_version") != BEAM_SCHEMA_VERSION:
-        fail("Beam manifest schema does not match this project")
-    if beam.get("test_data_used") is not False:
-        fail("Beam search must not use outer test data")
-    if beam.get("test_data_used_for_search") is not False:
-        fail("Beam search must not use outer test/OOT data")
-    if beam.get("ranking_objective") != "median_delta_pr_auc_primary_no_returns":
-        fail("Beam manifest has the wrong ranking objective")
-
-    settings = beam.get("settings")
-    if not isinstance(settings, Mapping):
-        fail("Beam manifest has no settings contract")
-    try:
-        frozen_settings = (
-            int(settings.get("width") or 0),
-            int(settings.get("min_features") or 0),
-            int(settings.get("max_remove") or -1),
-        )
-    except (TypeError, ValueError):
-        fail("Beam manifest settings are invalid")
-    if frozen_settings != (4, 6, 10):
-        fail("Beam manifest settings differ from frozen v3 adaptation")
-
-    candidates = tuple(
-        str(item) for item in (beam.get("candidate_features") or ())
-    )
-    if candidates != tuple(ADDED_RULE_FEATURE_COLUMNS_V2):
-        fail("Beam increment universe differs from the frozen 13 factors")
-    if beam.get("candidate_features_sha256") != beam_feature_columns_sha256(
-        candidates
-    ):
-        fail("Beam candidate universe hash mismatch")
-    if beam.get("prefilter_method") != "none_full_13_candidate_universe":
-        fail("Beam manifest used an unapproved candidate prefilter")
-    audited_candidates = tuple(
-        str(item) for item in (beam.get("all_increment_candidates") or ())
-    )
-    if audited_candidates != candidates:
-        fail("Beam candidate audit differs from canonical candidate_features")
-
-    selected = tuple(str(item) for item in (beam.get("selected_features") or ()))
-    if not 6 <= len(selected) <= len(candidates):
-        fail("Beam selected feature count violates its settings")
-    if len(selected) != len(set(selected)) or not set(selected) <= set(candidates):
-        fail("Beam selected features are duplicated or outside the candidate universe")
-    if beam.get("selected_features_sha256") != beam_feature_columns_sha256(selected):
-        fail("Beam selected feature subset hash mismatch")
-
-    try:
-        visited = int(beam.get("visited_combinations") or 0)
-        all_accessed = int(beam.get("all_accessed_combinations") or 0)
-    except (TypeError, ValueError):
-        fail("Beam visited-combination audit is invalid")
-    if visited <= 0 or all_accessed != visited:
-        fail("Beam manifest has no consistent visited-combination audit")
-
-    if beam.get("permutation_gate_passed") is not True:
-        fail("Beam manifest did not pass permutation gate")
-    pipeline_select = beam.get("pipeline_select")
-    if not isinstance(pipeline_select, Mapping) or (
-        pipeline_select.get("gate_passed") is not True
-        or pipeline_select.get("test_data_used") is not False
-    ):
-        fail("Beam pipeline_select evidence is invalid")
-    if beam.get("pipeline_select_gate_passed") is not True:
-        fail("Beam manifest did not pass pipeline_select gate")
-    if beam.get("development_gates_passed") is not True:
-        fail("Beam manifest did not pass all development gates")
-    return selected
-
-
 def _validated_source_rule_contract(
     *,
     selected_candidate: str,
     source_model: object,
     source_manifest: Mapping[str, Any],
 ) -> tuple[tuple[str, ...], str]:
+    forbidden_manifest = find_forbidden_aliases_in_payload(source_manifest)
+    if forbidden_manifest:
+        raise ValueError(
+            "shadow source manifest contains forbidden factor aliases: "
+            f"{forbidden_manifest}"
+        )
     if source_manifest.get("experiment") != selected_candidate:
         raise ValueError(
             "shadow source manifest experiment does not match "
@@ -407,6 +319,19 @@ def _validated_source_rule_contract(
     )
     if not common_features:
         raise TypeError("shadow source model must expose non-empty common_features")
+    assert_no_forbidden_factor_names(
+        common_features,
+        context="shadow source model common_features",
+    )
+    raw_feature_names = getattr(source_model, "feature_names_in_", None)
+    model_feature_names = tuple(
+        str(value) for value in (() if raw_feature_names is None else raw_feature_names)
+    )
+    if model_feature_names:
+        assert_no_forbidden_factor_names(
+            model_feature_names,
+            context="shadow source model feature_names_in_",
+        )
     manifest_common = tuple(
         str(value) for value in (source_manifest.get("common_features") or ())
     )
@@ -428,18 +353,9 @@ def _validated_source_rule_contract(
     if int(source_manifest.get("rule_feature_count") or -1) != len(manifest_rules):
         raise ValueError("shadow source manifest rule-factor count mismatch")
 
-    if selected_candidate == "unified_long_task_deep_rule105":
-        expected_rules = tuple(LEGACY_RULE_FEATURE_COLUMNS_V1)
-        expected_schema = LEGACY_RULE_FEATURE_SCHEMA_VERSION_V1
-    elif selected_candidate == "unified_long_task_deep":
+    if selected_candidate == "unified_long_task_deep":
         expected_rules = tuple(RULE_FEATURE_COLUMNS)
         expected_schema = RULE_FEATURE_SCHEMA_VERSION
-    elif selected_candidate == "unified_long_task_deep_beam":
-        selected_increment = _validated_beam_search_contract(
-            source_manifest.get("beam_search")
-        )
-        expected_rules = (*LEGACY_RULE_FEATURE_COLUMNS_V1, *selected_increment)
-        expected_schema = "right_side_rule_features_v1_105_plus_beam_v2_increment"
     else:
         raise ValueError(f"unsupported selected right-side candidate: {selected_candidate}")
     if manifest_rules != expected_rules:
@@ -502,7 +418,10 @@ def stage_shadow_release(
     common_features = tuple(
         str(value) for value in (getattr(model, "common_features", None) or ())
     )
-    external_features = tuple(dict.fromkeys((*common_features, *RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS)))
+    external_features = stable_canonical_feature_union(
+        common_features,
+        RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+    )
     model_input_contract_sha256 = factor_contract_sha256(
         external_features,
         schema_version=RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION,
@@ -523,11 +442,7 @@ def stage_shadow_release(
         "selected_rule_factor_count": len(selected_rule_features),
         "selected_rule_factor_columns": selected_rule_features,
         "selected_rule_factor_columns_sha256": selected_rule_hash,
-        "beam_search": (
-            dict(source_manifest.get("beam_search") or {})
-            if selected_candidate == "unified_long_task_deep_beam"
-            else None
-        ),
+        "beam_search": None,
         "ranking_decision_sha256": _sha256(config.paths.ranking_decision),
         "source_model_manifest_path": _relative(
             project_root,
@@ -620,7 +535,10 @@ def _build_shadow_symbol_feature(
             PROJECT_FACTOR_SCHEMA_VERSION
         ).all():
             raise ValueError("project factor calculator returned the wrong schema")
-        rules = compute_right_side_rule_features(normalized).reset_index(drop=True)
+        rules = compute_right_side_rule_features(
+            normalized,
+            canonical_factors=project,
+        ).reset_index(drop=True)
         missing_rules = set(RULE_FEATURE_COLUMNS) - set(rules.columns)
         if missing_rules:
             raise ValueError(
@@ -671,7 +589,7 @@ def build_right_side_shadow_feature_frame(
     target_date: str | pd.Timestamp,
     workers: int = 1,
 ) -> pd.DataFrame:
-    """Build one exact-date v4+118 feature frame from already loaded inputs."""
+    """Build one exact-date project-v5/rule-v4-113 frame from loaded inputs."""
 
     validate_right_side_shadow_factor_contract()
     target = _target_timestamp(target_date)
@@ -865,11 +783,14 @@ def _load_shadow_bundle(
         raise RuntimeError("right-side shadow bundle schema mismatch")
     if bundle.get("factor_contract_sha256") != RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256:
         raise RuntimeError("right-side shadow bundle factor hash mismatch")
-    if (
-        bundle.get("materialized_rule_factor_columns_sha256")
-        != RULE_FEATURE_COLUMNS_SHA256
-    ):
+    if bundle.get("materialized_rule_factor_columns_sha256") != RULE_FEATURE_COLUMNS_SHA256:
         raise RuntimeError("right-side shadow bundle materialized rule-factor hash mismatch")
+    forbidden_payload = find_forbidden_aliases_in_payload(bundle)
+    if forbidden_payload:
+        raise RuntimeError(
+            "right-side shadow bundle contains forbidden factor aliases: "
+            f"{forbidden_payload}"
+        )
     features = tuple(str(value) for value in (bundle.get("features") or ()))
     if len(features) != len(set(features)) or not features:
         raise RuntimeError("right-side shadow bundle features are empty or duplicated")
@@ -882,26 +803,10 @@ def _load_shadow_bundle(
         raise RuntimeError("right-side shadow bundle selected rule-factor hash mismatch")
     if int(bundle.get("selected_rule_factor_count") or -1) != len(selected_rules):
         raise RuntimeError("right-side shadow bundle selected rule-factor count mismatch")
-    if selected_candidate == "unified_long_task_deep_rule105":
-        valid_rule_contract = selected_rules == tuple(LEGACY_RULE_FEATURE_COLUMNS_V1)
-    elif selected_candidate == "unified_long_task_deep":
-        valid_rule_contract = selected_rules == tuple(RULE_FEATURE_COLUMNS)
-    elif selected_candidate == "unified_long_task_deep_beam":
-        increment = selected_rules[len(LEGACY_RULE_FEATURE_COLUMNS_V1) :]
-        beam_selected = _validated_beam_search_contract(
-            bundle.get("beam_search"),
-            error_type=RuntimeError,
-        )
-        valid_rule_contract = bool(
-            selected_rules[: len(LEGACY_RULE_FEATURE_COLUMNS_V1)]
-            == tuple(LEGACY_RULE_FEATURE_COLUMNS_V1)
-            and 6 <= len(increment) <= len(ADDED_RULE_FEATURE_COLUMNS_V2)
-            and len(increment) == len(set(increment))
-            and set(increment) <= set(ADDED_RULE_FEATURE_COLUMNS_V2)
-            and beam_selected == tuple(increment)
-        )
-    else:
-        valid_rule_contract = False
+    valid_rule_contract = bool(
+        selected_candidate == "unified_long_task_deep"
+        and selected_rules == tuple(RULE_FEATURE_COLUMNS)
+    )
     if not valid_rule_contract:
         raise RuntimeError("right-side shadow bundle has an unsupported rule subset")
     missing_rules = sorted(set(selected_rules) - set(features))
@@ -925,6 +830,15 @@ def _load_shadow_bundle(
         )
     if bundle.get("model") is None:
         raise RuntimeError("right-side shadow bundle has no model")
+    model = bundle["model"]
+    assert_no_forbidden_factor_names(
+        getattr(model, "feature_names_in_", ()),
+        context="right-side shadow model feature_names_in_",
+    )
+    assert_no_forbidden_factor_names(
+        getattr(model, "selected_features_", ()),
+        context="right-side shadow model selected_features_",
+    )
     return bundle, digest
 
 

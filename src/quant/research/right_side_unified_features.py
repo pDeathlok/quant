@@ -39,13 +39,24 @@ RIGHT_SIDE_SIGNALS: tuple[str, ...] = (
 )
 
 
+# B2 consumes these values from the canonical project-factor layer. They are
+# signal requirements, but must not be materialized again as rs_* aliases.
+RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS: tuple[str, ...] = (
+    "pct_chg",
+    "amplitude_1",
+    "volume_relative_5d",
+    "volume_relative_20d",
+    "kdj_d_j",
+)
+
+
 SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "B2": (
-        "rs_pct_chg_1d",
-        "rs_vol_ratio_5_inclusive",
-        "rs_vol_ratio_20_inclusive",
+        "pct_chg",
+        "volume_relative_5d",
+        "volume_relative_20d",
         "rs_close_pos",
-        "rs_family_kdj_j",
+        "kdj_d_j",
         "rs_recent_yin_count_4",
         "rs_close_to_ma60_pct",
         "rs_b1_support_ok",
@@ -65,10 +76,10 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_b2_recent_prev3",
         "rs_b2_broad_recent_prev3",
         "rs_days_since_b2",
-        "rs_pct_chg_1d",
-        "rs_amplitude_pct",
+        "pct_chg",
+        "amplitude_1",
         "rs_close_pos",
-        "rs_vol_ratio_5_inclusive",
+        "volume_relative_5d",
         "rs_b3_small_pos_amp7",
         "rs_b3_broad_small_pos",
         "rs_b3_broad_calm_pullback",
@@ -77,7 +88,7 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_body_abs_pct",
         "rs_is_rise",
         "rs_close_pos",
-        "rs_pct_chg_1d",
+        "pct_chg",
         "rs_vol_ratio_prev5",
         "rs_high_to_prev20_high_pct",
         "rs_low_to_prev20_low_pct",
@@ -87,7 +98,7 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_low_to_prev20_low_pct",
         "rs_at_bottom_20d",
         "rs_is_rise",
-        "rs_pct_chg_1d",
+        "pct_chg",
         "rs_close_pos",
         "rs_body_abs_pct",
         "rs_body_vs_prev6",
@@ -130,7 +141,7 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_volume_to_fangliang_ref",
         "rs_bbi_slope_5d_pct",
         "rs_bbi_distance_pct",
-        "rs_pct_chg_1d",
+        "pct_chg",
     ),
     "BREATHING": (
         "rs_phase_exhale",
@@ -138,7 +149,7 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_exhale_count_7d",
         "rs_inhale_count_7d",
         "rs_higher_low_ratio",
-        "rs_pct_chg_1d",
+        "pct_chg",
         "rs_vol_ratio_prev",
         "rs_close_pos",
     ),
@@ -147,7 +158,7 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_huge_volume_count_20d",
         "rs_huge_yang_share_20d",
         "rs_close_to_platform_high_pct",
-        "rs_pct_chg_1d",
+        "pct_chg",
         "rs_close_pos",
     ),
     "CHANGAN": (
@@ -156,8 +167,8 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_is_rise_lag1",
         "rs_vol_ratio_prev5_lag1",
         "rs_kdj_j_lag1_minus_lag2",
-        "rs_pct_chg_1d",
-        "rs_amplitude_pct",
+        "pct_chg",
+        "amplitude_1",
         "rs_vol_ratio_prev",
     ),
     "KENGQI": (
@@ -167,7 +178,7 @@ SIGNAL_FEATURE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "rs_pit_fill_ratio",
         "rs_post_to_pre_volume_ratio",
         "rs_last_pit_vol_ratio_prev",
-        "rs_pct_chg_1d",
+        "pct_chg",
     ),
     "VEGAS": (
         "rs_ema10",
@@ -215,18 +226,16 @@ RULE_FEATURE_COLUMNS: tuple[str, ...] = tuple(
         feature
         for signal in RIGHT_SIDE_SIGNALS
         for feature in SIGNAL_FEATURE_REQUIREMENTS[signal]
+        if feature not in frozenset(RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS)
     )
 )
 
 
-# Freeze the exact rule-factor contracts used by the first fair 105 vs 118
-# ablation.  Keep the added-column tuple explicit: deriving the legacy schema
-# from an old parquet file would make model behaviour depend on mutable data.
-RULE_FEATURE_SCHEMA_VERSION = "right_side_rule_features_v2_118_20260813"
+# The v4 contract removes every project-layer compatibility alias. Canonical
+# project factors enter the model union once and are not rule-layer outputs.
+RULE_FEATURE_SCHEMA_VERSION = "right_side_rule_features_v4_113_20260824"
 LEGACY_RULE_FEATURE_SCHEMA_VERSION_V1 = "right_side_rule_features_v1_105_20260812"
 ADDED_RULE_FEATURE_COLUMNS_V2: tuple[str, ...] = (
-    "rs_vol_ratio_20_inclusive",
-    "rs_family_kdj_j",
     "rs_recent_yin_count_4",
     "rs_close_to_ma60_pct",
     "rs_b1_support_ok",
@@ -263,6 +272,16 @@ def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return pd.to_numeric(numerator, errors="coerce").div(
         pd.to_numeric(denominator, errors="coerce").replace(0, np.nan)
     )
+
+
+def _nanmean_or_nan(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    return float(finite.mean()) if finite.size else np.nan
+
+
+def _nanmax_or_nan(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    return float(finite.max()) if finite.size else np.nan
 
 
 def _days_since(mask: pd.Series) -> pd.Series:
@@ -302,8 +321,12 @@ def _kengqi_event_state(frame: pd.DataFrame, vol_ratio_prev: pd.Series) -> dict[
             continue
         post_end = min(pit + 5, position) + 1
         post_slice = slice(pit + 1, post_end)
-        pre_volume = float(np.nanmean(volume[pre_slice]))
-        post_volume = float(np.nanmean(volume[post_slice])) if post_end > pit + 1 else np.nan
+        pre_volume = _nanmean_or_nan(volume[pre_slice])
+        post_volume = (
+            _nanmean_or_nan(volume[post_slice])
+            if post_end > pit + 1
+            else np.nan
+        )
         output["depth"][position] = (pre_high - pit_low) / pre_high
         output["recent"][position] = bool(
             close[pit] < open_[pit] and ratio[pit] >= 1.25
@@ -409,6 +432,31 @@ def _prepare_daily(daily: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def compute_right_side_project_requirements(daily: pd.DataFrame) -> pd.DataFrame:
+    """Return the canonical project factors consumed by rule predicates."""
+
+    frame = _prepare_daily(daily)
+    close = frame["close"]
+    pre_close = frame["pre_close"]
+    volume = frame["volume"]
+    low9 = frame["low"].rolling(9).min()
+    high9 = frame["high"].rolling(9).max()
+    rsv = _safe_div(close - low9, high9 - low9) * 100.0
+    k = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+    d = k.ewm(alpha=1 / 3, adjust=False).mean()
+    return pd.DataFrame(
+        {
+            "pct_chg": (_safe_div(close, pre_close) - 1.0) * 100.0,
+            "amplitude_1": _safe_div(frame["high"] - frame["low"], pre_close)
+            * 100.0,
+            "volume_relative_5d": _safe_div(volume, volume.rolling(5).mean()),
+            "volume_relative_20d": _safe_div(volume, volume.rolling(20).mean()),
+            "kdj_d_j": 3.0 * k - 2.0 * d,
+        },
+        index=frame.index,
+    )[list(RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS)]
+
+
 def _two_yang_state(
     frame: pd.DataFrame,
     strong_yang: pd.Series,
@@ -476,7 +524,7 @@ def _two_yang_state(
             }
             if middle_count > 0:
                 middle_volume = volume[middle]
-                middle_max = float(np.nanmax(middle_volume))
+                middle_max = _nanmax_or_nan(middle_volume)
                 pair_values.update(
                     {
                         "mid_yin_share": float(
@@ -488,7 +536,7 @@ def _two_yang_state(
                         "second_to_mid_max": (
                             second_volume / middle_max if middle_max else np.nan
                         ),
-                        "mid_avg_ratio": float(np.nanmean(ratio[middle])),
+                        "mid_avg_ratio": _nanmean_or_nan(ratio[middle]),
                     }
                 )
             cached_pair = pair
@@ -683,7 +731,43 @@ def _tvb_anchor_state(
     }
 
 
-def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
+_CANONICAL_REUSE_COLUMNS = (
+    "pct_chg",
+    "amplitude_1",
+    "volume_relative_5d",
+    "volume_relative_20d",
+    "kdj_d_j",
+)
+
+
+def _aligned_canonical_factors(
+    frame: pd.DataFrame,
+    canonical_factors: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    if canonical_factors is None:
+        return None
+    missing = sorted(set(_CANONICAL_REUSE_COLUMNS) - set(canonical_factors.columns))
+    if missing:
+        raise ValueError(f"canonical right-side factors are incomplete: {missing}")
+    if len(canonical_factors) != len(frame):
+        raise ValueError("canonical right-side factors must align one-to-one with daily rows")
+    aligned = canonical_factors
+    if not aligned.index.equals(frame.index):
+        aligned = aligned.reset_index(drop=True)
+        aligned.index = frame.index
+    if "date" in aligned:
+        source_dates = frame["date"].to_numpy()
+        canonical_dates = aligned["date"].to_numpy()
+        if not np.array_equal(source_dates, canonical_dates):
+            raise ValueError("canonical right-side factor dates do not align with daily rows")
+    return aligned
+
+
+def compute_right_side_rule_features(
+    daily: pd.DataFrame,
+    *,
+    canonical_factors: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Return causal rule primitives for one stock, ordered by trade date.
 
     The result contains exactly :data:`RULE_FEATURE_COLUMNS` and keeps the
@@ -691,6 +775,7 @@ def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
     """
 
     frame = _prepare_daily(daily)
+    canonical = _aligned_canonical_factors(frame, canonical_factors)
     index = frame.index
     open_ = frame["open"]
     high = frame["high"]
@@ -699,8 +784,16 @@ def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
     pre_close = frame["pre_close"]
     volume = frame["volume"]
 
-    pct_chg = (_safe_div(close, pre_close) - 1.0) * 100.0
-    amplitude = _safe_div(high - low, pre_close) * 100.0
+    pct_chg = (
+        canonical["pct_chg"]
+        if canonical is not None
+        else (_safe_div(close, pre_close) - 1.0) * 100.0
+    )
+    amplitude = (
+        canonical["amplitude_1"]
+        if canonical is not None
+        else _safe_div(high - low, pre_close) * 100.0
+    )
     close_pos = _safe_div(close - low, high - low)
     signed_body = _safe_div(close - open_, pre_close) * 100.0
     body_abs = signed_body.abs()
@@ -713,8 +806,16 @@ def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
     vol_ratio_prev5 = _safe_div(volume, volume.shift(1).rolling(5, min_periods=2).mean())
     # Family B1/B2/B3 uses the project daily-factor layer's inclusive rolling
     # means, which require the complete 5/20-bar window.
-    vol_ratio_5_inclusive = _safe_div(volume, volume.rolling(5).mean())
-    vol_ratio_20_inclusive = _safe_div(volume, volume.rolling(20).mean())
+    vol_ratio_5_inclusive = (
+        canonical["volume_relative_5d"]
+        if canonical is not None
+        else _safe_div(volume, volume.rolling(5).mean())
+    )
+    vol_ratio_20_inclusive = (
+        canonical["volume_relative_20d"]
+        if canonical is not None
+        else _safe_div(volume, volume.rolling(20).mean())
+    )
 
     low9 = low.rolling(9, min_periods=3).min()
     high9 = high.rolling(9, min_periods=3).max()
@@ -726,12 +827,15 @@ def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
     # Family B2/B3 consumes the project KDJ implementation, which starts only
     # after a complete nine-bar RSV window.  The live Z detector intentionally
     # uses the partial-history/fill-50 KDJ above.
-    family_low9 = low.rolling(9).min()
-    family_high9 = high.rolling(9).max()
-    family_rsv = _safe_div(close - family_low9, family_high9 - family_low9) * 100.0
-    family_k = family_rsv.ewm(alpha=1 / 3, adjust=False).mean()
-    family_d = family_k.ewm(alpha=1 / 3, adjust=False).mean()
-    family_kdj_j = 3.0 * family_k - 2.0 * family_d
+    if canonical is not None:
+        family_kdj_j = canonical["kdj_d_j"]
+    else:
+        family_low9 = low.rolling(9).min()
+        family_high9 = high.rolling(9).max()
+        family_rsv = _safe_div(close - family_low9, family_high9 - family_low9) * 100.0
+        family_k = family_rsv.ewm(alpha=1 / 3, adjust=False).mean()
+        family_d = family_k.ewm(alpha=1 / 3, adjust=False).mean()
+        family_kdj_j = 3.0 * family_k - 2.0 * family_d
 
     ma3 = close.rolling(3, min_periods=1).mean()
     ma6 = close.rolling(6, min_periods=2).mean()
@@ -964,9 +1068,9 @@ def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
     tvb_merged = tvb_candidate_25 | tvb_candidate_30
 
     features: dict[str, pd.Series] = {
-        "rs_pct_chg_1d": pct_chg,
+        "pct_chg": pct_chg,
         "rs_pct_chg_lag1": pct_chg.shift(1),
-        "rs_amplitude_pct": amplitude,
+        "amplitude_1": amplitude,
         "rs_close_pos": close_pos,
         "rs_body_abs_pct": body_abs,
         "rs_upper_shadow_pct": upper_shadow,
@@ -975,10 +1079,8 @@ def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
         "rs_vol_ratio_prev": vol_ratio_prev,
         "rs_vol_ratio_prev5": vol_ratio_prev5,
         "rs_vol_ratio_prev5_lag1": vol_ratio_prev5.shift(1),
-        "rs_vol_ratio_5_inclusive": vol_ratio_5_inclusive,
-        "rs_vol_ratio_20_inclusive": vol_ratio_20_inclusive,
+        "volume_relative_5d": vol_ratio_5_inclusive,
         "rs_kdj_j": kdj_j,
-        "rs_family_kdj_j": family_kdj_j,
         "rs_kdj_j_lag1": kdj_j.shift(1),
         "rs_kdj_j_lag2": kdj_j.shift(2),
         "rs_kdj_j_lag1_minus_lag2": kdj_j.shift(1) - kdj_j.shift(2),
@@ -1072,7 +1174,9 @@ def compute_right_side_rule_features(daily: pd.DataFrame) -> pd.DataFrame:
         "rs_tvb_merged": tvb_merged,
     }
     result = pd.DataFrame(features, index=index).loc[:, RULE_FEATURE_COLUMNS]
-    validate_signal_factor_contract(result.columns)
+    validate_signal_factor_contract(
+        (*result.columns, *RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS)
+    )
     return result
 
 
@@ -1153,6 +1257,7 @@ def validate_signal_factor_contract(columns: Iterable[str]) -> None:
 
 __all__ = [
     "RIGHT_SIDE_SIGNALS",
+    "RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS",
     "SIGNAL_FEATURE_REQUIREMENTS",
     "RULE_FEATURE_COLUMNS",
     "RULE_FEATURE_SCHEMA_VERSION",
@@ -1162,6 +1267,7 @@ __all__ = [
     "LEGACY_RULE_FEATURE_COLUMNS_SHA256_V1",
     "ADDED_RULE_FEATURE_COLUMNS_V2",
     "rule_feature_columns_sha256",
+    "compute_right_side_project_requirements",
     "compute_right_side_rule_features",
     "audit_factor_coverage",
     "validate_signal_factor_contract",

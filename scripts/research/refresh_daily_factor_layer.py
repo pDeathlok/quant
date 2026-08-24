@@ -21,8 +21,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--daily-dir", type=Path, default=PROJECT_ROOT / "data/raw/daily")
     parser.add_argument("--factor-root", type=Path, default=PROJECT_ROOT / DEFAULT_FACTOR_ROOT)
     parser.add_argument("--incremental-start-date", required=True)
-    parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--executor", choices=["threads", "processes"], default="processes")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="override configs/factors/governance.json calculator worker policy",
+    )
+    parser.add_argument(
+        "--executor",
+        choices=["threads", "processes"],
+        default=None,
+        help="override configs/factors/governance.json calculator executor",
+    )
     parser.add_argument("--limit", type=int, default=None)
     return parser.parse_args()
 

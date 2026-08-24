@@ -25,6 +25,12 @@ from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
+
+from quant.features.factor_execution import (
+    allocate_worker_budget,
+    calculator_execution_settings,
+    configured_worker_budget,
+)
 import yaml
 
 from quant.application.refresh_contracts import (
@@ -38,6 +44,7 @@ from quant.application.selector_ranking import (
     SelectorRankingSource,
     apply_selector_ranking_source,
 )
+from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
 from quant.application.blood_chip_long_plan import (
     BLOOD_CHIP_LONG_SCHEMA_VERSION,
     build_blood_chip_daily_iteration,
@@ -71,6 +78,8 @@ from quant.features.factor_registry import (
     LONG_PRODUCTION_FACTOR_COLUMNS,
     LONG_PRODUCTION_FACTOR_SCHEMA_VERSION,
 )
+from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
+from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 from quant.infrastructure.workspace_snapshots import (
     WorkspaceSnapshotRepository,
     canonical_snapshot_date,
@@ -4881,12 +4890,16 @@ def _resolve_selector_signal_date(
     if not signal_date:
         return snapshot_dates[-1] if snapshot_dates else _latest_candidate_signal_date()
     target = pd.to_datetime(signal_date, errors="raise")
+    target_iso = target.strftime("%Y-%m-%d")
     if not snapshot_dates:
-        return signal_date
-    if target.weekday() < 5 and signal_date in snapshot_dates:
-        return signal_date
-    previous = [item for item in snapshot_dates if item <= signal_date]
-    return previous[-1] if previous else signal_date
+        return target_iso
+    if target.weekday() < 5 and (
+        target_iso in snapshot_dates
+        or target_iso == _latest_candidate_signal_date()
+    ):
+        return target_iso
+    previous = [item for item in snapshot_dates if item <= target_iso]
+    return previous[-1] if previous else target_iso
 
 
 @lru_cache(maxsize=1)
@@ -5892,6 +5905,16 @@ def _model_playbook_for(signal_key: str) -> pd.Series | None:
 
 @lru_cache(maxsize=8)
 def _model_scored_candidates_for_date(signal_date: str | None = None) -> dict[tuple[str, str], pd.Series]:
+    # Once both unified rankers are active, per-strategy Z-skill model scores
+    # are rollback-only artifacts.  Signal discovery still comes from the
+    # canonical rule caches, while ordering comes exclusively from the two
+    # unified score contracts.
+    if (
+        DEFAULT_SELECTOR_RANKING_CONFIG.source
+        == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+        and DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled
+    ):
+        return {}
     if not EXTENDED_MODEL_SCORED.exists():
         return {}
     df = pd.read_parquet(EXTENDED_MODEL_SCORED)
@@ -7366,25 +7389,32 @@ def _b1_model_signal(row: dict[str, Any]) -> dict[str, Any]:
         if row.get("buy_min_price") is not None and row.get("buy_max_price") is not None
         else f">= {float(row['buy_min_price']):.2f}" if row.get("buy_min_price") is not None else "按策略开盘条件观察"
     )
+    unified_rank = row.get("ranking_score_normalized")
     pred_up10 = float(row.get("pred_up10_es") or 0)
     pred_down3 = float(row.get("pred_down3_es") or 0)
+    uses_unified_rank = unified_rank is not None
+    reason = (
+        f"左侧统一排序百分位={float(unified_rank):.2f}"
+        if uses_unified_rank
+        else f"up10={pred_up10:.3f}，down3={pred_down3:.3f}，J={float(row.get('kdj_d_j') or 0):.2f}"
+    )
     return _enrich_signal_group({
         "strategy_key": "B1_MODEL",
         "strategy_family": "B1",
         "strategy_name": row.get("strategy_name") or "B1 模型 Top20",
         "operation_key": str(row.get("buy_filter") or row.get("open_gap_text") or "B1"),
         "timeframe": "日线级，收盘后生成名单，T+1 开盘观察",
-        "logic": f"{row.get('entry_rule')}；{row.get('buy_filter')}；模型分阈值命中",
-        "reason": (
-            f"up10={pred_up10:.3f}，"
-            f"down3={pred_down3:.3f}，"
-            f"J={float(row.get('kdj_d_j') or 0):.2f}"
-        ),
+        "logic": f"{row.get('entry_rule')}；{row.get('buy_filter')}",
+        "reason": reason,
         "buy_plan": f"{row.get('open_gap_text')}；参考买入价 {price_range}。不满足开盘条件则空仓观察。",
         "sell_plan": row.get("sell_summary") or "按策略卖出规则执行",
         "metrics": metrics,
         "metrics_text": _metrics_text(metrics),
-        "strength_score": max(pred_up10 - pred_down3, 0) * 3,
+        "strength_score": (
+            float(unified_rank) / 25.0
+            if uses_unified_rank
+            else max(pred_up10 - pred_down3, 0) * 3
+        ),
     })
 
 
@@ -8884,9 +8914,10 @@ def _run_latest_refresh_job(
                 return (
                     payload.get("status") == "success"
                     and payload.get("candidate_coverage_status") == "complete"
-                    and int(payload.get("factor_count") or 0) == 147
+                    and int(payload.get("factor_count") or 0)
+                    == len(PROJECT_FACTOR_COLUMNS)
                     and payload.get("factor_schema_version")
-                    == "project-v1-latest-scale-global-rank"
+                    == PROJECT_FACTOR_SCHEMA_VERSION
                     and pd.notna(target)
                     and target.normalize() == expected_incremental_date
                     and parquet_current
@@ -9047,26 +9078,71 @@ def _run_latest_refresh_job(
             percent=72,
             complete_previous=False,
         )
-        model_score_workers = min(
-            4,
-            max(1, int(os.getenv("ROUTINE_MODEL_SCORE_WORKERS", "4"))),
+        worker_budget = configured_worker_budget()
+        model_score_request = max(
+            1, int(os.getenv("ROUTINE_MODEL_SCORE_WORKERS", "4"))
         )
-        chan_score_workers = min(
-            4,
-            max(1, int(os.getenv("ROUTINE_CHAN_WORKERS", "4"))),
+        chan_execution = calculator_execution_settings("chan_live")
+        chan_score_request = min(
+            chan_execution.max_workers,
+            max(
+                1,
+                int(
+                    os.getenv(
+                        "ROUTINE_CHAN_WORKERS",
+                        str(chan_execution.default_workers),
+                    )
+                ),
+            ),
         )
         right_side_enabled = (
             DEFAULT_SELECTOR_RANKING_CONFIG.source
             == SelectorRankingSource.RIGHT_SIDE_UNIFIED
         )
+        left_side_enabled = DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled
+        legacy_strategy_model_score_required = not (
+            right_side_enabled and left_side_enabled
+        )
+        right_side_execution = calculator_execution_settings("right_side_rule")
+        right_side_request = min(
+            right_side_execution.max_workers,
+            max(
+                1,
+                int(
+                    os.getenv(
+                        "ROUTINE_RIGHT_SIDE_WORKERS",
+                        str(right_side_execution.default_workers),
+                    )
+                ),
+            ),
+        )
+        model_phase = allocate_worker_budget(
+            {"model_score": model_score_request, "chan": chan_score_request},
+            total_budget=worker_budget,
+        )
+        right_side_phase = allocate_worker_budget(
+            {"right_side": right_side_request, "chan": chan_score_request},
+            total_budget=worker_budget,
+        )
+        chan_score_workers = min(model_phase["chan"], right_side_phase["chan"])
+        model_score_workers = min(
+            model_score_request,
+            max(1, worker_budget - chan_score_workers),
+        )
         right_side_workers = min(
-            6,
-            max(1, int(os.getenv("ROUTINE_RIGHT_SIDE_WORKERS", "6"))),
+            right_side_request,
+            max(1, worker_budget - chan_score_workers),
         )
         model_score_gate = threading.Event()
         model_score_failures: list[BaseException] = []
-        if model_score_ready:
+        if model_score_ready or not legacy_strategy_model_score_required:
             model_score_gate.set()
+        if not legacy_strategy_model_score_required:
+            results["model_score"] = {
+                "status": "retired",
+                "reason": "two_unified_short_rankers_active",
+                "active_consumers": 0,
+            }
 
         def score_models_then_release_workers() -> dict[str, Any]:
             try:
@@ -9101,6 +9177,13 @@ def _run_latest_refresh_job(
                 factor_workers=right_side_workers,
             )
 
+        def build_left_side_after_signal_cache() -> dict[str, Any]:
+            from quant.routine.left_side_unified_production import (
+                run_left_side_production,
+            )
+
+            return run_left_side_production(expected_signal_date)
+
         if right_side_enabled:
             _set_refresh_progress(
                 step_key="right_side_unified_features",
@@ -9108,20 +9191,19 @@ def _run_latest_refresh_job(
                 percent=72,
                 complete_previous=False,
             )
+        if left_side_enabled:
+            _set_refresh_progress(
+                step_key="left_side_unified_features",
+                message="正在构建左侧统一因子与排序分",
+                percent=72,
+                complete_previous=False,
+            )
 
         with ThreadPoolExecutor(
-            max_workers=5 if right_side_enabled else 4,
+            max_workers=4 + int(right_side_enabled) + int(left_side_enabled),
             thread_name_prefix="quant-daily-output",
         ) as executor:
             output_futures = {
-                executor.submit(generate_daily_plan): (
-                    "generate_daily_plan",
-                    "最新策略每日计划生成失败",
-                ),
-                executor.submit(generate_dashboard, allow_incompatible=True): (
-                    "generate_dashboard",
-                    "B1 Dashboard 生成失败",
-                ),
                 executor.submit(
                     refresh_chan_model_scores,
                     progress_callback=lambda percent, message: _set_refresh_progress(
@@ -9133,7 +9215,21 @@ def _run_latest_refresh_job(
                     workers=chan_score_workers,
                 ): ("refresh_chan_model_scores", "缠论实时评分刷新失败"),
             }
-            if not model_score_ready:
+            if not left_side_enabled:
+                output_futures[executor.submit(generate_daily_plan)] = (
+                    "generate_daily_plan",
+                    "最新策略每日计划生成失败",
+                )
+                output_futures[
+                    executor.submit(generate_dashboard, allow_incompatible=True)
+                ] = ("generate_dashboard", "B1 Dashboard 生成失败")
+            else:
+                results["generate_dashboard"] = {
+                    "status": "retired",
+                    "reason": "left_side_unified_replaces_legacy_b1_model_dashboard",
+                    "active_consumers": 0,
+                }
+            if not model_score_ready and legacy_strategy_model_score_required:
                 output_futures[
                     executor.submit(score_models_then_release_workers)
                 ] = ("model_score", "当日策略模型分计算失败")
@@ -9141,6 +9237,10 @@ def _run_latest_refresh_job(
                 output_futures[
                     executor.submit(build_right_side_after_model_score)
                 ] = ("right_side_unified", "右侧统一生产排序失败")
+            if left_side_enabled:
+                output_futures[
+                    executor.submit(build_left_side_after_signal_cache)
+                ] = ("left_side_unified", "左侧统一生产排序失败")
 
             completed_daily_outputs: set[str] = set()
             for future in as_completed(output_futures):
@@ -9189,6 +9289,43 @@ def _run_latest_refresh_job(
                             percent=percent,
                             complete_previous=False,
                         )
+                    continue
+                if result_key == "left_side_unified":
+                    results["left_side_unified_features"] = {
+                        "status": "success",
+                        "target_date": payload.get("target_date"),
+                        "checkpoint_reused": payload.get("checkpoint_reused", False),
+                    }
+                    results["left_side_unified_scores"] = payload
+                    results["left_side_unified_adapter"] = {
+                        **(payload.get("adapter") or {}),
+                        "status": "success",
+                    }
+                    plan_payload = generate_daily_plan()
+                    results["generate_daily_plan"] = {
+                        **plan_payload,
+                        "status": "success",
+                        "ranking_source": "left_side_unified",
+                    }
+                    for step_key, message, percent in (
+                        ("left_side_unified_features", "左侧生产因子构建完成", 73),
+                        ("left_side_unified_score", "左侧统一排序分计算完成", 77),
+                        ("left_side_unified_adapter", "左侧 selector 排序适配校验完成", 79),
+                    ):
+                        _set_refresh_progress(
+                            step_key=step_key,
+                            step_status="success",
+                            message=message,
+                            percent=percent,
+                            complete_previous=False,
+                        )
+                    _set_refresh_progress(
+                        step_key="daily_plan",
+                        step_status="success",
+                        message="左侧统一排序每日计划已生成；旧B1模型看板已退役",
+                        percent=80,
+                        complete_previous=False,
+                    )
                     continue
 
                 results[result_key] = payload

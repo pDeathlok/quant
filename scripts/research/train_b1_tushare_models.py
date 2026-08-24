@@ -14,6 +14,7 @@ No AkShare fields are read or required.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -43,7 +44,13 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.atomic_io import atomic_write_json
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.canonical_factor_names import (
+    FORBIDDEN_COMPATIBILITY_ALIASES,
+    assert_no_forbidden_factor_names,
+    migrate_legacy_factor_columns,
+)
 from quant.features.b1_gate import calculate_b1_gate
 from quant.features.daily_factor_layer import attach_daily_base_factors
 from quant.features.project_factor_layer import (
@@ -55,6 +62,7 @@ from quant.features.variable_library import (
     PROJECT_FACTOR_COLUMNS,
     merge_daily_basic_features,
 )
+from quant.features.right_side_factor_contract import factor_contract_sha256
 from quant.ml.feature_coverage import model_feature_history_start
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
@@ -594,6 +602,10 @@ def train_models(
     factor_schema_version = next(iter(factor_schemas))
 
     configured_features = list(dict.fromkeys(feature_columns or B1_FEATURE_COLUMNS))
+    assert_no_forbidden_factor_names(
+        configured_features,
+        context="B1 training features",
+    )
     for model_name, label_col in LABELS.items():
         cols = [col for col in configured_features if col in data.columns]
         subset = data.loc[:, [*cols, label_col, "date", "symbol", "split"]].dropna(subset=[label_col]).copy()
@@ -687,6 +699,11 @@ def train_models(
             "feature_selection_k": "all" if model_select_k is None else model_select_k,
             "selected_feature_count": len(selected),
             "selected_features": selected,
+            "model_input_contract_sha256": factor_contract_sha256(
+                cols,
+                schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
+            ),
+            "forbidden_aliases": [],
             "scale_pos_weight": float(scale_pos_weight),
             "xgboost_params": MODEL_PARAMS[model_name],
             "best_iteration": int(classifier.best_iteration) if getattr(classifier, "best_iteration", None) is not None else None,
@@ -794,6 +811,7 @@ def main() -> None:
     parser.add_argument("--enrichment-min-non-null-rows", type=int, default=500)
     parser.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "models/research/b1_xgb_project_vars")
     parser.add_argument("--report-dir", type=Path, default=PROJECT_ROOT / "reports/b1/research/xgb_project_vars")
+    parser.add_argument("--release-id", default="b1-canonical-v5-20260824")
     parser.add_argument("--select-k", type=int, default=0, help="0 means use all available factors; positive values enable SelectKBest")
     args = parser.parse_args()
 
@@ -813,7 +831,15 @@ def main() -> None:
         input_dataset = args.input_dataset or args.dataset_out
         if not input_dataset.exists():
             raise FileNotFoundError(f"Training dataset does not exist: {input_dataset}")
-        data = pd.read_parquet(input_dataset)
+        data = migrate_legacy_factor_columns(
+            pd.read_parquet(input_dataset),
+            context=f"B1 training dataset boundary {input_dataset}",
+            copy=False,
+        )
+        assert_no_forbidden_factor_names(
+            data.columns,
+            context="B1 training dataframe",
+        )
         data["date"] = pd.to_datetime(data["date"], errors="coerce")
         print(f"reusing training dataset: {input_dataset} rows={len(data)}", flush=True)
     else:
@@ -871,7 +897,7 @@ def main() -> None:
     data.to_parquet(args.dataset_out, index=False)
     print(f"training dataset written: {args.dataset_out} rows={len(data)}", flush=True)
     select_k = None if args.select_k == 0 else args.select_k
-    train_models(
+    reports = train_models(
         data,
         args.model_dir,
         args.report_dir,
@@ -879,6 +905,47 @@ def main() -> None:
         feature_columns=feature_columns,
         dataset_metadata=dataset_metadata,
     )
+    model_items: dict[str, dict[str, object]] = {}
+    for model_name in LABELS:
+        artifact_path = args.model_dir / f"{model_name}.joblib"
+        model = joblib.load(artifact_path)
+        feature_names = tuple(str(value) for value in model.feature_names_in_)
+        selected_features = tuple(str(value) for value in model.selected_features_)
+        assert_no_forbidden_factor_names(
+            feature_names,
+            context=f"B1 artifact {model_name}",
+        )
+        assert_no_forbidden_factor_names(
+            selected_features,
+            context=f"B1 selected features {model_name}",
+        )
+        model_items[model_name] = {
+            "path": str(artifact_path.resolve().relative_to(PROJECT_ROOT.resolve())),
+            "sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+            "feature_count": len(feature_names),
+            "features": list(feature_names),
+            "selected_features": list(selected_features),
+            "model_input_contract_sha256": factor_contract_sha256(
+                feature_names,
+                schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
+            ),
+        }
+    manifest = {
+        "schema_version": "b1-model-bundle-v2-canonical-alias-free",
+        "release_id": args.release_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+        "factor_count": len(PROJECT_FACTOR_COLUMNS),
+        "canonical_features": list(PROJECT_FACTOR_COLUMNS),
+        "forbidden_aliases": [],
+        "training_report": str(
+            (args.report_dir / "training_report.json")
+            .resolve()
+            .relative_to(PROJECT_ROOT.resolve())
+        ),
+        "models": model_items,
+    }
+    atomic_write_json(manifest, args.model_dir / "manifest.json")
 
 
 if __name__ == "__main__":

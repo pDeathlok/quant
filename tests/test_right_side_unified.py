@@ -16,6 +16,7 @@ from quant.research.right_side_unified import (
 )
 from quant.research.right_side_unified_features import (
     RIGHT_SIDE_SIGNALS as FEATURE_SIGNALS,
+    RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS,
     RULE_FEATURE_COLUMNS,
     SIGNAL_FEATURE_REQUIREMENTS,
     compute_right_side_rule_features,
@@ -319,7 +320,9 @@ def test_every_signal_has_materialized_rule_features() -> None:
     assert set(FEATURE_SIGNALS) == set(RIGHT_SIDE_SIGNALS)
     assert set(SIGNAL_FEATURE_REQUIREMENTS) == set(RIGHT_SIDE_SIGNALS)
     assert len(RULE_FEATURE_COLUMNS) >= 90
-    validate_signal_factor_contract(RULE_FEATURE_COLUMNS)
+    validate_signal_factor_contract(
+        (*RULE_FEATURE_COLUMNS, *RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS)
+    )
 
 
 def test_rule_features_are_prefix_causal() -> None:

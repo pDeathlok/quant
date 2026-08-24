@@ -50,11 +50,12 @@ def test_every_page_refresh_starts_from_shared_market_daily_data(scope: str) -> 
     assert REFRESH_SCOPE_STEPS[scope][0] == "refresh_data"
 
 
-def test_daily_refresh_orders_factor_layer_before_long_page_outputs() -> None:
+def test_daily_refresh_orders_unified_short_factors_before_page_outputs() -> None:
     steps = REFRESH_SCOPE_STEPS["all"]
 
-    assert steps.index("feature_cache") < steps.index("long_stock_pool")
-    assert "统一日频因子层" in REFRESH_STEP_DEFINITIONS["feature_cache"]["label"]
+    assert steps.index("right_side_unified_features") < steps.index("daily_plan")
+    assert steps.index("left_side_unified_features") < steps.index("daily_plan")
+    assert "canonical 因子" in REFRESH_STEP_DEFINITIONS["right_side_unified_features"]["label"]
     assert "长线因子截面" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]
     assert "页面股票池" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]
     assert "带血筹" in REFRESH_STEP_DEFINITIONS["long_stock_pool"]["label"]

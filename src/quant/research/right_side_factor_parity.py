@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from quant.research.right_side_unified_features import (
+    RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS,
     RIGHT_SIDE_SIGNALS,
     RULE_FEATURE_COLUMNS,
     SIGNAL_FEATURE_REQUIREMENTS,
@@ -37,7 +38,7 @@ from quant.research.right_side_unified_signals import (
 from quant.strategies.custom.vegas_tunnel import OPTIMIZED_VEGAS_TUNNEL_PARAMS
 
 
-PREDICATE_FACTOR_SCHEMA_VERSION = "right_side_predicate_factor_v2_20260813"
+PREDICATE_FACTOR_SCHEMA_VERSION = "right_side_predicate_factor_v3_20260824"
 
 TRIPLE_VOLUME_CONFIG_SHA256 = (
     "a99b00574759071a1fd012d3bc9f0490cf4d388a91ac4ad3e48eb8aa11ad82d8"
@@ -141,7 +142,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
                 "b2.b1_anchor",
                 "B1 anchor: oversold, relative-volume contraction, fewer than four yin bars, and BBI/MA60 support.",
                 (
-                    "rs_vol_ratio_20_inclusive",
+                    "volume_relative_20d",
                     "rs_recent_yin_count_4",
                     "rs_close_to_ma60_pct",
                     "rs_b1_support_ok",
@@ -157,10 +158,10 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
                 "b2.current_confirmation",
                 "Current-bar right-side confirmation margins.",
                 (
-                    "rs_pct_chg_1d",
-                    "rs_vol_ratio_5_inclusive",
+                    "pct_chg",
+                    "volume_relative_5d",
                     "rs_close_pos",
-                    "rs_family_kdj_j",
+                    "kdj_d_j",
                     "rs_upper_shadow_pct",
                 ),
                 "branch-specific pct>=3/4/5, vol5>=1.2/1.5, close_pos>=0.65/0.70/0.75, J<55/60/80",
@@ -216,7 +217,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "b3.current_consolidation",
                 "Small-positive or calm-pullback current-bar margins.",
-                ("rs_pct_chg_1d", "rs_amplitude_pct", "rs_close_pos", "rs_vol_ratio_5_inclusive"),
+                ("pct_chg", "amplitude_1", "rs_close_pos", "volume_relative_5d"),
                 "pct in (0,2) or [-1,2), amplitude<7, close_pos>=0.5, vol5<=1.3 as branch requires",
                 "5 bars",
                 "continuous_margin",
@@ -243,7 +244,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "key_k.body_close_volume",
                 "Bull body, close position, return and dynamic volume threshold.",
-                ("rs_body_abs_pct", "rs_is_rise", "rs_close_pos", "rs_pct_chg_1d", "rs_vol_ratio_prev5"),
+                ("rs_body_abs_pct", "rs_is_rise", "rs_close_pos", "pct_chg", "rs_vol_ratio_prev5"),
                 "body>=3, rise, close_pos>=0.75, pct>=2; vol5>=1.1 if body>=7 else >=1.3",
                 "20 bars",
                 "continuous_margin",
@@ -279,7 +280,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "violence_k.impulse",
                 "Bullish large-body and volume impulse.",
-                ("rs_is_rise", "rs_pct_chg_1d", "rs_close_pos", "rs_body_abs_pct", "rs_body_vs_prev6", "rs_vol_ratio_prev5"),
+                ("rs_is_rise", "pct_chg", "rs_close_pos", "rs_body_abs_pct", "rs_body_vs_prev6", "rs_vol_ratio_prev5"),
                 "rise, pct>0, close_pos>=0.70, body>=5 and >2x prior-six mean, vol5>=2",
                 "20 bars",
                 "continuous_margin",
@@ -351,7 +352,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "changan.three_day_sequence",
                 "Oversold day, prior-day impulse, and current small-yang half-volume confirmation.",
-                ("rs_kdj_j_lag2", "rs_pct_chg_lag1", "rs_is_rise_lag1", "rs_vol_ratio_prev5_lag1", "rs_kdj_j_lag1_minus_lag2", "rs_pct_chg_1d", "rs_amplitude_pct", "rs_vol_ratio_prev"),
+                ("rs_kdj_j_lag2", "rs_pct_chg_lag1", "rs_is_rise_lag1", "rs_vol_ratio_prev5_lag1", "rs_kdj_j_lag1_minus_lag2", "pct_chg", "amplitude_1", "rs_vol_ratio_prev"),
                 "J[t-2]<-13; pct[t-1]>=4,rise,vol5>=1.4,J rising; 0<pct[t]<2.2,amp<7,vol/prev<=0.55",
                 "12 bars",
                 "continuous_margin",
@@ -378,7 +379,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "kengqi.fill",
                 "Fill ratio and post-pit volume contraction.",
-                ("rs_pit_fill_ratio", "rs_post_to_pre_volume_ratio", "rs_pct_chg_1d"),
+                ("rs_pit_fill_ratio", "rs_post_to_pre_volume_ratio", "pct_chg"),
                 "fill in [0.78,1.12], post/pre volume<0.8, current pct<=3",
                 "pit plus up to five post bars",
                 "continuous_margin",
@@ -510,7 +511,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "zaihou.rebuild",
                 "Rising BBI, proximity, and shrink relative to the anchor.",
-                ("rs_volume_to_fangliang_ref", "rs_bbi_slope_5d_pct", "rs_bbi_distance_pct", "rs_pct_chg_1d"),
+                ("rs_volume_to_fangliang_ref", "rs_bbi_slope_5d_pct", "rs_bbi_distance_pct", "pct_chg"),
                 "BBI slope>0, abs(close/BBI-1)<2.5%, volume/anchor<0.6; pct is context",
                 "anchor plus BBI history",
                 "continuous_margin",
@@ -537,7 +538,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "breathing.current_confirmation",
                 "Current return, previous-day volume ratio, and close-position confirmation.",
-                ("rs_pct_chg_1d", "rs_vol_ratio_prev", "rs_close_pos"),
+                ("pct_chg", "rs_vol_ratio_prev", "rs_close_pos"),
                 "pct>=1, vol/prev>=1.2, close_pos>=0.60",
                 "16 bars",
                 "continuous_margin",
@@ -564,7 +565,7 @@ PREDICATE_FACTOR_CONTRACTS: tuple[PredicateFactorContract, ...] = (
             _p(
                 "yueyue.volume_tests",
                 "Huge-volume count and bullish share in the platform.",
-                ("rs_huge_volume_count_20d", "rs_huge_yang_share_20d", "rs_pct_chg_1d", "rs_close_pos"),
+                ("rs_huge_volume_count_20d", "rs_huge_yang_share_20d", "pct_chg", "rs_close_pos"),
                 "volume>2x inclusive MA10 on >=2 bars and bullish share>=0.5; pct/close_pos are ranking context",
                 "35 bars",
                 "continuous_margin",
@@ -627,7 +628,10 @@ def validate_generator_fingerprints() -> None:
 def contract_factor_audit(
     contracts: Sequence[PredicateFactorContract] = PREDICATE_FACTOR_CONTRACTS,
     *,
-    model_features: Sequence[str] = RULE_FEATURE_COLUMNS,
+    model_features: Sequence[str] = (
+        *RULE_FEATURE_COLUMNS,
+        *RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS,
+    ),
 ) -> pd.DataFrame:
     """Return one audit row per predicate without silently dropping errors."""
 
@@ -654,7 +658,10 @@ def contract_factor_audit(
 def validate_predicate_factor_contracts(
     contracts: Sequence[PredicateFactorContract] = PREDICATE_FACTOR_CONTRACTS,
     *,
-    model_features: Sequence[str] = RULE_FEATURE_COLUMNS,
+    model_features: Sequence[str] = (
+        *RULE_FEATURE_COLUMNS,
+        *RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS,
+    ),
 ) -> None:
     """Fail on missing/duplicate members, unmapped factors, or proxy claims."""
 

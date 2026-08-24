@@ -229,7 +229,7 @@ def _load_cached_candidate_rows(
     missing_factors = sorted(set(PROJECT_FACTOR_COLUMNS) - set(cached.columns))
     if missing_factors:
         raise RuntimeError(
-            "Active candidate feature cache does not satisfy the 147-factor contract: "
+            "Active candidate feature cache does not satisfy the canonical factor contract: "
             f"missing={missing_factors[:20]} count={len(missing_factors)}"
         )
     expected_schema = resolve_project_factor_schema()

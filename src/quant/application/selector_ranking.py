@@ -21,20 +21,32 @@ import pandas as pd
 import yaml
 
 from quant.core.paths import PROJECT_ROOT
+from quant.application.left_side_ranking import (
+    DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+    LeftSideRankingConfig,
+    load_left_side_ranking_scores,
+)
+from quant.features.canonical_factor_names import (
+    find_forbidden_aliases_in_payload,
+)
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
+    RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION,
 )
+from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
 from quant.research.right_side_unified_features import RIGHT_SIDE_SIGNALS
+from quant.research.right_side_unified_features import RULE_FEATURE_SCHEMA_VERSION
+from quant.research.short_side_groups import LEFT_GROUP_MEMBERS
 
 
 DEFAULT_SELECTOR_RANKING_CONFIG_PATH = Path(
     "configs/strategies/right_side_ranking_selector.yaml"
 )
 RIGHT_SIDE_PRODUCTION_ARTIFACT_SCHEMA_VERSION = (
-    "right-side-unified-ranking-production-v1"
+    "right-side-unified-ranking-production-v2-canonical-alias-free"
 )
 RIGHT_SIDE_PRODUCTION_SCORE_SCHEMA_VERSION = (
-    "right-side-unified-ranking-score-v1"
+    "right-side-unified-ranking-score-v2-canonical-alias-free"
 )
 RIGHT_SIDE_PRODUCTION_APPROVAL_SCHEMA_VERSION = (
     "right-side-production-rollout-approval-v1"
@@ -120,6 +132,12 @@ def load_selector_ranking_config(
         raise FileNotFoundError(f"selector ranking config is missing: {path}") from exc
     if not isinstance(payload, Mapping):
         raise ValueError("selector ranking config must be a mapping")
+    forbidden_factor_aliases = find_forbidden_aliases_in_payload(payload)
+    if forbidden_factor_aliases:
+        raise ValueError(
+            "selector ranking config contains forbidden factor aliases: "
+            f"{forbidden_factor_aliases}"
+        )
     release = _mapping(payload.get("release"), field="release")
     selector = _mapping(payload.get("selector"), field="selector")
     unified = _mapping(payload.get("right_side_unified"), field="right_side_unified")
@@ -129,7 +147,6 @@ def load_selector_ranking_config(
     if release.get("lifecycle") != "production":
         raise ValueError("selector ranking release.lifecycle must be production")
     expected_nodes = {
-        "score.z_skill",
         "feature.right_side_unified",
         "score.right_side_unified",
         "product.right_side_unified_adapter",
@@ -221,6 +238,12 @@ def load_selector_ranking_config(
         raise ValueError("right-side production artifact schema drifted")
     if unified.get("score_schema_version") != RIGHT_SIDE_PRODUCTION_SCORE_SCHEMA_VERSION:
         raise ValueError("right-side production score schema drifted")
+    if unified.get("feature_schema_version") != RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION:
+        raise ValueError("right-side production feature schema drifted")
+    if unified.get("project_factor_schema_version") != PROJECT_FACTOR_SCHEMA_VERSION:
+        raise ValueError("right-side production project factor schema drifted")
+    if unified.get("rule_factor_schema_version") != RULE_FEATURE_SCHEMA_VERSION:
+        raise ValueError("right-side production rule factor schema drifted")
     if unified.get("factor_contract_sha256") != (
         RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256
     ):
@@ -332,13 +355,12 @@ def validate_selector_promotion_approval(
         "selected_research_candidate"
     ):
         raise RuntimeError("selector promotion candidate differs from research decision")
-    if research_payload.get("replace_online") is not False:
-        raise RuntimeError("operator approval must not conceal the research replacement result")
+    if research_payload.get("replace_online") is not True:
+        raise RuntimeError("selector promotion requires a passing ranking replacement result")
     acknowledgements = set(str(value) for value in (approval.get("acknowledged_risks") or ()))
     required_acknowledgements = {
-        "legacy_exact_overlap_not_consistently_superior",
-        "full_118_increment_rejected",
-        "beam_residual_v3_rejected",
+        "canonical_alias_free_retrain_completed",
+        "legacy_artifact_preserved_for_rollback",
     }
     if not required_acknowledgements <= acknowledgements:
         raise RuntimeError("selector promotion approval does not acknowledge research risks")
@@ -358,11 +380,7 @@ def validate_selector_promotion_approval(
     ):
         raise RuntimeError("selector promotion shadow acceptance is not successful")
     selected = str(approval.get("selected_research_candidate") or "")
-    if selected not in {
-        "unified_long_task_deep_rule105",
-        "unified_long_task_deep",
-        "unified_long_task_deep_beam",
-    }:
+    if selected != "unified_long_task_deep":
         raise RuntimeError("selector promotion approval has no supported candidate")
     return approval
 
@@ -518,62 +536,114 @@ def apply_selector_ranking_source(
     signal_date: str | None,
     *,
     config: SelectorRankingConfig | None = None,
+    left_config: LeftSideRankingConfig | None = None,
     require_all_ranked_candidates: bool = False,
 ) -> list[dict[str, Any]]:
-    """Apply the configured ranking source without changing buy/sell scores.
-
-    ``legacy_z_skill`` is a strict no-op for backward compatibility.  Under
-    ``right_side_unified``, every eligible right-side row must have an exact
-    production score; non-right-side rows retain their existing selector score.
-    """
+    """Apply the two unified rankers with deterministic right-side precedence."""
 
     active = config or DEFAULT_SELECTOR_RANKING_CONFIG
-    if active.source == SelectorRankingSource.LEGACY_Z_SKILL:
-        return rows
-    supported = set(active.supported_strategy_keys)
-    eligible_symbols = {
+    active_left = (
+        left_config
+        if left_config is not None
+        else DEFAULT_LEFT_SIDE_RANKING_CONFIG
+        if config is None
+        else None
+    )
+    right_eligible_symbols = {
         str(row.get("symbol") or "")
         for row in rows
-        if _row_uses_supported_strategy(row, supported)
+        if active.source == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+        and _row_uses_supported_strategy(row, set(active.supported_strategy_keys))
     }
-    if not eligible_symbols:
-        for row in rows:
-            row["ranking_source"] = "legacy_z_skill_non_right_side"
-        return rows
-    if not signal_date:
-        raise RuntimeError("right-side unified selector ranking requires signal_date")
-    score_map, manifest = load_right_side_ranking_scores(signal_date, config=active)
-    missing = sorted(symbol for symbol in eligible_symbols if symbol not in score_map)
-    if missing:
-        raise RuntimeError(
-            "right-side unified ranking coverage is incomplete for selector rows: "
-            f"{missing[:20]}"
+    if right_eligible_symbols:
+        if not signal_date:
+            raise RuntimeError("right-side unified selector ranking requires signal_date")
+        right_scores, right_manifest = load_right_side_ranking_scores(
+            signal_date, config=active
         )
-    if require_all_ranked_candidates:
-        unconsumed = sorted(set(score_map) - eligible_symbols)
-        if unconsumed:
+        missing = sorted(right_eligible_symbols - set(right_scores))
+        if missing:
             raise RuntimeError(
-                "selector did not materialize all right-side ranked candidates: "
-                f"{unconsumed[:20]}"
+                "right-side unified ranking coverage is incomplete for selector rows: "
+                f"{missing[:20]}"
             )
-    artifact_sha = str(manifest.get("artifact_sha256") or "")
+        if require_all_ranked_candidates:
+            unconsumed = sorted(set(right_scores) - right_eligible_symbols)
+            if unconsumed:
+                raise RuntimeError(
+                    "selector did not materialize all right-side ranked candidates: "
+                    f"{unconsumed[:20]}"
+                )
+        right_artifact_sha = str(right_manifest.get("artifact_sha256") or "")
+    else:
+        right_scores = {}
+        right_artifact_sha = ""
+
+    left_members = {
+        member
+        for members in LEFT_GROUP_MEMBERS.values()
+        for member in members
+    }
+    left_eligible_symbols = {
+        str(row.get("symbol") or "")
+        for row in rows
+        if active_left is not None
+        and active_left.enabled
+        and str(row.get("symbol") or "") not in right_eligible_symbols
+        and _row_uses_supported_strategy(row, left_members)
+    }
+    if left_eligible_symbols:
+        if not signal_date:
+            raise RuntimeError("left-side unified selector ranking requires signal_date")
+        left_scores, left_manifest = load_left_side_ranking_scores(
+            signal_date, config=active_left
+        )
+        missing = sorted(left_eligible_symbols - set(left_scores))
+        if missing:
+            raise RuntimeError(
+                "left-side unified ranking coverage is incomplete for selector rows: "
+                f"{missing[:20]}"
+            )
+        if require_all_ranked_candidates:
+            unconsumed = sorted(set(left_scores) - left_eligible_symbols)
+            if unconsumed:
+                raise RuntimeError(
+                    "selector did not materialize all left-side ranked candidates: "
+                    f"{unconsumed[:20]}"
+                )
+        left_artifact_sha = str(left_manifest.get("artifact_sha256") or "")
+    else:
+        left_scores = {}
+        left_artifact_sha = ""
+
     for row in rows:
         symbol = str(row.get("symbol") or "")
-        if symbol not in eligible_symbols:
-            row["ranking_source"] = "legacy_z_skill_non_right_side"
+        if symbol in right_eligible_symbols:
+            raw_score, normalized_score = right_scores[symbol]
+            ranking_source = SelectorRankingSource.RIGHT_SIDE_UNIFIED.value
+            artifact_sha = right_artifact_sha
+            normalization = active.score_normalization
+            threshold_mode = active.production_threshold_mode
+        elif symbol in left_eligible_symbols:
+            raw_score, normalized_score = left_scores[symbol]
+            ranking_source = "left_side_unified"
+            artifact_sha = left_artifact_sha
+            normalization = active_left.score_normalization
+            threshold_mode = "none_rank_only"
+        else:
+            row["ranking_source"] = "unified_ranker_not_applicable"
             continue
-        raw_score, normalized_score = score_map[symbol]
         row[RANKING_SCORE_FIELD] = float(raw_score)
         normalized_score = float(normalized_score)
         row[NORMALIZED_RANKING_SCORE_FIELD] = normalized_score
         row["ranking_score_percent"] = round(normalized_score, 6)
         row["selector_score"] = row["ranking_score_percent"]
-        row["ranking_source"] = SelectorRankingSource.RIGHT_SIDE_UNIFIED.value
+        row["ranking_source"] = ranking_source
         row["ranking_score_date"] = pd.Timestamp(signal_date).date().isoformat()
         row["ranking_model_artifact_sha256"] = artifact_sha
         row["ranking_score_target"] = "cross_candidate_ordering_only"
-        row["ranking_normalization"] = active.score_normalization
-        row["ranking_threshold_mode"] = active.production_threshold_mode
+        row["ranking_normalization"] = normalization
+        row["ranking_threshold_mode"] = threshold_mode
     return rows
 
 

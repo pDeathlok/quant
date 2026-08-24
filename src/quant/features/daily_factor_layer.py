@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -29,6 +29,10 @@ from quant.features.variable_library import (
     build_continuous_ohlc,
     calc_bbi,
     calculate_project_extra_features,
+)
+from quant.features.factor_execution import (
+    bounded_executor_results,
+    calculator_execution_settings,
 )
 
 
@@ -1193,8 +1197,8 @@ def refresh_daily_factor_layer(
     daily_dir: Path,
     factor_root: Path = DEFAULT_FACTOR_ROOT,
     incremental_start_date: str | pd.Timestamp = "2020-01-01",
-    workers: int = 8,
-    executor_type: str = "processes",
+    workers: int | None = None,
+    executor_type: str | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
     """Idempotently refresh the shared layer and write a freshness manifest."""
@@ -1221,24 +1225,35 @@ def refresh_daily_factor_layer(
         tasks = [(path, None) for path in files]
     if not tasks:
         raise RuntimeError(f"No standard daily data found in {daily_dir}")
-    executor_cls = ProcessPoolExecutor if executor_type == "processes" else ThreadPoolExecutor
+    execution = calculator_execution_settings("project_daily")
+    effective_executor = executor_type or execution.executor
+    effective_workers = min(
+        execution.max_workers,
+        max(1, int(workers or execution.default_workers)),
+    )
+    max_pending = effective_workers * execution.max_pending_multiplier
+    executor_cls = (
+        ProcessPoolExecutor if effective_executor == "processes" else ThreadPoolExecutor
+    )
     results: list[dict[str, Any]] = []
     started = perf_counter()
-    with executor_cls(max_workers=max(1, workers)) as executor:
-        futures = [
-            executor.submit(
+    arguments = (
+        (path, Path(factor_root), incremental_start_date, source_frame)
+        for path, source_frame in tasks
+    )
+    with executor_cls(max_workers=effective_workers) as executor:
+        for n, result in enumerate(
+            bounded_executor_results(
+                executor,
                 refresh_symbol_factor_cache,
-                path,
-                Path(factor_root),
-                incremental_start_date,
-                source_frame,
-            )
-            for path, source_frame in tasks
-        ]
-        for n, future in enumerate(as_completed(futures), start=1):
-            results.append(future.result())
-            if n % 500 == 0 or n == len(futures):
-                print(f"daily factor layer: {n}/{len(futures)} symbols", flush=True)
+                arguments,
+                max_pending=max_pending,
+            ),
+            start=1,
+        ):
+            results.append(result)
+            if n % 500 == 0 or n == len(tasks):
+                print(f"daily factor layer: {n}/{len(tasks)} symbols", flush=True)
     max_dates = [item["date_max"] for item in results if item["date_max"]]
     manifest = {
         "status": "success",
@@ -1248,6 +1263,9 @@ def refresh_daily_factor_layer(
         "symbols": len(results),
         "rows": sum(int(item["rows"]) for item in results),
         "cache_hits": sum(bool(item.get("cache_hit")) for item in results),
+        "executor": effective_executor,
+        "workers": effective_workers,
+        "max_pending": max_pending,
         "date_max": max(max_dates) if max_dates else None,
         "elapsed_seconds": perf_counter() - started,
     }

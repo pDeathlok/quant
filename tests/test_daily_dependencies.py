@@ -139,12 +139,14 @@ def test_default_scope_closure_contains_only_required_production_branches() -> N
     assert {
         "data.market_daily",
         "data.daily_basic",
-        "feature.project_daily",
-        "score.b1",
-        "score.z_skill",
+        "feature.left_side_unified",
+        "score.left_side_unified",
+        "score.right_side_unified",
         "score.selector",
         "product.short_snapshot",
     } <= short
+    assert "score.b1" not in short
+    assert "score.z_skill" not in short
     assert "product.long_pools" not in short
     assert "data.financial_pit" not in short
     assert "data.tradability" not in short

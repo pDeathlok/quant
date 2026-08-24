@@ -10,6 +10,7 @@ from quant.features.factor_registry import (
     CHAN_LIVE_FACTOR_COLUMNS,
     FACTOR_REGISTRY,
     FACTOR_ALIAS_TARGETS,
+    FACTOR_LEVELS,
     LONG_ANNUAL_QUALITY_ASSET_FACTOR_COLUMNS,
     LONG_ANNUAL_QUALITY_CASHFLOW_FACTOR_COLUMNS,
     LONG_ANNUAL_QUALITY_FACTOR_COLUMNS,
@@ -21,7 +22,13 @@ from quant.features.factor_registry import (
     LONG_RESEARCH_FACTOR_COLUMNS,
     PRODUCTION_REGISTRY_COLUMNS,
     SELECTOR_LIVE_FACTOR_COLUMNS,
+    SEMANTIC_CATEGORIES,
     validate_registry,
+)
+from quant.features.canonical_factor_names import FORBIDDEN_COMPATIBILITY_ALIASES
+from quant.research.left_side_unified_features import (
+    LEFT_SIDE_RULE_FEATURE_COLUMNS,
+    LEFT_SIDE_SIGNALS,
 )
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
@@ -66,7 +73,7 @@ def _daily(rows: int = 300) -> pd.DataFrame:
     )
 
 
-def test_complete_project_factor_contract_has_all_147_columns() -> None:
+def test_complete_project_factor_contract_has_all_145_canonical_columns() -> None:
     daily = _daily()
     basic = pd.DataFrame(
         {
@@ -79,9 +86,10 @@ def test_complete_project_factor_contract_has_all_147_columns() -> None:
 
     result = calculate_project_factor_frame(daily, daily_basic_features=basic)
 
-    assert len(PROJECT_FACTOR_COLUMNS) == 147
+    assert len(PROJECT_FACTOR_COLUMNS) == 145
     assert list(result.columns[4:-1]) == PROJECT_FACTOR_COLUMNS
     assert result["factor_schema_version"].eq(PROJECT_FACTOR_SCHEMA_VERSION).all()
+    assert FORBIDDEN_COMPATIBILITY_ALIASES.isdisjoint(result.columns)
 
 
 def test_project_market_factors_do_not_change_when_future_rows_are_appended() -> None:
@@ -113,7 +121,7 @@ def test_project_market_factors_do_not_change_when_future_rows_are_appended() ->
         "kdj_d_j",
         "weekly_ma55",
         "ma_120",
-        "price_level",
+        "close",
         "return_120d",
         "volatility_60d",
     ]
@@ -166,12 +174,15 @@ def test_registry_governance_separates_canonical_alias_and_lifecycle() -> None:
     definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
     role_counts = pd.Series([definition.role for definition in FACTOR_REGISTRY]).value_counts()
 
-    assert len(FACTOR_REGISTRY) == 607
+    assert len(FACTOR_REGISTRY) == (
+        597 + len(LEFT_SIDE_RULE_FEATURE_COLUMNS) + len(LEFT_SIDE_SIGNALS)
+    )
     assert role_counts.to_dict() == {
-        "feature": 583,
-        "strategy_identity": 14,
-        "compatibility_alias": 10,
+        "feature": 583 + len(LEFT_SIDE_RULE_FEATURE_COLUMNS),
+        "strategy_identity": 14 + len(LEFT_SIDE_SIGNALS),
     }
+    assert FACTOR_ALIAS_TARGETS == {}
+    assert FORBIDDEN_COMPATIBILITY_ALIASES.isdisjoint(definitions)
     assert set(PRODUCTION_REGISTRY_COLUMNS) <= set(definitions)
     assert set(SELECTOR_LIVE_FACTOR_COLUMNS) <= set(definitions)
     assert set(CHAN_LIVE_FACTOR_COLUMNS) <= set(definitions)
@@ -182,11 +193,28 @@ def test_registry_governance_separates_canonical_alias_and_lifecycle() -> None:
     assert definitions["selector_return_1d"].lifecycle == "production_model"
     assert definitions["short_balance"].family == "margin"
     assert definitions["small_net_amount_ratio"].family == "moneyflow"
-    for alias, canonical in FACTOR_ALIAS_TARGETS.items():
-        assert definitions[alias].role == "compatibility_alias"
-        assert definitions[alias].canonical_name == canonical
 
 
+def test_registry_uses_strategy_neutral_business_categories() -> None:
+    assert all(
+        definition.semantic_category in SEMANTIC_CATEGORIES
+        for definition in FACTOR_REGISTRY
+    )
+    assert all(definition.factor_level in FACTOR_LEVELS for definition in FACTOR_REGISTRY)
+    assert all(definition.calculator_id for definition in FACTOR_REGISTRY)
+    assert all(definition.calculation_owner for definition in FACTOR_REGISTRY)
+    assert all(definition.consumers == definition.active_consumers for definition in FACTOR_REGISTRY)
+    assert not any(
+        token in definition.semantic_category
+        for definition in FACTOR_REGISTRY
+        for token in ("right_side", "left_side", "selector", "chan", "good_stock")
+    )
+    assert all(
+        definition.refresh_cadence == "trade_daily"
+        for definition in FACTOR_REGISTRY
+        if definition.lifecycle
+        in {"production_model", "production_materialized", "strategy_identity"}
+    )
 def test_registry_includes_computable_psy_and_vr_candidates() -> None:
     definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
 
@@ -197,24 +225,14 @@ def test_registry_includes_computable_psy_and_vr_candidates() -> None:
         )
 
 
-def test_exact_compatibility_aliases_share_values() -> None:
-    legacy = calculate_legacy_market_factors(_daily())
+def test_project_layer_emits_no_compatibility_aliases() -> None:
     project = calculate_project_market_factors(_daily())
 
-    pd.testing.assert_series_equal(
-        project["close"], project["price_level"], check_names=False
+    assert FORBIDDEN_COMPATIBILITY_ALIASES.isdisjoint(project.columns)
+    assert {"close", "ma_20"} <= set(project.columns)
+    assert {"kdj_k", "kdj_d", "kdj_j"}.isdisjoint(
+        calculate_legacy_market_factors(_daily()).columns
     )
-    pd.testing.assert_series_equal(
-        project["ma_20"], project["bb_middle"], check_names=False
-    )
-    for alias, canonical in {
-        "kdj_k": "kdj_d_k",
-        "kdj_d": "kdj_d_d",
-        "kdj_j": "kdj_d_j",
-    }.items():
-        pd.testing.assert_series_equal(
-            legacy[alias], project[canonical], check_names=False
-        )
 
 
 def test_limit_up_flags_respect_board_st_and_exchange_limit_prices() -> None:
@@ -263,12 +281,12 @@ def test_registry_covers_stable_annual_quality_model_contract() -> None:
     assert definitions["industry_value_score"].source.endswith("current_industry_mapping")
 
 
-def test_registry_covers_right_side_shadow_118_factor_contract() -> None:
+def test_registry_covers_right_side_shadow_113_factor_contract() -> None:
     definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
     payload = right_side_shadow_contract_payload()
 
-    assert len(RULE_FEATURE_COLUMNS) == 118
-    assert len(RIGHT_SIDE_SHADOW_FACTOR_COLUMNS) == 265
+    assert len(RULE_FEATURE_COLUMNS) == 113
+    assert len(RIGHT_SIDE_SHADOW_FACTOR_COLUMNS) == 258
     assert len(RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS) == 14
     assert payload["factor_contract_sha256"] == (
         RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256
@@ -285,6 +303,22 @@ def test_registry_covers_right_side_shadow_118_factor_contract() -> None:
     assert all(
         definitions[name].role == "strategy_identity"
         for name in RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS
+    )
+
+
+def test_registry_covers_left_side_unified_contract() -> None:
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+
+    assert set(LEFT_SIDE_RULE_FEATURE_COLUMNS) <= set(definitions)
+    assert set(LEFT_SIDE_SIGNALS) <= set(definitions)
+    assert all(
+        definitions[name].family == "left_side_rule"
+        and definitions[name].consumers == ("left_side_unified",)
+        for name in LEFT_SIDE_RULE_FEATURE_COLUMNS
+    )
+    assert all(
+        definitions[name].role == "strategy_identity"
+        for name in LEFT_SIDE_SIGNALS
     )
 
 
@@ -331,9 +365,11 @@ def test_pipeline_publishes_factor_registry_snapshot(monkeypatch, tmp_path) -> N
     assert result["status"] == "success"
     payload = json.loads((tmp_path / "data/features/factor_registry/latest.json").read_text())
     assert payload["factor_count"] == len(FACTOR_REGISTRY)
-    assert payload["canonical_factor_count"] == 583
-    assert payload["compatibility_alias_count"] == 10
-    assert payload["strategy_identity_count"] == 14
+    assert payload["canonical_factor_count"] == (
+        583 + len(LEFT_SIDE_RULE_FEATURE_COLUMNS)
+    )
+    assert payload["compatibility_alias_count"] == 0
+    assert payload["strategy_identity_count"] == 14 + len(LEFT_SIDE_SIGNALS)
     assert payload["point_in_time_factor_count"] == payload["factor_count"]
 
 

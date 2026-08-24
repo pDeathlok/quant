@@ -13,6 +13,7 @@ This is the z-skill analogue of the B1 model workflow:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import warnings
@@ -40,7 +41,12 @@ from analyze_b1_xgb_entry_exit_grid import DEFAULT_DAILY_DIR, DEFAULT_OUTPUT_DIR
 from analyze_z_skill_entry_exit_backtest import OpenFilter, apply_open_filter, build_open_filters
 from quant.data.source_merge import normalize_tushare_daily
 from quant.data import list_partitioned_symbol_paths, read_partitioned_symbol_file
-from quant.data.atomic_io import atomic_link_or_copy
+from quant.data.atomic_io import atomic_link_or_copy, atomic_write_json
+from quant.features.canonical_factor_names import (
+    assert_no_forbidden_factor_names,
+    find_forbidden_aliases_in_payload,
+    migrate_legacy_factor_columns,
+)
 from quant.features.daily_factor_layer import attach_daily_base_factors
 from quant.features.project_factor_layer import (
     LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
@@ -53,6 +59,7 @@ from quant.features.variable_library import (
     build_continuous_ohlc,
     build_latest_scale_ohlc,
 )
+from quant.features.right_side_factor_contract import factor_contract_sha256
 from quant.ml.feature_coverage import model_feature_history_start
 from quant.ml.label_maker import create_b1_labels
 from quant.ml.xgb_research import XGBResearchModel
@@ -62,8 +69,8 @@ warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 SIGNAL_CACHE = PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet"
 FAMILY_SIGNAL_CACHE = PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet"
-DATASET_PATH = PROJECT_ROOT / "data/features/z_skill_model_dataset.parquet"
-MODEL_DIR = PROJECT_ROOT / "models/research/z_skill"
+DATASET_PATH = PROJECT_ROOT / "data/features/z_skill_model_dataset_canonical_v5.parquet"
+MODEL_DIR = PROJECT_ROOT / "models/research/z_skill_canonical_v5"
 
 PRIORITY_SIGNALS = [
     "B2",
@@ -353,7 +360,11 @@ def build_model_dataset(
     executor_type: str = "threads",
 ) -> pd.DataFrame:
     if DATASET_PATH.exists() and not force_refresh:
-        data = pd.read_parquet(DATASET_PATH)
+        data = migrate_legacy_factor_columns(
+            pd.read_parquet(DATASET_PATH),
+            context=f"Z-skill training dataset boundary {DATASET_PATH}",
+            copy=False,
+        )
         data["date"] = pd.to_datetime(data["date"])
         expected = set(signals) | set(LABELS.values())
         schemas = (
@@ -525,6 +536,10 @@ def train_models(data: pd.DataFrame, signals: list[str], model_dir: Path) -> tup
             f"expected={PROJECT_FACTOR_SCHEMA_VERSION} actual={sorted(schemas) or ['missing']}"
         )
     feature_cols = _feature_columns(data)
+    assert_no_forbidden_factor_names(
+        feature_cols,
+        context="Z-skill training features",
+    )
     models: dict[tuple[str, str], XGBResearchModel] = {}
     reports: list[dict] = []
     for signal in signals:
@@ -800,7 +815,7 @@ def write_report(model_report: pd.DataFrame, summary: pd.DataFrame, playbooks: p
         f.write("# z-skill 高频战法建模与买卖策略评估\n\n")
         f.write("## 建模口径\n\n")
         f.write("- 优先策略：命中多但规则边际较弱的 z-skill 战法。\n")
-        f.write("- 特征：项目变量库 147 个 Tushare/技术派生变量，按单只股票历史滚动计算。\n")
+        f.write(f"- 特征：项目变量库 {len(PROJECT_FACTOR_COLUMNS)} 个规范 Tushare/技术派生变量，按单只股票历史滚动计算。\n")
         f.write("- 标签：T+1 开盘后 5 日内 up5/up8/down3，复用 B1 exit-aware 标签口径。\n")
         f.write("- 切分：2020-2024 中按股票代码随机 8:2 切 train/test，2025+ 为 OOT。\n")
         f.write("- 训练：XGBoost，使用 test AUC 与 train/test AUC gap 的 early stop，避免过拟合。\n")
@@ -905,6 +920,49 @@ def main() -> None:
         latest_model_report = args.output_dir / "latest_z_skill_model_training_report.csv"
         model_report.to_csv(model_report_path, index=False)
         atomic_link_or_copy(model_report_path, latest_model_report)
+        model_items: dict[str, dict[str, object]] = {}
+        for (signal, label_name), model in models.items():
+            artifact_path = args.model_dir / f"{signal}_{label_name}.joblib"
+            feature_names = tuple(str(value) for value in model.feature_names_in_)
+            selected_features = tuple(str(value) for value in model.selected_features_)
+            assert_no_forbidden_factor_names(
+                feature_names,
+                context=f"Z-skill artifact {signal}/{label_name}",
+            )
+            assert_no_forbidden_factor_names(
+                selected_features,
+                context=f"Z-skill selected features {signal}/{label_name}",
+            )
+            digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            model_items[f"{signal}_{label_name}"] = {
+                "path": str(
+                    artifact_path.resolve().relative_to(PROJECT_ROOT.resolve())
+                ),
+                "sha256": digest,
+                "feature_count": len(feature_names),
+                "features": list(feature_names),
+                "selected_features": list(selected_features),
+                "model_input_contract_sha256": factor_contract_sha256(
+                    feature_names,
+                    schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
+                ),
+            }
+        artifact_manifest = {
+            "schema_version": "z-skill-model-bundle-v2-canonical-alias-free",
+            "release_id": f"z-skill-canonical-v5-{timestamp}",
+            "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+            "factor_count": len(PROJECT_FACTOR_COLUMNS),
+            "canonical_features": list(PROJECT_FACTOR_COLUMNS),
+            "forbidden_aliases": [],
+            "models": model_items,
+        }
+        forbidden_manifest = find_forbidden_aliases_in_payload(artifact_manifest)
+        if forbidden_manifest:
+            raise RuntimeError(
+                "Z-skill artifact manifest contains forbidden aliases: "
+                f"{forbidden_manifest}"
+            )
+        atomic_write_json(artifact_manifest, args.model_dir / "manifest.json")
 
     print("adding model predictions", flush=True)
     predicted = add_predictions(data, models, signals)
@@ -941,6 +999,9 @@ def main() -> None:
         "signals": signals,
         "dataset": str(DATASET_PATH),
         "model_dir": str(args.model_dir),
+        "model_manifest": str(args.model_dir / "manifest.json"),
+        "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+        "factor_count": len(PROJECT_FACTOR_COLUMNS),
         "model_report": str(model_report_path),
         "summary": str(summary_path),
         "playbook": str(playbook_path),

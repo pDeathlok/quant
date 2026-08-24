@@ -283,6 +283,13 @@ def test_dataset_audit_requires_every_signal_and_complete_mature_labels(
         ],
         axis=1,
     )
+    for feature in {
+        feature
+        for requirements in module.SIGNAL_FEATURE_REQUIREMENTS.values()
+        for feature in requirements
+    }:
+        if feature not in events:
+            events[feature] = 1.0
 
     labels = events[["symbol", "date"]].copy()
     labels["entry_mode"] = "next_open"

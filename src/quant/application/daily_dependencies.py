@@ -18,25 +18,40 @@ from quant.application.selector_ranking import (
     RIGHT_SIDE_PRODUCTION_SCORE_SCHEMA_VERSION,
     SelectorRankingSource,
 )
+from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+from quant.features.left_side_factor_contract import (
+    LEFT_SIDE_ARTIFACT_SCHEMA_VERSION,
+    LEFT_SIDE_FACTOR_COLUMNS,
+    LEFT_SIDE_FACTOR_CONTRACT_SHA256,
+    LEFT_SIDE_FEATURE_SCHEMA_VERSION,
+    LEFT_SIDE_SCORE_SCHEMA_VERSION,
+)
 from quant.features.factor_registry import (
     LONG_PRODUCTION_FACTOR_COLUMNS,
     LONG_PRODUCTION_FACTOR_SCHEMA_VERSION,
 )
+from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
+from quant.features.right_side_factor_contract import (
+    RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION,
+    RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
+    RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
+    RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION,
+)
+from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
+from quant.research.right_side_unified_features import (
+    RULE_FEATURE_COLUMNS,
+    RULE_FEATURE_SCHEMA_VERSION,
+)
 
 
-REGISTRY_SCHEMA_VERSION = "daily_dependency_registry_v2_factor_governance"
-PRODUCTION_PROJECT_FACTOR_SCHEMA = "project-v1-latest-scale-global-rank"
-RIGHT_SIDE_SHADOW_PROJECT_FACTOR_SCHEMA = "project-v4-causal-price-alpha"
-RIGHT_SIDE_SHADOW_RULE_FACTOR_SCHEMA = "right_side_rule_features_v2_118_20260813"
-RIGHT_SIDE_SHADOW_FEATURE_SCHEMA = (
-    "right-side-shadow-features-v1-project-v4-rule-v2-118"
-)
-RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA = "right-side-unified-ranking-shadow-v1"
-RIGHT_SIDE_SHADOW_FACTOR_COUNT = 265
-RIGHT_SIDE_SHADOW_RULE_FACTOR_COUNT = 118
-RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256 = (
-    "6fc15ad06252b66b40f890165243f6b17cb74444909019155e12934683cace9c"
-)
+REGISTRY_SCHEMA_VERSION = "daily_dependency_registry_v4_canonical_alias_free"
+PRODUCTION_PROJECT_FACTOR_SCHEMA = PROJECT_FACTOR_SCHEMA_VERSION
+RIGHT_SIDE_SHADOW_PROJECT_FACTOR_SCHEMA = PROJECT_FACTOR_SCHEMA_VERSION
+RIGHT_SIDE_SHADOW_RULE_FACTOR_SCHEMA = RULE_FEATURE_SCHEMA_VERSION
+RIGHT_SIDE_SHADOW_FEATURE_SCHEMA = RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION
+RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA = RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION
+RIGHT_SIDE_SHADOW_FACTOR_COUNT = len(RIGHT_SIDE_SHADOW_FACTOR_COLUMNS)
+RIGHT_SIDE_SHADOW_RULE_FACTOR_COUNT = len(RULE_FEATURE_COLUMNS)
 LEGACY_Z_SIGNAL_KEYS: tuple[str, ...] = (
     "B2",
     "BREATHING",
@@ -634,7 +649,9 @@ def _daily_incremental(
 
 
 def _z_artifacts(signals: Sequence[str] | None = None) -> tuple[str, ...]:
-    active_signals = tuple(signals or LEGACY_Z_SIGNAL_KEYS)
+    active_signals = (
+        tuple(LEGACY_Z_SIGNAL_KEYS) if signals is None else tuple(signals)
+    )
     return tuple(
         f"models/research/z_skill/{signal}_{label}.joblib"
         for signal in active_signals
@@ -659,7 +676,15 @@ def build_default_daily_dependency_registry(
         if isinstance(selector_ranking_source, SelectorRankingSource)
         else SelectorRankingSource(str(selector_ranking_source))
     )
+    left_side_enabled = DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled
+    two_unified_rankers_active = (
+        configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+        and left_side_enabled
+    )
     legacy_z_active_signals = (
+        ()
+        if two_unified_rankers_active
+        else
         DEFAULT_SELECTOR_RANKING_CONFIG.preserved_legacy_signals
         if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED
         else LEGACY_Z_SIGNAL_KEYS
@@ -943,7 +968,8 @@ def build_default_daily_dependency_registry(
         ),
         DependencyNode(
             "feature.project_daily", Layer.FEATURE, "features.project_factor_layer",
-            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
+            Lifecycle.RETIRED if two_unified_rankers_active else Lifecycle.PRODUCTION,
+            Cadence.ON_DEMAND if two_unified_rankers_active else Cadence.TRADE_DAILY,
             (_edge("data.market_daily"), _edge("data.daily_basic"),
              _edge("feature.strategy_signals")),
             _exact(
@@ -958,7 +984,7 @@ def build_default_daily_dependency_registry(
                     "data/features/b1/active_candidate_project_features_manifest.json",
                     "target_date",
                     predicate_field="factor_count",
-                    expected_value=147,
+                    expected_value=len(PROJECT_FACTOR_COLUMNS),
                 ),
                 _json(
                     "data/features/b1/active_candidate_project_features_manifest.json",
@@ -982,6 +1008,9 @@ def build_default_daily_dependency_registry(
                 "src/quant/features/project_factor_layer.py",
                 "src/quant/features/variable_library.py",
                 "src/quant/features/factor_registry.py",
+                "src/quant/features/factor_execution.py",
+                "src/quant/features/factor_governance.py",
+                "configs/factors/governance.json",
                 "scripts/research/refresh_b1_feature_cache.py",
                 "scripts/research/train_b1_tushare_models.py",
             ),
@@ -1158,7 +1187,8 @@ def build_default_daily_dependency_registry(
         ),
         DependencyNode(
             "score.b1", Layer.MODEL_SCORE, "routine.b1_daily_plan",
-            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
+            Lifecycle.RETIRED if left_side_enabled else Lifecycle.PRODUCTION,
+            Cadence.ON_DEMAND if left_side_enabled else Cadence.TRADE_DAILY,
             (_edge("feature.project_daily", ColumnMode.MODEL_ARTIFACT),),
             _exact(_json("web/data/b1_daily_plan.json", "signal_date")),
             _daily_incremental(keys=("date", "symbol")), "score_b1_release",
@@ -1173,7 +1203,8 @@ def build_default_daily_dependency_registry(
         ),
         DependencyNode(
             "score.z_skill", Layer.MODEL_SCORE, "research.z_skill",
-            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
+            Lifecycle.RETIRED if two_unified_rankers_active else Lifecycle.PRODUCTION,
+            Cadence.ON_DEMAND if two_unified_rankers_active else Cadence.TRADE_DAILY,
             (_edge("feature.project_daily", ColumnMode.MODEL_ARTIFACT),
              _edge("feature.strategy_signals")),
             _exact(
@@ -1256,7 +1287,7 @@ def build_default_daily_dependency_registry(
             ),
             result_aliases=("right_side_unified_features",),
             ui_step="right_side_unified_features",
-            ui_order=113,
+            ui_order=41,
             feature_catalog_provider="right_side_unified_factor_columns",
             final_gate=True,
             notes=(
@@ -1305,12 +1336,14 @@ def build_default_daily_dependency_registry(
             ),
             result_aliases=("right_side_unified_scores",),
             ui_step="right_side_unified_score",
-            ui_order=114,
+            ui_order=42,
             artifact=ArtifactSpec(
-                ("models/production/right_side_unified/ranking.joblib",),
+                ("models/production/right_side_unified_canonical_v2/ranking.joblib",),
                 "bundle_features",
                 "feature.right_side_unified",
-                manifest_path="models/production/right_side_unified/manifest.json",
+                manifest_path=(
+                    "models/production/right_side_unified_canonical_v2/manifest.json"
+                ),
                 expected_schema=RIGHT_SIDE_PRODUCTION_ARTIFACT_SCHEMA_VERSION,
             ),
             final_gate=True,
@@ -1320,17 +1353,117 @@ def build_default_daily_dependency_registry(
             ),
         ),
         DependencyNode(
+            "feature.left_side_unified",
+            Layer.FEATURE,
+            "routine.left_side_unified_production",
+            Lifecycle.PRODUCTION if left_side_enabled else Lifecycle.RETIRED,
+            Cadence.TRADE_DAILY if left_side_enabled else Cadence.ON_DEMAND,
+            (_edge("data.market_daily"), _edge("feature.strategy_signals")),
+            _exact(
+                _file("data/features/left_side_unified/latest_features.parquet"),
+                _json(
+                    "data/features/left_side_unified/feature_manifest.json",
+                    "target_date",
+                    predicate_field="candidate_coverage_status",
+                    expected_value="complete",
+                ),
+                _json(
+                    "data/features/left_side_unified/feature_manifest.json",
+                    "target_date",
+                    predicate_field="factor_contract_sha256",
+                    expected_value=LEFT_SIDE_FACTOR_CONTRACT_SHA256,
+                ),
+            ),
+            _daily_incremental(years=6, keys=("date", "symbol")),
+            "build_left_side_production_features",
+            contract_sources=(
+                "configs/strategies/left_side_unified.yaml",
+                "configs/strategies/b1_selected.yaml",
+                "src/quant/application/left_side_ranking.py",
+                "src/quant/features/left_side_factor_contract.py",
+                "src/quant/research/left_side_unified_features.py",
+                "src/quant/routine/left_side_unified_production.py",
+            ),
+            outputs=(
+                "data/features/left_side_unified/latest_features.parquet",
+                "data/features/left_side_unified/feature_manifest.json",
+            ),
+            result_aliases=("left_side_unified_features",),
+            ui_step="left_side_unified_features",
+            ui_order=43,
+            feature_catalog_provider="left_side_unified_factor_columns",
+            final_gate=True,
+            notes="Four stable left groups share one canonical production ranker.",
+        ),
+        DependencyNode(
+            "score.left_side_unified",
+            Layer.MODEL_SCORE,
+            "routine.left_side_unified_production",
+            Lifecycle.PRODUCTION if left_side_enabled else Lifecycle.RETIRED,
+            Cadence.TRADE_DAILY if left_side_enabled else Cadence.ON_DEMAND,
+            (_edge("feature.left_side_unified", ColumnMode.MODEL_ARTIFACT),),
+            _exact(
+                _file("data/features/left_side_unified/latest_scores.parquet"),
+                _json(
+                    "data/features/left_side_unified/score_manifest.json",
+                    "target_date",
+                    predicate_field="schema_version",
+                    expected_value=LEFT_SIDE_SCORE_SCHEMA_VERSION,
+                ),
+                _json(
+                    "data/features/left_side_unified/score_manifest.json",
+                    "target_date",
+                    predicate_field="selector_adapter_status",
+                    expected_value="ready",
+                ),
+            ),
+            _daily_incremental(keys=("date", "symbol")),
+            "score_left_side_production",
+            contract_sources=(
+                "configs/strategies/left_side_unified.yaml",
+                "configs/strategies/b1_selected.yaml",
+                "src/quant/application/left_side_ranking.py",
+                "src/quant/routine/left_side_unified_production.py",
+            ),
+            outputs=(
+                "data/features/left_side_unified/latest_scores.parquet",
+                "data/features/left_side_unified/score_manifest.json",
+            ),
+            result_aliases=("left_side_unified_scores",),
+            ui_step="left_side_unified_score",
+            ui_order=44,
+            artifact=ArtifactSpec(
+                (
+                    "models/production/left_side_unified_canonical_v4_group4/"
+                    "ranking.joblib",
+                ),
+                "bundle_features",
+                "feature.left_side_unified",
+                manifest_path=(
+                    "models/production/left_side_unified_canonical_v4_group4/"
+                    "manifest.json"
+                ),
+                expected_schema=LEFT_SIDE_ARTIFACT_SCHEMA_VERSION,
+            ),
+            final_gate=True,
+            notes="Ranking-only output with daily cross-sectional percentile normalization.",
+        ),
+        DependencyNode(
             "score.selector", Layer.MODEL_SCORE, "webapp.services.selector",
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
             (_edge("feature.selector_live", ColumnMode.MODEL_ARTIFACT),
-             _edge("score.b1"), _edge("score.z_skill"),
-             *((_edge("score.right_side_unified"),) if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED else ())),
+             *((_edge("score.b1"),) if not left_side_enabled else ()),
+             *((_edge("score.z_skill"),) if not two_unified_rankers_active else ()),
+             *((_edge("score.right_side_unified"),) if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED else ()),
+             *((_edge("score.left_side_unified"),) if left_side_enabled else ())),
             _exact(_result("selector_extended", "signal_date")),
             _daily_incremental(keys=("date", "symbol")), "score_selector_buy_hold",
             contract_sources=(
                 "src/quant/webapp/services.py",
                 "src/quant/application/selector_ranking.py",
+                "src/quant/application/left_side_ranking.py",
                 "configs/strategies/right_side_ranking_selector.yaml",
+                "configs/strategies/left_side_unified.yaml",
             ),
             result_aliases=("selector_core", "selector_extended"), ui_step="selector_core", ui_order=70,
             artifact=ArtifactSpec(
@@ -1454,8 +1587,8 @@ def build_default_daily_dependency_registry(
             feature_catalog_provider="right_side_shadow_factor_columns",
             final_gate=True,
             notes=(
-                "Independent research shadow: causal project-v4 plus all 118 "
-                "right-side rule factors; never consumed by score.selector."
+                "Independent research shadow: canonical project-v5 plus the "
+                "canonical right-side rule union; never consumed by score.selector."
             ),
         ),
         DependencyNode(
@@ -1494,10 +1627,14 @@ def build_default_daily_dependency_registry(
             ui_step="right_side_shadow_score",
             ui_order=111,
             artifact=ArtifactSpec(
-                ("models/research/right_side_unified_v2_118/shadow/ranking.joblib",),
+                (
+                    "models/research/right_side_unified_canonical_v5_rule113/shadow/ranking.joblib",
+                ),
                 "bundle_features",
                 "feature.right_side_unified_shadow",
-                manifest_path="models/research/right_side_unified_v2_118/shadow/manifest.json",
+                manifest_path=(
+                    "models/research/right_side_unified_canonical_v5_rule113/shadow/manifest.json"
+                ),
                 expected_schema=RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA,
                 approved_research_path=True,
             ),
@@ -1516,16 +1653,16 @@ def build_default_daily_dependency_registry(
             (_edge("score.right_side_unified_shadow"),),
             _exact(
                 _file(
-                    "reports/research/right_side_unified_v2_118/shadow/latest_candidates.parquet"
+                    "reports/research/right_side_unified_canonical_v5_rule113/shadow/latest_candidates.parquet"
                 ),
                 _json(
-                    "reports/research/right_side_unified_v2_118/shadow/product_manifest.json",
+                    "reports/research/right_side_unified_canonical_v5_rule113/shadow/product_manifest.json",
                     "target_date",
                     predicate_field="candidate_coverage_status",
                     expected_value="complete",
                 ),
                 _json(
-                    "reports/research/right_side_unified_v2_118/shadow/product_manifest.json",
+                    "reports/research/right_side_unified_canonical_v5_rule113/shadow/product_manifest.json",
                     "target_date",
                     predicate_field="consumer",
                     expected_value="research_shadow_only",
@@ -1538,8 +1675,8 @@ def build_default_daily_dependency_registry(
                 "src/quant/routine/right_side_unified_shadow.py",
             ),
             outputs=(
-                "reports/research/right_side_unified_v2_118/shadow/latest_candidates.parquet",
-                "reports/research/right_side_unified_v2_118/shadow/product_manifest.json",
+                "reports/research/right_side_unified_canonical_v5_rule113/shadow/latest_candidates.parquet",
+                "reports/research/right_side_unified_canonical_v5_rule113/shadow/product_manifest.json",
             ),
             result_aliases=("right_side_shadow_product",),
             ui_step="right_side_shadow_product",
@@ -1579,7 +1716,7 @@ def build_default_daily_dependency_registry(
             outputs=("data/features/right_side_unified/score_manifest.json",),
             result_aliases=("right_side_unified_adapter",),
             ui_step="right_side_unified_adapter",
-            ui_order=115,
+            ui_order=45,
             final_gate=True,
             notes=(
                 "Production-readiness scope only while the default selector source "
@@ -1587,8 +1724,43 @@ def build_default_daily_dependency_registry(
             ),
         ),
         DependencyNode(
+            "product.left_side_unified_adapter",
+            Layer.PRODUCT,
+            "webapp.services.selector",
+            Lifecycle.PRODUCTION if left_side_enabled else Lifecycle.RETIRED,
+            Cadence.TRADE_DAILY if left_side_enabled else Cadence.ON_DEMAND,
+            (_edge("score.left_side_unified"),),
+            _exact(
+                _json(
+                    "data/features/left_side_unified/score_manifest.json",
+                    "target_date",
+                    predicate_field="selector_adapter_status",
+                    expected_value="ready",
+                ),
+            ),
+            _daily_incremental(keys=("date", "symbol")),
+            "validate_left_side_selector_adapter",
+            contract_sources=(
+                "configs/strategies/left_side_unified.yaml",
+                "src/quant/application/left_side_ranking.py",
+                "src/quant/routine/left_side_unified_production.py",
+                "src/quant/webapp/services.py",
+            ),
+            outputs=("data/features/left_side_unified/score_manifest.json",),
+            result_aliases=("left_side_unified_adapter",),
+            ui_step="left_side_unified_adapter",
+            ui_order=46,
+            final_gate=True,
+            notes="Production adapter for B1/SB1/SUPER_B1/LOW_PULLBACK.",
+        ),
+        DependencyNode(
             "product.b1_plan", Layer.PRODUCT, "routine.b1_daily_plan",
-            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("score.b1"),),
+            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
+            (
+                _edge("score.left_side_unified")
+                if left_side_enabled
+                else _edge("score.b1")
+            ,),
             _exact(_json("web/data/b1_daily_plan.json", "signal_date")),
             _daily_incremental(), "generate_daily_plan", outputs=("web/data/b1_daily_plan.json",),
             contract_sources=("configs/strategies/b1_selected.yaml",),
@@ -1707,6 +1879,7 @@ def build_default_daily_dependency_registry(
         "similar": ("product.similar",),
         "rightSideShadow": ("product.right_side_unified_shadow",),
         "rightSideRankingCandidate": ("product.right_side_unified_adapter",),
+        "leftSideRanking": ("product.left_side_unified_adapter",),
     }
     return DependencyRegistry(nodes, scopes)
 

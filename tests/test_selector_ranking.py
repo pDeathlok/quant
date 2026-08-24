@@ -88,7 +88,7 @@ def _write_promotion_approval(
         json.dumps(
             {
                 "selected_research_candidate": selected_candidate,
-                "replace_online": False,
+                "replace_online": True,
             }
         ),
         encoding="utf-8",
@@ -121,9 +121,8 @@ def _write_promotion_approval(
                     "sha256": _sha256(shadow_path),
                 },
                 "acknowledged_risks": [
-                    "legacy_exact_overlap_not_consistently_superior",
-                    "full_118_increment_rejected",
-                    "beam_residual_v3_rejected",
+                    "canonical_alias_free_retrain_completed",
+                    "legacy_artifact_preserved_for_rollback",
                 ],
             }
         ),
@@ -132,7 +131,7 @@ def _write_promotion_approval(
 
 
 def _write_scores(config, rows: list[dict[str, object]]) -> None:
-    selected_candidate = "unified_long_task_deep_rule105"
+    selected_candidate = "unified_long_task_deep"
     _write_promotion_approval(
         config,
         selected_candidate=selected_candidate,
@@ -272,7 +271,7 @@ def test_unified_adapter_uses_only_ranking_score_and_keeps_playbook_scores(
     assert result[0]["signals"][0]["sell_plan"] == "B"
     assert not {"pred_up5", "pred_up8", "pred_down3"} & set(result[0])
     assert result[1]["selector_score"] == 80.0
-    assert result[1]["ranking_source"] == "legacy_z_skill_non_right_side"
+    assert result[1]["ranking_source"] == "unified_ranker_not_applicable"
 
 
 def test_unified_adapter_fails_closed_on_missing_eligible_score(tmp_path: Path) -> None:
@@ -351,7 +350,8 @@ def test_registry_source_switch_is_explicit_and_legacy_is_rollback_default() -> 
     assert "score.z_skill" in default_inputs
     assert "score.right_side_unified" not in default_inputs
     assert "score.right_side_unified" in promoted_inputs
-    assert "score.z_skill" in promoted_inputs
+    assert "score.z_skill" not in promoted_inputs
+    assert "score.left_side_unified" in promoted_inputs
     assert "score.right_side_unified" not in set(default.required_node_ids("short"))
     assert "score.right_side_unified" in set(promoted.required_node_ids("short"))
     assert default.required_node_ids("rightSideRankingCandidate")[-1] == (
@@ -369,11 +369,8 @@ def test_registry_source_switch_is_explicit_and_legacy_is_rollback_default() -> 
     default_z = default.nodes["score.z_skill"].artifact
     promoted_z = promoted.nodes["score.z_skill"].artifact
     assert default_z is not None and len(default_z.artifact_paths) == 30
-    assert promoted_z is not None and len(promoted_z.artifact_paths) == 9
-    assert {
-        path.rsplit("/", 1)[-1].rsplit("_", 1)[0]
-        for path in promoted_z.artifact_paths
-    } == set(config.preserved_legacy_signals)
+    assert promoted_z is not None and len(promoted_z.artifact_paths) == 0
+    assert promoted_z.artifact_paths == ()
     assert not any(
         f"/{signal}_" in path
         for signal in ("B2", "BREATHING", "GOLDEN_BOWL", "KEY_K", "VIOLENCE_K", "YUEYUE", "ZAIHOU")
@@ -400,7 +397,31 @@ def test_selector_snapshot_cache_cannot_cross_ranking_source_cutover(
     assert not services._selector_snapshot_matches_current_ranking_source({})
 
 
-def test_promoted_legacy_score_reader_keeps_only_preserved_signal_scope(
+def test_latest_candidate_date_does_not_fall_back_to_an_old_selector_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant.webapp import services
+
+    monkeypatch.setattr(
+        services,
+        "_selector_snapshot_dates",
+        lambda strategies, include_extended: ["2026-08-20", "2026-08-21"],
+    )
+    monkeypatch.setattr(
+        services,
+        "_latest_candidate_signal_date",
+        lambda: "2026-08-24",
+    )
+
+    assert services._resolve_selector_signal_date(
+        "2026-08-24", None, False
+    ) == "2026-08-24"
+    assert services._resolve_selector_signal_date(
+        "2026-08-23", None, False
+    ) == "2026-08-21"
+
+
+def test_two_unified_rankers_retire_legacy_strategy_model_score_reader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -428,11 +449,7 @@ def test_promoted_legacy_score_reader_keeps_only_preserved_signal_scope(
     finally:
         services._model_scored_candidates_for_date.cache_clear()
 
-    assert {key[1] for key in result} == {
-        "DUICHEN_VA",
-        "NANA",
-        "YIDONG_DILIAN",
-    }
+    assert result == {}
 
 
 class _ProductionModel:
@@ -549,24 +566,22 @@ def _write_production_bundle(
     )
 
 
-def test_production_artifact_blocks_beam_that_failed_permutation_gate(
+def test_production_artifact_blocks_retired_beam_candidate(
     tmp_path: Path,
 ) -> None:
     config = _promoted_config(tmp_path)
     _write_production_bundle(config, permutation_gate_passed=False)
 
-    with pytest.raises(RuntimeError, match="permutation gate"):
+    with pytest.raises(RuntimeError, match="supported candidate"):
         validate_production_ranking_artifact(config, project_root=tmp_path)
 
 
-def test_production_artifact_accepts_project_beam_contract(tmp_path: Path) -> None:
+def test_production_artifact_does_not_accept_precanonical_beam_contract(tmp_path: Path) -> None:
     config = _promoted_config(tmp_path)
     _write_production_bundle(config, permutation_gate_passed=True)
 
-    bundle = validate_production_ranking_artifact(config, project_root=tmp_path)
-
-    assert bundle["selected_candidate"] == "unified_long_task_deep_beam"
-    assert bundle["score_field"] == "ranking_score"
+    with pytest.raises(RuntimeError, match="supported candidate"):
+        validate_production_ranking_artifact(config, project_root=tmp_path)
 
 
 def test_production_artifact_rejects_old_budget_limited_beam_contract(
@@ -579,7 +594,7 @@ def test_production_artifact_rejects_old_budget_limited_beam_contract(
         max_remove=2,
     )
 
-    with pytest.raises(RuntimeError, match="frozen v3 adaptation"):
+    with pytest.raises(RuntimeError, match="supported candidate"):
         validate_production_ranking_artifact(config, project_root=tmp_path)
 
 
@@ -593,5 +608,5 @@ def test_production_artifact_requires_independent_pipeline_select_gate(
         pipeline_select_gate_passed=False,
     )
 
-    with pytest.raises(RuntimeError, match="pipeline_select"):
+    with pytest.raises(RuntimeError, match="supported candidate"):
         validate_production_ranking_artifact(config, project_root=tmp_path)

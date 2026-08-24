@@ -3,8 +3,18 @@ release:
   lifecycle: production
   consumer: quant.routine.b1_daily_plan
   dependency_nodes:
-    - score.b1
+    - score.left_side_unified
     - product.b1_plan
+  ranking_source: left_side_unified
+  legacy_model_lifecycle: rollback_only
+  active_entry_threshold:
+    mode: none_rank_only
+    normalization: daily_cross_section_percentile_v1
+    top_n_per_day: 20
+    legacy_probability_thresholds: rollback_only
+  # The fields below pin the previous five-model release for rollback only.
+  # Active daily selection consumes score.left_side_unified and the Top20
+  # contract above; it does not score these models or apply their thresholds.
   model_dir: models/production/b1
   model_manifest: models/production/b1/manifest.json
   model_names:

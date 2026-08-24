@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 import pandas as pd
 
+from quant.features.factor_governance import (
+    factor_governance_config_sha256,
+    load_factor_governance_config,
+)
 from quant.features.long_external_factors import LONG_EXTERNAL_FACTOR_COLUMNS
+from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
 )
 from quant.features.variable_library import DAILY_BASIC_SOURCE_COLUMNS, PROJECT_FACTOR_COLUMNS
-from quant.research.right_side_unified_features import RULE_FEATURE_COLUMNS
+from quant.research.left_side_unified_features import (
+    LEFT_SIDE_RULE_FEATURE_COLUMNS,
+    LEFT_SIDE_RULE_FEATURE_SCHEMA_VERSION,
+    LEFT_SIDE_SIGNAL_SCHEMA_VERSION,
+    LEFT_SIDE_SIGNALS,
+)
+from quant.research.right_side_unified_features import (
+    RULE_FEATURE_COLUMNS,
+    RULE_FEATURE_SCHEMA_VERSION,
+)
 
 
 @dataclass(frozen=True)
@@ -29,9 +43,15 @@ class FactorDefinition:
     calculation_version: str = ""
     refresh_cadence: str = "on_demand"
     lifecycle: str = "research_candidate"
+    semantic_category: str = ""
+    factor_level: str = ""
+    calculation_owner: str = ""
+    calculator_id: str = ""
+    materialization: str = ""
+    active_consumers: tuple[str, ...] = ()
 
 
-FACTOR_REGISTRY_SCHEMA_VERSION = "factor_registry_v2_governed"
+FACTOR_REGISTRY_SCHEMA_VERSION = "factor_registry_v4_orthogonal_execution_dag"
 LONG_PRODUCTION_FACTOR_SCHEMA_VERSION = "long-page-v2-governed-82"
 
 
@@ -300,9 +320,6 @@ _EXTRA_DAILY_PROJECT_FACTORS = (
     "williams_r_14",
     "cmf",
     "eom",
-    "kdj_k",
-    "kdj_d",
-    "kdj_j",
     "reversal_20d",
     "risk_adjusted_momentum",
     "price_volume_ratio",
@@ -320,18 +337,7 @@ _EXTRA_DAILY_PROJECT_FACTORS = (
 
 _EXTRA_WEEKLY_LONG_FACTORS = LONG_EXTERNAL_FACTOR_COLUMNS
 
-FACTOR_ALIAS_TARGETS = {
-    "price_level": "close",
-    "bb_middle": "ma_20",
-    "kdj_k": "kdj_d_k",
-    "kdj_d": "kdj_d_d",
-    "kdj_j": "kdj_d_j",
-    "rs_pct_chg_1d": "pct_chg",
-    "rs_amplitude_pct": "amplitude_1",
-    "rs_vol_ratio_5_inclusive": "volume_relative_5d",
-    "rs_vol_ratio_20_inclusive": "volume_relative_20d",
-    "rs_family_kdj_j": "kdj_d_j",
-}
+FACTOR_ALIAS_TARGETS: dict[str, str] = {}
 
 SELECTOR_LIVE_FACTOR_COLUMNS = (
     "group__B2",
@@ -440,6 +446,8 @@ PRODUCTION_REGISTRY_COLUMNS = tuple(
             *PROJECT_FACTOR_COLUMNS,
             *RULE_FEATURE_COLUMNS,
             *RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+            *LEFT_SIDE_RULE_FEATURE_COLUMNS,
+            *LEFT_SIDE_SIGNALS,
             *SELECTOR_LIVE_FACTOR_COLUMNS,
             *CHAN_LIVE_FACTOR_COLUMNS,
             *LONG_PRODUCTION_FACTOR_COLUMNS,
@@ -477,6 +485,209 @@ def _daily_family(name: str) -> tuple[str, str]:
     return "price_structure", "tushare_daily_ohlcv"
 
 
+SEMANTIC_CATEGORIES = frozenset(
+    {
+        "price_return",
+        "trend",
+        "momentum",
+        "oscillator",
+        "volatility_risk",
+        "volume_liquidity",
+        "price_structure",
+        "capital_flow",
+        "margin_short",
+        "valuation",
+        "profitability",
+        "growth",
+        "cashflow_quality",
+        "balance_sheet_quality",
+        "shareholder_governance",
+        "analyst_expectation",
+        "event_news",
+        "relative_cross_section",
+        "composite_score",
+        "signal_state",
+    }
+)
+FACTOR_LEVELS = frozenset(
+    {"atomic", "derived", "composite", "signal", "identity", "compatibility"}
+)
+
+_LAYER_CALCULATOR = {
+    "project_daily": "project_daily",
+    "project_daily_candidate": "project_daily_candidate",
+    "right_side_rule": "right_side_rule",
+    "right_side_identity": "right_side_identity",
+    "left_side_rule": "left_side_rule",
+    "left_side_identity": "left_side_identity",
+    "selector_live": "selector_live",
+    "chan_live": "chan_live",
+    "long_snapshot": "long_snapshot",
+    "long_research": "long_research",
+    "long_external_candidate": "long_external",
+}
+_CALCULATION_OWNER = {
+    "project_daily": "factor_core",
+    "project_daily_candidate": "factor_core_research",
+    "right_side_rule": "rule_feature_engine",
+    "right_side_identity": "signal_identity_engine",
+    "left_side_rule": "rule_feature_engine",
+    "left_side_identity": "signal_identity_engine",
+    "selector_live": "selector_feature_engine",
+    "chan_live": "chan_feature_engine",
+    "long_snapshot": "long_factor_engine",
+    "long_research": "long_factor_research",
+    "long_external_candidate": "external_factor_engine",
+}
+
+
+def _semantic_category(definition: FactorDefinition) -> str:
+    name = definition.name.lower()
+    family = definition.family
+    if definition.role == "strategy_identity" or name.startswith("group__"):
+        return "signal_state"
+    if name.startswith("analyst_"):
+        return "analyst_expectation"
+    if name.startswith("top_list_"):
+        return "event_news"
+    if name.startswith(("holder_", "pledge_")):
+        return "shareholder_governance"
+    if name.startswith(("margin_", "short_")):
+        return "margin_short"
+    if name.startswith(("moneyflow_", "large_", "medium_", "small_", "top_net_")):
+        return "capital_flow"
+    if any(
+        token in name
+        for token in (
+            "cross_section",
+            "industry_pct",
+            "pct_rank",
+            "minus_market",
+            "minus_industry",
+            "excess_return",
+        )
+    ):
+        return "relative_cross_section"
+    if name.endswith("_score") or any(
+        token in name
+        for token in ("composite", "blended_value", "good_stock", "coverage")
+    ):
+        return "composite_score"
+    if any(
+        token in name
+        for token in (
+            "pe_",
+            "pb_",
+            "ps_",
+            "pr_",
+            "valuation",
+            "earnings_yield",
+            "book_yield",
+            "sales_yield",
+            "dv_ttm",
+        )
+    ) or name in {"pe", "pb", "pr"}:
+        return "valuation"
+    if any(token in name for token in ("cashflow", "free_cashflow", "accrual", "cfo_")):
+        return "cashflow_quality"
+    if any(token in name for token in ("growth", "cagr", "or_yoy", "basic_eps_yoy")):
+        return "growth"
+    if any(token in name for token in ("roe", "roa", "margin", "profit_positive", "netprofit")):
+        return "profitability"
+    if any(
+        token in name
+        for token in (
+            "debt_",
+            "current_ratio",
+            "quick_ratio",
+            "goodwill",
+            "inventory",
+            "cash_to_assets",
+            "asset_quality",
+            "ar_turn",
+            "inv_turn",
+        )
+    ):
+        return "balance_sheet_quality"
+    if name.startswith("alpha"):
+        return "relative_cross_section"
+    if name.startswith(("vr_", "volume", "turnover", "amount", "obv", "ts_volume")) or "volume_ratio" in name:
+        return "volume_liquidity"
+    if any(token in name for token in ("volatility", "downside", "drawdown", "atr", "amplitude", "panic", "risk")):
+        return "volatility_risk"
+    if name.startswith(("kdj", "rsi", "psy_", "williams", "cci", "arbr")) or "kdj" in name:
+        return "oscillator"
+    if name.startswith(("ma", "ema", "bbi", "macd", "bias", "close_to_ma")) or any(
+        token in name for token in ("trend", "slope", "boll", "tunnel")
+    ):
+        return "trend"
+    if name.startswith(("return", "ret_", "selector_return", "momentum", "reversal", "limit_up", "gt_9p5")) or any(
+        token in name for token in ("pct_chg", "positive_ratio")
+    ):
+        return "momentum"
+    if any(token in name for token in ("open", "high", "low", "close", "gap", "body", "shadow", "price", "support", "center")):
+        return "price_structure"
+    family_defaults = {
+        "analyst_expectation": "analyst_expectation",
+        "asset_quality": "balance_sheet_quality",
+        "cashflow_quality": "cashflow_quality",
+        "earnings_persistence": "profitability",
+        "fundamental_quality": "profitability",
+        "good_stock_quality": "balance_sheet_quality",
+        "holder": "shareholder_governance",
+        "margin": "margin_short",
+        "moneyflow": "capital_flow",
+        "pledge": "shareholder_governance",
+        "quality_relative_value": "relative_cross_section",
+        "long_quality_composite": "composite_score",
+        "top_list": "event_news",
+        "valuation_history": "valuation",
+        "valuation_liquidity": "valuation",
+        "volume_liquidity": "volume_liquidity",
+        "risk": "volatility_risk",
+        "momentum_timing": "momentum",
+        "price_structure": "price_structure",
+        "right_side_rule": "price_structure",
+        "left_side_rule": "price_structure",
+        "selector_live": "price_return",
+        "chan_live": "price_structure",
+    }
+    return family_defaults.get(family, "price_structure")
+
+
+def _factor_level(definition: FactorDefinition, semantic_category: str) -> str:
+    if definition.role == "compatibility_alias":
+        return "compatibility"
+    if definition.role == "strategy_identity":
+        return "identity"
+    if definition.name.startswith("group__"):
+        return "signal"
+    if semantic_category == "composite_score":
+        return "composite"
+    if definition.name in DAILY_BASIC_SOURCE_COLUMNS or definition.name in {
+        "open",
+        "high",
+        "low",
+        "close",
+        "pre_close",
+        "volume",
+        "amount",
+        "pct_chg",
+    }:
+        return "atomic"
+    return "derived"
+
+
+def _materialization(definition: FactorDefinition) -> str:
+    if definition.lifecycle == "compatibility_alias":
+        return "compatibility_view"
+    if definition.lifecycle == "strategy_identity":
+        return "signal_cache"
+    if definition.lifecycle == "research_candidate":
+        return "on_demand"
+    return "daily_snapshot" if definition.frequency == "daily" else "weekly_snapshot"
+
+
 def build_factor_registry() -> tuple[FactorDefinition, ...]:
     definitions: list[FactorDefinition] = []
     for name in PROJECT_FACTOR_COLUMNS:
@@ -486,6 +697,7 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
             "long_entry_weekly",
             "right_side_unified_shadow",
             "right_side_unified",
+            "left_side_unified",
         ]
         if name in CHAN_LIVE_FACTOR_COLUMNS:
             consumers.append("score.chan")
@@ -530,7 +742,7 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 calculation_entrypoint=(
                     "quant.research.right_side_unified_features.compute_right_side_rule_features"
                 ),
-                calculation_version="right_side_rule_features_v2_118_20260813",
+                calculation_version=RULE_FEATURE_SCHEMA_VERSION,
                 refresh_cadence="trade_daily",
                 lifecycle=(
                     "compatibility_alias"
@@ -556,6 +768,53 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 layer="right_side_identity",
                 calculation_entrypoint="canonical_right_side_signal_cache",
                 calculation_version="right_side_unified_signal_v1_live_z_20260813",
+                refresh_cadence="trade_daily",
+                lifecycle="strategy_identity",
+            )
+        )
+        existing.add(name)
+    for name in LEFT_SIDE_RULE_FEATURE_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="left_side_rule",
+                frequency="daily",
+                source=(
+                    "quant.research.left_side_unified_features."
+                    "compute_left_side_rule_features"
+                ),
+                point_in_time=True,
+                consumers=("left_side_unified",),
+                canonical_name=name,
+                layer="left_side_rule",
+                calculation_entrypoint=(
+                    "quant.research.left_side_unified_features."
+                    "compute_left_side_rule_features"
+                ),
+                calculation_version=LEFT_SIDE_RULE_FEATURE_SCHEMA_VERSION,
+                refresh_cadence="trade_daily",
+                lifecycle="production_materialized",
+            )
+        )
+        existing.add(name)
+    for name in LEFT_SIDE_SIGNALS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="left_side_signal_identity",
+                frequency="daily",
+                source="canonical_left_side_signal_cache",
+                point_in_time=True,
+                consumers=("left_side_unified",),
+                role="strategy_identity",
+                canonical_name=name,
+                layer="left_side_identity",
+                calculation_entrypoint="canonical_left_side_signal_cache",
+                calculation_version=LEFT_SIDE_SIGNAL_SCHEMA_VERSION,
                 refresh_cadence="trade_daily",
                 lifecycle="strategy_identity",
             )
@@ -620,7 +879,7 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                 calculation_entrypoint=(
                     "quant.features.project_factor_layer.calculate_legacy_market_factors"
                 ),
-                calculation_version="project-v4-causal-price-alpha",
+                calculation_version=PROJECT_FACTOR_SCHEMA_VERSION,
                 refresh_cadence="on_demand",
                 lifecycle=(
                     "compatibility_alias" if canonical_name != name else "research_candidate"
@@ -733,7 +992,77 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
     return tuple(definitions)
 
 
-FACTOR_REGISTRY = build_factor_registry()
+_FACTOR_GOVERNANCE_CONFIG = load_factor_governance_config()
+FACTOR_REGISTRY_CONFIG_SHA256 = factor_governance_config_sha256(
+    _FACTOR_GOVERNANCE_CONFIG
+)
+_FACTOR_OVERRIDE_FIELDS = frozenset(
+    {
+        "semantic_category",
+        "factor_level",
+        "calculation_owner",
+        "calculator_id",
+        "materialization",
+        "active_consumers",
+        "refresh_cadence",
+        "lifecycle",
+    }
+)
+
+
+def _configured_factor_extensions() -> tuple[FactorDefinition, ...]:
+    extensions: list[FactorDefinition] = []
+    for raw in _FACTOR_GOVERNANCE_CONFIG["factor_extensions"]:
+        if not isinstance(raw, dict):
+            raise ValueError("factor_extensions entries must be objects")
+        normalized = dict(raw)
+        for tuple_field in ("consumers", "active_consumers"):
+            if tuple_field in normalized:
+                normalized[tuple_field] = tuple(normalized[tuple_field])
+        extensions.append(FactorDefinition(**normalized))
+    return tuple(extensions)
+
+
+def _apply_factor_governance(
+    definitions: tuple[FactorDefinition, ...],
+) -> tuple[FactorDefinition, ...]:
+    overrides = _FACTOR_GOVERNANCE_CONFIG["factor_overrides"]
+    names = {definition.name for definition in definitions}
+    unknown_factors = sorted(set(overrides) - names)
+    if unknown_factors:
+        raise ValueError(f"factor overrides reference unknown factors: {unknown_factors}")
+    governed: list[FactorDefinition] = []
+    for definition in definitions:
+        category = _semantic_category(definition)
+        enriched = replace(
+            definition,
+            semantic_category=category,
+            factor_level=_factor_level(definition, category),
+            calculation_owner=_CALCULATION_OWNER[definition.layer],
+            calculator_id=_LAYER_CALCULATOR[definition.layer],
+            materialization=_materialization(definition),
+            active_consumers=definition.consumers,
+        )
+        override = dict(overrides.get(definition.name, {}))
+        unsupported = sorted(set(override) - _FACTOR_OVERRIDE_FIELDS)
+        if unsupported:
+            raise ValueError(
+                f"factor {definition.name} has unsupported overrides: {unsupported}"
+            )
+        if "active_consumers" in override:
+            override["active_consumers"] = tuple(override["active_consumers"])
+            override["consumers"] = override["active_consumers"]
+        if override:
+            enriched = replace(enriched, **override)
+        governed.append(enriched)
+    return tuple(governed)
+
+
+_BASE_FACTOR_REGISTRY = (
+    *build_factor_registry(),
+    *_configured_factor_extensions(),
+)
+FACTOR_REGISTRY = _apply_factor_governance(_BASE_FACTOR_REGISTRY)
 
 
 def registry_frame() -> pd.DataFrame:
@@ -781,6 +1110,44 @@ def validate_registry() -> None:
         or not definition.calculation_version
         or not definition.refresh_cadence
         or not definition.lifecycle
+        or not definition.semantic_category
+        or not definition.factor_level
+        or not definition.calculation_owner
+        or not definition.calculator_id
+        or not definition.materialization
     )
     if invalid_metadata:
         raise ValueError(f"factor governance metadata is incomplete: {invalid_metadata}")
+    invalid_categories = sorted(
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.semantic_category not in SEMANTIC_CATEGORIES
+    )
+    if invalid_categories:
+        raise ValueError(f"invalid semantic factor categories: {invalid_categories}")
+    invalid_levels = sorted(
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.factor_level not in FACTOR_LEVELS
+    )
+    if invalid_levels:
+        raise ValueError(f"invalid factor levels: {invalid_levels}")
+    invalid_daily_lifecycle = sorted(
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.lifecycle
+        in {"production_model", "production_materialized", "strategy_identity"}
+        and definition.refresh_cadence != "trade_daily"
+    )
+    if invalid_daily_lifecycle:
+        raise ValueError(
+            "production factors must refresh on every trade day: "
+            f"{invalid_daily_lifecycle}"
+        )
+    consumer_drift = sorted(
+        definition.name
+        for definition in FACTOR_REGISTRY
+        if definition.consumers != definition.active_consumers
+    )
+    if consumer_drift:
+        raise ValueError(f"legacy and active consumer metadata drifted: {consumer_drift}")

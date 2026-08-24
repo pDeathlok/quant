@@ -2,12 +2,12 @@
 
 项目现在把“因子定义、计算、刷新、应用”拆成同一契约下的四层，而不是继续把 B1 候选缓存当作项目因子层：
 
-- `factor_registry.py`：机器可读治理注册表，当前共 607 条记录，包括 583 个规范因子、10 个兼容别名和 14 个策略身份字段；每条记录均声明规范名称、计算层、计算入口、计算版本、刷新节奏和生命周期；
-- `project_factor_layer.py`：完整日频因子唯一计算入口，市场因子与 `daily_basic` 合并后严格输出 147 列；
+- `factor_registry.py`：机器可读治理注册表，当前共 628 条记录，包括 610 个规范因子、0 个兼容别名和 18 个策略身份字段；每条记录均声明规范名称、计算层、计算入口、计算版本、刷新节奏和生命周期；
+- `project_factor_layer.py`：完整日频因子唯一计算入口，市场因子与 `daily_basic` 合并后严格输出 145 列；
 - `daily_factor_layer.py`：门控和多策略共用的轻量滚动缓存，保留快速日刷能力；
 - `long_weekly_factors.py`：公告日/报告日点时的长线周频估值、双 PR、历史分位、行业相对和研报因子；长线注册池为 190 个字段，其中生产快照合同固定 82 个，另外 108 个保留为按需研究候选。
 
-注册表还登记 25 个日频研究候选和 26 个长线外部候选。登记不等于上线：只有生命周期为 `production_model` 或 `production_materialized`，并进入活动每日依赖闭包的因子，才承诺生产日更。完整口径、迁移规则和清单分别见[因子治理与生命周期](factor_governance.md)和[完整因子目录](factor_catalog.md)。
+注册表还登记 22 个日频研究候选和 26 个长线外部候选。右侧独有规则层为 113 个字段，B2 直接复用项目层的 `volume_relative_20d` 和 `kdj_d_j`；左侧独有规则层为 27 个字段，并直接复用 `rs_is_rise`、`rs_close_pos`。登记不等于上线：只有生命周期为 `production_model` 或 `production_materialized`，并进入活动每日依赖闭包的因子，才承诺生产日更。完整口径、迁移规则和清单分别见[因子治理与生命周期](factor_governance.md)和[完整因子目录](factor_catalog.md)。
 
 跨数据源、特征、模型分和最终产物的执行依赖由
 `src/quant/application/daily_dependencies.py` 统一登记；维护规则见
@@ -30,8 +30,8 @@
 - 财务只允许 `ann_date <= signal_date`，研报只允许 `report_date <= signal_date`；训练标签不进入注册表。
 - 年度质量注册字段取四张财务源的本地首次公告值，以最晚源公告日作为 `available_at`；23 个原始/滚动字段和 11 个子分由 `long_entry_quality_shadow` 消费。行业相对价值三字段依赖当前 `stock_basic` 行业映射，注册表来源显式带 `current_industry_mapping`，历史回测必须继续披露重分类偏差。
 - 模型首轮因子准入只看非空样本量、覆盖率与是否常量，不使用单因子收益或重要性预筛。
-- `project-v4-causal-price-alpha` 修正两类历史泄漏：Alpha101 单股票实现改为过去 252 个交易日滚动时序排名；连续价格改为只从公司行动发生日向后累积的因果尺度，未来除权不再改写过去绝对均线。
-- 已发布但未声明 schema 的旧短线模型只允许在显式 `project-v1-latest-scale-global-rank` 兼容模式下消费旧口径因子；旧模型与 v4 特征、v4 模型与旧特征都会硬失败，不能静默混用。正式日刷暂时固定旧发布版口径，新研究/重训默认固定 v4，待独立回测和发布门禁通过后再迁移生产。
+- `project-v5-canonical-alias-free` 继承因果价格与滚动时序排名修正，并删除五个重复兼容别名；项目合同由 147 列稳定去重为 145 列。
+- 左右统一短线模型、每日依赖和页面合同均固定 canonical schema；旧模型只作为独立 rollback artifact 保存，不参与活动日更，也不允许新模型依赖运行时旧名映射。
 
 ## 手工预热或回填
 

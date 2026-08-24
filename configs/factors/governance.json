@@ -1,0 +1,21 @@
+{
+  "schema_version": "factor_governance_v1",
+  "execution": {
+    "global_cpu_worker_budget": 10
+  },
+  "calculators": {
+    "project_daily": {"enabled": true, "executor": "processes", "default_workers": 8, "max_workers": 8, "max_pending_multiplier": 2},
+    "project_daily_candidate": {"enabled": true, "executor": "processes", "default_workers": 4, "max_workers": 8, "max_pending_multiplier": 2},
+    "right_side_rule": {"enabled": true, "executor": "processes", "default_workers": 6, "max_workers": 6, "max_pending_multiplier": 2},
+    "right_side_identity": {"enabled": true, "executor": "serial", "default_workers": 1, "max_workers": 1, "max_pending_multiplier": 1},
+    "left_side_rule": {"enabled": true, "executor": "processes", "default_workers": 6, "max_workers": 8, "max_pending_multiplier": 2},
+    "left_side_identity": {"enabled": true, "executor": "serial", "default_workers": 1, "max_workers": 1, "max_pending_multiplier": 1},
+    "selector_live": {"enabled": true, "executor": "serial", "default_workers": 1, "max_workers": 1, "max_pending_multiplier": 1},
+    "chan_live": {"enabled": true, "executor": "processes", "default_workers": 4, "max_workers": 4, "max_pending_multiplier": 2},
+    "long_snapshot": {"enabled": true, "executor": "serial", "default_workers": 1, "max_workers": 1, "max_pending_multiplier": 1},
+    "long_research": {"enabled": true, "executor": "serial", "default_workers": 1, "max_workers": 1, "max_pending_multiplier": 1},
+    "long_external": {"enabled": true, "executor": "threads", "default_workers": 4, "max_workers": 6, "max_pending_multiplier": 2}
+  },
+  "factor_overrides": {},
+  "factor_extensions": []
+}

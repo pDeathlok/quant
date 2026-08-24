@@ -164,6 +164,9 @@ def _composite_decision(
         "shadow_candidate": shadow_candidate,
         "replace_online": replace_online,
         "architecture_gate": {"passed": True},
+        "canonical_factor_gate": {
+            "passed": selected == "unified_long_task_deep"
+        },
         "full_118_factor_increment_gate": {
             "passed": selected == "unified_long_task_deep"
         },
@@ -189,7 +192,7 @@ def test_repository_shadow_config_is_disabled_and_promotion_is_not_automatic() -
     )
     assert config.decision_field == "shadow_candidate"
     assert config.production_replacement_field == "replace_online"
-    assert "unified_long_task_deep_rule105" in config.eligible_candidates
+    assert config.eligible_candidates == ("unified_long_task_deep",)
 
 
 def test_disabled_shadow_returns_without_accessing_artifacts() -> None:
@@ -242,7 +245,8 @@ def test_shadow_feature_frame_requires_complete_exact_date_candidate_coverage(
             }
         )
 
-    def fake_rules(daily):
+    def fake_rules(daily, *, canonical_factors=None):
+        assert canonical_factors is not None
         return pd.DataFrame(
             {
                 name: np.arange(len(daily), dtype=float)
@@ -453,19 +457,19 @@ def test_shadow_stage_wraps_passed_model_without_writing_production(
 ) -> None:
     config = _config(tmp_path)
     source = tmp_path / "model.joblib"
-    joblib.dump(_Rule105StageableModel(), source)
+    joblib.dump(_StageableModel(), source)
     config.paths.ranking_decision.parent.mkdir(parents=True)
     config.paths.ranking_decision.write_text(
         json.dumps(
-            _composite_decision("unified_long_task_deep_rule105")
+            _composite_decision("unified_long_task_deep")
         ),
         encoding="utf-8",
     )
     _write_source_manifest(
         source,
-        experiment="unified_long_task_deep_rule105",
-        common_features=_Rule105StageableModel.common_features,
-        rule_features=tuple(LEGACY_RULE_FEATURE_COLUMNS_V1),
+        experiment="unified_long_task_deep",
+        common_features=_StageableModel.common_features,
+        rule_features=tuple(RULE_FEATURE_COLUMNS),
     )
     monkeypatch.setattr(shadow, "load_shadow_release_config", lambda *args: config)
 
@@ -475,8 +479,8 @@ def test_shadow_stage_wraps_passed_model_without_writing_production(
     assert result["status"] == "success"
     assert result["production_changed"] is False
     assert manifest["lifecycle"] == "research_only"
-    assert manifest["selected_rule_factor_count"] == 105
-    assert manifest["rule_factor_count"] == 118
+    assert manifest["selected_rule_factor_count"] == len(RULE_FEATURE_COLUMNS)
+    assert manifest["rule_factor_count"] == len(RULE_FEATURE_COLUMNS)
     assert manifest["factor_contract_sha256"] == RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256
     assert not (tmp_path / "models/production/right_side_unified").exists()
 
@@ -487,7 +491,7 @@ def test_shadow_stage_wraps_passed_model_without_writing_production(
         shadow.validate_shadow_release_preflight(config, project_root=tmp_path)
 
 
-def test_shadow_stage_accepts_only_manifest_frozen_beam_rule_subset(
+def test_shadow_stage_rejects_pre_canonical_beam_candidate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -510,14 +514,6 @@ def test_shadow_stage_accepts_only_manifest_frozen_beam_rule_subset(
     )
     monkeypatch.setattr(shadow, "load_shadow_release_config", lambda *args: config)
 
-    result = shadow.stage_shadow_release(source, project_root=tmp_path)
-    bundle = joblib.load(config.paths.artifact)
-
-    assert result["status"] == "success"
-    assert bundle["selected_candidate"] == "unified_long_task_deep_beam"
-    assert tuple(bundle["selected_rule_factor_columns"]) == _BEAM_RULE_FEATURES
-    assert bundle["selected_rule_factor_count"] == 111
-    assert set(ADDED_RULE_FEATURE_COLUMNS_V2[6:]).isdisjoint(bundle["features"])
-    assert bundle["materialized_rule_factor_columns_sha256"] == (
-        RULE_FEATURE_COLUMNS_SHA256
-    )
+    with pytest.raises(ValueError, match="unsupported selected right-side candidate"):
+        shadow.stage_shadow_release(source, project_root=tmp_path)
+    assert not config.paths.artifact.exists()

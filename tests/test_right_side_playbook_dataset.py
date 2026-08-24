@@ -102,7 +102,7 @@ def test_narrow_tables_keep_wide_factors_once_and_cover_every_action() -> None:
     assert len(outcomes) == 2 * len(DEFAULT_PLAYBOOK_CATALOG)
     assert "rs_accidental_factor_copy" not in outcomes
     assert set(EVENT_FACTOR_COLUMNS).isdisjoint(outcomes.columns)
-    assert audit["rule_feature_count"] == 118
+    assert audit["rule_feature_count"] == 113
     assert audit["actions_per_event"] == 9
     assert audit["known_utility_regular_coverage"] == pytest.approx(1.0)
     assert audit["eligible_immature_null_utility_rows"] == 0

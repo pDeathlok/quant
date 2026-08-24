@@ -33,6 +33,10 @@ from quant.application.selector_ranking import (
     validate_selector_promotion_approval,
 )
 from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
+from quant.features.canonical_factor_names import (
+    assert_no_forbidden_factor_names,
+    find_forbidden_aliases_in_payload,
+)
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
     RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
@@ -40,8 +44,6 @@ from quant.features.right_side_factor_contract import (
     factor_contract_sha256,
 )
 from quant.research.right_side_unified_features import (
-    ADDED_RULE_FEATURE_COLUMNS_V2,
-    LEGACY_RULE_FEATURE_COLUMNS_V1,
     RULE_FEATURE_COLUMNS,
     RULE_FEATURE_COLUMNS_SHA256,
     rule_feature_columns_sha256,
@@ -52,20 +54,21 @@ from quant.routine.right_side_unified_shadow import (
     ShadowPaths,
     ShadowReleaseConfig,
     _load_shadow_bundle,
-    _validated_beam_search_contract,
     build_right_side_shadow_features,
     load_shadow_release_config,
 )
 
 
 DEFAULT_PRODUCTION_SOURCE_SHADOW = (
-    PROJECT_ROOT / "models/research/right_side_unified_v2_118/shadow/ranking.joblib"
+    PROJECT_ROOT
+    / "models/research/right_side_unified_canonical_v5_rule113/shadow/ranking.joblib"
 )
 DEFAULT_NORMALIZATION_REFERENCE = (
-    PROJECT_ROOT / "reports/research/right_side_unified_v2_118/test_predictions.parquet"
+    PROJECT_ROOT
+    / "reports/research/right_side_unified_canonical_v5_rule113/test_predictions.parquet"
 )
 NORMALIZATION_REFERENCE_PREDICTION_COLUMN = (
-    "pred_unified_long_task_deep_rule105"
+    "pred_unified_long_task_deep"
 )
 NORMALIZATION_QUANTILE_COUNT = 1001
 
@@ -345,20 +348,6 @@ def _production_input_snapshot(
     return hashlib.sha256(encoded).hexdigest(), payload
 
 
-def _validate_beam_contract(bundle: Mapping[str, Any]) -> None:
-    if bundle.get("selected_candidate") != "unified_long_task_deep_beam":
-        return
-    selected = _validated_beam_search_contract(
-        bundle.get("beam_search"),
-        error_type=RuntimeError,
-    )
-    selected_rules = tuple(
-        str(value) for value in (bundle.get("selected_rule_factor_columns") or ())
-    )
-    if selected_rules != (*LEGACY_RULE_FEATURE_COLUMNS_V1, *selected):
-        raise RuntimeError("Beam selected increment differs from model rule inputs")
-
-
 def validate_production_ranking_artifact(
     config: SelectorRankingConfig,
     *,
@@ -386,6 +375,12 @@ def validate_production_ranking_artifact(
         config.preserved_legacy_signals
     ):
         raise RuntimeError("right-side production preserved_legacy_signals mismatch")
+    forbidden_manifest = find_forbidden_aliases_in_payload(manifest)
+    if forbidden_manifest:
+        raise RuntimeError(
+            "right-side production manifest contains forbidden factor aliases: "
+            f"{forbidden_manifest}"
+        )
     if manifest.get("factor_contract_sha256") != RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256:
         raise RuntimeError("right-side production artifact factor contract mismatch")
     if manifest.get("selected_candidate") != approval.get(
@@ -423,15 +418,25 @@ def validate_production_ranking_artifact(
     forbidden = {"pred_up5", "pred_up8", "pred_down3"} & set(bundle)
     if forbidden:
         raise RuntimeError(f"right-side ranker contains forbidden output aliases: {sorted(forbidden)}")
+    forbidden_bundle = find_forbidden_aliases_in_payload(bundle)
+    if forbidden_bundle:
+        raise RuntimeError(
+            "right-side production bundle contains forbidden factor aliases: "
+            f"{forbidden_bundle}"
+        )
     if bundle.get("factor_contract_sha256") != RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256:
         raise RuntimeError("right-side production bundle factor contract mismatch")
     if manifest.get("selected_candidate") != bundle.get("selected_candidate"):
         raise RuntimeError("right-side production selected candidate mismatch")
     if bundle.get("materialized_rule_factor_columns_sha256") != RULE_FEATURE_COLUMNS_SHA256:
-        raise RuntimeError("right-side production materialized 118-factor hash mismatch")
+        raise RuntimeError("right-side production materialized rule-factor hash mismatch")
     features = tuple(str(value) for value in (bundle.get("features") or ()))
     if not features or len(features) != len(set(features)):
         raise RuntimeError("right-side production model inputs are empty or duplicated")
+    assert_no_forbidden_factor_names(
+        features,
+        context="right-side production artifact inputs",
+    )
     unknown = sorted(set(features) - set(RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS))
     missing_identity = sorted(
         set(RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS) - set(features)
@@ -447,20 +452,10 @@ def validate_production_ranking_artifact(
         raise RuntimeError("right-side production selected rule-factor contract mismatch")
     if manifest.get("selected_rule_factor_columns") != list(selected_rules):
         raise RuntimeError("right-side production manifest rule-factor list mismatch")
-    if bundle.get("selected_candidate") == "unified_long_task_deep_rule105":
-        valid_rules = selected_rules == tuple(LEGACY_RULE_FEATURE_COLUMNS_V1)
-    elif bundle.get("selected_candidate") == "unified_long_task_deep":
-        valid_rules = selected_rules == tuple(RULE_FEATURE_COLUMNS)
-    elif bundle.get("selected_candidate") == "unified_long_task_deep_beam":
-        increment = selected_rules[len(LEGACY_RULE_FEATURE_COLUMNS_V1) :]
-        valid_rules = bool(
-            selected_rules[: len(LEGACY_RULE_FEATURE_COLUMNS_V1)]
-            == tuple(LEGACY_RULE_FEATURE_COLUMNS_V1)
-            and set(increment) <= set(ADDED_RULE_FEATURE_COLUMNS_V2)
-            and len(increment) == len(set(increment))
-        )
-    else:
-        valid_rules = False
+    valid_rules = bool(
+        bundle.get("selected_candidate") == "unified_long_task_deep"
+        and selected_rules == tuple(RULE_FEATURE_COLUMNS)
+    )
     missing_rules = sorted(set(selected_rules) - set(features))
     if unknown or missing_identity or missing_rules or not valid_rules:
         raise RuntimeError(
@@ -476,7 +471,15 @@ def validate_production_ranking_artifact(
         raise RuntimeError("right-side production model-input hash mismatch")
     if bundle.get("model") is None:
         raise RuntimeError("right-side production bundle has no model")
-    _validate_beam_contract(bundle)
+    model = bundle["model"]
+    assert_no_forbidden_factor_names(
+        getattr(model, "feature_names_in_", ()),
+        context="right-side production model feature_names_in_",
+    )
+    assert_no_forbidden_factor_names(
+        getattr(model, "selected_features_", ()),
+        context="right-side production model selected_features_",
+    )
     return bundle
 
 
@@ -505,11 +508,7 @@ def _shadow_compatible_config(config: SelectorRankingConfig) -> ShadowReleaseCon
         decision_field="status",
         accepted_decisions=("success",),
         selected_candidate_field="selected_candidate",
-        eligible_candidates=(
-            "unified_long_task_deep_rule105",
-            "unified_long_task_deep",
-            "unified_long_task_deep_beam",
-        ),
+        eligible_candidates=("unified_long_task_deep",),
         decision_schema_version="right-side-production-replacement-decision-v1",
         production_replacement_field="replace_online",
         factor_workers=config.factor_workers,
@@ -521,7 +520,7 @@ def build_right_side_unified_production_features(
     *,
     config: SelectorRankingConfig,
 ) -> dict[str, Any]:
-    """Build the exact-date causal v4+118 production sidecar."""
+    """Build the exact-date canonical project-v5/rule-v4 production sidecar."""
 
     return build_right_side_shadow_features(
         target_date,

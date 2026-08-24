@@ -4,7 +4,7 @@
 # 排序 A/B 门槛通过并显式封装 shadow artifact 后，才允许把 routine.enabled
 # 改为 true。生产 promotion 仍是另一次独立、可回滚的变更。
 release:
-  id: right-side-unified-v2-118-shadow
+  id: right-side-unified-canonical-v5-rule113-shadow-20260824
   lifecycle: research_only
   consumer: quant.routine.right_side_unified_shadow
   dependency_nodes:
@@ -12,20 +12,20 @@ release:
     - score.right_side_unified_shadow
     - product.right_side_unified_shadow
   scope: rightSideShadow
-  artifact: models/research/right_side_unified_v2_118/shadow/ranking.joblib
-  artifact_manifest: models/research/right_side_unified_v2_118/shadow/manifest.json
-  artifact_schema_version: right-side-unified-ranking-shadow-v1
-  feature_schema_version: right-side-shadow-features-v1-project-v4-rule-v2-118
-  project_factor_schema_version: project-v4-causal-price-alpha
-  rule_factor_schema_version: right_side_rule_features_v2_118_20260813
-  rule_factor_count: 118
-  factor_count: 265
-  factor_contract_sha256: 6fc15ad06252b66b40f890165243f6b17cb74444909019155e12934683cace9c
-  ranking_decision: reports/research/right_side_unified_v2_118/production_replacement_decision_ab.json
+  artifact: models/research/right_side_unified_canonical_v5_rule113/shadow/ranking.joblib
+  artifact_manifest: models/research/right_side_unified_canonical_v5_rule113/shadow/manifest.json
+  artifact_schema_version: right-side-unified-ranking-shadow-v2-canonical-alias-free
+  feature_schema_version: right-side-features-v3-project-v5-rule-v4-113
+  project_factor_schema_version: project-v5-canonical-alias-free
+  rule_factor_schema_version: right_side_rule_features_v4_113_20260824
+  rule_factor_count: 113
+  factor_count: 258
+  factor_contract_sha256: 847a73b56e31e3f9111d0816781655ec27a772131e0d2adbb7922d7bd5c70595
+  ranking_decision: reports/research/right_side_unified_canonical_v5_rule113/production_replacement_decision_ab.json
 
 routine:
-  # 当前保持关闭：105 已封装为 research-only shadow artifact；
-  # 118 增量与线上 legacy 替换门均未通过，仅允许显式手工 dry-run。
+  # 保持独立影子链路关闭；新 canonical artifact 已通过一次显式 postflight，
+  # 正式 selector 使用独立 production bundle，不从该影子路径隐式取数。
   enabled: false
   target_top_n: 50
   factor_workers: 8
@@ -34,9 +34,9 @@ routine:
   feature_manifest: data/features/right_side_unified_shadow/feature_manifest.json
   score_output: data/features/right_side_unified_shadow/latest_scores.parquet
   score_manifest: data/features/right_side_unified_shadow/score_manifest.json
-  product_output: reports/research/right_side_unified_v2_118/shadow/latest_candidates.parquet
-  product_manifest: reports/research/right_side_unified_v2_118/shadow/product_manifest.json
-  run_status: reports/research/right_side_unified_v2_118/shadow/run_status.json
+  product_output: reports/research/right_side_unified_canonical_v5_rule113/shadow/latest_candidates.parquet
+  product_manifest: reports/research/right_side_unified_canonical_v5_rule113/shadow/product_manifest.json
+  run_status: reports/research/right_side_unified_canonical_v5_rule113/shadow/run_status.json
   z_signal_cache: data/features/z_skill_daily_candidates.parquet
   family_signal_cache: data/features/b1/b1_family_rule_candidates.parquet
   market_data_root: data/raw
@@ -62,9 +62,7 @@ ranking_gate:
   # 不在配置中硬编码获胜臂；以 decision.selected_candidate 为唯一权威。
   selected_candidate_field: selected_research_candidate
   eligible_candidates:
-    - unified_long_task_deep_rule105
     - unified_long_task_deep
-    - unified_long_task_deep_beam
   production_replacement_field: replace_online
 
 promotion:
@@ -74,8 +72,8 @@ promotion:
   engineering_acceptance:
     minimum_complete_shadow_runs: 1
     require_schema_freshness_artifact_final_gate: true
-  production_artifact: models/production/right_side_unified/ranking.joblib
-  production_manifest: models/production/right_side_unified/manifest.json
+  production_artifact: models/production/right_side_unified_canonical_v2/ranking.joblib
+  production_manifest: models/production/right_side_unified_canonical_v2/manifest.json
   selector_consumer: score.selector
   selector_source_after_promotion: score.right_side_unified
   rollback_selector_source: score.z_skill

@@ -1,0 +1,69 @@
+# Unified left-side ranking release contract.  The B selection and C
+# confirmation folds must both pass before a checksum-pinned production
+# artifact is staged from the confirmed C fold.
+release:
+  id: left-side-ranking-v4-group4-production-20260824
+  lifecycle: production
+  consumer: quant.webapp.services.selector
+  dependency_nodes:
+    - feature.left_side_unified
+    - score.left_side_unified
+    - product.left_side_unified_adapter
+    - score.selector
+
+selector:
+  enabled: true
+  failure_policy: fail_closed
+  score_field: ranking_score
+  normalized_score_field: ranking_score_normalized
+  production_threshold_mode: none_rank_only
+  selection_policy: downstream_top_n_ordering
+  normalization: daily_cross_section_percentile_v1
+  factor_workers: 6
+  overlap_policy: right_side_precedence
+  strategy_keys:
+    - B1
+    - SB1
+    - SUPER_B1
+    - LOW_PULLBACK
+
+model:
+  artifact: models/production/left_side_unified_canonical_v4_group4/ranking.joblib
+  artifact_manifest: models/production/left_side_unified_canonical_v4_group4/manifest.json
+  artifact_schema_version: left-side-unified-ranking-production-v4-group4-canonical-alias-free
+  feature_schema_version: left-side-features-v2-project-v5-shared-right2-rule-v2-canonical-174
+  project_factor_schema_version: project-v5-canonical-alias-free
+  rule_factor_schema_version: left_side_rule_features_v2_27_20260824
+  score_schema_version: left-side-unified-ranking-score-v4-group4
+  factor_contract_sha256: f328be7e3583748ffbf2dcb288de05f4c29cd080e4ee789abe3c965c3cdba58a
+  model_input_contract_sha256: 5afc04838d4890719673c0476b793662fbe1a1b23b62756ca85fd4fbe4b14881
+  scoring_input_contract_sha256: f71224361ccd15ea16319cbac2e3ef3ba312a47b20b06aff6494f76357e21fbe
+
+paths:
+  project_feature_cache: data/features/b1/active_candidate_project_features.parquet
+  project_feature_manifest: data/features/b1/active_candidate_project_features_manifest.json
+  signal_cache: data/features/z_skill_daily_candidates.parquet
+  b1_gate_cache: data/features/b1/b1_gate_candidates.parquet
+  family_signal_cache: data/features/b1/b1_family_rule_candidates.parquet
+  market_data_root: data/raw
+  feature_output: data/features/left_side_unified/latest_features.parquet
+  feature_manifest: data/features/left_side_unified/feature_manifest.json
+  score_output: data/features/left_side_unified/latest_scores.parquet
+  score_manifest: data/features/left_side_unified/score_manifest.json
+  ranking_decision: reports/research/left_side_unified_v3_group4_input_parity/ranking_replacement_decision.json
+
+promotion:
+  require_replace_online: true
+  required_decision_schema: left-side-ranking-replacement-decision-v2-group4
+  production_candidate_fold: C
+  preserve_rollback_artifacts:
+    - models/production/left_side_unified_canonical_v3_group4/ranking.joblib
+    - models/research/z_skill/DUICHEN_VA_up5.joblib
+    - models/research/z_skill/DUICHEN_VA_up8.joblib
+    - models/research/z_skill/DUICHEN_VA_down3.joblib
+    - models/research/z_skill/NANA_up5.joblib
+    - models/research/z_skill/NANA_up8.joblib
+    - models/research/z_skill/NANA_down3.joblib
+    - models/research/z_skill/YIDONG_DILIAN_up5.joblib
+    - models/research/z_skill/YIDONG_DILIAN_up8.joblib
+    - models/research/z_skill/YIDONG_DILIAN_down3.joblib

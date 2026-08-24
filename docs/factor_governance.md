@@ -4,20 +4,20 @@
 
 ## 当前治理基线
 
-注册表 schema 为 `factor_registry_v2_governed`，当前共有 607 条记录。
+注册表 schema 为 `factor_registry_v2_governed`，当前共有 628 条记录。
 
 | 维度 | 状态 | 数量 | 含义 |
 | --- | --- | ---: | --- |
-| 角色 | `feature` | 583 | 有独立语义的规范因子 |
-| 角色 | `compatibility_alias` | 10 | 旧名称兼容映射，不建立第二套计算逻辑 |
-| 角色 | `strategy_identity` | 14 | 代码、日期、方向等策略身份字段 |
+| 角色 | `feature` | 610 | 有独立语义的规范因子 |
+| 角色 | `compatibility_alias` | 0 | 旧名称消费者已清零并从注册表删除 |
+| 角色 | `strategy_identity` | 18 | 左/右策略身份字段 |
 | 生命周期 | `production_model` | 236 | 被当前生产模型直接消费 |
-| 生命周期 | `production_materialized` | 191 | 被生产规则、页面或快照直接物化 |
+| 生命周期 | `production_materialized` | 218 | 被生产规则、页面或快照直接物化 |
 | 生命周期 | `research_candidate` | 156 | 已登记且可研究，未承诺生产日更 |
-| 生命周期 | `compatibility_alias` | 10 | 只用于兼容旧消费者 |
-| 生命周期 | `strategy_identity` | 14 | 随对应策略产物管理 |
+| 生命周期 | `compatibility_alias` | 0 | 当前没有活动兼容别名 |
+| 生命周期 | `strategy_identity` | 18 | 随对应策略产物管理 |
 
-刷新节奏共有 448 条 `trade_daily` 记录和 159 条 `on_demand` 记录。刷新节奏是声明，活动 DAG 才是执行依据；两者不一致时生产门禁必须失败，而不是静默漏算。
+刷新节奏共有 472 条 `trade_daily` 记录和 156 条 `on_demand` 记录。刷新节奏是声明，活动 DAG 才是执行依据；两者不一致时生产门禁必须失败，而不是静默漏算。
 
 ## 三个事实来源
 
@@ -33,10 +33,12 @@
 
 | 计算层 | 注册记录数 | 责任边界 |
 | --- | ---: | --- |
-| `project_daily` | 147 | B1/Z 等项目级日频量价与技术因子 |
-| `project_daily_candidate` | 25 | 已有公式或明确口径、尚未晋级的日频候选 |
-| `right_side_rule` | 118 | 右侧和混合策略规则字段 |
+| `project_daily` | 145 | 规范化后的项目级日频量价与技术因子 |
+| `project_daily_candidate` | 22 | 已有公式或明确口径、尚未晋级的日频候选 |
+| `right_side_rule` | 113 | 右侧和混合策略独有规则字段；重复项目因子已直接复用 |
 | `right_side_identity` | 14 | 右侧规则产物的身份字段 |
+| `left_side_rule` | 27 | 四组左侧策略独有规则字段；另复用 2 个右侧基础字段 |
+| `left_side_identity` | 4 | B1、SB1、SUPER_B1、LOW_PULLBACK 身份字段 |
 | `selector_live` | 49 | selector 生产模型输入 |
 | `chan_live` | 42 | Chan 独有生产输入；另有 4 个复用规范因子，所以模型合同共 46 列 |
 | `long_snapshot` | 78 | 长线生产快照独有字段；另有 4 个复用规范因子，所以快照合同共 82 列 |
@@ -142,18 +144,7 @@ compatibility_alias
 
 ## 当前兼容别名
 
-| 兼容名称 | 规范名称 |
-| --- | --- |
-| `price_level` | `close` |
-| `bb_middle` | `ma_20` |
-| `kdj_k` | `kdj_d_k` |
-| `kdj_d` | `kdj_d_d` |
-| `kdj_j` | `kdj_d_j` |
-| `rs_pct_chg_1d` | `pct_chg` |
-| `rs_amplitude_pct` | `amplitude_1` |
-| `rs_vol_ratio_5_inclusive` | `volume_relative_5d` |
-| `rs_vol_ratio_20_inclusive` | `volume_relative_20d` |
-| `rs_family_kdj_j` | `kdj_d_j` |
+当前数量为 0。五个历史兼容名称的活动消费者已经清零，注册表只保留规范名称。旧 Parquet 只允许在数据读取边界执行一次“逐值及 NaN 位置一致性校验—改名—删除旧列”；训练、评分、artifact、策略配置和页面合同均禁止继续携带旧名称。
 
 ## 每日更新保障
 
@@ -201,4 +192,14 @@ PYTHONPATH=src pytest -q \
 
 ## 完整目录
 
-[完整因子目录](factor_catalog.md)由注册表自动生成，不手工编辑。目录包含每条记录的名称、规范映射、角色、生命周期、计算层、类别、频率、刷新节奏、消费者、来源、计算入口和版本。
+[完整因子目录](factor_catalog.md)由注册表自动生成，不手工编辑。目录包含每条记录的规范名称、业务语义类别、因子层级、生命周期、计算器、计算归属、物化方式、刷新节奏、当前消费者、来源和版本。
+
+## 正交分类模型
+
+- `semantic_category`：只描述策略无关的业务含义，例如趋势、波动风险、估值、盈利和资金流。
+- `factor_level`：描述原子、派生、复合、信号或身份层级。
+- `calculation_owner/calculator_id`：描述技术实现和唯一计算责任，不限制策略使用范围。
+- `active_consumers`：描述当前线上事实，不是访问控制列表；新策略通过 DAG 声明依赖即可使用任何规范因子。
+- `lifecycle/refresh_cadence`：决定是否进入活动日更闭包。
+
+计算器依赖、配置化晋级、共享 worker 预算和并行边界见[因子计算 DAG 与并行治理](factor_execution_and_parallelism.md)。

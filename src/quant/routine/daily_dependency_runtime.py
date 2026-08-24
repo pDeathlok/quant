@@ -37,6 +37,7 @@ from quant.features.factor_registry import (
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
 )
+from quant.features.left_side_factor_contract import LEFT_SIDE_SCORING_INPUT_COLUMNS
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 
 
@@ -640,6 +641,7 @@ def _feature_catalogs(
         "feature.right_side_unified": tuple(
             RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS
         ),
+        "feature.left_side_unified": tuple(LEFT_SIDE_SCORING_INPUT_COLUMNS),
     }
 
 

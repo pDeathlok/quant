@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import yaml
 
 from quant.routine import b1_daily_plan
 from quant.routine.strategies import (
@@ -44,9 +45,9 @@ def _release() -> StrategyRelease:
 
 
 def test_production_b1_yaml_declares_current_release_and_five_models() -> None:
-    release = load_strategy_release(
-        Path("configs/strategies/b1_selected.yaml")
-    )
+    path = Path("configs/strategies/b1_selected.yaml")
+    release = load_strategy_release(path)
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     assert release.id == "b1-20260722"
     assert release.model_dir == "models/production/b1"
@@ -61,6 +62,12 @@ def test_production_b1_yaml_declares_current_release_and_five_models() -> None:
         "b1_stable",
         "b1_aggressive",
     ]
+    assert payload["release"]["active_entry_threshold"] == {
+        "mode": "none_rank_only",
+        "normalization": "daily_cross_section_percentile_v1",
+        "top_n_per_day": 20,
+        "legacy_probability_thresholds": "rollback_only",
+    }
 
 
 def test_daily_plan_does_not_reuse_prior_day_when_target_has_no_signal(
@@ -196,7 +203,7 @@ def test_live_active_candidate_sidecar_is_preferred_and_filters_z_only(
                 "status": "success",
                 "target_date": "2026-08-12",
                 "candidate_coverage_status": "complete",
-                "factor_count": 147,
+                "factor_count": 145,
             }
         ),
         encoding="utf-8",

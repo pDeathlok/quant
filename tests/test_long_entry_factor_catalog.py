@@ -26,7 +26,7 @@ def test_catalog_covers_all_previously_used_project_and_selector_factors() -> No
         "PROJECT_FACTOR_COLUMNS",
     )
 
-    assert len(project_factors) == 147
+    assert len(project_factors) == 145
     assert len(SELECTOR_PRODUCTION_FEATURES) == 49
     assert set(project_factors) <= set(by_factor)
     assert set(SELECTOR_PRODUCTION_FEATURES) <= set(by_factor)

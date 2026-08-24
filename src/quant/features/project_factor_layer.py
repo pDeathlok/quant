@@ -85,7 +85,7 @@ from quant.features.variable_library import (
 )
 
 
-PROJECT_FACTOR_SCHEMA_VERSION = "project-v4-causal-price-alpha"
+PROJECT_FACTOR_SCHEMA_VERSION = "project-v5-canonical-alias-free"
 LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION = "project-v1-latest-scale-global-rank"
 KEY_COLUMNS = ("ts_code", "symbol", "trade_date", "date")
 
@@ -268,15 +268,10 @@ def calculate_legacy_market_factors(
     factors["macd"] = MACD().compute(frame)
     for window in (6, 12, 24):
         factors[f"rsi_{window}"] = RSI(window).compute(frame)
-    kdj = KDJ().compute(frame)
-    factors[["kdj_k", "kdj_d", "kdj_j"]] = kdj[["K", "D", "J"]].to_numpy()
     bands = BollingerBands().compute(frame)
     if isinstance(bands, pd.DataFrame):
         factors["bb_upper"] = bands.iloc[:, 0]
-        factors["bb_middle"] = factors["ma_20"]
         factors["bb_lower"] = bands.iloc[:, 2]
-    else:
-        factors["bb_middle"] = bands
     factors["atr_14"] = ATR(14).compute(frame)
     factors["williams_r_14"] = WilliamsR(14).compute(frame)
     factors["cci"] = CCI().compute(frame)
@@ -349,7 +344,6 @@ def calculate_legacy_market_factors(
     for window in (20, 60):
         factors[f"volatility_{window}d"] = Volatility(window).compute(frame)
         factors[f"downside_volatility_{window}d"] = DownsideVolatility(window).compute(frame)
-    factors["price_level"] = frame["close"]
     factors["price_log"] = np.log(frame["close"] + 1)
     factors["price_volume_ratio"] = frame["close"] / (frame["volume"] + 1)
     factors["volume_relative_60d"] = frame["volume"] / frame["volume"].rolling(60).mean().replace(0, np.nan)
@@ -410,7 +404,7 @@ def calculate_project_factor_frame(
     daily_basic_features: pd.DataFrame | None = None,
     factor_schema_version: str | None = None,
 ) -> pd.DataFrame:
-    """Return the complete 147-factor contract when daily_basic is supplied.
+    """Return the complete canonical project contract when daily_basic is supplied.
 
     The daily_basic frame must already be point-in-time derived by
     ``load_daily_basic_features``.  Applications may defer this merge until

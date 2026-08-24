@@ -11,6 +11,10 @@ import hashlib
 import json
 from typing import Sequence
 
+from quant.features.canonical_factor_names import (
+    assert_no_forbidden_factor_names,
+    stable_canonical_feature_union,
+)
 from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 from quant.research.right_side_unified_features import (
@@ -25,20 +29,21 @@ CANONICAL_SIGNAL_SCHEMA_VERSION = "right_side_unified_signal_v1_live_z_20260813"
 
 
 RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION = (
-    "right-side-unified-ranking-shadow-v1"
+    "right-side-unified-ranking-shadow-v2-canonical-alias-free"
 )
 RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION = (
-    "right-side-shadow-features-v1-project-v4-rule-v2-118"
+    "right-side-features-v3-project-v5-rule-v4-113"
 )
-
-RIGHT_SIDE_SHADOW_FACTOR_COLUMNS: tuple[str, ...] = (
-    *PROJECT_FACTOR_COLUMNS,
-    *RULE_FEATURE_COLUMNS,
+RIGHT_SIDE_SHADOW_FACTOR_COLUMNS: tuple[str, ...] = stable_canonical_feature_union(
+    PROJECT_FACTOR_COLUMNS,
+    RULE_FEATURE_COLUMNS,
 )
 RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS: tuple[str, ...] = tuple(RIGHT_SIDE_SIGNALS)
 RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS: tuple[str, ...] = (
-    *RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
-    *RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+    stable_canonical_feature_union(
+        RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
+        RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
+    )
 )
 
 
@@ -77,15 +82,33 @@ RIGHT_SIDE_SHADOW_MODEL_INPUT_CONTRACT_SHA256 = factor_contract_sha256(
 
 
 def validate_right_side_shadow_factor_contract() -> None:
-    """Fail closed when any frozen count, ordering, or namespace drifts."""
+    """Fail closed on duplicates, forbidden aliases, or namespace overlap."""
 
-    if len(PROJECT_FACTOR_COLUMNS) != 147:
+    assert_no_forbidden_factor_names(
+        PROJECT_FACTOR_COLUMNS,
+        context="right-side project factor contract",
+    )
+    assert_no_forbidden_factor_names(
+        RULE_FEATURE_COLUMNS,
+        context="right-side rule factor contract",
+    )
+    assert_no_forbidden_factor_names(
+        RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
+        context="right-side model input contract",
+    )
+    expected_factor_union = stable_canonical_feature_union(
+        PROJECT_FACTOR_COLUMNS,
+        RULE_FEATURE_COLUMNS,
+    )
+    if RIGHT_SIDE_SHADOW_FACTOR_COLUMNS != expected_factor_union:
+        raise ValueError("right-side factor union is not canonical and stable")
+    if len(expected_factor_union) != (
+        len(PROJECT_FACTOR_COLUMNS) + len(RULE_FEATURE_COLUMNS)
+    ):
+        overlap = sorted(set(PROJECT_FACTOR_COLUMNS) & set(RULE_FEATURE_COLUMNS))
         raise ValueError(
-            "right-side shadow project-factor contract must contain 147 columns"
-        )
-    if len(RULE_FEATURE_COLUMNS) != 118:
-        raise ValueError(
-            "right-side shadow rule-factor contract must contain 118 columns"
+            "right-side project/rule contracts overlap instead of reusing the "
+            f"project layer: {overlap}"
         )
     if len(RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS) != 14:
         raise ValueError(

@@ -734,14 +734,33 @@ def build_features(
 def refresh_factor_registry_snapshot() -> dict:
     """Publish the factor contract consumed by every daily/weekly application."""
 
+    from quant.features.factor_execution import (
+        factor_execution_plan_payload,
+        validate_factor_execution_registry,
+    )
+    from quant.features.factor_registry import FACTOR_REGISTRY_CONFIG_SHA256
+
     started = time.monotonic()
     output_path = PROJECT_ROOT / "data/features/factor_registry/latest.json"
     try:
         validate_registry()
+        validate_factor_execution_registry()
         registry = registry_frame()
         family_counts = {
             str(key): int(value)
             for key, value in registry["family"].value_counts().sort_index().items()
+        }
+        semantic_category_counts = {
+            str(key): int(value)
+            for key, value in registry["semantic_category"].value_counts().sort_index().items()
+        }
+        factor_level_counts = {
+            str(key): int(value)
+            for key, value in registry["factor_level"].value_counts().sort_index().items()
+        }
+        calculator_counts = {
+            str(key): int(value)
+            for key, value in registry["calculator_id"].value_counts().sort_index().items()
         }
         frequency_counts = {
             str(key): int(value)
@@ -805,6 +824,11 @@ def refresh_factor_registry_snapshot() -> dict:
                 registry["role"].eq("strategy_identity").sum()
             ),
             "family_counts": family_counts,
+            "semantic_category_counts": semantic_category_counts,
+            "factor_level_counts": factor_level_counts,
+            "calculator_counts": calculator_counts,
+            "governance_config_sha256": FACTOR_REGISTRY_CONFIG_SHA256,
+            "daily_execution_plan": factor_execution_plan_payload(),
             "frequency_counts": frequency_counts,
             "role_counts": role_counts,
             "lifecycle_counts": lifecycle_counts,

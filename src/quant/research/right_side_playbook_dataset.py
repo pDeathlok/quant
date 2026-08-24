@@ -507,8 +507,8 @@ def prepare_playbook_events(
     merged = merged.drop(columns="_merge")
     merged["event_id"] = stable_event_ids(merged["symbol"], merged["date"])
     validate_first_layer_score_contract(merged)
-    if len(RULE_FEATURE_COLUMNS) != 118:
-        raise ValueError("playbook v2 requires the frozen 118-rule-factor contract")
+    if len(RULE_FEATURE_COLUMNS) != len(set(RULE_FEATURE_COLUMNS)):
+        raise ValueError("playbook rule-factor contract contains duplicates")
     return merged[
         [
             "fold",

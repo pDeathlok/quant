@@ -36,6 +36,7 @@ from quant.research.right_side_unified_features import (
     ADDED_RULE_FEATURE_COLUMNS_V2,
     LEGACY_RULE_FEATURE_COLUMNS_SHA256_V1,
     LEGACY_RULE_FEATURE_COLUMNS_V1,
+    RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS,
     RIGHT_SIDE_SIGNALS,
     RULE_FEATURE_COLUMNS_SHA256,
     RULE_FEATURE_SCHEMA_VERSION,
@@ -43,6 +44,7 @@ from quant.research.right_side_unified_features import (
     SIGNAL_FEATURE_REQUIREMENTS,
     compute_right_side_rule_features,
 )
+from quant.features.project_factor_layer import calculate_project_market_factors
 from quant.research.right_side_unified_signals import (
     B2_FAMILY_SOURCE_COLUMNS,
     B3_FAMILY_SOURCE_COLUMNS,
@@ -177,22 +179,40 @@ def test_versioned_contract_covers_every_signal_and_every_rule_factor() -> None:
     validate_predicate_factor_contracts()
     assert tuple(contract.signal for contract in PREDICATE_FACTOR_CONTRACTS) == RIGHT_SIDE_SIGNALS
     assert set(CONTRACT_BY_SIGNAL) == set(RIGHT_SIDE_SIGNALS)
-    assert len(RULE_FEATURE_COLUMNS) == 118
+    assert len(RULE_FEATURE_COLUMNS) == 113
     assert set(RULE_FEATURE_COLUMNS) == {
         factor
         for contract in PREDICATE_FACTOR_CONTRACTS
         for predicate in contract.predicates
         for factor in predicate.factors
-    }
+    } - set(RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS)
     audit = contract_factor_audit()
     assert audit["status"].eq("ok").all()
     assert not audit["predicate_id"].duplicated().any()
 
 
-def test_rule_feature_version_contract_freezes_105_plus_13_equals_118() -> None:
-    assert RULE_FEATURE_SCHEMA_VERSION == "right_side_rule_features_v2_118_20260813"
-    assert len(LEGACY_RULE_FEATURE_COLUMNS_V1) == 105
-    assert len(ADDED_RULE_FEATURE_COLUMNS_V2) == 13
+def test_rule_features_reuse_canonical_project_factors_without_output_drift() -> None:
+    daily = _random_daily()
+    project = calculate_project_market_factors(daily)
+
+    standalone = compute_right_side_rule_features(daily).reset_index(drop=True)
+    reused = compute_right_side_rule_features(
+        daily,
+        canonical_factors=project,
+    ).reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(standalone, reused, check_dtype=False)
+    with pytest.raises(ValueError, match="incomplete"):
+        compute_right_side_rule_features(
+            daily,
+            canonical_factors=project.drop(columns=["kdj_d_j"]),
+        )
+
+
+def test_rule_feature_version_contract_freezes_canonical_102_plus_11_equals_113() -> None:
+    assert RULE_FEATURE_SCHEMA_VERSION == "right_side_rule_features_v4_113_20260824"
+    assert len(LEGACY_RULE_FEATURE_COLUMNS_V1) == 102
+    assert len(ADDED_RULE_FEATURE_COLUMNS_V2) == 11
     assert not set(LEGACY_RULE_FEATURE_COLUMNS_V1).intersection(
         ADDED_RULE_FEATURE_COLUMNS_V2
     )
@@ -250,11 +270,8 @@ def test_b2_b3_rule_flags_match_current_production_generator_for_every_row() -> 
     production = compute_signal_flags(daily)
     rule = compute_right_side_rule_features(daily)
     reconstructed = reconstruct_web_family_flags(rule)
-    np.testing.assert_allclose(
-        rule["rs_family_kdj_j"],
-        production["kdj_d_j"],
-        equal_nan=True,
-    )
+    assert "rs_family_kdj_j" not in rule
+    assert "rs_vol_ratio_20_inclusive" not in rule
     sources = (*B2_FAMILY_SOURCE_COLUMNS, *B3_FAMILY_SOURCE_COLUMNS)
     assert production[list(sources)].any(axis=None)
     for source in sources:
@@ -342,7 +359,11 @@ def test_new_rule_columns_remain_prefix_causal() -> None:
 
 
 def test_active_signal_slice_audit_rejects_empty_missing_and_infinite() -> None:
-    frame = pd.DataFrame(1.0, index=range(len(RIGHT_SIDE_SIGNALS)), columns=RULE_FEATURE_COLUMNS)
+    frame = pd.DataFrame(
+        1.0,
+        index=range(len(RIGHT_SIDE_SIGNALS)),
+        columns=(*RULE_FEATURE_COLUMNS, *RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS),
+    )
     for signal in RIGHT_SIDE_SIGNALS:
         frame[signal] = False
     for row, signal in enumerate(RIGHT_SIDE_SIGNALS):

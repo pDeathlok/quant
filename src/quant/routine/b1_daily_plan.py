@@ -10,19 +10,33 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+import yaml
 
 from quant.data.atomic_io import atomic_write_json
+from quant.application.left_side_ranking import (
+    DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+    load_left_side_ranking_scores,
+)
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.features.canonical_factor_names import (
+    assert_no_forbidden_factor_names,
+    find_forbidden_aliases_in_payload,
+    migrate_legacy_factor_columns,
+)
 from quant.features.project_factor_layer import (
     LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
     PROJECT_FACTOR_SCHEMA_VERSION,
 )
+from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 from quant.ml.feature_coverage import validate_required_feature_coverage
 from quant.routine.paths import CONFIG_PATH, PROJECT_ROOT, ROUTINE_DIR, WEB_DATA_DIR
 from quant.routine.strategies import ExitConfig, StrategyConfig, StrategyRelease, load_strategy_release
 
 
-FEATURE_PATH = PROJECT_ROOT / "data/features/b1/training_xgb_project_vars.parquet"
+FEATURE_PATH = (
+    PROJECT_ROOT
+    / "data/features/b1/training_xgb_project_vars_canonical_v5.parquet"
+)
 ACTIVE_FEATURE_PATH = (
     PROJECT_ROOT / "data/features/b1/active_candidate_project_features.parquet"
 )
@@ -70,6 +84,15 @@ def _release_assets(
         raise RuntimeError(
             f"B1 model manifest release mismatch: expected={release.id} "
             f"actual={model_manifest.get('release_id')}"
+        )
+    if model_manifest.get("factor_schema_version") != PROJECT_FACTOR_SCHEMA_VERSION:
+        raise RuntimeError("B1 model manifest factor schema is not canonical project-v5")
+    if int(model_manifest.get("factor_count") or -1) != len(PROJECT_FACTOR_COLUMNS):
+        raise RuntimeError("B1 model manifest factor count drifted")
+    forbidden_manifest = find_forbidden_aliases_in_payload(model_manifest)
+    if forbidden_manifest:
+        raise RuntimeError(
+            f"B1 model manifest contains forbidden factor aliases: {forbidden_manifest}"
         )
     manifest_models = model_manifest.get("models") or {}
     for name in release.model_names:
@@ -136,7 +159,8 @@ def _load_candidate_features(
             if (
                 active_manifest.get("status") == "success"
                 and active_manifest.get("candidate_coverage_status") == "complete"
-                and int(active_manifest.get("factor_count") or 0) == 147
+                and int(active_manifest.get("factor_count") or 0)
+                == len(PROJECT_FACTOR_COLUMNS)
                 and pd.notna(active_target)
                 and (
                     requested_target is None
@@ -148,7 +172,10 @@ def _load_candidate_features(
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             active_manifest = None
 
-    candidates = pd.read_parquet(selected_path)
+    candidates = migrate_legacy_factor_columns(
+        pd.read_parquet(selected_path),
+        context=f"B1 scoring boundary {selected_path}",
+    )
     candidates["date"] = pd.to_datetime(candidates["date"], errors="coerce")
     candidates = candidates.dropna(subset=["date"])
     if "candidate_source_b1" in candidates.columns:
@@ -165,7 +192,10 @@ def predict_models(
     model_dir: Path,
     model_names: tuple[str, ...],
 ) -> pd.DataFrame:
-    out = candidates.copy()
+    out = migrate_legacy_factor_columns(
+        candidates,
+        context="B1 model scoring input",
+    )
     if "factor_schema_version" in out.columns:
         candidate_schemas = set(
             out["factor_schema_version"].dropna().astype(str).unique()
@@ -187,6 +217,10 @@ def predict_models(
     for model_name in model_names:
         model_path = model_dir / f"{model_name}.joblib"
         model = joblib.load(model_path)
+        assert_no_forbidden_factor_names(
+            getattr(model, "feature_names_in_", ()),
+            context=f"B1 production model {model_name}",
+        )
         model_schema = (
             getattr(model, "factor_schema_version_", None)
             or LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
@@ -394,6 +428,12 @@ def build_daily_plan(
     config_path: Path = CONFIG_PATH,
     feature_path: Path | None = None,
 ) -> dict[str, Any]:
+    if (
+        DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled
+        and config_path == CONFIG_PATH
+        and feature_path is None
+    ):
+        return _build_unified_left_b1_plan(signal_date=signal_date, max_rows=max_rows)
     feature_path = feature_path or FEATURE_PATH
     (
         release,
@@ -529,6 +569,150 @@ def build_daily_plan(
     }
 
 
+def _build_unified_left_b1_plan(
+    *,
+    signal_date: str | None,
+    max_rows: int,
+) -> dict[str, Any]:
+    """Publish the B1 plan from the active unified left ranker."""
+
+    config = DEFAULT_LEFT_SIDE_RANKING_CONFIG
+    if signal_date:
+        target = pd.to_datetime(signal_date, errors="raise").normalize()
+    else:
+        manifest = json.loads(config.paths.score_manifest.read_text(encoding="utf-8"))
+        target = pd.to_datetime(manifest.get("target_date"), errors="raise").normalize()
+    load_left_side_ranking_scores(target, config=config)
+    scores = pd.read_parquet(config.paths.score_output)
+    features = pd.read_parquet(config.paths.feature_output)
+    scores["date"] = pd.to_datetime(scores["date"], errors="coerce").dt.normalize()
+    features["date"] = pd.to_datetime(features["date"], errors="coerce").dt.normalize()
+    latest = scores[
+        scores["date"].eq(target) & scores["B1"].fillna(False).astype(bool)
+    ].copy()
+    config_payload = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    active_threshold = (config_payload.get("release") or {}).get(
+        "active_entry_threshold"
+    ) or {}
+    if (
+        active_threshold.get("mode") != "none_rank_only"
+        or active_threshold.get("normalization")
+        != "daily_cross_section_percentile_v1"
+    ):
+        raise RuntimeError("B1 unified entry threshold contract drifted")
+    top_n = int(active_threshold.get("top_n_per_day") or 0)
+    if not 1 <= top_n <= 500:
+        raise RuntimeError("B1 unified top_n_per_day must be in [1, 500]")
+    raw_b1_candidate_count = len(latest)
+    latest = latest.sort_values(
+        ["ranking_score_normalized", "symbol"],
+        ascending=[False, True],
+        kind="stable",
+    ).head(top_n)
+    context_columns = [
+        column
+        for column in ("symbol", "date", "name", "close", "kdj_d_j")
+        if column in features.columns
+    ]
+    latest = latest.merge(
+        features[context_columns],
+        on=["symbol", "date"],
+        how="left",
+        validate="one_to_one",
+    )
+    release = load_strategy_release(CONFIG_PATH)
+    plan_rows = []
+    for strategy in release.strategies:
+        local = latest.copy()
+        local["priority"] = strategy.priority
+        local["strategy_id"] = strategy.id
+        local["strategy_name"] = strategy.name
+        local["entry_rule"] = "左侧统一模型横截面排序"
+        local["buy_filter"] = "rank_only_top_n"
+        local["exit_mode"] = _exit_mode(strategy.exit)
+        local["open_gap_text"] = "T+1按原策略执行条件观察"
+        local["buy_min_price"] = np.nan
+        local["buy_max_price"] = np.nan
+        local["sell_summary"] = _sell_plan(strategy.exit)["summary"]
+        plan_rows.append(local)
+    plan_df = (
+        pd.concat(plan_rows, ignore_index=True)
+        if plan_rows and not latest.empty
+        else pd.DataFrame()
+    )
+    if not plan_df.empty:
+        plan_df = plan_df.sort_values(
+            ["priority", "ranking_score_normalized", "symbol"],
+            ascending=[True, False, True],
+            kind="stable",
+        ).head(max_rows)
+        unique = (
+            plan_df.sort_values(
+                ["symbol", "priority", "ranking_score_normalized"],
+                ascending=[True, True, False],
+                kind="stable",
+            )
+            .drop_duplicates("symbol")
+            .sort_values(
+                ["priority", "ranking_score_normalized"],
+                ascending=[True, False],
+                kind="stable",
+            )
+        )
+    else:
+        unique = pd.DataFrame()
+    strategy_pool = [
+        {
+            "strategy_id": strategy.id,
+            "name": strategy.name,
+            "entry_rule": "左侧统一模型横截面排序",
+            "buy_filter": "rank_only_top_n",
+            "buy_filter_desc": "不使用固定概率阈值，按每日百分位和下游TopN排序",
+            "exit_mode": _exit_mode(strategy.exit),
+            "open_gap_rule": {
+                "min_gap_pct": None,
+                "max_gap_pct": None,
+                "text": "T+1按原策略执行条件观察",
+            },
+            "entry_thresholds": {
+                "mode": "none_rank_only",
+                "normalized_by": "daily_cross_section_percentile_v1",
+                "top_n_per_day": top_n,
+            },
+            "sell_plan": _sell_plan(strategy.exit),
+            "metrics": None,
+        }
+        for strategy in release.strategies
+    ]
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "signal_date": target.date().isoformat(),
+        "execution_date": "下一个交易日",
+        "release_id": config.release_id,
+        "feature_coverage": {
+            "status": "valid",
+            "candidate_count": len(scores),
+            "b1_candidate_count": raw_b1_candidate_count,
+            "b1_selected_count": len(latest),
+        },
+        "source": {
+            "feature_path": str(config.paths.feature_output),
+            "score_path": str(config.paths.score_output),
+            "artifact_path": str(config.paths.artifact),
+            "ranking_decision": str(config.paths.ranking_decision),
+            "legacy_b1_models": "rollback_only",
+        },
+        "strategy_pool": strategy_pool,
+        "plan_rows": _records(plan_df),
+        "unique_symbols": _records(unique),
+        "notes": [
+            "B1名单由左侧统一模型排序，不再调用五个独立涨跌概率模型。",
+            f"固定概率阈值已退役，按每日横截面百分位选择 Top{top_n}。",
+            "买卖执行仍沿用已注册策略的退出规则。",
+        ],
+    }
+
+
 def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     if frame.empty:
         return []
@@ -559,6 +743,8 @@ def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:
         "oot_max_drawdown_pct",
         "oot_profit_factor",
         "sell_summary",
+        "ranking_score",
+        "ranking_score_normalized",
     ]
     normalized = frame[[col for col in keep_columns if col in frame.columns]].copy()
     for column in normalized.columns:

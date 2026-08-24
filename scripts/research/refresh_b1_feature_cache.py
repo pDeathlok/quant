@@ -31,6 +31,10 @@ from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 from quant.data.source_merge import normalize_tushare_daily
 from quant.features.daily_factor_layer import attach_daily_base_factors
+from quant.features.canonical_factor_names import (
+    assert_no_forbidden_factor_names,
+    migrate_legacy_factor_columns,
+)
 from quant.features.project_factor_layer import (
     LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
     calculate_project_market_factors,
@@ -87,6 +91,10 @@ def _released_b1_required_features(
             raise RuntimeError(
                 f"Released B1 model declares no required features: {model_path}"
             )
+        assert_no_forbidden_factor_names(
+            model_features,
+            context=f"released B1 model {model_name}",
+        )
         required.extend(str(feature) for feature in model_features)
     return list(dict.fromkeys(required)), release.id
 
@@ -154,7 +162,7 @@ def _additional_only_symbols(
 def _process_active_candidate_frame(
     args: tuple[str, pd.DataFrame, pd.Timestamp],
 ) -> tuple[pd.DataFrame | None, str | None, str | None]:
-    """Calculate one exact-date 147-factor candidate row.
+    """Calculate one exact-date canonical-factor candidate row.
 
     Daily-basic columns are joined once after all B1 and Z rows are combined,
     so this worker calculates only the price/volume portion of the contract.
@@ -366,7 +374,7 @@ def _assemble_active_candidate_cache(
         missing_factors = sorted(set(PROJECT_FACTOR_COLUMNS) - set(features.columns))
         if missing_factors:
             raise RuntimeError(
-                "Active candidate feature cache does not satisfy the 147-factor contract: "
+                "Active candidate feature cache does not satisfy the canonical factor contract: "
                 f"missing={missing_factors[:20]} count={len(missing_factors)}"
             )
         schemas = set(features["factor_schema_version"].dropna().astype(str).unique())
@@ -623,7 +631,7 @@ def main() -> None:
 
     additional_symbols: list[str] = []
     if pd.notna(actual_source_latest) and not additional_gate_rows.empty:
-        # B1 current candidates have already paid for the 147-factor build in
+        # B1 current candidates have already paid for the canonical factor build in
         # build_dataset.  Calculate only the Z-only symbols here.
         additional_symbols = _additional_only_symbols(
             b1_gate_rows,
@@ -681,7 +689,11 @@ def main() -> None:
         ).reset_index(drop=True)
 
     if args.dataset_out.exists() and not args.live_only:
-        existing = pd.read_parquet(args.dataset_out)
+        existing = migrate_legacy_factor_columns(
+            pd.read_parquet(args.dataset_out),
+            context=f"B1 feature-cache boundary {args.dataset_out}",
+            copy=False,
+        )
         existing["date"] = pd.to_datetime(existing["date"])
         if "factor_schema_version" not in existing.columns:
             if factor_schema_version != LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION:

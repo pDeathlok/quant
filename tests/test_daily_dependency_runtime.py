@@ -29,6 +29,7 @@ from quant.application.daily_dependencies import (
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
 )
+from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 from quant.routine import daily_dependency_runtime as runtime
 
 
@@ -362,7 +363,7 @@ def test_active_project_manifest_is_exact_truth_when_candidate_union_is_empty(
                 "union_candidate_count": 0,
                 "computed_candidate_count": 0,
                 "empty_candidate_set": True,
-                "factor_count": 147,
+                "factor_count": len(PROJECT_FACTOR_COLUMNS),
                 "factor_schema_version": PRODUCTION_PROJECT_FACTOR_SCHEMA,
             }
         ),

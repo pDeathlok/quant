@@ -20,6 +20,10 @@ from quant.research.right_side_long_task import (
     merge_prediction_artifacts,
 )
 from quant.research.right_side_unified import RIGHT_SIDE_SIGNALS
+from quant.research.right_side_unified_features import (
+    LEGACY_RULE_FEATURE_COLUMNS_V1,
+    RULE_FEATURE_COLUMNS,
+)
 
 
 def _events() -> pd.DataFrame:
@@ -123,8 +127,39 @@ def test_long_task_arm_specs_change_only_preregistered_dimensions() -> None:
         == arms["unified_long_task_deep"].task_weighting
         == "one_vote"
     )
-    assert len(arms["unified_long_task_deep_rule105"].rule_feature_columns) == 105
-    assert len(arms["unified_long_task_deep"].rule_feature_columns) == 118
+    assert len(arms["unified_long_task_deep_rule105"].rule_feature_columns) == len(
+        LEGACY_RULE_FEATURE_COLUMNS_V1
+    )
+    assert len(arms["unified_long_task_deep"].rule_feature_columns) == len(
+        RULE_FEATURE_COLUMNS
+    )
+
+
+def test_long_task_expansion_accepts_an_explicit_left_side_task_contract() -> None:
+    signals = ("DUICHEN_VA", "NANA", "YIDONG_DILIAN")
+    tasks = tuple(f"task_{signal}" for signal in signals)
+    events = pd.DataFrame(
+        {
+            "DUICHEN_VA": [True, False],
+            "NANA": [True, False],
+            "YIDONG_DILIAN": [False, True],
+            "factor": [1.0, 2.0],
+        }
+    )
+
+    expanded = expand_long_task_rows(
+        events,
+        retained_columns=("factor",),
+        signal_columns=signals,
+        task_feature_columns=tasks,
+    )
+
+    assert expanded[ACTIVE_TASK_COLUMN].tolist() == [
+        "DUICHEN_VA",
+        "NANA",
+        "YIDONG_DILIAN",
+    ]
+    assert expanded[list(tasks)].sum(axis=1).eq(1).all()
 
 
 class _TaskScoreModel:

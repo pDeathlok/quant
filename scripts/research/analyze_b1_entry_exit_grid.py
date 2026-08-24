@@ -288,11 +288,10 @@ def calculate_minimal_model_features(df: pd.DataFrame) -> pd.DataFrame:
     if "kdj_j" in selected:
         factors["kdj_j"] = btd.KDJ().compute(df)["J"]
 
-    boll_needed = {"bb_upper", "bb_middle", "bb_lower"} & selected
+    boll_needed = {"bb_upper", "bb_lower"} & selected
     if boll_needed:
         bb = btd.BollingerBands().compute(df)
         factors["bb_upper"] = bb.iloc[:, 0]
-        factors["bb_middle"] = bb.iloc[:, 1]
         factors["bb_lower"] = bb.iloc[:, 2]
 
     if "atr_14" in selected:
@@ -375,8 +374,8 @@ def calculate_minimal_model_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in selected:
             factors[col] = btd.DownsideVolatility(window).compute(df)
 
-    if "price_level" in selected:
-        factors["price_level"] = close
+    if "close" in selected:
+        factors["close"] = close
     if "price_log" in selected:
         factors["price_log"] = np.log(close + 1)
     if "turnover_ratio" in selected:

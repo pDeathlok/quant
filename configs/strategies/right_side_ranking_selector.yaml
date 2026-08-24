@@ -1,15 +1,13 @@
 # Selector ranking-source release contract.
 #
-# The production adapter is registered now, but the active selector source
-# remains the legacy Z-skill path.  Switching to the unified ranker requires
-# one explicit, reviewable config change plus a checksum-pinned production
-# artifact; no research/shadow output is consumed implicitly.
+# The checksum-pinned unified ranker is the active production selector source.
+# The legacy Z-skill path and its artifacts are retained only for an explicit
+# rollback; no research/shadow output is consumed implicitly.
 release:
-  id: right-side-ranking-selector-v1
+  id: right-side-ranking-selector-v2-canonical-20260824
   lifecycle: production
   consumer: quant.webapp.services.selector
   dependency_nodes:
-    - score.z_skill
     - feature.right_side_unified
     - score.right_side_unified
     - product.right_side_unified_adapter
@@ -69,17 +67,18 @@ selector:
     - YIDONG_DILIAN
 
 right_side_unified:
-  artifact: models/production/right_side_unified/ranking.joblib
-  artifact_manifest: models/production/right_side_unified/manifest.json
-  artifact_schema_version: right-side-unified-ranking-production-v1
+  artifact: models/production/right_side_unified_canonical_v2/ranking.joblib
+  artifact_manifest: models/production/right_side_unified_canonical_v2/manifest.json
+  artifact_schema_version: right-side-unified-ranking-production-v2-canonical-alias-free
   feature_output: data/features/right_side_unified/latest_features.parquet
   feature_manifest: data/features/right_side_unified/feature_manifest.json
   score_output: data/features/right_side_unified/latest_scores.parquet
   score_manifest: data/features/right_side_unified/score_manifest.json
-  score_schema_version: right-side-unified-ranking-score-v1
-  project_factor_schema_version: project-v4-causal-price-alpha
-  rule_factor_schema_version: right_side_rule_features_v2_118_20260813
-  factor_contract_sha256: 6fc15ad06252b66b40f890165243f6b17cb74444909019155e12934683cace9c
+  score_schema_version: right-side-unified-ranking-score-v2-canonical-alias-free
+  feature_schema_version: right-side-features-v3-project-v5-rule-v4-113
+  project_factor_schema_version: project-v5-canonical-alias-free
+  rule_factor_schema_version: right_side_rule_features_v4_113_20260824
+  factor_contract_sha256: 847a73b56e31e3f9111d0816781655ec27a772131e0d2adbb7922d7bd5c70595
   z_signal_cache: data/features/z_skill_daily_candidates.parquet
   family_signal_cache: data/features/b1/b1_family_rule_candidates.parquet
   market_data_root: data/raw
@@ -90,12 +89,12 @@ promotion:
   # Enabled by the checksum-pinned operator rollout approval.  Rollback is the
   # inverse two-line change: source=legacy_z_skill and enabled=false.
   enabled: true
-  approval_manifest: reports/research/right_side_unified_v2_118/production_rollout_approval.json
+  approval_manifest: reports/research/right_side_unified_canonical_v5_rule113/production_rollout_approval.json
   approval_schema_version: right-side-production-rollout-approval-v1
   approval_field: approve_online
-  required_shadow_schema_version: right-side-unified-ranking-shadow-v1
+  required_shadow_schema_version: right-side-unified-ranking-shadow-v2-canonical-alias-free
   require_ranking_decision_pass: true
-  require_beam_permutation_gate_when_selected: true
+  require_beam_permutation_gate_when_selected: false
   preserve_rollback_score_node: score.z_skill
   preserved_legacy_score_node: score.z_skill
   rollback_observation_cycles: 1

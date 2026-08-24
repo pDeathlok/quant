@@ -26,11 +26,24 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet, atomic_write_text
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.canonical_factor_names import (
+    FORBIDDEN_COMPATIBILITY_ALIASES,
+    LEGACY_TO_CANONICAL_FACTOR_NAMES,
+    assert_no_forbidden_factor_names,
+    migrate_legacy_factor_columns,
+    stable_canonical_feature_union,
+)
 from quant.features.project_factor_layer import (
     PROJECT_FACTOR_SCHEMA_VERSION,
     calculate_project_market_factors,
 )
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
+from quant.features.right_side_factor_contract import (
+    RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
+    RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION,
+    RIGHT_SIDE_SHADOW_MODEL_INPUT_CONTRACT_SHA256,
+    factor_contract_sha256,
+)
 from quant.ml.xgb_research import XGBResearchModel
 from quant.research.right_side_long_task import (
     DEFAULT_XGB_CLASSIFIER_SPEC,
@@ -121,9 +134,10 @@ DEFAULT_FAMILY_CACHE = PROJECT_ROOT / "data/features/b1/b1_family_rule_candidate
 DEFAULT_DAILY_PARTITIONS = PROJECT_ROOT / "data/raw/daily_partitioned"
 DEFAULT_DAILY_BASIC = PROJECT_ROOT / "data/raw/daily_basic"
 DEFAULT_TRADABILITY = PROJECT_ROOT / "data/raw/tradability"
-DEFAULT_RESEARCH_ROOT = PROJECT_ROOT / "data/research/right_side_unified"
-DEFAULT_MODEL_ROOT = PROJECT_ROOT / "models/research/right_side_unified"
-DEFAULT_REPORT_ROOT = PROJECT_ROOT / "reports/research/right_side_unified"
+CANONICAL_RELEASE_SLUG = "right_side_unified_canonical_v5_rule113"
+DEFAULT_RESEARCH_ROOT = PROJECT_ROOT / "data/research" / CANONICAL_RELEASE_SLUG
+DEFAULT_MODEL_ROOT = PROJECT_ROOT / "models/research" / CANONICAL_RELEASE_SLUG
+DEFAULT_REPORT_ROOT = PROJECT_ROOT / "reports/research" / CANONICAL_RELEASE_SLUG
 
 DATASET_PATH = DEFAULT_RESEARCH_ROOT / "unified_right_side_dataset.parquet"
 LABEL_DATASET_PATH = DEFAULT_RESEARCH_ROOT / "unified_right_side_labels.parquet"
@@ -176,11 +190,7 @@ EXPERIMENTS: tuple[str, ...] = (
     "unified_long_task_deep",
     "unified_long_task_deep_beam",
 )
-DEFAULT_TRAIN_EXPERIMENTS: tuple[str, ...] = tuple(
-    experiment
-    for experiment in EXPERIMENTS
-    if experiment != "unified_long_task_deep_beam"
-)
+DEFAULT_TRAIN_EXPERIMENTS: tuple[str, ...] = ("unified_long_task_deep",)
 PAIRED_EXPERIMENTS: tuple[str, ...] = (
     "unified_with_signal_id",
     "unified_balanced",
@@ -208,6 +218,55 @@ LABEL_OUTPUT_COLUMNS: tuple[str, ...] = (
     "maturity_reason",
     *LABEL_COLUMNS,
 )
+
+
+def _read_canonical_feature_frame(
+    path: Path,
+    *,
+    columns: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """Read one cache through the strict legacy-to-canonical boundary."""
+
+    import pyarrow.parquet as pq
+
+    available = tuple(pq.ParquetFile(path).schema.names)
+    requested = None if columns is None else tuple(dict.fromkeys(columns))
+    if requested is None:
+        read_columns = list(available)
+    else:
+        alias_by_canonical = {
+            canonical: alias
+            for alias, canonical in LEGACY_TO_CANONICAL_FACTOR_NAMES.items()
+        }
+        missing = sorted(
+            column
+            for column in requested
+            if column not in available
+            and alias_by_canonical.get(column) not in available
+        )
+        if missing:
+            raise RuntimeError(f"feature dataset missing required columns: {missing}")
+        read_columns = [column for column in requested if column in available]
+        read_columns.extend(
+            alias
+            for alias in sorted(FORBIDDEN_COMPATIBILITY_ALIASES)
+            if alias in available and alias not in read_columns
+        )
+    frame = pd.read_parquet(path, columns=read_columns)
+    frame = migrate_legacy_factor_columns(
+        frame,
+        context=f"right-side dataset boundary {path}",
+        copy=False,
+    )
+    if requested is not None:
+        frame = frame.loc[:, requested]
+    if len(frame.columns) != len(set(frame.columns)):
+        raise RuntimeError("canonical feature dataset contains duplicate columns")
+    assert_no_forbidden_factor_names(
+        frame.columns,
+        context="right-side training dataframe",
+    )
+    return frame
 
 
 class _StreamingParquetWriter:
@@ -500,6 +559,10 @@ def _process_symbol_features(
             "has_mixed_signal",
         ]
         events = merged[event_columns].sort_values("date", kind="stable").reset_index(drop=True)
+        assert_no_forbidden_factor_names(
+            events.columns,
+            context="new right-side event dataset",
+        )
 
         label_daily = normalized[
             normalized["date"].between(calendar[0], calendar[-1])
@@ -731,15 +794,20 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     atomic_write_json(sample_audit, args.sample_audit_out)
     manifest = {
         "built_at": datetime.now().isoformat(timespec="seconds"),
-        "schema_version": "right-side-unified-v2-split-events-labels",
+        "schema_version": "right-side-unified-dataset-v4-rule113-canonical-current",
         "signal_schema_version": CANONICAL_SIGNAL_SCHEMA_VERSION,
         "signal_contract_notes": dict(SIGNAL_CONTRACT_NOTES),
         "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+        "feature_schema_version": RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION,
+        "factor_contract_sha256": RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
+        "model_input_contract_sha256": RIGHT_SIDE_SHADOW_MODEL_INPUT_CONTRACT_SHA256,
+        "forbidden_aliases": [],
         "daily_basic_included": False,
         "start_date": args.start_date,
         "end_date": args.end_date,
         "signals": list(RIGHT_SIDE_SIGNALS),
         "project_factor_contract_count": len(PROJECT_FACTOR_COLUMNS),
+        "project_factor_columns": list(PROJECT_FACTOR_COLUMNS),
         "project_factor_materialized_count": materialized_project_count,
         "rule_feature_count": len(RULE_FEATURE_COLUMNS),
         "rule_feature_schema_version": RULE_FEATURE_SCHEMA_VERSION,
@@ -754,7 +822,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def audit_dataset(args: argparse.Namespace) -> dict[str, Any]:
-    events = pd.read_parquet(args.dataset)
+    events = _read_canonical_feature_frame(args.dataset)
     labels = pd.read_parquet(args.labels)
     validate_signal_factor_contract(events.columns)
     required_events = {
@@ -1881,7 +1949,9 @@ def train_models(args: argparse.Namespace) -> dict[str, Any]:
     selected_folds = [fold_by_name[name] for name in args.folds]
     validate_target_cost(args.label, args.round_trip_cost_bps)
     current_target_metadata = target_metadata(args.label)
-    fixed_features = [*PROJECT_FACTOR_COLUMNS, *RULE_FEATURE_COLUMNS]
+    fixed_features = list(
+        stable_canonical_feature_union(PROJECT_FACTOR_COLUMNS, RULE_FEATURE_COLUMNS)
+    )
     label_input_columns = list(
         dict.fromkeys(
             [
@@ -1927,7 +1997,7 @@ def train_models(args: argparse.Namespace) -> dict[str, Any]:
             ]
         )
     )
-    events = pd.read_parquet(args.dataset, columns=event_columns)
+    events = _read_canonical_feature_frame(args.dataset, columns=event_columns)
     events["date"] = pd.to_datetime(events["date"])
     selected = events.merge(
         label_frame,
@@ -2157,6 +2227,13 @@ def train_models(args: argparse.Namespace) -> dict[str, Any]:
                     "experiment": experiment,
                     "fold": asdict(fold),
                     "common_features": list(arm_common_features),
+                    "feature_schema_version": RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION,
+                    "factor_contract_sha256": RIGHT_SIDE_SHADOW_FACTOR_CONTRACT_SHA256,
+                    "model_input_contract_sha256": factor_contract_sha256(
+                        [*arm_common_features, *LONG_TASK_FEATURE_COLUMNS],
+                        schema_version=LONG_TASK_SCHEMA_VERSION,
+                    ),
+                    "forbidden_aliases": [],
                     "rule_feature_schema_version": arm_spec.rule_feature_schema_version,
                     "rule_feature_count": len(arm_rule_features),
                     "rule_feature_columns": arm_rule_features,

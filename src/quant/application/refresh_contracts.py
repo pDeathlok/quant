@@ -16,6 +16,7 @@ REFRESH_SCOPE_LABELS = {
     "similar": "自选池",
     "rightSideShadow": "右侧统一模型影子",
     "rightSideRankingCandidate": "右侧统一模型生产候选验收",
+    "leftSideRanking": "左侧统一模型生产验收",
 }
 
 # Compatibility export used by the Web progress UI.  The dependency registry
@@ -41,12 +42,15 @@ REFRESH_STEP_DEFINITIONS = {
     "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
     "similar_patterns": {"label": "刷新自选池相似走势", "percent": 97},
     "snapshot": {"label": "写入策略股票池快照", "percent": 98},
-    "right_side_shadow_features": {"label": "构建右侧影子 118 因子", "percent": 80},
+    "right_side_shadow_features": {"label": "构建右侧影子 canonical 因子", "percent": 80},
     "right_side_shadow_score": {"label": "计算右侧统一模型影子排序", "percent": 90},
     "right_side_shadow_product": {"label": "发布右侧影子候选", "percent": 98},
-    "right_side_unified_features": {"label": "构建右侧生产 118 因子", "percent": 72},
+    "right_side_unified_features": {"label": "构建右侧生产 canonical 因子", "percent": 72},
     "right_side_unified_score": {"label": "计算右侧生产统一排序", "percent": 76},
     "right_side_unified_adapter": {"label": "校验右侧 selector 排序适配", "percent": 78},
+    "left_side_unified_features": {"label": "构建左侧生产统一因子", "percent": 73},
+    "left_side_unified_score": {"label": "计算左侧生产统一排序", "percent": 77},
+    "left_side_unified_adapter": {"label": "校验左侧 selector 排序适配", "percent": 79},
 }
 
 

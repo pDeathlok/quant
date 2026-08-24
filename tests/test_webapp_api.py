@@ -120,8 +120,11 @@ def _stub_successful_global_refresh(
     convertible_bond_plan=None,
     convertible_bond_allotment=None,
     byd_daily_plan=None,
+    right_side_ranker=None,
+    left_side_ranker=None,
 ):
     from quant.routine import pipeline
+    from quant.routine import left_side_unified_production
     from quant.routine import right_side_unified_production
 
     status = {
@@ -195,7 +198,7 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(
         right_side_unified_production,
         "run_right_side_unified_production",
-        lambda target_date, **kwargs: {
+        right_side_ranker or (lambda target_date, **kwargs: {
             "status": "success",
             "target_date": target_date,
             "checkpoint_reused": True,
@@ -203,7 +206,20 @@ def _stub_successful_global_refresh(
                 "status": "success",
                 "target_date": target_date,
             },
-        },
+        }),
+    )
+    monkeypatch.setattr(
+        left_side_unified_production,
+        "run_left_side_production",
+        left_side_ranker or (lambda target_date, **kwargs: {
+            "status": "success",
+            "target_date": target_date,
+            "checkpoint_reused": True,
+            "adapter": {
+                "status": "success",
+                "target_date": target_date,
+            },
+        }),
     )
     monkeypatch.setattr(pipeline, "generate_daily_plan", generate_daily_plan or success)
     monkeypatch.setattr(pipeline, "generate_dashboard", generate_dashboard or success)
@@ -687,7 +703,7 @@ def test_allotment_scope_refreshes_daily_basic_inputs(monkeypatch) -> None:
 
 
 def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -> None:
-    rendezvous = threading.Barrier(4, timeout=3)
+    rendezvous = threading.Barrier(3, timeout=3)
     active = 0
     max_active = 0
     active_lock = threading.Lock()
@@ -706,61 +722,62 @@ def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -
 
         return run
 
-    plan = parallel_output({"status": "success", "output": "plan.json"})
-    dashboard = parallel_output({"status": "success", "output": "dashboard.json"})
-    score_body = parallel_output({"status": "success"})
     chan_body = parallel_output({"status": "success"})
-
-    def score(*, workers: int):
-        worker_args["model"] = workers
-        return score_body()
+    right_body = parallel_output(
+        {"status": "success", "target_date": "2026-07-23", "selector_adapter": {"status": "success"}}
+    )
+    left_body = parallel_output(
+        {"status": "success", "target_date": "2026-07-23", "adapter": {"status": "success"}}
+    )
 
     def chan(*, progress_callback, workers: int):
         worker_args["chan"] = workers
         return chan_body()
 
+    def right(target_date: str, *, factor_workers: int):
+        worker_args["right_side"] = factor_workers
+        return right_body()
+
+    def left(target_date: str):
+        return left_body()
+
     monkeypatch.setenv("ROUTINE_MODEL_SCORE_WORKERS", "99")
     monkeypatch.setenv("ROUTINE_CHAN_WORKERS", "99")
     status = _stub_successful_global_refresh(
         monkeypatch,
-        generate_daily_plan=plan,
-        generate_dashboard=dashboard,
-        score_latest_models=score,
+        generate_daily_plan=lambda: {"status": "success", "output": "plan.json"},
         refresh_chan_model_scores=chan,
+        right_side_ranker=right,
+        left_side_ranker=left,
     )
 
     services._run_latest_refresh_job("all", run_id="parallel-daily-outputs")
 
     assert status["status"] == "success"
-    assert max_active == 4
-    assert worker_args == {"model": 4, "chan": 4}
+    assert max_active == 3
+    assert worker_args == {"chan": 4, "right_side": 6}
     assert status["result"]["generate_daily_plan"]["status"] == "success"
-    assert status["result"]["generate_dashboard"]["status"] == "success"
-    assert status["result"]["model_score"]["status"] == "success"
+    assert status["result"]["generate_dashboard"]["status"] == "retired"
+    assert status["result"]["model_score"]["status"] == "retired"
     assert status["result"]["refresh_chan_model_scores"]["status"] == "success"
 
 
-def test_global_refresh_overlaps_right_side_with_chan_after_model_score(
+def test_global_refresh_overlaps_both_unified_rankers_with_chan(
     monkeypatch,
 ) -> None:
     from quant.routine import right_side_unified_production
 
-    model_finished = threading.Event()
     right_side_started = threading.Event()
+    left_side_started = threading.Event()
     worker_args: dict[str, int] = {}
-
-    def score(*, workers: int):
-        worker_args["model"] = workers
-        model_finished.set()
-        return {"status": "success"}
 
     def chan(*, progress_callback, workers: int):
         worker_args["chan"] = workers
         assert right_side_started.wait(timeout=3)
+        assert left_side_started.wait(timeout=3)
         return {"status": "success"}
 
     def right_side(target_date: str, *, factor_workers: int):
-        assert model_finished.is_set()
         worker_args["right_side"] = factor_workers
         right_side_started.set()
         return {
@@ -769,22 +786,25 @@ def test_global_refresh_overlaps_right_side_with_chan_after_model_score(
             "selector_adapter": {"status": "success"},
         }
 
+    def left_side(target_date: str):
+        left_side_started.set()
+        return {
+            "status": "success",
+            "target_date": target_date,
+            "adapter": {"status": "success"},
+        }
+
     monkeypatch.setenv("ROUTINE_RIGHT_SIDE_WORKERS", "99")
     status = _stub_successful_global_refresh(
         monkeypatch,
-        score_latest_models=score,
         refresh_chan_model_scores=chan,
+        right_side_ranker=right_side,
+        left_side_ranker=left_side,
     )
-    monkeypatch.setattr(
-        right_side_unified_production,
-        "run_right_side_unified_production",
-        right_side,
-    )
-
     services._run_latest_refresh_job("all", run_id="parallel-right-side")
 
     assert status["status"] == "success", status.get("error")
-    assert worker_args == {"model": 4, "chan": 4, "right_side": 6}
+    assert worker_args == {"chan": 4, "right_side": 6}
     assert status["result"]["right_side_unified_features"] == {
         "status": "success",
         "target_date": "2026-07-23",
@@ -792,7 +812,7 @@ def test_global_refresh_overlaps_right_side_with_chan_after_model_score(
     }
 
 
-def test_global_refresh_cancels_right_side_when_model_score_fails(
+def test_global_refresh_does_not_run_retired_legacy_model_score(
     monkeypatch,
 ) -> None:
     from quant.routine import right_side_unified_production
@@ -804,24 +824,24 @@ def test_global_refresh_cancels_right_side_when_model_score_fails(
         right_side_calls += 1
         return {"status": "success"}
 
+    legacy_score_calls = 0
+
+    def legacy_score(**kwargs):
+        nonlocal legacy_score_calls
+        legacy_score_calls += 1
+        return {"status": "failed", "stderr_tail": "must not run"}
+
     status = _stub_successful_global_refresh(
         monkeypatch,
-        score_latest_models=lambda **kwargs: {
-            "status": "failed",
-            "stderr_tail": "model score failed",
-        },
+        score_latest_models=legacy_score,
+        right_side_ranker=right_side,
     )
-    monkeypatch.setattr(
-        right_side_unified_production,
-        "run_right_side_unified_production",
-        right_side,
-    )
-
     services._run_latest_refresh_job("all", run_id="model-failure-cancels-right")
 
-    assert status["status"] == "failed"
-    assert right_side_calls == 0
-    assert "model score failed" in status["error"]
+    assert status["status"] == "success"
+    assert legacy_score_calls == 0
+    assert right_side_calls == 1
+    assert status["result"]["model_score"]["status"] == "retired"
 
 
 def test_global_refresh_propagates_early_workspace_failure(monkeypatch) -> None:
@@ -1380,18 +1400,15 @@ def test_input_resume_marks_only_reused_steps_as_checkpoints(
         step["key"]: step
         for step in status["steps"]
     }
-    for key in (
-        "refresh_data",
-        "feature_cache",
-        "signal_cache",
-        "model_score",
-    ):
-        assert step_map[key]["checkpoint_reused"] is True
-        assert step_map[key]["elapsed_seconds"] == 0.0
+    assert step_map["refresh_data"]["checkpoint_reused"] is True
+    assert step_map["refresh_data"]["elapsed_seconds"] == 0.0
+    assert step_map["signal_cache"]["checkpoint_reused"] is False
+    assert "feature_cache" not in step_map
+    assert "model_score" not in step_map
     assert step_map["daily_plan"]["checkpoint_reused"] is False
 
 
-def test_input_resume_recomputes_same_day_model_score_when_artifact_is_dirty(
+def test_input_resume_ignores_retired_z_score_dirty_hint(
     monkeypatch,
 ) -> None:
     from quant.routine import pipeline
@@ -1474,7 +1491,7 @@ def test_input_resume_recomputes_same_day_model_score_when_artifact_is_dirty(
     )
 
     assert status["status"] == "success"
-    assert score_calls == 1
+    assert score_calls == 0
     assert status["result"]["model_score"].get("checkpoint_reused") is not True
 
 

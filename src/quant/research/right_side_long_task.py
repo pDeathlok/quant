@@ -121,6 +121,7 @@ def expand_long_task_rows(
     *,
     retained_columns: Sequence[str],
     signal_columns: Sequence[str] = RIGHT_SIDE_SIGNALS,
+    task_feature_columns: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """Expand events to one row per active signal with a unique task one-hot.
 
@@ -130,6 +131,17 @@ def expand_long_task_rows(
     """
 
     signals = tuple(signal_columns)
+    task_features = (
+        tuple(task_feature_columns)
+        if task_feature_columns is not None
+        else tuple(f"task_{signal}" for signal in signals)
+    )
+    if not signals or len(signals) != len(set(signals)):
+        raise ValueError("long-task signal columns must be unique and non-empty")
+    if len(task_features) != len(signals) or len(task_features) != len(
+        set(task_features)
+    ):
+        raise ValueError("long-task feature columns must map one-to-one to signals")
     retained = tuple(dict.fromkeys(retained_columns))
     missing = set(signals).union(retained) - set(events.columns)
     if missing:
@@ -147,7 +159,7 @@ def expand_long_task_rows(
         *retained,
         EVENT_POSITION_COLUMN,
         ACTIVE_TASK_COLUMN,
-        *LONG_TASK_FEATURE_COLUMNS,
+        *task_features,
     ]
     if len(event_positions) == 0:
         return pd.DataFrame(columns=output_columns)
@@ -158,15 +170,15 @@ def expand_long_task_rows(
     expanded[ACTIVE_TASK_COLUMN] = task_names
 
     task_matrix = np.zeros(
-        (len(expanded), len(RIGHT_SIDE_SIGNALS)),
+        (len(expanded), len(signals)),
         dtype=bool,
     )
-    canonical_position = {signal: position for position, signal in enumerate(RIGHT_SIDE_SIGNALS)}
+    canonical_position = {signal: position for position, signal in enumerate(signals)}
     for row_position, task_name in enumerate(task_names):
         if task_name not in canonical_position:
             raise ValueError(f"unknown long-task signal: {task_name}")
         task_matrix[row_position, canonical_position[str(task_name)]] = True
-    task_frame = pd.DataFrame(task_matrix, columns=LONG_TASK_FEATURE_COLUMNS)
+    task_frame = pd.DataFrame(task_matrix, columns=task_features)
     return pd.concat([expanded, task_frame], axis=1)
 
 
@@ -280,10 +292,20 @@ class LongTaskUnifiedModel:
     base_model: object
     event_calibrator: object
     common_features: tuple[str, ...]
+    signal_columns: tuple[str, ...] = RIGHT_SIDE_SIGNALS
+    task_feature_columns: tuple[str, ...] = LONG_TASK_FEATURE_COLUMNS
+
+    def _signal_columns(self) -> tuple[str, ...]:
+        return tuple(getattr(self, "signal_columns", RIGHT_SIDE_SIGNALS))
+
+    def _task_feature_columns(self) -> tuple[str, ...]:
+        return tuple(
+            getattr(self, "task_feature_columns", LONG_TASK_FEATURE_COLUMNS)
+        )
 
     @property
     def feature_names_in_(self) -> list[str]:
-        return [*self.common_features, *LONG_TASK_FEATURE_COLUMNS]
+        return [*self.common_features, *self._task_feature_columns()]
 
     @property
     def selected_features_(self) -> list[str]:
@@ -297,6 +319,8 @@ class LongTaskUnifiedModel:
         expanded = expand_long_task_rows(
             events,
             retained_columns=self.common_features,
+            signal_columns=self._signal_columns(),
+            task_feature_columns=self._task_feature_columns(),
         )
         if expanded.empty:
             probability = np.full(len(events), np.nan, dtype=float)
