@@ -86,6 +86,10 @@ from quant.features.project_factor_layer import (
     PROJECT_FACTOR_SCHEMA_VERSION,
     calculate_project_factor_frame,
 )
+from quant.features.long_factor_snapshot import (
+    publish_long_factor_snapshot,
+    read_long_factor_snapshot,
+)
 from quant.features.selector_buy_hold_factor_contract import (
     SELECTOR_BUY_HOLD_ARTIFACT_SCHEMA_VERSION,
     SELECTOR_BUY_HOLD_MANIFEST_SCHEMA_VERSION,
@@ -2153,27 +2157,7 @@ def _publish_long_factor_snapshot(frame: pd.DataFrame, signal_ts: pd.Timestamp) 
     snapshot["factor_schema_version"] = LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION
     snapshot = snapshot.sort_values("ts_code").reset_index(drop=True)
 
-    dated_path = LONG_FACTOR_SNAPSHOT_DIR / f"{signal_date.replace('-', '')}.parquet"
-    latest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.parquet"
-    manifest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.json"
-    atomic_write_parquet(snapshot, dated_path, index=False)
-    atomic_write_parquet(snapshot, latest_path, index=False)
-    manifest = {
-        "status": "success",
-        "factor_schema_version": LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION,
-        "signal_date": signal_date,
-        "rows": int(len(snapshot)),
-        "factor_count": int(len(factor_columns)),
-        "expected_factor_count": int(len(LONG_PRODUCTION_FACTOR_COLUMNS)),
-        "missing_factors": [],
-        "coverage_status": "complete",
-        "source": "long_page_point_in_time_cross_section",
-        "dated_path": str(dated_path),
-        "latest_path": str(latest_path),
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    atomic_write_json(manifest, manifest_path)
-    return {**manifest, "manifest_path": str(manifest_path)}
+    return publish_long_factor_snapshot(snapshot, LONG_FACTOR_SNAPSHOT_DIR)
 
 
 def _long_good_stock_assessment(row: pd.Series) -> dict[str, Any]:
@@ -5178,6 +5162,14 @@ def _write_selector_snapshot_batch(
 ) -> None:
     if not snapshots:
         return
+    for payload, _, _ in snapshots:
+        failed = [
+            str(row.get("symbol")) for row in payload.get("stocks") or []
+            if (row.get("feature_quality") or {}).get("status") != "complete"
+            or row.get("model_score_available") is not True
+        ]
+        if failed:
+            raise RuntimeError(f"selector snapshot rejected: incomplete model scores: {failed[:20]}")
     prepared = [
         _prepare_selector_snapshot_write(payload, strategies, include_extended)
         for payload, strategies, include_extended in snapshots
@@ -5222,10 +5214,12 @@ def _write_selector_snapshot_batch(
                 ),
                 [item["sql_values"] for item in prepared],
             )
-    except Exception:
+    except Exception as exc:
         with _SELECTOR_SNAPSHOT_SCHEMA_LOCK:
             _SELECTOR_SNAPSHOT_SCHEMA_READY_URLS.discard(schema_cache_key)
-        return
+        raise RuntimeError(
+            "selector MySQL snapshot publication failed; filesystem recovery copies retained"
+        ) from exc
     finally:
         if engine is not None:
             try:
@@ -5430,11 +5424,12 @@ def _apply_selector_score_presentation(
                 row.get("ranking_score_normalized", row.get("ranking_score_percent"))
             )
         row["model_score_normalized"] = model_score
+        score_failed = (row.get("feature_quality") or {}).get("status") == "failed"
         row["buy_score_normalized"] = _score_in_display_range(
-            row.get("opportunity_score")
+            None if score_failed else row.get("opportunity_score")
         )
         row["hold_score_normalized"] = _score_in_display_range(
-            row.get("holding_score")
+            None if score_failed else row.get("holding_score")
         )
         row["model_score_source_label"] = model_source_labels.get(
             ranking_source, "统一模型未覆盖"
@@ -6992,7 +6987,6 @@ def _selector_active_model_features() -> tuple[str, ...]:
     return tuple(str(value) for value in artifacts["buy"]["features"])
 
 
-@lru_cache(maxsize=32)
 def _selector_production_snapshot_rows(
     signal_date: str,
 ) -> dict[str, dict[str, Any]]:
@@ -7012,43 +7006,79 @@ def _selector_production_snapshot_rows(
             frozenset({"project_daily", "left_side_rule"}),
         ),
         (
-            PROJECT_ROOT / "data/features/long/latest.parquet",
+            LONG_FACTOR_SNAPSHOT_DIR / "latest.parquet",
             frozenset({"long_snapshot"}),
         ),
     )
     target = pd.Timestamp(signal_date).normalize()
     rows: dict[str, dict[str, Any]] = {}
     source_names: dict[str, set[str]] = {}
+    layer_coverage: dict[str, dict[str, Any]] = {}
     for path, calculators in source_specs:
-        if not path.is_file():
+        required = [
+            feature for feature in features
+            if definitions[feature].calculator_id in calculators
+        ]
+        if not required:
             continue
         try:
             import pyarrow.parquet as pq
 
-            available = set(pq.ParquetFile(path).schema.names)
-        except Exception:
-            continue
-        symbol_column = "symbol" if "symbol" in available else "ts_code"
-        owned = [
-            feature
-            for feature in features
-            if feature in available
-            and definitions[feature].calculator_id in calculators
-        ]
-        if not owned or "date" not in available or symbol_column not in available:
-            continue
-        try:
-            frame = pd.read_parquet(
-                path,
-                columns=[symbol_column, "date", *owned],
-                filters=[("date", "==", target)],
-            )
-        except Exception:
-            continue
+            if "long_snapshot" in calculators:
+                dated_path = LONG_FACTOR_SNAPSHOT_DIR / f"{target:%Y%m%d}.parquet"
+                frame, manifest = read_long_factor_snapshot(
+                    LONG_FACTOR_SNAPSHOT_DIR, signal_date, latest=not dated_path.is_file(),
+                )
+                path = Path(manifest["snapshot_path"])
+                available = set(frame.columns)
+            else:
+                dated_path = path.with_name(f"{target:%Y%m%d}_features.parquet")
+                if dated_path.is_file():
+                    path = dated_path
+                available = set(pq.ParquetFile(path).schema.names)
+                symbol_column = "symbol" if "symbol" in available else "ts_code"
+                missing = set(required) - available
+                if missing:
+                    raise RuntimeError(f"missing columns: {sorted(missing)}")
+                frame = pd.read_parquet(
+                    path, columns=[symbol_column, "date", *required],
+                    filters=[("date", "==", target)],
+                )
+            symbol_column = "symbol" if "symbol" in available else "ts_code"
+            if frame[symbol_column].duplicated().any():
+                raise RuntimeError("duplicate symbols in exact-date cross-section")
+            if frame.empty:
+                metadata_path = (
+                    path.with_suffix(".json") if path.name != "latest_features.parquet"
+                    else path.with_name("feature_manifest.json")
+                )
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not (
+                    metadata.get("status") == "success"
+                    and metadata.get("target_date") == signal_date
+                    and metadata.get("signal_candidate_count") == 0
+                    and metadata.get("output_sha256") == _file_sha256(path)
+                ):
+                    raise RuntimeError("empty exact-date cross-section without zero-candidate proof")
+            for calculator in calculators:
+                columns = [feature for feature in required if definitions[feature].calculator_id == calculator]
+                if columns and not frame.empty and not frame[columns].notna().any(axis=None):
+                    raise RuntimeError(f"entire required factor layer is null: {calculator}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"selector required factor layer unavailable: {sorted(calculators)} "
+                f"date={signal_date} source={path}: {exc}"
+            ) from exc
+        owned = required
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
-        frame = frame.loc[frame["date"].eq(target)].drop_duplicates(
-            symbol_column, keep="last"
-        )
+        if not frame["date"].eq(target).all():
+            raise RuntimeError(f"selector required factor layer date mismatch: {path}")
+        for calculator in calculators:
+            if any(definitions[feature].calculator_id == calculator for feature in required):
+                layer_coverage[calculator] = {
+                    "status": "complete", "date": signal_date,
+                    "rows": len(frame), "path": str(path.relative_to(PROJECT_ROOT)),
+                }
         for record in frame.to_dict("records"):
             symbol = normalize_ts_code(str(record[symbol_column]))
             destination = rows.setdefault(symbol, {})
@@ -7071,6 +7101,7 @@ def _selector_production_snapshot_rows(
             )
     for symbol, values in rows.items():
         values["_selector_snapshot_sources"] = sorted(source_names[symbol])
+        values["_selector_layer_coverage"] = layer_coverage
     return rows
 
 
@@ -7182,6 +7213,8 @@ def _selector_live_feature_rows(
         columns=["ts_code", "trade_date", "date", "pct_chg"],
     )
     market_values = _selector_market_feature_values_from_daily(market, signal_date)
+    if not market_values:
+        raise RuntimeError(f"selector required market_cross_section unavailable: {signal_date}")
     daily = store.read_market_range(
         DAILY_DIR.name,
         start_date=(target - pd.Timedelta(days=130)).strftime("%Y-%m-%d"),
@@ -7229,6 +7262,11 @@ def _selector_live_feature_rows(
             }
         )
         feature.update(project_rows.get(canonical_symbol, {}))
+        missing_project = sorted(set(project_features) - set(feature))
+        if missing_project:
+            raise RuntimeError(
+                f"selector required project_daily columns unavailable: {canonical_symbol}: {missing_project}"
+            )
         feature["selector_excess_return_1d"] = (
             feature.get("selector_return_1d", np.nan)
             - feature.get("selector_market_mean_1d", np.nan)
@@ -7241,6 +7279,9 @@ def _selector_live_feature_rows(
             sources.append("project_daily_on_demand")
         feature["_score_feature_source"] = "+".join(dict.fromkeys(sources))
         feature["_score_feature_date"] = signal_date
+        feature["_selector_layer_coverage"] = next(
+            (values["_selector_layer_coverage"] for values in snapshot_rows.values()), {}
+        )
         result[canonical_symbol] = feature
     return result
 
@@ -7313,8 +7354,15 @@ def _selector_feature_rows_for_score_rows(rows: list[dict[str, Any]]) -> dict[st
             continue
         try:
             live_rows = _selector_live_feature_rows(missing_symbols, signal_date)
-        except Exception:
-            live_rows = {}
+        except Exception as exc:
+            live_rows = {
+                symbol: {
+                    "_score_feature_error": f"{type(exc).__name__}: {exc}",
+                    "_score_feature_source": "unavailable",
+                    "_score_feature_date": signal_date,
+                }
+                for symbol in missing_symbols
+            }
         feature_rows.update(live_rows)
     return feature_rows
 
@@ -7323,6 +7371,12 @@ def _apply_return_model_scores(
     rows: list[dict[str, Any]],
     feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
 ) -> None:
+    for row in rows:
+        row.pop("feature_quality", None)
+        for mode in ("buy", "hold"):
+            row.pop(f"historical_{mode}_score", None)
+            row.pop(f"{mode}_score_source", None)
+        row["model_score_available"] = False
     artifacts = _selector_buy_hold_models()
     if not artifacts:
         for row in rows:
@@ -7345,10 +7399,10 @@ def _apply_return_model_scores(
             signal_date = str(row.get("date") or "")
             symbol = str(row.get("symbol") or "")
             source = feature_rows_by_symbol.get(symbol)
-            if source is None:
+            if source is None or source.get("_score_feature_error"):
                 row["feature_quality"] = {
                     "status": "failed",
-                    "error": "missing_exact_date_feature_row",
+                    "error": (source or {}).get("_score_feature_error") or "missing_exact_date_feature_row",
                     "source": "unavailable",
                     "date": signal_date or None,
                 }
@@ -7384,6 +7438,28 @@ def _apply_return_model_scores(
             for feature in features:
                 if feature.startswith("group__"):
                     values[feature] = float(feature.removeprefix("group__") in groups)
+            if artifact.get("preprocessing") == "xgboost_native_nan_float32_v1":
+                missing_columns = sorted(set(features) - set(values))
+                definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+                required_layers = {
+                    definitions[feature].calculator_id for feature in features
+                    if feature in definitions and definitions[feature].calculator_id != "selector_live"
+                }
+                coverage = source.get("_selector_layer_coverage") or {}
+                missing_layers = sorted(
+                    layer for layer in required_layers
+                    if source_name != "model_history" and (
+                        (coverage.get(layer) or {}).get("status") != "complete"
+                        or (coverage.get(layer) or {}).get("date") != signal_date
+                    )
+                )
+                if missing_columns or missing_layers:
+                    row["feature_quality"] = {
+                        "status": "failed", "error": "incomplete_required_factor_layers",
+                        "date": signal_date, "source": source_name,
+                        "missing_columns": missing_columns, "missing_layers": missing_layers,
+                    }
+                    continue
             indexes.append(index)
             feature_rows.append(values)
         if not feature_rows:
@@ -7497,6 +7573,8 @@ def _apply_return_model_scores(
                     artifact["score_reference"],
                     artifact.get("normalization_width", 2.0),
                 )
+            if not np.isfinite(scores).all():
+                raise RuntimeError("model returned non-finite scores")
         except Exception as exc:
             for index in indexes:
                 source = feature_rows_by_symbol.get(str(rows[index].get("symbol") or ""), {})
@@ -7525,6 +7603,8 @@ def _apply_return_model_scores(
             )
             source_name = str(source.get("_score_feature_source") or "model_history")
             rows[index]["score_feature_source"] = source_name
+            if (rows[index].get("feature_quality") or {}).get("status") == "failed":
+                continue
             rows[index]["feature_quality"] = {
                 "status": "complete",
                 "error": None,
@@ -7533,6 +7613,8 @@ def _apply_return_model_scores(
                 "required_feature_count": len(features),
                 "available_feature_count": int(frame.iloc[position].notna().sum()),
                 "minimum_available_feature_count": minimum_non_null,
+                "layer_coverage": source.get("_selector_layer_coverage", {}),
+                "null_value_policy": "native_missing_values_with_validated_source_layers" if native_missing else "complete_values",
             }
 
 
@@ -7596,8 +7678,15 @@ def _watchlist_buy_hold_scores(symbols: tuple[str, ...]) -> dict[str, dict[str, 
             feature_rows.update(
                 _selector_live_feature_rows(missing_symbols, score_date)
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            feature_rows.update({
+                symbol: {
+                    "_score_feature_error": f"{type(exc).__name__}: {exc}",
+                    "_score_feature_source": "unavailable",
+                    "_score_feature_date": score_date,
+                }
+                for symbol in missing_symbols
+            })
     rows = [
         {
             "symbol": symbol,
@@ -8346,6 +8435,8 @@ def _clear_selector_caches() -> None:
         _selector_buy_hold_score_artifact,
         _selector_score_calibration,
         _selector_buy_hold_models,
+        _selector_active_model_features,
+        _selector_watchlist_feature_row,
         _selector_model_feature_rows,
         _selector_model_score_date,
         _selector_snapshot_dates_cached,
@@ -8553,25 +8644,21 @@ def _ensure_selector_long_factor_snapshot(
             "checkpoint_reused": True,
         }
 
-    manifest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.json"
-    latest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.parquet"
-    current: dict[str, Any] = {}
     try:
-        current = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        current = {}
-    current_is_valid = bool(
-        latest_path.is_file()
-        and current.get("status") == "success"
-        and current.get("signal_date") == signal_date
-        and current.get("coverage_status") == "complete"
-        and current.get("factor_schema_version")
-        == LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION
-        and int(current.get("factor_count") or 0)
-        == len(LONG_PRODUCTION_FACTOR_COLUMNS)
-    )
-    if current_is_valid and not force_refresh:
-        return {**current, "checkpoint_reused": True}
+        _, current = read_long_factor_snapshot(
+            LONG_FACTOR_SNAPSHOT_DIR, signal_date, latest=True,
+        )
+        if not force_refresh:
+            return {**current, "checkpoint_reused": True}
+    except RuntimeError:
+        if not force_refresh:
+            try:
+                archived, _ = read_long_factor_snapshot(LONG_FACTOR_SNAPSHOT_DIR, signal_date)
+            except RuntimeError:
+                pass
+            else:
+                restored = publish_long_factor_snapshot(archived, LONG_FACTOR_SNAPSHOT_DIR)
+                return {**restored, "checkpoint_reused": True, "latest_restored_from_dated": True}
 
     # Clear once after shared inputs are refreshed.  The later all-scope long
     # workspace reuses this same tea payload rather than recalculating it.
@@ -8589,6 +8676,7 @@ def _ensure_selector_long_factor_snapshot(
             "selector 长线因子截面发布失败: "
             f"expected={signal_date} actual={snapshot}"
         )
+    read_long_factor_snapshot(LONG_FACTOR_SNAPSHOT_DIR, signal_date)
     return {**snapshot, "checkpoint_reused": False}
 
 
@@ -10546,6 +10634,8 @@ def get_stock_selector_payload(
         "signal_date": effective_signal_date,
         "execution_date": plan.get("execution_date"),
         "ranking_source": DEFAULT_SELECTOR_RANKING_CONFIG.source.value,
+        "model_release_id": SELECTOR_BUY_HOLD_RELEASE_ID,
+        "factor_validation_schema": "selector-required-layers-v1",
         "available_strategies": [
             {
                 "key": item["key"],

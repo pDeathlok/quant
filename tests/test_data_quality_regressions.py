@@ -319,7 +319,7 @@ def test_watchlist_reports_exact_date_feature_failure_instead_of_dropping_symbol
     assert result["000001.SZ"]["model_score_available"] is False
     assert result["000001.SZ"]["feature_quality"] == {
         "status": "failed",
-        "error": "missing_exact_date_feature_row",
+        "error": "RuntimeError: daily input unavailable",
         "source": "unavailable",
         "date": "2026-08-12",
     }

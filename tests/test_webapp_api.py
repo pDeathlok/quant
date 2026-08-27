@@ -21,6 +21,11 @@ from quant.webapp import api as webapp_api
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def isolate_long_factor_publication(monkeypatch, tmp_path):
+    monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path / "long_factors")
+
+
 def test_selector_score_presentation_normalizes_and_ranks_all_three_scores() -> None:
     rows = [
         {
@@ -357,6 +362,13 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(services, "_clear_selector_caches", lambda: None)
     monkeypatch.setattr(
         services,
+        "_ensure_selector_long_factor_snapshot",
+        lambda signal_date, **kwargs: {
+            "status": "success", "signal_date": signal_date, "checkpoint_reused": True,
+        },
+    )
+    monkeypatch.setattr(
+        services,
         "get_stock_selector_payload",
         lambda **kwargs: {"signal_date": "2026-07-23", "stocks": []},
     )
@@ -434,8 +446,51 @@ def _stub_successful_global_refresh(
     return status
 
 
+def test_global_refresh_stub_never_calls_real_long_factor_builder(monkeypatch, tmp_path):
+    calls = []
+
+    class UnexpectedBuilder:
+        def cache_clear(self):
+            pass
+
+        def __call__(self, variant, signal_date):
+            calls.append(signal_date)
+            raise RuntimeError("test reached an unisolated production factor builder")
+
+    _stub_successful_global_refresh(monkeypatch)
+    monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path / "long")
+    monkeypatch.setattr(services, "_selector_active_model_features", lambda: ("roe",))
+    monkeypatch.setattr(services, "_build_tea_master_stock_pool_cached", UnexpectedBuilder())
+
+    services._run_latest_refresh_job("short")
+
+    assert calls == []
+
+
+def test_historical_long_snapshot_cannot_replace_newer_latest(monkeypatch, tmp_path):
+    monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path)
+    row = {column: 1.0 for column in services.LONG_PRODUCTION_FACTOR_COLUMNS}
+    row.update(ts_code="000001.SZ", date=pd.Timestamp("2026-08-26"))
+    services._publish_long_factor_snapshot(pd.DataFrame([row]), row["date"])
+    before = {name: (tmp_path / name).read_bytes() for name in ("latest.json", "latest.parquet")}
+    row["date"] = pd.Timestamp("2026-07-23")
+
+    services._publish_long_factor_snapshot(pd.DataFrame([row]), row["date"])
+
+    assert (tmp_path / "20260723.parquet").exists()
+    assert {name: (tmp_path / name).read_bytes() for name in before} == before
+
+
+def test_selector_rejects_missing_required_long_factor_layer(monkeypatch, tmp_path):
+    monkeypatch.setattr(services, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path / "data/features/long")
+    monkeypatch.setattr(services, "_selector_active_model_features", lambda: ("roe",))
+    with pytest.raises(RuntimeError, match="long_snapshot"):
+        services._selector_production_snapshot_rows("2026-08-26")
+
+
 def test_historical_scores_are_independent_of_current_candidate_pool(monkeypatch) -> None:
-    monkeypatch.setattr(services, "_selector_buy_hold_models", lambda: {})
+    monkeypatch.setattr(services, "_apply_return_model_scores", lambda *args: None)
     base_row = {
         "symbol": "000001.SZ",
         "historical_buy_score": 72.4,
@@ -2146,19 +2201,10 @@ def test_selector_long_factor_snapshot_reuses_current_and_refreshes_when_planned
     tmp_path,
 ) -> None:
     snapshot_dir = tmp_path / "long"
-    snapshot_dir.mkdir()
-    (snapshot_dir / "latest.parquet").touch()
-    manifest = {
-        "status": "success",
-        "signal_date": "2026-07-30",
-        "coverage_status": "complete",
-        "factor_schema_version": services.LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION,
-        "factor_count": len(services.LONG_PRODUCTION_FACTOR_COLUMNS),
-    }
-    (snapshot_dir / "latest.json").write_text(
-        json.dumps(manifest),
-        encoding="utf-8",
-    )
+    monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", snapshot_dir)
+    row = {column: 1.0 for column in services.LONG_PRODUCTION_FACTOR_COLUMNS}
+    row.update(ts_code="000001.SZ", date=pd.Timestamp("2026-07-30"))
+    manifest = services._publish_long_factor_snapshot(pd.DataFrame([row]), row["date"])
 
     class FakeTeaBuilder:
         calls = 0

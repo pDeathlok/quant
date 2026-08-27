@@ -20,7 +20,7 @@ from quant.application.left_side_ranking import (
     LeftSideRankingConfig,
     load_left_side_ranking_scores,
 )
-from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
+from quant.data.atomic_io import atomic_link_or_copy, atomic_write_json, atomic_write_parquet
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import normalize_tushare_daily
 from quant.features.canonical_factor_names import (
@@ -578,6 +578,9 @@ def build_left_side_production_features(
         **left_side_contract_payload(),
     }
     atomic_write_json(manifest, config.paths.feature_manifest)
+    dated_path = config.paths.feature_output.with_name(f"{target:%Y%m%d}_features.parquet")
+    atomic_link_or_copy(config.paths.feature_output, dated_path)
+    atomic_write_json(manifest, dated_path.with_suffix(".json"))
     return manifest
 
 

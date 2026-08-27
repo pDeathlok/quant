@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -30,7 +30,11 @@ from quant.features.selector_buy_hold_factor_contract import (
     SELECTOR_BUY_HOLD_RELEASE_ID,
     validate_selector_buy_hold_artifact,
 )
-from quant.routine.daily_dependency_runtime import resolve_model_contracts
+from quant.routine.daily_dependency_runtime import (
+    audit_required_freshness,
+    collect_node_states,
+    resolve_model_contracts,
+)
 
 
 PRODUCTION_ROOT = PROJECT_ROOT / "models/production/selector_buy_hold_registry_v3"
@@ -145,12 +149,39 @@ def _default_target_date(refresh_status: Mapping[str, Any]) -> str:
     raise RuntimeError("could not resolve the latest selector trade date")
 
 
+def _committed_selector_dependency_snapshot(target_date: str) -> dict[str, Any]:
+    candidates = []
+    for scope in ("short", "all"):
+        path = PROJECT_ROOT / f"data/contracts/daily_dependencies/latest-{scope}.json"
+        if not path.is_file():
+            continue
+        payload = _load_json(path)
+        if (
+            payload.get("status") == "success"
+            and payload.get("baseline_committed") is True
+            and payload.get("target_trade_date") == target_date
+            and "score.selector" in (payload.get("model_contract_hashes") or {})
+        ):
+            candidates.append(payload)
+    if not candidates:
+        raise RuntimeError(f"no successful committed selector dependency baseline for {target_date}")
+    return max(candidates, key=lambda payload: str(payload.get("created_at") or ""))
+
+
 def _regenerate_latest(target_date: str) -> tuple[dict[str, Any], dict[str, Any]]:
     from quant.routine.pipeline import publish_daily_dependency_contract
+    from quant.routine.left_side_unified_production import run_left_side_production
+    from quant.routine.right_side_unified_production import run_right_side_unified_production
     from quant.webapp import services
 
     refresh_status = _load_json(REFRESH_STATUS_PATH)
     results = dict(refresh_status.get("result") or {})
+    ranker_refresh = {
+        "right": run_right_side_unified_production(target_date),
+        "left": run_left_side_production(target_date),
+    }
+    if any(result.get("status") != "success" for result in ranker_refresh.values()):
+        raise RuntimeError(f"selector upstream ranker validation failed: {ranker_refresh}")
     preflight = publish_daily_dependency_contract(
         target_date,
         "short",
@@ -186,6 +217,9 @@ def _regenerate_latest(target_date: str) -> tuple[dict[str, Any], dict[str, Any]
             raise RuntimeError(
                 f"selector {name} output date drifted: expected={target_date} actual={actual}"
             )
+        page_audit = _page_score_audit(payload, target_date)
+        if page_audit["status"] != "success":
+            raise RuntimeError(f"selector {name} page score audit failed: {page_audit}")
     results["selector_core"] = {
         "status": "success",
         "signal_date": target_date,
@@ -223,6 +257,7 @@ def _regenerate_latest(target_date: str) -> tuple[dict[str, Any], dict[str, Any]
         "selector_core": results["selector_core"],
         "selector_extended": results["selector_extended"],
         "snapshot": results["snapshot"],
+        "ranker_refresh": ranker_refresh,
     }
 
 
@@ -232,7 +267,8 @@ def _page_score_audit(payload: Mapping[str, Any], target_date: str) -> dict[str,
     incomplete = [
         str(row.get("symbol") or "")
         for row in rows
-        if row.get("buy_score_source") != "historical_return_model"
+        if row.get("model_score_available") is not True
+        or row.get("buy_score_source") != "historical_return_model"
         or row.get("hold_score_source") != "historical_return_model"
         or (row.get("feature_quality") or {}).get("status") != "complete"
         or str(row.get("score_date") or "") != str(row.get("date") or "")
@@ -245,6 +281,11 @@ def _page_score_audit(payload: Mapping[str, Any], target_date: str) -> dict[str,
     signal_dates = sorted(
         {str(row.get("date") or "") for row in rows if row.get("date")}
     )
+    release_matches = (
+        payload.get("model_release_id") == SELECTOR_BUY_HOLD_RELEASE_ID
+        and payload.get("factor_validation_schema") == "selector-required-layers-v1"
+    )
+    snapshot_date_matches = str(payload.get("signal_date") or "") == target_date
     return {
         "target_date": target_date,
         "row_count": len(rows),
@@ -257,8 +298,55 @@ def _page_score_audit(payload: Mapping[str, Any], target_date: str) -> dict[str,
         "prior_signal_row_count": len(prior_signal_rows),
         "prior_signal_symbols": prior_signal_rows,
         "score_date_contract": "each row is scored on its own causal signal date",
-        "status": "success" if rows and not incomplete else "failed",
+        "release_and_validation_contract_matches": release_matches,
+        "snapshot_date_matches": snapshot_date_matches,
+        "status": "success" if rows and not incomplete and release_matches and snapshot_date_matches else "failed",
     }
+
+
+def _mysql_snapshot_audit(payload: Mapping[str, Any], target_date: str) -> dict[str, Any]:
+    from sqlalchemy import bindparam, text
+    from quant.webapp import services
+
+    store = services.MarketDataStore(services.MarketDataStoreConfig.from_env())
+    if not store.config.sql_url:
+        return {"status": "not_configured", "checked_snapshot_count": 0}
+    extended_keys = {str(item["key"]).upper() for item in services.EXTENDED_STRATEGIES}
+    scopes: list[tuple[list[str] | None, bool]] = [(None, True)]
+    for strategy in services._strategy_keys_from_payload(dict(payload)):
+        members = services.STRATEGY_GROUP_MEMBERS.get(strategy, {strategy})
+        scopes.append(([strategy], bool(members & extended_keys)))
+    expected: dict[str, Any] = {}
+    engine = None
+    try:
+        for scope, include_extended in scopes:
+            key = services._selector_snapshot_key(target_date, scope, include_extended)[0]
+            expected[key] = _load_json(services._selector_snapshot_path(key))
+        engine = store._engine()
+        with engine.connect() as connection:
+            records = connection.execute(
+                text(
+                    f"SELECT snapshot_key, payload_json FROM {services.SELECTOR_SNAPSHOT_TABLE} "
+                    "WHERE snapshot_key IN :keys"
+                ).bindparams(bindparam("keys", expanding=True)),
+                {"keys": list(expected)},
+            ).mappings().all()
+        actual = {row["snapshot_key"]: json.loads(row["payload_json"]) for row in records}
+        mismatches = [key for key, value in expected.items() if actual.get(key) != value]
+        return {
+            "status": "success" if not mismatches else "failed",
+            "checked_snapshot_count": len(expected),
+            "mismatched_snapshot_keys": mismatches,
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "checked_snapshot_count": 0,
+        }
+    finally:
+        if engine is not None:
+            engine.dispose()
 
 
 def main() -> None:
@@ -287,15 +375,14 @@ def main() -> None:
             use_cache=True,
             full_snapshot=True,
         )
-        committed = _load_json(
-            PROJECT_ROOT / "data/contracts/daily_dependencies/latest-short.json"
-        )
+        committed = _committed_selector_dependency_snapshot(target_date)
         release_run = {
             "status": "validated_published_snapshot",
             "snapshot_generated_at": page_payload.get("generated_at"),
             "snapshot_cache": page_payload.get("cache"),
             "postflight": {
                 "status": committed.get("status"),
+                "scope": committed.get("scope"),
                 "target_trade_date": committed.get("target_trade_date"),
                 "baseline_committed": committed.get("baseline_committed"),
                 "refresh_node_ids": committed.get("refresh_node_ids"),
@@ -308,6 +395,17 @@ def main() -> None:
             },
         }
     page_audit = _page_score_audit(page_payload, target_date)
+    mysql_audit = _mysql_snapshot_audit(page_payload, target_date)
+    live_freshness = audit_required_freshness(
+        DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+        "short",
+        date.fromisoformat(target_date),
+        collect_node_states(
+            DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+            PROJECT_ROOT,
+            refresh_status.get("result") or {},
+        ),
+    )
 
     registry_aliases = sorted(
         definition.name
@@ -383,7 +481,9 @@ def main() -> None:
         and not consumer_zero_report["legacy_selector_model"]["missing_artifacts"]
         and contract_audit.get("status") == "success"
         and page_audit["status"] == "success"
+        and mysql_audit["status"] in {"success", "not_configured"}
         and dependency_postflight_ready
+        and live_freshness.get("status") == "success"
         and tuple(model_features) == tuple(dict.fromkeys(model_features))
     )
 
@@ -423,6 +523,8 @@ def main() -> None:
         "daily_contract_status": contract_audit.get("status"),
         "dependency_postflight_ready": dependency_postflight_ready,
         "page_score_audit": page_audit,
+        "mysql_snapshot_audit": mysql_audit,
+        "live_freshness_audit": live_freshness,
         "release_run": release_run,
         "consumer_zero_report": str(
             (REPORT_ROOT / "consumer_zero_report.json").relative_to(PROJECT_ROOT)

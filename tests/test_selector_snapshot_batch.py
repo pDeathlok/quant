@@ -84,7 +84,10 @@ def _selector_payload() -> dict:
         "signal_date": "2026-08-12",
         "generated_at": "2026-08-12T18:30:00",
         "available_strategies": [{"key": "B2"}, {"key": "B1"}],
-        "stocks": [{"symbol": "000001.SZ"}, {"symbol": "000002.SZ"}],
+        "stocks": [
+            {"symbol": symbol, "model_score_available": True, "feature_quality": {"status": "complete"}}
+            for symbol in ("000001.SZ", "000002.SZ")
+        ],
     }
 
 
@@ -92,7 +95,10 @@ def _install_filtered_payload_stub(monkeypatch) -> None:
     def filtered(payload: dict, strategies: list[str]) -> dict:
         return {
             **payload,
-            "stocks": [{"symbol": f"{strategies[0]}-candidate"}],
+            "stocks": [{
+                "symbol": f"{strategies[0]}-candidate", "model_score_available": True,
+                "feature_quality": {"status": "complete"},
+            }],
         }
 
     monkeypatch.setattr(services, "_filtered_selector_payload", filtered)
@@ -191,12 +197,12 @@ def test_strategy_pool_snapshot_sql_failure_keeps_atomic_files_and_invalidates_s
         fail_insert=True,
     )
 
-    written = services._write_strategy_pool_snapshots(
-        _selector_payload(),
-        include_extended=True,
-    )
+    with pytest.raises(RuntimeError, match="MySQL snapshot publication failed"):
+        services._write_strategy_pool_snapshots(
+            _selector_payload(),
+            include_extended=True,
+        )
 
-    assert written == {"ALL": 2, "B1": 1, "B2": 1}
     assert len(list((tmp_path / "snapshots").glob("*.json"))) == 3
     assert cache_clears == ["clear"]
     assert len([sql for sql, _ in events if sql.startswith("INSERT INTO")]) == 1

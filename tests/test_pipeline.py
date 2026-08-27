@@ -915,6 +915,7 @@ def test_daily_pipeline_stops_before_features_when_source_refresh_is_incomplete(
 
     monkeypatch.setattr(pipeline, "load_strategy_configs", lambda path: [])
     monkeypatch.setattr(pipeline, "run_cache_cleanup", lambda project_root: {"status": "success"})
+    monkeypatch.setattr(pipeline, "resolve_daily_dependency_source_options", lambda scope: {"scope": scope})
     monkeypatch.setattr(pipeline, "refresh_data", lambda dry_run: {"status": "failed", "failed": 1})
     monkeypatch.setattr(pipeline, "build_features", build_should_not_run)
     monkeypatch.setattr(pipeline, "write_run_manifest", lambda results, strategies: tmp_path / "manifest.json")
@@ -923,4 +924,5 @@ def test_daily_pipeline_stops_before_features_when_source_refresh_is_incomplete(
 
     assert result["status"] == "failed"
     assert result["steps"]["pipeline"]["status"] == "failed"
+    assert result["steps"]["dependency_source_options"]["scope"] == "short"
     assert feature_called is False

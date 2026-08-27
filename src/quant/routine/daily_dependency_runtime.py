@@ -435,6 +435,15 @@ def _evidence_value(
     predicate_field: str | None = None,
     expected_value: Any = None,
 ) -> tuple[date | None, datetime | None, str | None] | None:
+    if adapter == "long_factor_snapshot":
+        from quant.features.long_factor_snapshot import read_long_factor_snapshot
+
+        try:
+            _, manifest = read_long_factor_snapshot(_safe_path(project_root, locator), latest=True)
+        except RuntimeError:
+            return None
+        value = manifest["signal_date"]
+        return _parse_date(value), _parse_datetime(value), manifest["data_sha256"]
     if adapter == "result":
         payload = _lookup(results, locator)
         if not isinstance(payload, Mapping):

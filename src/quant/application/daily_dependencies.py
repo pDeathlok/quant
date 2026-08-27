@@ -1092,6 +1092,7 @@ def build_default_daily_dependency_registry(
              _edge("data.stock_basic"), _edge("data.financial_pit"), _edge("data.analyst_pit"),
              _edge("feature.market_regime")),
             _exact(
+                EvidenceSpec("long_factor_snapshot", "data/features/long", "signal_date"),
                 _json(
                     "data/features/long/latest.json",
                     "signal_date",
@@ -1120,6 +1121,7 @@ def build_default_daily_dependency_registry(
             "refresh_long_factor_snapshot",
             contract_sources=(
                 "src/quant/webapp/services.py",
+                "src/quant/features/long_factor_snapshot.py",
                 "src/quant/features/factor_registry.py",
                 "configs/strategies/tea_master_long.yaml",
                 "configs/strategies/long_dividend_quality.yaml",
