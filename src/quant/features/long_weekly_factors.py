@@ -35,6 +35,18 @@ LABEL_PREFIXES = (
     "benchmark_return_",
 )
 
+MONTHLY_VALUATION_HISTORY_COLUMNS: tuple[str, ...] = (
+    "roe_hist_percentile",
+    "roe_history_points",
+    "pe_hist_percentile",
+    "pb_hist_percentile",
+    "pr_pe_hist_percentile",
+    "pr_pb_hist_percentile",
+    "pr_hist_percentile",
+    "historical_value_score",
+    "valuation_history_points",
+)
+
 
 def _rolling_last_percentile(
     values: pd.Series,
@@ -133,6 +145,76 @@ def add_weekly_valuation_history(
     ).clip(0, 100)
     # Stable public aliases omit the daily_basic source spelling.
     out[f"pe_hist_percentile_{suffix}"] = out[f"pe_ttm_hist_percentile_{suffix}"]
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def add_monthly_valuation_history(
+    frame: pd.DataFrame,
+    *,
+    window_months: int = 84,
+    minimum_months: int = 24,
+) -> pd.DataFrame:
+    """Add the canonical unsuffixed PIT valuation-history factors.
+
+    ``frame`` must contain one point-in-time observation per stock and month.
+    Keeping this calculation in the factor layer lets research datasets
+    materialize the same governed factors without depending on a live snapshot.
+    """
+
+    if minimum_months < 1 or window_months < minimum_months:
+        raise ValueError(
+            "monthly valuation history requires 1 <= minimum_months <= window_months"
+        )
+    required = {"date", "ts_code", "industry", "roe", "pe_ttm", "pb"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"monthly valuation history misses columns: {missing}")
+    out = _add_dual_pr(frame.sort_values(["ts_code", "date"]))
+    for source, target in (
+        ("roe", "roe_hist_percentile"),
+        ("pe_ttm", "pe_hist_percentile"),
+        ("pb", "pb_hist_percentile"),
+        ("pr_pe", "pr_pe_hist_percentile"),
+        ("pr_pb", "pr_pb_hist_percentile"),
+    ):
+        clean = pd.to_numeric(out[source], errors="coerce")
+        if source != "roe":
+            clean = clean.where(clean > 0)
+        out[target] = clean.groupby(out["ts_code"], sort=False).transform(
+            lambda values: _rolling_last_percentile(
+                values,
+                window=window_months,
+                minimum=minimum_months,
+            )
+        )
+    out["pr_hist_percentile"] = (
+        out["pr_pe_hist_percentile"] * out["pr_pe_weight"]
+        + out["pr_pb_hist_percentile"] * out["pr_pb_weight"]
+    )
+    history_counts = []
+    for source in ("pe_ttm", "pb", "pr_pe", "pr_pb"):
+        clean = pd.to_numeric(out[source], errors="coerce").where(
+            lambda values: values > 0
+        )
+        history_counts.append(
+            clean.groupby(out["ts_code"], sort=False).transform(
+                lambda values: values.rolling(window_months, min_periods=1).count()
+            )
+        )
+    out["valuation_history_points"] = pd.concat(history_counts, axis=1).min(axis=1)
+    out["roe_history_points"] = pd.to_numeric(
+        out["roe"], errors="coerce"
+    ).groupby(out["ts_code"], sort=False).transform(
+        lambda values: values.rolling(window_months, min_periods=1).count()
+    )
+    out["historical_value_score"] = (
+        100.0
+        - out[
+            ["pe_hist_percentile", "pb_hist_percentile", "pr_hist_percentile"]
+        ]
+        .mul([0.30, 0.25, 0.45])
+        .sum(axis=1, min_count=3)
+    ).clip(0, 100)
     return out.replace([np.inf, -np.inf], np.nan)
 
 

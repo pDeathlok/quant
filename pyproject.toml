@@ -27,6 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 ml = [
+    "polars>=1.30.0",
     "torch>=2.0.0",
 ]
 dev = [

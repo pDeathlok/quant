@@ -131,6 +131,51 @@ PYTHONPATH=src python -m compileall -q src tests scripts
 ruff check src tests
 ```
 
+## 配债股自选池复核任务
+
+配债股出入池使用独立的两阶段脚本执行。默认命令只生成待确认名单，不修改自选池：
+
+```bash
+python scripts/review_convertible_bond_watchlist.py plan
+```
+
+脚本要求 `data/routine/convertible_bond_allotments_latest.json` 是当日全部事件源轮询成功的快照。如快照未更新，可在生成名单时显式刷新配债事件源；该操作调用每日更新和页面使用的同一个 `get_convertible_bond_allotments` 入口，统一执行公告轮询、质量门禁和快照落盘。随后仅从本次缓存生成包含已过登记日记录的复核全集，不会再次独立联网刷新：
+
+```bash
+python scripts/review_convertible_bond_watchlist.py plan --refresh
+```
+
+生成计划前会逐股比较每日页面结果和复核全集中的阶段、公告标题、公告日期和公告链接；两边任一股票缺失或公告证据不一致都会中止，不产出可执行计划。计划会写入 `data/routine/convertible_bond_watchlist_review_latest.json`，并输出待出池、待入池、待补配债标记和需人工复核四类名单。只有确认名单后，才使用计划输出的完整 `plan_id` 执行：
+
+```bash
+PYTHONPATH=src python scripts/review_convertible_bond_watchlist.py apply \
+  --plan data/routine/convertible_bond_watchlist_review_latest.json \
+  --confirm <plan_id>
+```
+
+`apply` 会拒绝错误确认码、非当日计划，以及生成计划后又被其他操作改动过的自选池。执行前会在同目录生成 `watchlist.before_cb_review_<时间>_<plan_id>.json` 备份，再原子更新正式自选池。入池条件是“上市委通过”或“同意注册”；股权登记日早于复核日才列为待出池。数据源缺失或阶段异常回退只会进入人工复核，不会自动出池。
+
+每次确认执行还会同步所有有效配债股的任务信息，而不只处理新增股票：备注区块统一刷新阶段、配售参数、股权登记日、最新价格及日期、日/周/月 KDJ、公告标题和链接。原有人工备注及其他提醒保持不变；每只有效配债股都会确保存在一个可独立触发的 `日线J < 5` 提醒，已有相同单条件提醒时不重复添加。出池股票随自选池记录一并清理备注和提醒。
+
+名单原子更新后，脚本会立即轻量刷新全部自选股的买入分、持有分、评分日期和特征质量，并更新 `data/research/similar_patterns/web_watchlist_analysis.json`；该步骤不重跑耗时的相似走势案例分析。评分必须覆盖全部自选股，否则脚本恢复执行前备份并报告失败，避免出现名单已加入但页面评分为空的半完成状态。
+
+### 配债公告回归测试集
+
+公告适配样本集中维护在 `tests/fixtures/convertible_bond_announcement_cases.json`，分为两类：
+
+- `title_cases`：单条公告是否属于公开发行配债流程，以及对应阶段；
+- `timeline_cases`：同一股票连续公告后的最终阶段，防止普通后续公告覆盖已经确认的更高阶段。
+
+遇到新的公告措辞、漏报或误报时，先把真实标题加入该文件，再调整分类规则。定向可转债、并购支付对价型可转债，以及转股、付息、赎回等存量债券公告必须保留反例。执行：
+
+```bash
+PYTHONPATH=src python -m pytest -q tests/test_convertible_bond_announcement_cases.py
+```
+
+该测试文件由常规 `pytest` 自动发现，无需单独接入每日任务。
+
+每周六 09:00 的 Codex 任务会刷新并核对公告证据、页面配债池、复核结果和自选池名单。若发现漏报、误报或两条结果不一致，任务应先将真实公告加入上述测试集，再修复共享分类代码，运行配债相关测试和完整测试套件；测试全部通过后重新生成待执行名单。自动任务不得执行 `apply`，自选池仍需人工确认后修改。
+
 ## 回测结果契约
 
 `BacktestEngine.run()` 继续返回 akquant 原始结果，兼容已有策略和报告生成；新的应用、研究脚本与组合层应优先读取 `engine.artifacts`。`BacktestArtifacts` 固定提供：

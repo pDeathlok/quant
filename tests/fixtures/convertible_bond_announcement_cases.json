@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "title_cases": [
+    {
+      "id": "public_board_plan",
+      "title": "关于向不特定对象发行可转换公司债券预案的公告",
+      "is_pipeline": true,
+      "stage": "board_plan",
+      "status": "董事会预案"
+    },
+    {
+      "id": "public_board_resolution",
+      "title": "董事会关于向不特定对象发行可转换公司债券方案的决议公告",
+      "is_pipeline": true,
+      "stage": "board_plan",
+      "status": "董事会预案"
+    },
+    {
+      "id": "shareholders_meeting_approved",
+      "title": "关于股东大会审议通过向不特定对象发行可转换公司债券事项的公告",
+      "is_pipeline": true,
+      "stage": "shareholder_approved",
+      "status": "股东大会通过"
+    },
+    {
+      "id": "shareholders_meeting_new_legal_wording",
+      "title": "关于股东会审议通过向不特定对象发行可转换公司债券事项的公告",
+      "is_pipeline": true,
+      "stage": "shareholder_approved",
+      "status": "股东大会通过"
+    },
+    {
+      "id": "exchange_accepted",
+      "title": "关于向不特定对象发行可转换公司债券申请获得上海证券交易所受理的公告",
+      "is_pipeline": true,
+      "stage": "accepted",
+      "status": "交易所受理"
+    },
+    {
+      "id": "exchange_inquiry_reply",
+      "title": "关于向不特定对象发行可转换公司债券审核问询函回复的提示性公告",
+      "is_pipeline": true,
+      "stage": "accepted",
+      "status": "交易所受理"
+    },
+    {
+      "id": "prospectus_application_draft",
+      "title": "向不特定对象发行可转换公司债券募集说明书（申报稿）",
+      "is_pipeline": true,
+      "stage": "accepted",
+      "status": "交易所受理"
+    },
+    {
+      "id": "listing_committee_approved",
+      "title": "关于向不特定对象发行可转换公司债券申请获得上市审核委员会审核通过的公告",
+      "is_pipeline": true,
+      "stage": "exchange_approved",
+      "status": "上市委通过"
+    },
+    {
+      "id": "registration_draft_after_committee",
+      "title": "关于向不特定对象发行可转换公司债券提交募集说明书（注册稿）等申请文件的提示性公告",
+      "is_pipeline": true,
+      "stage": "exchange_approved",
+      "status": "上市委通过"
+    },
+    {
+      "id": "registration_approved",
+      "title": "关于向不特定对象发行可转换公司债券申请获得中国证监会同意注册批复的公告",
+      "is_pipeline": true,
+      "stage": "registered",
+      "status": "同意注册"
+    },
+    {
+      "id": "issue_announcement",
+      "title": "向不特定对象发行可转换公司债券发行公告",
+      "is_pipeline": true,
+      "stage": "issuing",
+      "status": "发行公告"
+    },
+    {
+      "id": "issue_reminder",
+      "title": "向不特定对象发行可转换公司债券发行提示性公告",
+      "is_pipeline": true,
+      "stage": "issuing",
+      "status": "发行公告"
+    },
+    {
+      "id": "public_issue_terminated",
+      "title": "关于终止向不特定对象发行可转换公司债券事项的公告",
+      "is_pipeline": true,
+      "stage": "terminated",
+      "status": "已终止"
+    },
+    {
+      "id": "bond_listing_announcement",
+      "title": "向不特定对象发行可转换公司债券上市公告书",
+      "is_pipeline": true,
+      "stage": "listed",
+      "status": "已上市"
+    },
+    {
+      "id": "generic_validity_extension",
+      "title": "关于延长公司向不特定对象发行可转换公司债券股东会决议有效期及相关授权期限的公告",
+      "is_pipeline": true,
+      "stage": "announced",
+      "status": "已公告"
+    },
+    {
+      "id": "html_markup_registration_draft",
+      "title": "向不特定对象发行<em>可转换公司债券</em>募集说明书（注册稿）",
+      "is_pipeline": true,
+      "stage": "exchange_approved",
+      "status": "上市委通过"
+    },
+    {
+      "id": "targeted_convertible_bond",
+      "title": "向特定对象发行可转换公司债券申请获得中国证监会同意注册批复的公告",
+      "is_pipeline": false
+    },
+    {
+      "id": "private_placement_convertible_bond",
+      "title": "定向发行可转换公司债券募集说明书",
+      "is_pipeline": false
+    },
+    {
+      "id": "ma_shares_and_convertible_bond",
+      "title": "发行股份及可转换公司债券购买资产并募集配套资金报告书",
+      "is_pipeline": false
+    },
+    {
+      "id": "ma_convertible_bond_and_cash",
+      "title": "关于发行可转换公司债券及支付现金购买资产事项获得中国证监会同意注册批复的公告",
+      "is_pipeline": false
+    },
+    {
+      "id": "conversion_price_adjustment",
+      "title": "关于向不特定对象发行可转换公司债券转股价格调整的公告",
+      "is_pipeline": false
+    },
+    {
+      "id": "interest_payment",
+      "title": "关于公开发行可转换公司债券付息的公告",
+      "is_pipeline": false
+    },
+    {
+      "id": "early_redemption",
+      "title": "关于公开发行可转换公司债券赎回结果的公告",
+      "is_pipeline": false
+    },
+    {
+      "id": "rating_report",
+      "title": "公开发行可转换公司债券2026年度跟踪评级报告",
+      "is_pipeline": false
+    },
+    {
+      "id": "raised_funds_account",
+      "title": "关于向不特定对象发行可转换公司债券募集资金专项账户的公告",
+      "is_pipeline": false
+    },
+    {
+      "id": "unrelated_company_announcement",
+      "title": "关于召开2026年第一次临时股东会的通知",
+      "is_pipeline": false
+    },
+    {
+      "id": "empty_title",
+      "title": "",
+      "is_pipeline": false
+    }
+  ],
+  "timeline_cases": [
+    {
+      "id": "registration_draft_keeps_exchange_approved",
+      "stock_code": "301018",
+      "stock_name": "申菱环境",
+      "announcements": [
+        {
+          "title": "关于向不特定对象发行可转换公司债券申请获得深圳证券交易所上市审核委员会审核通过的公告",
+          "announce_time": "2026-08-18 18:00:00",
+          "url": "http://example.test/301018/committee"
+        },
+        {
+          "title": "关于向不特定对象发行可转换公司债券提交募集说明书（注册稿）等申请文件的提示性公告",
+          "announce_time": "2026-08-20 18:10:27",
+          "url": "http://example.test/301018/registration-draft"
+        }
+      ],
+      "expected": {
+        "stage": "exchange_approved",
+        "status": "上市委通过",
+        "announce_date": "2026-08-20",
+        "url": "http://example.test/301018/registration-draft"
+      }
+    },
+    {
+      "id": "generic_extension_does_not_downgrade_exchange_approved",
+      "stock_code": "603125",
+      "stock_name": "常青科技",
+      "announcements": [
+        {
+          "title": "关于向不特定对象发行可转换公司债券申请获得上海证券交易所上市审核委员会审核通过的公告",
+          "announce_time": "2026-07-24 18:00:00",
+          "url": "http://example.test/603125/committee"
+        },
+        {
+          "title": "关于延长公司向不特定对象发行可转换公司债券股东会决议有效期及相关授权期限的公告",
+          "announce_time": "2026-08-27 08:00:00",
+          "url": "http://example.test/603125/extension"
+        }
+      ],
+      "expected": {
+        "stage": "exchange_approved",
+        "status": "上市委通过",
+        "announce_date": "2026-07-24",
+        "url": "http://example.test/603125/committee"
+      }
+    },
+    {
+      "id": "generic_extension_does_not_downgrade_registered",
+      "stock_code": "002913",
+      "stock_name": "奥士康",
+      "announcements": [
+        {
+          "title": "关于向不特定对象发行可转换公司债券申请获得中国证监会同意注册批复的公告",
+          "announce_time": "2026-04-02 18:00:00",
+          "url": "http://example.test/002913/registered"
+        },
+        {
+          "title": "关于延长向不特定对象发行可转换公司债券股东会决议有效期的公告",
+          "announce_time": "2026-08-01 18:00:00",
+          "url": "http://example.test/002913/extension"
+        }
+      ],
+      "expected": {
+        "stage": "registered",
+        "status": "同意注册",
+        "announce_date": "2026-04-02",
+        "url": "http://example.test/002913/registered"
+      }
+    },
+    {
+      "id": "latest_same_stage_milestone_wins",
+      "stock_code": "301175",
+      "stock_name": "中科环保",
+      "announcements": [
+        {
+          "title": "关于向不特定对象发行可转换公司债券申请获得交易所上市审核委员会审核通过的公告",
+          "announce_time": "2026-07-20 18:00:00",
+          "url": "http://example.test/301175/committee"
+        },
+        {
+          "title": "向不特定对象发行可转换公司债券募集说明书（注册稿）",
+          "announce_time": "2026-07-29 18:00:00",
+          "url": "http://example.test/301175/registration-draft"
+        }
+      ],
+      "expected": {
+        "stage": "exchange_approved",
+        "status": "上市委通过",
+        "announce_date": "2026-07-29",
+        "url": "http://example.test/301175/registration-draft"
+      }
+    },
+    {
+      "id": "inquiry_reply_advances_accepted_date",
+      "stock_code": "300001",
+      "stock_name": "测试股份",
+      "announcements": [
+        {
+          "title": "关于向不特定对象发行可转换公司债券申请获得交易所受理的公告",
+          "announce_time": "2026-01-10 18:00:00",
+          "url": "http://example.test/300001/accepted"
+        },
+        {
+          "title": "关于向不特定对象发行可转换公司债券审核问询函回复的公告",
+          "announce_time": "2026-02-10 18:00:00",
+          "url": "http://example.test/300001/inquiry"
+        }
+      ],
+      "expected": {
+        "stage": "accepted",
+        "status": "交易所受理",
+        "announce_date": "2026-02-10",
+        "url": "http://example.test/300001/inquiry"
+      }
+    },
+    {
+      "id": "termination_closes_previous_pipeline",
+      "stock_code": "300002",
+      "stock_name": "终止股份",
+      "announcements": [
+        {
+          "title": "关于向不特定对象发行可转换公司债券申请获得上市审核委员会审核通过的公告",
+          "announce_time": "2026-03-10 18:00:00",
+          "url": "http://example.test/300002/committee"
+        },
+        {
+          "title": "关于终止向不特定对象发行可转换公司债券事项的公告",
+          "announce_time": "2026-04-10 18:00:00",
+          "url": "http://example.test/300002/terminated"
+        }
+      ],
+      "expected": null
+    },
+    {
+      "id": "new_application_after_termination_restarts_pipeline",
+      "stock_code": "300003",
+      "stock_name": "重启股份",
+      "announcements": [
+        {
+          "title": "关于终止向不特定对象发行可转换公司债券事项的公告",
+          "announce_time": "2025-12-10 18:00:00",
+          "url": "http://example.test/300003/terminated"
+        },
+        {
+          "title": "关于向不特定对象发行可转换公司债券预案的公告",
+          "announce_time": "2026-06-10 18:00:00",
+          "url": "http://example.test/300003/restart"
+        }
+      ],
+      "expected": {
+        "stage": "board_plan",
+        "status": "董事会预案",
+        "announce_date": "2026-06-10",
+        "url": "http://example.test/300003/restart"
+      }
+    },
+    {
+      "id": "listing_closes_issuing_pipeline",
+      "stock_code": "300004",
+      "stock_name": "上市股份",
+      "announcements": [
+        {
+          "title": "向不特定对象发行可转换公司债券发行公告",
+          "announce_time": "2026-05-10 18:00:00",
+          "url": "http://example.test/300004/issue"
+        },
+        {
+          "title": "向不特定对象发行可转换公司债券上市公告书",
+          "announce_time": "2026-06-10 18:00:00",
+          "url": "http://example.test/300004/listed"
+        }
+      ],
+      "expected": null
+    },
+    {
+      "id": "generic_only_remains_unconfirmed",
+      "stock_code": "300005",
+      "stock_name": "观察股份",
+      "announcements": [
+        {
+          "title": "关于延长向不特定对象发行可转换公司债券股东会决议有效期的公告",
+          "announce_time": "2026-06-10 18:00:00",
+          "url": "http://example.test/300005/generic"
+        }
+      ],
+      "expected": {
+        "stage": "announced",
+        "status": "已公告",
+        "announce_date": "2026-06-10",
+        "url": "http://example.test/300005/generic"
+      }
+    }
+  ]
+}

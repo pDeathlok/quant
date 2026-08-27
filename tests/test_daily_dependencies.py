@@ -148,7 +148,11 @@ def test_default_scope_closure_contains_only_required_production_branches() -> N
     assert "score.b1" not in short
     assert "score.z_skill" not in short
     assert "product.long_pools" not in short
-    assert "data.financial_pit" not in short
+    # The active selector buy/hold artifact consumes the exact-date long
+    # factor snapshot, so its PIT inputs are now part of the short closure.
+    assert "feature.long_snapshot" in short
+    assert "data.financial_pit" in short
+    assert "data.analyst_pit" in short
     assert "data.tradability" not in short
 
     similar = set(DEFAULT_DAILY_DEPENDENCY_REGISTRY.required_node_ids("similar"))

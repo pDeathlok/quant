@@ -80,6 +80,10 @@ def _is_pipeline_issuance_title(title: Any) -> bool:
         "定向可转债",
         "发行股份及可转换公司债券购买资产",
         "发行股份、可转换公司债券购买资产",
+        "发行可转换公司债券购买资产",
+        "发行可转债购买资产",
+        "发行可转换公司债券及支付现金购买资产",
+        "发行可转债及支付现金购买资产",
     ]
     if any(key in text for key in non_public_issue):
         return False
@@ -1036,18 +1040,26 @@ def _stage_from_title(title: Any) -> tuple[str, str]:
         return "listed", "已上市"
     if any(key in text for key in ["发行公告", "发行提示", "网上路演", "申购", "募集说明书提示性公告"]):
         return "issuing", PIPELINE_STAGE_STATUS["issuing"]
-    if any(key in text for key in ["申报稿", "文件更新", "募集说明书等申请文件"]):
-        return "accepted", PIPELINE_STAGE_STATUS["accepted"]
     if any(key in text for key in ["同意注册", "注册批复", "予以注册"]):
         return "registered", PIPELINE_STAGE_STATUS["registered"]
+    if "注册稿" in text:
+        # A registration draft is submitted only after the exchange listing
+        # committee has approved the application.  Treating this later filing
+        # as a generic announcement would incorrectly hide the issuer from the
+        # exchange-approved stage.
+        return "exchange_approved", PIPELINE_STAGE_STATUS["exchange_approved"]
+    if any(key in text for key in ["申报稿", "文件更新", "募集说明书等申请文件"]):
+        return "accepted", PIPELINE_STAGE_STATUS["accepted"]
+    shareholder_meeting = "股东大会" in text or "股东会" in text
+    shareholder_approval = any(key in text for key in ["审议通过", "表决通过", "决议公告"])
+    if shareholder_meeting and shareholder_approval:
+        return "shareholder_approved", PIPELINE_STAGE_STATUS["shareholder_approved"]
     if any(key in text for key in ["审核通过", "上市委", "审议通过"]):
         return "exchange_approved", PIPELINE_STAGE_STATUS["exchange_approved"]
     if any(key in text for key in ["问询", "审核问询", "落实函", "回复"]):
         return "accepted", PIPELINE_STAGE_STATUS["accepted"]
     if any(key in text for key in ["受理", "获受理"]):
         return "accepted", PIPELINE_STAGE_STATUS["accepted"]
-    if "股东大会" in text:
-        return "shareholder_approved", PIPELINE_STAGE_STATUS["shareholder_approved"]
     if any(key in text for key in ["预案", "董事会", "方案", "可行性分析", "论证分析"]):
         return "board_plan", PIPELINE_STAGE_STATUS["board_plan"]
     return "announced", "已公告"
@@ -1082,11 +1094,46 @@ def _pipeline_from_announcements(announcements: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=required + ["stage", "status"])
     frame["stage"], frame["status"] = zip(*frame["announcement_title"].map(_stage_from_title))
-    frame = frame[~frame["stage"].isin({"listed", "terminated"})].copy()
-    frame["announce_date"] = pd.to_datetime(frame["announce_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    frame = frame.sort_values(["stock_code", "announce_date"], ascending=[True, False])
-    frame = frame.drop_duplicates("stock_code", keep="first")
-    return frame[required + ["stage", "status"]].copy()
+    frame["_announce_timestamp"] = pd.to_datetime(frame["announce_date"], errors="coerce")
+    frame["announce_date"] = frame["_announce_timestamp"].dt.strftime("%Y-%m-%d")
+
+    # A later process-related announcement (for example, extending the
+    # shareholder-resolution validity period) must not downgrade a confirmed
+    # exchange-approved or registered milestone.  Keep the most advanced
+    # milestone, using recency only to break ties at the same stage.
+    stage_rank = {
+        "board_plan": 1,
+        "shareholder_approved": 2,
+        "accepted": 3,
+        "exchange_approved": 4,
+        "registered": 5,
+        "issuing": 6,
+    }
+    selected_rows: list[pd.Series] = []
+    for _, group in frame.groupby("stock_code", sort=False):
+        ordered = group.sort_values("_announce_timestamp", ascending=True)
+        terminal = ordered[ordered["stage"].isin({"listed", "terminated"})]
+        if not terminal.empty:
+            last_terminal_at = terminal["_announce_timestamp"].max()
+            ordered = ordered[ordered["_announce_timestamp"] > last_terminal_at]
+        if ordered.empty:
+            continue
+
+        milestones = ordered[ordered["stage"].isin(PIPELINE_STAGES)].copy()
+        if milestones.empty:
+            chosen = ordered.sort_values("_announce_timestamp", ascending=False).iloc[0]
+        else:
+            milestones["_stage_rank"] = milestones["stage"].map(stage_rank).fillna(0)
+            chosen = milestones.sort_values(
+                ["_stage_rank", "_announce_timestamp"],
+                ascending=[False, False],
+            ).iloc[0]
+        selected_rows.append(chosen)
+
+    if not selected_rows:
+        return pd.DataFrame(columns=required + ["stage", "status"])
+    selected = pd.DataFrame(selected_rows)
+    return selected[required + ["stage", "status"]].copy()
 
 
 def _cninfo_issue_records(issue: pd.DataFrame, today_text: str) -> list[dict[str, Any]]:
@@ -1434,6 +1481,7 @@ def build_convertible_bond_allotment_payload(
     include_listed_days: int = 90,
     refresh: bool = False,
     stage_scope: str = "pipeline",
+    include_expired_record_dates: bool = False,
     fetcher: TushareDataFetcher | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
@@ -1461,7 +1509,7 @@ def build_convertible_bond_allotment_payload(
         list_ts = pd.to_datetime(list_text, errors="coerce") if list_text else pd.NaT
         if stage_scope == "pipeline" and item.get("stage") not in PIPELINE_STAGES:
             continue
-        if _record_date_expired(item, today_text):
+        if not include_expired_record_dates and _record_date_expired(item, today_text):
             continue
         if item["stage"] == "delisted":
             continue
@@ -1493,6 +1541,7 @@ def build_convertible_bond_allotment_payload(
         # advance this marker; cached fallbacks and caught exceptions do not.
         **event_poll,
         "stage_scope": stage_scope,
+        "include_expired_record_dates": include_expired_record_dates,
         "records": filtered,
         "stage_counts": {str(key): int(value) for key, value in stage_counts.items()},
         "field_schema": [

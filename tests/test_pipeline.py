@@ -505,6 +505,9 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     )
     assert "--live-only" in command
     assert "start_new_session" not in kwargs
+    assert kwargs["env"]["PROJECT_FACTOR_COMPATIBILITY_MODE"] == (
+        pipeline.PROJECT_FACTOR_SCHEMA_VERSION
+    )
     assert result["status"] == "success"
 
 

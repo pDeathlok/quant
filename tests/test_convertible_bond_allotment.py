@@ -167,6 +167,14 @@ def test_convertible_bond_allotment_excludes_targeted_convertible_bond_pipeline(
                 "stage": "registered",
                 "status": "同意注册",
             },
+            {
+                "stock_code": "688230",
+                "stock_name": "并购发行股份",
+                "announcement_title": "关于发行可转换公司债券及支付现金购买资产事项获得中国证监会同意注册批复的公告",
+                "announce_date": "2026-08-08",
+                "stage": "registered",
+                "status": "同意注册",
+            },
         ]
     ).to_parquet(pipeline_path, index=False)
     monkeypatch.setattr(module, "CB_BASIC_PATH", basic_path)
@@ -178,6 +186,7 @@ def test_convertible_bond_allotment_excludes_targeted_convertible_bond_pipeline(
 
     stock_codes = {record["stock_code"] for record in payload["records"]}
     assert "600048" not in stock_codes
+    assert "688230" not in stock_codes
     assert "300001" in stock_codes
 
 
@@ -222,10 +231,17 @@ def test_convertible_bond_allotment_filters_expired_record_date(monkeypatch, tmp
     monkeypatch.setattr(module, "CB_CNINFO_ISSUE_PATH", cninfo_issue_path)
 
     payload = module.build_convertible_bond_allotment_payload(today=date(2026, 6, 18))
+    review_payload = module.build_convertible_bond_allotment_payload(
+        today=date(2026, 6, 18),
+        include_expired_record_dates=True,
+    )
 
     codes = {record["bond_code"] for record in payload["records"]}
+    review_codes = {record["bond_code"] for record in review_payload["records"]}
     assert "123999" not in codes
     assert "123998" in codes
+    assert "123999" in review_codes
+    assert review_payload["include_expired_record_dates"] is True
 
 
 def test_convertible_bond_allotment_merges_issue_dates_before_expired_filter(monkeypatch, tmp_path):

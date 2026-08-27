@@ -44,7 +44,10 @@ from quant.application.selector_ranking import (
     SelectorRankingSource,
     apply_selector_ranking_source,
 )
-from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+from quant.application.left_side_ranking import (
+    DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+    load_left_side_ranking_candidates,
+)
 from quant.application.blood_chip_long_plan import (
     BLOOD_CHIP_LONG_SCHEMA_VERSION,
     build_blood_chip_daily_iteration,
@@ -75,11 +78,24 @@ from quant.data.source_merge import normalize_ts_code
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.features.factor_registry import (
+    FACTOR_REGISTRY,
     LONG_PRODUCTION_FACTOR_COLUMNS,
     LONG_PRODUCTION_FACTOR_SCHEMA_VERSION,
 )
-from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
-from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
+from quant.features.project_factor_layer import (
+    PROJECT_FACTOR_SCHEMA_VERSION,
+    calculate_project_factor_frame,
+)
+from quant.features.selector_buy_hold_factor_contract import (
+    SELECTOR_BUY_HOLD_ARTIFACT_SCHEMA_VERSION,
+    SELECTOR_BUY_HOLD_MANIFEST_SCHEMA_VERSION,
+    SELECTOR_BUY_HOLD_RELEASE_ID,
+    validate_selector_buy_hold_artifact,
+)
+from quant.features.variable_library import (
+    PROJECT_FACTOR_COLUMNS,
+    load_daily_basic_features,
+)
 from quant.infrastructure.workspace_snapshots import (
     WorkspaceSnapshotRepository,
     canonical_snapshot_date,
@@ -106,6 +122,7 @@ from quant.research.similar_patterns import (
 )
 from quant.research.similar_patterns_validation import build_industry_regime, load_market_regime
 from quant.research.blood_chip import load_benchmark, load_canonical_daily
+from quant.research.short_side_groups import GROUP_SIDE as SHORT_GROUP_SIDE
 from quant.strategies.custom.b1_family import add_b1_family_signals
 from quant.strategies.custom.triple_volume_breakout import add_triple_volume_strategy_pool_signals
 from quant.strategies.custom.z_skill_patterns import (
@@ -131,8 +148,17 @@ EXTENDED_MODEL_SUMMARY = REPORT_DIR / "latest_z_skill_model_entry_exit_backtest.
 VEGAS_TUNNEL_REPORT_DIR = PROJECT_ROOT / "reports/vegas_tunnel"
 SELECTOR_HISTORY_SIGNAL_SAMPLES = PROJECT_ROOT / "data/research/selector_history_full/selector_signal_history_samples.parquet"
 SELECTOR_BUY_HOLD_SCORE_CALIBRATION = PROJECT_ROOT / "config/selector_buy_hold_score_calibration.json"
-SELECTOR_BUY_HOLD_MODEL_DIR = PROJECT_ROOT / "models/production/selector_buy_hold"
-SELECTOR_MODEL_HISTORY = PROJECT_ROOT / "data/research/selector_model_history_2020.parquet"
+SELECTOR_BUY_HOLD_MODEL_DIR = (
+    PROJECT_ROOT / "models/production/selector_buy_hold_registry_v3"
+)
+SELECTOR_BUY_HOLD_ROLLBACK_MODEL_DIR = (
+    PROJECT_ROOT / "models/production/selector_buy_hold"
+)
+SELECTOR_SCORE_PROBABILITY_BANDS = PROJECT_ROOT / "config/selector_score_probability_bands.json"
+SELECTOR_MODEL_HISTORY = (
+    PROJECT_ROOT
+    / "data/research/selector_buy_hold_registry_v2/selector_buy_hold_registry_dataset.parquet"
+)
 SELECTOR_DAILY_BASIC_DIR = PROJECT_ROOT / "data/raw/daily_basic"
 SELECTOR_MARKET_FEATURE_COLUMNS = (
     "selector_market_mean_1d",
@@ -4286,6 +4312,67 @@ def _read_similar_pattern_analysis_cache() -> dict[str, Any] | None:
         return None
 
 
+def refresh_similar_pattern_watchlist_scores() -> dict[str, Any]:
+    """Refresh lightweight buy/hold scores without rebuilding pattern analysis."""
+
+    profiles = _similar_pattern_watchlist_profiles(
+        _stock_basic_for_similar_patterns(),
+        include_scores=True,
+    )
+    missing = [
+        str(item.get("symbol") or "")
+        for item in profiles
+        if _safe_float(item.get("opportunity_score")) is None
+        or _safe_float(item.get("holding_score")) is None
+    ]
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = "..." if len(missing) > 8 else ""
+        raise RuntimeError(
+            "自选池买入分或持有分缺失，拒绝覆盖评分缓存: "
+            f"missing={len(missing)}/{len(profiles)} ({preview}{suffix})"
+        )
+
+    cached = _read_similar_pattern_analysis_cache() or {}
+    current_symbols = {
+        str(item.get("symbol") or "").upper()
+        for item in profiles
+        if item.get("symbol")
+    }
+    preserved_results = [
+        item
+        for item in cached.get("results") or []
+        if str(item.get("target", {}).get("symbol") or "").upper()
+        in current_symbols
+    ]
+    refreshed_at = datetime.now().isoformat(timespec="seconds")
+    score_dates = sorted(
+        {
+            str(item.get("score_date"))
+            for item in profiles
+            if item.get("score_date")
+        }
+    )
+    payload = {
+        **cached,
+        "generated_at": cached.get("generated_at") or refreshed_at,
+        "watchlist_scores_generated_at": refreshed_at,
+        "watchlist_score_dates": score_dates,
+        "watchlist": profiles,
+        "results": preserved_results,
+        "config": cached.get("config") or _similarity_score_config(),
+        "global_policy": cached.get("global_policy") or {},
+    }
+    atomic_write_json(payload, SIMILAR_PATTERN_ANALYSIS_PATH)
+    return {
+        "status": "success",
+        "watchlist_count": len(profiles),
+        "scored_count": len(profiles) - len(missing),
+        "score_dates": score_dates,
+        "analysis_results_preserved": len(preserved_results),
+    }
+
+
 def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[str, Any]]]:
     """Collect current cross-workspace hits for watchlist symbols from existing strategy payloads."""
     targets = {str(symbol).upper() for symbol in symbols}
@@ -4703,6 +4790,9 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
                 "hold_score",
                 "score_date",
                 "score_target",
+                "score_feature_source",
+                "feature_quality",
+                "model_score_available",
             )
             cached["watchlist"] = [
                 {
@@ -5263,6 +5353,7 @@ def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELE
     )
     if not (payload.get("snapshot_scope") or {}).get("strategies"):
         display_rows = _diversify_default_rows(display_rows, len(display_rows))
+    _apply_selector_score_presentation(display_rows)
     total = len(display_rows)
     display = display_rows[:limit] if limit > 0 else display_rows
     out = dict(payload)
@@ -5271,7 +5362,167 @@ def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELE
     out["complete_stock_count"] = complete_total
     out["display_limit"] = limit
     out["is_truncated"] = total > len(display)
+    out["score_presentation"] = {
+        "schema_version": "selector-score-presentation-v1",
+        "range": [0.0, 100.0],
+        "direction": "higher_is_better",
+        "rank_scope": "current_actionable_candidate_pool",
+        "rank_method": "competition_rank_descending",
+        "fields": {
+            "model": "model_score_normalized",
+            "buy": "buy_score_normalized",
+            "hold": "hold_score_normalized",
+        },
+        "targets": {
+            "model": "T+5 好路径排序（冲高且控制回撤）",
+            "buy": "T+5 最大冲高收益",
+            "hold": "T+5 收盘收益",
+        },
+    }
+    out["score_probability_bands"] = _selector_score_probability_bands()
     return out
+
+
+def _score_in_display_range(value: Any) -> float | None:
+    score = _safe_float(value, None)
+    if score is None or not 0.0 <= score <= 100.0:
+        return None
+    return round(float(score), 1)
+
+
+def _competition_ranks(
+    rows: list[dict[str, Any]],
+    *,
+    score_field: str,
+    rank_field: str,
+) -> None:
+    values = [
+        float(row[score_field])
+        for row in rows
+        if row.get(score_field) is not None
+    ]
+    ordered = sorted(values, reverse=True)
+    rank_by_score: dict[float, int] = {}
+    for index, score in enumerate(ordered, start=1):
+        rank_by_score.setdefault(score, index)
+    count = len(ordered)
+    count_field = f"{rank_field}_count"
+    for row in rows:
+        score = row.get(score_field)
+        row[rank_field] = rank_by_score.get(float(score)) if score is not None else None
+        row[count_field] = count
+
+
+def _apply_selector_score_presentation(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose one 0-100, higher-is-better display contract for all scores."""
+
+    model_source_labels = {
+        SelectorRankingSource.RIGHT_SIDE_UNIFIED.value: "右侧统一模型",
+        "left_side_unified": "左侧统一模型",
+    }
+    for row in rows:
+        ranking_source = str(row.get("ranking_source") or "")
+        model_score = None
+        if ranking_source in model_source_labels:
+            model_score = _score_in_display_range(
+                row.get("ranking_score_normalized", row.get("ranking_score_percent"))
+            )
+        row["model_score_normalized"] = model_score
+        row["buy_score_normalized"] = _score_in_display_range(
+            row.get("opportunity_score")
+        )
+        row["hold_score_normalized"] = _score_in_display_range(
+            row.get("holding_score")
+        )
+        row["model_score_source_label"] = model_source_labels.get(
+            ranking_source, "统一模型未覆盖"
+        )
+        row["score_normalization_schema_version"] = (
+            "selector-score-presentation-v1"
+        )
+
+    for prefix in ("model", "buy", "hold"):
+        _competition_ranks(
+            rows,
+            score_field=f"{prefix}_score_normalized",
+            rank_field=f"{prefix}_score_rank",
+        )
+    return rows
+
+
+def _score_probability_source_path(value: Any) -> Path:
+    path = (PROJECT_ROOT / str(value or "")).resolve()
+    try:
+        path.relative_to(PROJECT_ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError("score probability source escapes project root") from exc
+    return path
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _selector_score_probability_bands() -> dict[str, Any]:
+    """Load OOT band frequencies only when they match active artifacts."""
+
+    unavailable = {
+        "available": False,
+        "schema_version": "selector-score-probability-bands-v1",
+        "reason": "分档概率校准不可用或已过期",
+        "calibrations": [],
+    }
+    try:
+        payload = json.loads(
+            SELECTOR_SCORE_PROBABILITY_BANDS.read_text(encoding="utf-8")
+        )
+        if payload.get("schema_version") != (
+            "selector-score-probability-bands-v1"
+        ):
+            return unavailable
+        calibrations = payload.get("calibrations")
+        if not isinstance(calibrations, list) or not calibrations:
+            return unavailable
+        source_hashes: dict[Path, str] = {}
+        for calibration in calibrations:
+            if not isinstance(calibration, dict):
+                return unavailable
+            source = calibration.get("source")
+            bands = calibration.get("bands")
+            if not isinstance(source, dict) or not isinstance(bands, list):
+                return unavailable
+            for path_field, hash_field in (
+                ("artifact_path", "artifact_sha256"),
+                ("sample_path", "sample_sha256"),
+            ):
+                source_path = _score_probability_source_path(
+                    source.get(path_field)
+                )
+                if not source_path.is_file():
+                    return unavailable
+                digest = source_hashes.get(source_path)
+                if digest is None:
+                    digest = _file_sha256(source_path)
+                    source_hashes[source_path] = digest
+                if digest != str(source.get(hash_field) or ""):
+                    return unavailable
+            for band in bands:
+                probability = _safe_float((band or {}).get("probability_pct"), None)
+                sample_count = int((band or {}).get("sample_count") or 0)
+                if probability is None or not 0.0 <= probability <= 100.0:
+                    return unavailable
+                if sample_count <= 0:
+                    return unavailable
+        return {**payload, "available": True}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return unavailable
 
 
 def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> dict[str, Any]:
@@ -6504,17 +6755,38 @@ def _selector_buy_hold_models() -> dict[str, dict[str, Any]]:
         import joblib
     except ImportError:
         return {}
+    manifest_path = SELECTOR_BUY_HOLD_MODEL_DIR / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if (
+        manifest.get("status") != "success"
+        or manifest.get("schema_version")
+        != SELECTOR_BUY_HOLD_MANIFEST_SCHEMA_VERSION
+        or manifest.get("release_id") != SELECTOR_BUY_HOLD_RELEASE_ID
+    ):
+        return {}
     artifacts: dict[str, dict[str, Any]] = {}
     for mode in ("buy", "hold"):
         path = SELECTOR_BUY_HOLD_MODEL_DIR / f"{mode}.joblib"
         if not path.exists():
-            continue
+            return {}
         try:
             artifact = joblib.load(path)
+            features = validate_selector_buy_hold_artifact(artifact)
         except Exception:
-            continue
-        if isinstance(artifact, dict) and artifact.get("schema_version") == "selector_buy_hold_return_model_v1":
-            artifacts[mode] = artifact
+            return {}
+        model_manifest = (manifest.get("models") or {}).get(mode) or {}
+        if (
+            model_manifest.get("sha256") != _file_sha256(path)
+            or artifact.get("release_id") != SELECTOR_BUY_HOLD_RELEASE_ID
+            or tuple(manifest.get("model_input_columns") or ()) != features
+        ):
+            return {}
+        artifacts[mode] = artifact
+    if tuple(artifacts["buy"]["features"]) != tuple(artifacts["hold"]["features"]):
+        return {}
     return artifacts
 
 
@@ -6712,6 +6984,165 @@ def _selector_watchlist_feature_row_from_daily(
     return values
 
 
+@lru_cache(maxsize=1)
+def _selector_active_model_features() -> tuple[str, ...]:
+    artifacts = _selector_buy_hold_models()
+    if not artifacts:
+        return ()
+    return tuple(str(value) for value in artifacts["buy"]["features"])
+
+
+@lru_cache(maxsize=32)
+def _selector_production_snapshot_rows(
+    signal_date: str,
+) -> dict[str, dict[str, Any]]:
+    """Load exact-date upstream factors owned by released daily calculators."""
+
+    features = _selector_active_model_features()
+    if not features:
+        return {}
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+    source_specs = (
+        (
+            PROJECT_ROOT / "data/features/right_side_unified/latest_features.parquet",
+            frozenset({"project_daily", "right_side_rule"}),
+        ),
+        (
+            PROJECT_ROOT / "data/features/left_side_unified/latest_features.parquet",
+            frozenset({"project_daily", "left_side_rule"}),
+        ),
+        (
+            PROJECT_ROOT / "data/features/long/latest.parquet",
+            frozenset({"long_snapshot"}),
+        ),
+    )
+    target = pd.Timestamp(signal_date).normalize()
+    rows: dict[str, dict[str, Any]] = {}
+    source_names: dict[str, set[str]] = {}
+    for path, calculators in source_specs:
+        if not path.is_file():
+            continue
+        try:
+            import pyarrow.parquet as pq
+
+            available = set(pq.ParquetFile(path).schema.names)
+        except Exception:
+            continue
+        symbol_column = "symbol" if "symbol" in available else "ts_code"
+        owned = [
+            feature
+            for feature in features
+            if feature in available
+            and definitions[feature].calculator_id in calculators
+        ]
+        if not owned or "date" not in available or symbol_column not in available:
+            continue
+        try:
+            frame = pd.read_parquet(
+                path,
+                columns=[symbol_column, "date", *owned],
+                filters=[("date", "==", target)],
+            )
+        except Exception:
+            continue
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+        frame = frame.loc[frame["date"].eq(target)].drop_duplicates(
+            symbol_column, keep="last"
+        )
+        for record in frame.to_dict("records"):
+            symbol = normalize_ts_code(str(record[symbol_column]))
+            destination = rows.setdefault(symbol, {})
+            for feature in owned:
+                incoming = record.get(feature)
+                existing = destination.get(feature)
+                if pd.notna(existing) and pd.notna(incoming):
+                    left = np.float32(existing)
+                    right = np.float32(incoming)
+                    if not bool(left == right):
+                        raise RuntimeError(
+                            "selector exact-date canonical factor mismatch: "
+                            f"symbol={symbol} date={signal_date} factor={feature} "
+                            f"source={path}"
+                        )
+                if feature not in destination or pd.isna(existing):
+                    destination[feature] = incoming
+            source_names.setdefault(symbol, set()).add(
+                str(path.relative_to(PROJECT_ROOT))
+            )
+    for symbol, values in rows.items():
+        values["_selector_snapshot_sources"] = sorted(source_names[symbol])
+    return rows
+
+
+def _selector_project_feature_rows(
+    symbols: list[str],
+    signal_date: str,
+    store: MarketDataStore,
+) -> dict[str, dict[str, Any]]:
+    """Materialize canonical project factors for watchlist-only symbols."""
+
+    if not symbols:
+        return {}
+    target = pd.Timestamp(signal_date).normalize()
+    daily = store.read_market_range(
+        DAILY_DIR.name,
+        start_date=(target - pd.Timedelta(days=2600)).strftime("%Y-%m-%d"),
+        end_date=target.strftime("%Y-%m-%d"),
+        symbols=symbols,
+        columns=[
+            "ts_code",
+            "symbol",
+            "trade_date",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "volume",
+            "amount",
+        ],
+    )
+    if daily.empty:
+        return {}
+    target_keys = pd.DataFrame(
+        {
+            "ts_code": symbols,
+            "trade_date": target.strftime("%Y%m%d"),
+        }
+    )
+    daily_basic = load_daily_basic_features(
+        SELECTOR_DAILY_BASIC_DIR,
+        target_keys=target_keys,
+    )
+    result: dict[str, dict[str, Any]] = {}
+    symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
+    for raw_symbol, frame in daily.groupby(symbol_column, sort=False):
+        symbol = normalize_ts_code(str(raw_symbol))
+        symbol_basic = (
+            daily_basic[daily_basic["ts_code"].astype(str).eq(symbol)]
+            if not daily_basic.empty and "ts_code" in daily_basic
+            else pd.DataFrame()
+        )
+        factors = calculate_project_factor_frame(
+            frame,
+            symbol,
+            daily_basic_features=symbol_basic,
+            factor_schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
+        )
+        if factors.empty:
+            continue
+        exact = factors.loc[
+            pd.to_datetime(factors["date"], errors="coerce").dt.normalize().eq(target)
+        ]
+        if not exact.empty:
+            result[symbol] = exact.iloc[-1].to_dict()
+    return result
+
+
 def _selector_live_feature_rows(
     symbols: list[str],
     signal_date: str,
@@ -6719,8 +7150,31 @@ def _selector_live_feature_rows(
     """Build complete live selector factors from exact-date local inputs."""
     if not symbols:
         return {}
+    canonical_symbols = list(
+        dict.fromkeys(normalize_ts_code(str(symbol)) for symbol in symbols)
+    )
+    features = _selector_active_model_features()
+    if not features:
+        return {}
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
     target = pd.Timestamp(signal_date).normalize()
+    snapshot_rows = _selector_production_snapshot_rows(signal_date)
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+    project_features = tuple(
+        feature
+        for feature in features
+        if definitions[feature].calculator_id == "project_daily"
+    )
+    project_fallback_symbols = [
+        symbol
+        for symbol in canonical_symbols
+        if not set(project_features).issubset(snapshot_rows.get(symbol, {}))
+    ]
+    project_rows = _selector_project_feature_rows(
+        project_fallback_symbols,
+        signal_date,
+        store,
+    )
     market = store.read_market_range(
         DAILY_DIR.name,
         start_date=(target - pd.Timedelta(days=45)).strftime("%Y-%m-%d"),
@@ -6732,7 +7186,7 @@ def _selector_live_feature_rows(
         DAILY_DIR.name,
         start_date=(target - pd.Timedelta(days=130)).strftime("%Y-%m-%d"),
         end_date=target.strftime("%Y-%m-%d"),
-        symbols=symbols,
+        symbols=canonical_symbols,
         columns=[
             "ts_code",
             "symbol",
@@ -6749,7 +7203,10 @@ def _selector_live_feature_rows(
     )
     if daily.empty:
         return {}
-    turnover_rows = _selector_turnover_feature_rows(symbols, signal_date)
+    turnover_rows = _selector_turnover_feature_rows(
+        canonical_symbols,
+        signal_date,
+    )
     symbol_column = "symbol" if "symbol" in daily.columns else "ts_code"
     result: dict[str, dict[str, Any]] = {}
     for symbol, frame in daily.groupby(symbol_column, sort=False):
@@ -6763,11 +7220,26 @@ def _selector_live_feature_rows(
             continue
         feature.update(market_values)
         feature.update(turnover_rows.get(canonical_symbol, {}))
+        snapshot = snapshot_rows.get(canonical_symbol, {})
+        feature.update(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if not key.startswith("_")
+            }
+        )
+        feature.update(project_rows.get(canonical_symbol, {}))
         feature["selector_excess_return_1d"] = (
             feature.get("selector_return_1d", np.nan)
             - feature.get("selector_market_mean_1d", np.nan)
         )
-        feature["_score_feature_source"] = "live_daily+daily_basic+market_cross_section"
+        for model_feature in features:
+            feature.setdefault(model_feature, np.nan)
+        sources = ["live_daily", "daily_basic", "market_cross_section"]
+        sources.extend(snapshot.get("_selector_snapshot_sources", []))
+        if canonical_symbol in project_rows:
+            sources.append("project_daily_on_demand")
+        feature["_score_feature_source"] = "+".join(dict.fromkeys(sources))
         feature["_score_feature_date"] = signal_date
         result[canonical_symbol] = feature
     return result
@@ -6918,12 +7390,25 @@ def _apply_return_model_scores(
             continue
         raw_frame = pd.DataFrame(feature_rows)
         missing_columns = [feature for feature in features if feature not in raw_frame.columns]
-        frame = raw_frame.reindex(columns=features).replace([np.inf, -np.inf], np.nan)
-        all_nan_features = [feature for feature in features if frame[feature].isna().all()]
+        frame = (
+            raw_frame.reindex(columns=features)
+            .apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .astype(np.float32)
+        )
+        native_missing = (
+            artifact.get("preprocessing") == "xgboost_native_nan_float32_v1"
+        )
+        all_nan_features = (
+            []
+            if native_missing
+            else [feature for feature in features if frame[feature].isna().all()]
+        )
         if missing_columns or all_nan_features:
             error = (
                 "incomplete_model_features: "
-                f"missing_columns={missing_columns}; all_nan_features={all_nan_features}"
+                f"missing_columns={missing_columns}; "
+                f"all_nan_features={all_nan_features}"
             )
             for index in indexes:
                 source = feature_rows_by_symbol.get(str(rows[index].get("symbol") or ""), {})
@@ -6940,7 +7425,21 @@ def _apply_return_model_scores(
                 rows[index]["score_feature_source"] = source_name
                 rows[index]["score_date"] = str(rows[index].get("date") or "") or None
             continue
-        invalid_positions = frame.isna().any(axis=1)
+        # The released XGBoost contract intentionally uses native missing-value
+        # routing: rule factors from the other strategy side are structurally
+        # absent, not silently imputed.  Still require the shared project,
+        # selector and long layers to provide a meaningful minimum footprint.
+        minimum_non_null = (
+            max(1, int(np.ceil(len(features) * 0.45)))
+            if native_missing
+            else len(features)
+        )
+        non_null_counts = frame.notna().sum(axis=1)
+        invalid_positions = (
+            non_null_counts.lt(minimum_non_null)
+            if native_missing
+            else frame.isna().any(axis=1)
+        )
         if invalid_positions.any():
             valid_positions: list[int] = []
             for position, invalid in enumerate(invalid_positions.tolist()):
@@ -6955,16 +7454,21 @@ def _apply_return_model_scores(
                 source_name = str(
                     source.get("_score_feature_source") or "model_history"
                 )
-                missing_features = frame.columns[
-                    frame.iloc[position].isna()
-                ].tolist()
                 rows[index]["feature_quality"] = {
                     "status": "failed",
-                    "error": "incomplete_row_features",
+                    "error": (
+                        "insufficient_non_null_model_features"
+                        if native_missing
+                        else "incomplete_row_features"
+                    ),
                     "source": source_name,
                     "date": str(rows[index].get("date") or "") or None,
                     "required_feature_count": len(features),
-                    "missing_features": missing_features,
+                    "available_feature_count": int(non_null_counts.iloc[position]),
+                    "minimum_available_feature_count": minimum_non_null,
+                    "missing_features": frame.columns[
+                        frame.iloc[position].isna()
+                    ].tolist(),
                 }
                 rows[index]["score_feature_source"] = source_name
                 rows[index]["score_date"] = str(rows[index].get("date") or "") or None
@@ -6973,7 +7477,8 @@ def _apply_return_model_scores(
             indexes = [indexes[position] for position in valid_positions]
             frame = frame.iloc[valid_positions].reset_index(drop=True)
         try:
-            transformed = artifact["imputer"].transform(frame)
+            imputer = artifact.get("imputer")
+            transformed = imputer.transform(frame) if imputer is not None else frame
             if "models" in artifact:
                 component_scores: dict[str, np.ndarray] = {}
                 for component, model in artifact["models"].items():
@@ -7005,7 +7510,7 @@ def _apply_return_model_scores(
                 }
             continue
         historical_name = "historical_buy_score" if mode == "buy" else "historical_hold_score"
-        for index, score in zip(indexes, scores):
+        for position, (index, score) in enumerate(zip(indexes, scores)):
             rows[index][historical_name] = round(float(np.clip(score, 0.0, 100.0)), 1)
             rows[index][f"{mode}_score_source"] = "historical_return_model"
             source = feature_rows_by_symbol.get(str(rows[index].get("symbol") or ""), {})
@@ -7026,6 +7531,8 @@ def _apply_return_model_scores(
                 "source": source_name,
                 "date": rows[index]["score_date"],
                 "required_feature_count": len(features),
+                "available_feature_count": int(frame.iloc[position].notna().sum()),
+                "minimum_available_feature_count": minimum_non_null,
             }
 
 
@@ -7255,6 +7762,9 @@ def build_selector_stock_row(
         "matched_count": len(groups),
         "matched_families": group_labels,
         "matched_groups": groups,
+        "matched_group_sides": {
+            group: SHORT_GROUP_SIDE.get(group, "unknown") for group in groups
+        },
         "matched_strategy_names": [signal.get("strategy_name") for signal in ordered_signals],
         "best_profit_factor": best_pf,
         "best_avg_return_pct": best_avg if best_avg > -999 else None,
@@ -7601,6 +8111,92 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
     return signal_rows
 
 
+def _left_side_ranked_signal(strategy_group: str) -> dict[str, Any]:
+    label = STRATEGY_GROUP_LABELS.get(strategy_group, strategy_group)
+    return _enrich_signal_group(
+        {
+            "strategy_key": strategy_group,
+            "strategy_family": strategy_group,
+            "strategy_group": strategy_group,
+            "strategy_name": label,
+            "operation_key": f"{strategy_group}_UNIFIED_RANK",
+            "timeframe": "日线级，收盘后生成候选，T+1 开盘观察",
+            "logic": f"命中{label}原始策略候选，由左侧统一模型进行横截面排序。",
+            "reason": "已进入当日左侧统一排序候选池。",
+            "buy_plan": "T+1 开盘观察，按统一排序与策略既有风控执行。",
+            "sell_plan": "按该策略既有退出规则执行。",
+            "metrics": None,
+            "metrics_text": "",
+            "action_level": "观察",
+            "playbook_source": "左侧统一排序",
+            "strength_score": 0.0,
+        }
+    )
+
+
+def _materialize_left_side_ranked_candidates(
+    stocks: dict[str, dict[str, Any]],
+    candidates: pd.DataFrame,
+    latest_profiles: pd.DataFrame,
+    signal_date: str | None,
+) -> None:
+    family_profiles = _family_profiles_for_date(signal_date)
+    for _, candidate in candidates.iterrows():
+        symbol = str(candidate.get("symbol") or "")
+        if not symbol:
+            raise RuntimeError("left-side ranked candidate has no symbol")
+        if symbol not in stocks:
+            family_profile = family_profiles.get(symbol) or {}
+            market_profile = (
+                latest_profiles.loc[symbol]
+                if symbol in latest_profiles.index
+                else {}
+            )
+            stocks[symbol] = {
+                "symbol": symbol,
+                "name": family_profile.get("name")
+                or (
+                    market_profile.get("name", "")
+                    if hasattr(market_profile, "get")
+                    else ""
+                ),
+                "date": family_profile.get("date")
+                or (
+                    market_profile.get("date").strftime("%Y-%m-%d")
+                    if hasattr(market_profile, "get")
+                    and pd.notna(market_profile.get("date"))
+                    else signal_date
+                ),
+                "close": family_profile.get("close")
+                if family_profile
+                else (
+                    float(market_profile.get("close"))
+                    if hasattr(market_profile, "get")
+                    and pd.notna(market_profile.get("close"))
+                    else None
+                ),
+                "industry": family_profile.get("industry")
+                or (
+                    market_profile.get("industry", "")
+                    if hasattr(market_profile, "get")
+                    else ""
+                ),
+                "signals": [],
+            }
+            _fill_stock_profile(stocks[symbol], signal_date)
+
+        existing_groups = {
+            _signal_group_key(signal)
+            for signal in stocks[symbol].get("signals") or []
+        }
+        for strategy_group in DEFAULT_LEFT_SIDE_RANKING_CONFIG.strategy_keys:
+            if bool(candidate.get(strategy_group, False)) and strategy_group not in existing_groups:
+                stocks[symbol]["signals"].append(
+                    _left_side_ranked_signal(strategy_group)
+                )
+                existing_groups.add(strategy_group)
+
+
 def _latest_family_signals() -> dict[str, list[dict[str, Any]]]:
     return _family_signals_for_date(None)
 
@@ -7929,6 +8525,71 @@ def _refresh_long_workspace(
             "simulated_positions": len(blood_chip.get("simulated_positions") or []),
         },
     }
+
+
+def _ensure_selector_long_factor_snapshot(
+    signal_date: str,
+    *,
+    force_refresh: bool,
+) -> dict[str, Any]:
+    """Publish the exact-date long-factor slice before selector v3 scoring.
+
+    The selector consumes a subset of the governed long-page PIT factors.  A
+    short-only routine therefore needs the factor slice even though it does
+    not build or publish the long-page strategy pools.
+    """
+
+    active_features = _selector_active_model_features()
+    definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+    needs_long_snapshot = any(
+        definitions[feature].calculator_id == "long_snapshot"
+        for feature in active_features
+    )
+    if not needs_long_snapshot:
+        return {
+            "status": "skipped",
+            "reason": "active_selector_model_has_no_long_snapshot_features",
+            "signal_date": signal_date,
+            "checkpoint_reused": True,
+        }
+
+    manifest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.json"
+    latest_path = LONG_FACTOR_SNAPSHOT_DIR / "latest.parquet"
+    current: dict[str, Any] = {}
+    try:
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        current = {}
+    current_is_valid = bool(
+        latest_path.is_file()
+        and current.get("status") == "success"
+        and current.get("signal_date") == signal_date
+        and current.get("coverage_status") == "complete"
+        and current.get("factor_schema_version")
+        == LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION
+        and int(current.get("factor_count") or 0)
+        == len(LONG_PRODUCTION_FACTOR_COLUMNS)
+    )
+    if current_is_valid and not force_refresh:
+        return {**current, "checkpoint_reused": True}
+
+    # Clear once after shared inputs are refreshed.  The later all-scope long
+    # workspace reuses this same tea payload rather than recalculating it.
+    _build_tea_master_stock_pool_cached.cache_clear()
+    payload = _build_tea_master_stock_pool_cached("tea", signal_date)
+    snapshot = dict(payload.get("factor_snapshot") or {})
+    if (
+        snapshot.get("status") != "success"
+        or snapshot.get("signal_date") != signal_date
+        or snapshot.get("coverage_status") != "complete"
+        or int(snapshot.get("factor_count") or 0)
+        != len(LONG_PRODUCTION_FACTOR_COLUMNS)
+    ):
+        raise RuntimeError(
+            "selector 长线因子截面发布失败: "
+            f"expected={signal_date} actual={snapshot}"
+        )
+    return {**snapshot, "checkpoint_reused": False}
 
 
 def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -9366,6 +10027,20 @@ def _run_latest_refresh_job(
                             percent=72,
                             complete_previous=False,
                         )
+        _set_refresh_progress(
+            step_key="selector_core",
+            message="正在准备选股模型所需的当日长线因子截面",
+            percent=79,
+            complete_previous=False,
+        )
+        selector_long_snapshot = _ensure_selector_long_factor_snapshot(
+            expected_signal_date,
+            force_refresh="feature.long_snapshot" in planned_refresh_nodes,
+        )
+        results["selector_long_factor_snapshot"] = selector_long_snapshot
+        selector_long_snapshot_rebuilt = not bool(
+            selector_long_snapshot.get("checkpoint_reused")
+        )
         _clear_selector_caches()
 
         _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
@@ -9434,7 +10109,8 @@ def _run_latest_refresh_job(
                 _persist_refresh_status_unlocked()
             return
 
-        _build_tea_master_stock_pool_cached.cache_clear()
+        if not selector_long_snapshot_rebuilt:
+            _build_tea_master_stock_pool_cached.cache_clear()
         _build_long_stock_pool_cached.cache_clear()
         long_variants = ["tea", "tea_safe", "v44"]
         signal_date = full_payload.get("signal_date")
@@ -9813,6 +10489,18 @@ def get_stock_selector_payload(
             _fill_stock_profile(stocks[symbol], effective_signal_date)
         stocks[symbol]["signals"].append(_model_filtered_signal_payload(signal_key, model_score))
 
+    if DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled:
+        left_candidates, _ = load_left_side_ranking_candidates(
+            effective_signal_date,
+            config=DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+        )
+        _materialize_left_side_ranked_candidates(
+            stocks,
+            left_candidates,
+            latest,
+            effective_signal_date,
+        )
+
     selected = {item.upper() for item in strategies or [] if item}
     selected_members = _strategy_filter_members(strategies)
     selected_groups = _strategy_filter_groups(strategies)
@@ -9859,7 +10547,13 @@ def get_stock_selector_payload(
         "execution_date": plan.get("execution_date"),
         "ranking_source": DEFAULT_SELECTOR_RANKING_CONFIG.source.value,
         "available_strategies": [
-            {"key": item["key"], "label": item["label"], "status": item["status"], "members": item["members"]}
+            {
+                "key": item["key"],
+                "label": item["label"],
+                "status": item["status"],
+                "members": item["members"],
+                "side": SHORT_GROUP_SIDE.get(item["key"], "unknown"),
+            }
             for item in STRATEGY_GROUPS
         ],
         "stocks": rows,

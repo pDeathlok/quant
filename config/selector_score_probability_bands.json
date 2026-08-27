@@ -1,0 +1,100 @@
+{
+  "schema_version": "selector-score-probability-bands-v1",
+  "generated_at": "2026-08-27T13:50:00+08:00",
+  "method": "strict_out_of_sample_observed_frequency_by_display_score_band",
+  "score_range": [0.0, 100.0],
+  "bands": [
+    {"label": "0-40", "min_score": 0.0, "max_score": 40.0},
+    {"label": "40-50", "min_score": 40.0, "max_score": 50.0},
+    {"label": "50-60", "min_score": 50.0, "max_score": 60.0},
+    {"label": "60-70", "min_score": 60.0, "max_score": 70.0},
+    {"label": "70-100", "min_score": 70.0, "max_score": 100.0}
+  ],
+  "calibrations": [
+    {
+      "key": "model_right",
+      "label": "右侧模型分",
+      "target_label": "T+5 好路径概率",
+      "target_definition": "次日收盘买入后，未来 5 个交易日达到 +5% 冲高且未先触发 -3% 回撤",
+      "normalization": "frozen_oot_b_quantile_cdf_v1",
+      "evaluation_scope": "Fold B 样本外，next_close，horizon=5",
+      "source": {
+        "artifact_path": "models/production/right_side_unified_canonical_v2/ranking.joblib",
+        "artifact_sha256": "6168648ea8a3c3a44f5f4624604ac44f49bf13510e923737faf18750cd46c50e",
+        "sample_path": "reports/research/right_side_unified_canonical_v5_rule113/test_predictions.parquet",
+        "sample_sha256": "0171ea1d52bdd57c9f2b15618eb7a84b66c6c47098e402da322468851970d98d"
+      },
+      "bands": [
+        {"label": "0-40", "sample_count": 137098, "event_count": 28428, "probability_pct": 20.74},
+        {"label": "40-50", "sample_count": 34274, "event_count": 9157, "probability_pct": 26.72},
+        {"label": "50-60", "sample_count": 34274, "event_count": 9349, "probability_pct": 27.28},
+        {"label": "60-70", "sample_count": 34275, "event_count": 9806, "probability_pct": 28.61},
+        {"label": "70-100", "sample_count": 102824, "event_count": 31817, "probability_pct": 30.94}
+      ]
+    },
+    {
+      "key": "model_left",
+      "label": "左侧模型分",
+      "target_label": "T+5 好路径概率",
+      "target_definition": "次日收盘买入后，未来 5 个交易日达到 +5% 冲高且未先触发 -3% 回撤",
+      "normalization": "daily_cross_section_percentile_v1",
+      "evaluation_scope": "Fold C 样本外，next_close，horizon=5",
+      "source": {
+        "artifact_path": "models/production/left_side_unified_canonical_v4_group4/ranking.joblib",
+        "artifact_sha256": "b6e539f240fb42053bed7a0b7a392a1358d7abfd01a19995bbcf48571a8153f7",
+        "sample_path": "reports/research/left_side_unified_v3_group4_input_parity/test_predictions.parquet",
+        "sample_sha256": "c754864d3d076470872fc92f849543d5a0951e5af4905702411bb89df1b1ff35"
+      },
+      "bands": [
+        {"label": "0-40", "sample_count": 30455, "event_count": 5703, "probability_pct": 18.73},
+        {"label": "40-50", "sample_count": 7609, "event_count": 1803, "probability_pct": 23.70},
+        {"label": "50-60", "sample_count": 7654, "event_count": 1866, "probability_pct": 24.38},
+        {"label": "60-70", "sample_count": 7649, "event_count": 1915, "probability_pct": 25.04},
+        {"label": "70-100", "sample_count": 22986, "event_count": 5831, "probability_pct": 25.37}
+      ]
+    },
+    {
+      "key": "buy",
+      "label": "买入分",
+      "target_label": "T+5 冲高 ≥ 5% 概率",
+      "target_definition": "次日收盘买入后，未来 5 个交易日最高价相对买入价涨幅达到 5%",
+      "normalization": "fixed_robust_historical_transform_v1",
+      "evaluation_scope": "Fold C：2026-01-05 至 2026-08-14 严格样本外",
+      "source": {
+        "artifact_path": "models/production/selector_buy_hold_registry_v3/buy.joblib",
+        "artifact_sha256": "0aec605c34bf4094d898d80982746c24067266d327620485b3a3de716a63aa36",
+        "sample_path": "data/research/selector_buy_hold_registry_v2/selector_buy_hold_registry_dataset.parquet",
+        "sample_sha256": "89aea5f726756a05beb49ee2fa721851401c67cd410572f8ae34c12521f2a41b"
+      },
+      "bands": [
+        {"label": "0-40", "sample_count": 43, "event_count": 2, "probability_pct": 4.65},
+        {"label": "40-50", "sample_count": 26477, "event_count": 6862, "probability_pct": 25.92},
+        {"label": "50-60", "sample_count": 37418, "event_count": 17069, "probability_pct": 45.62},
+        {"label": "60-70", "sample_count": 6849, "event_count": 4066, "probability_pct": 59.37},
+        {"label": "70-100", "sample_count": 544, "event_count": 335, "probability_pct": 61.58}
+      ]
+    },
+    {
+      "key": "hold",
+      "label": "持有分",
+      "target_label": "T+5 正收益概率",
+      "target_definition": "次日收盘买入后，第 5 个交易日收盘收益大于 0",
+      "normalization": "fixed_robust_historical_transform_v1",
+      "evaluation_scope": "Fold C：2026-01-05 至 2026-08-14 严格样本外",
+      "source": {
+        "artifact_path": "models/production/selector_buy_hold_registry_v3/hold.joblib",
+        "artifact_sha256": "cb7d9bbb764777ce831383bd33a53ca55e005d08df45675e5ef6ec66f5f3139c",
+        "sample_path": "data/research/selector_buy_hold_registry_v2/selector_buy_hold_registry_dataset.parquet",
+        "sample_sha256": "89aea5f726756a05beb49ee2fa721851401c67cd410572f8ae34c12521f2a41b"
+      },
+      "bands": [
+        {"label": "0-40", "sample_count": 6800, "event_count": 2551, "probability_pct": 37.51},
+        {"label": "40-50", "sample_count": 34130, "event_count": 14307, "probability_pct": 41.92},
+        {"label": "50-60", "sample_count": 27135, "event_count": 12296, "probability_pct": 45.31},
+        {"label": "60-70", "sample_count": 2543, "event_count": 1345, "probability_pct": 52.89},
+        {"label": "70-100", "sample_count": 723, "event_count": 341, "probability_pct": 47.16}
+      ]
+    }
+  ],
+  "disclaimer": "概率为严格样本外历史分档频率，只说明同分档历史表现，不是对单只股票的收益承诺。"
+}

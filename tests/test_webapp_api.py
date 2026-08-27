@@ -21,6 +21,131 @@ from quant.webapp import api as webapp_api
 client = TestClient(app)
 
 
+def test_selector_score_presentation_normalizes_and_ranks_all_three_scores() -> None:
+    rows = [
+        {
+            "symbol": "000001.SZ",
+            "ranking_source": "right_side_unified",
+            "ranking_score_normalized": 80.0,
+            "opportunity_score": 40.0,
+            "holding_score": 60.0,
+        },
+        {
+            "symbol": "000002.SZ",
+            "ranking_source": "left_side_unified",
+            "ranking_score_normalized": 70.0,
+            "opportunity_score": 80.0,
+            "holding_score": 60.0,
+        },
+        {
+            "symbol": "000003.SZ",
+            "ranking_source": "unified_ranker_not_applicable",
+            "opportunity_score": 50.0,
+            "holding_score": 20.0,
+        },
+    ]
+
+    result = services._apply_selector_score_presentation(rows)
+
+    assert result[0]["model_score_normalized"] == 80.0
+    assert result[0]["model_score_rank"] == 1
+    assert result[0]["model_score_rank_count"] == 2
+    assert result[1]["model_score_rank"] == 2
+    assert result[2]["model_score_normalized"] is None
+    assert result[2]["model_score_rank"] is None
+    assert [row["buy_score_rank"] for row in result] == [3, 1, 2]
+    assert [row["hold_score_rank"] for row in result] == [1, 1, 3]
+    assert all(row["buy_score_rank_count"] == 3 for row in result)
+    assert all(row["hold_score_rank_count"] == 3 for row in result)
+    assert result[0]["model_score_source_label"] == "右侧统一模型"
+    assert result[1]["model_score_source_label"] == "左侧统一模型"
+    assert result[0]["score_normalization_schema_version"] == (
+        "selector-score-presentation-v1"
+    )
+
+
+def test_selector_score_probability_bands_match_active_artifacts() -> None:
+    services._selector_score_probability_bands.cache_clear()
+
+    payload = services._selector_score_probability_bands()
+
+    assert payload["available"] is True
+    assert payload["schema_version"] == "selector-score-probability-bands-v1"
+    assert {item["key"] for item in payload["calibrations"]} == {
+        "model_right",
+        "model_left",
+        "buy",
+        "hold",
+    }
+    assert all(
+        len(item["bands"]) == 5 for item in payload["calibrations"]
+    )
+
+
+def test_materialize_left_side_ranked_candidates_adds_missing_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(services, "_family_profiles_for_date", lambda *args: {})
+    monkeypatch.setattr(services, "_fill_stock_profile", lambda stock, *args: stock)
+    stocks = {
+        "000001.SZ": {
+            "symbol": "000001.SZ",
+            "signals": [
+                services._enrich_signal_group(
+                    {
+                        "strategy_key": "B1_MODEL",
+                        "strategy_family": "B1",
+                    }
+                )
+            ],
+        }
+    }
+    candidates = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "B1": True,
+                "SB1": False,
+                "SUPER_B1": False,
+                "LOW_PULLBACK": False,
+            },
+            {
+                "symbol": "000002.SZ",
+                "B1": False,
+                "SB1": False,
+                "SUPER_B1": True,
+                "LOW_PULLBACK": True,
+            },
+        ]
+    )
+    latest = pd.DataFrame(
+        [
+            {
+                "symbol": "000002.SZ",
+                "date": pd.Timestamp("2026-08-26"),
+                "name": "测试股票",
+                "industry": "测试行业",
+                "close": 12.34,
+            }
+        ]
+    ).set_index("symbol")
+
+    services._materialize_left_side_ranked_candidates(
+        stocks,
+        candidates,
+        latest,
+        "2026-08-26",
+    )
+
+    assert len(stocks["000001.SZ"]["signals"]) == 1
+    assert {
+        signal["strategy_group"]
+        for signal in stocks["000002.SZ"]["signals"]
+    } == {"SUPER_B1", "LOW_PULLBACK"}
+    assert stocks["000002.SZ"]["name"] == "测试股票"
+    assert stocks["000002.SZ"]["close"] == 12.34
+
+
 def test_operation_plan_crud_persists_tomorrow_and_long_term(monkeypatch, tmp_path) -> None:
     plan_path = tmp_path / "operation_plans.json"
     monkeypatch.setattr(services, "OPERATION_PLANS_PATH", plan_path)
@@ -2016,6 +2141,61 @@ def test_long_factor_snapshot_rejects_incomplete_production_contract(tmp_path) -
         services._publish_long_factor_snapshot(frame, pd.Timestamp("2026-07-30"))
 
 
+def test_selector_long_factor_snapshot_reuses_current_and_refreshes_when_planned(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    snapshot_dir = tmp_path / "long"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "latest.parquet").touch()
+    manifest = {
+        "status": "success",
+        "signal_date": "2026-07-30",
+        "coverage_status": "complete",
+        "factor_schema_version": services.LONG_FACTOR_SNAPSHOT_SCHEMA_VERSION,
+        "factor_count": len(services.LONG_PRODUCTION_FACTOR_COLUMNS),
+    }
+    (snapshot_dir / "latest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    class FakeTeaBuilder:
+        calls = 0
+        clears = 0
+
+        def cache_clear(self):
+            self.clears += 1
+
+        def __call__(self, variant, signal_date):
+            self.calls += 1
+            return {
+                "factor_snapshot": {
+                    **manifest,
+                    "signal_date": signal_date,
+                }
+            }
+
+    builder = FakeTeaBuilder()
+    monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", snapshot_dir)
+    monkeypatch.setattr(services, "_selector_active_model_features", lambda: ("roe",))
+    monkeypatch.setattr(services, "_build_tea_master_stock_pool_cached", builder)
+
+    reused = services._ensure_selector_long_factor_snapshot(
+        "2026-07-30",
+        force_refresh=False,
+    )
+    refreshed = services._ensure_selector_long_factor_snapshot(
+        "2026-07-30",
+        force_refresh=True,
+    )
+
+    assert reused["checkpoint_reused"] is True
+    assert refreshed["checkpoint_reused"] is False
+    assert builder.clears == 1
+    assert builder.calls == 1
+
+
 def test_long_refresh_publishes_factor_result_before_page_snapshot(monkeypatch) -> None:
     order = []
     factor_snapshot = {
@@ -3838,6 +4018,103 @@ def test_similar_pattern_cache_filters_results_removed_from_watchlist(monkeypatc
     assert payload["watchlist"][0]["opportunity_score"] == 73.2
     assert payload["watchlist"][0]["holding_score"] == 61.8
     assert payload["cache"]["watchlist_changed"] is True
+
+
+def test_refresh_watchlist_scores_updates_all_profiles_without_rebuilding_analysis(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    analysis_path = tmp_path / "analysis.json"
+    analysis_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-08-26T17:46:19",
+                "watchlist": [
+                    {
+                        "symbol": "002594.SZ",
+                        "opportunity_score": 70.0,
+                        "holding_score": 60.0,
+                    }
+                ],
+                "results": [
+                    {"target": {"symbol": "002594.SZ"}},
+                    {"target": {"symbol": "000792.SZ"}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_ANALYSIS_PATH", analysis_path)
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        services,
+        "_similar_pattern_watchlist_profiles",
+        lambda basic=None, include_scores=True: [
+            {
+                "symbol": "002594.SZ",
+                "opportunity_score": 73.2,
+                "holding_score": 61.8,
+                "score_date": "2026-08-27",
+            },
+            {
+                "symbol": "600368.SH",
+                "opportunity_score": 66.4,
+                "holding_score": 58.1,
+                "score_date": "2026-08-27",
+            },
+        ],
+    )
+
+    result = services.refresh_similar_pattern_watchlist_scores()
+
+    saved = json.loads(analysis_path.read_text(encoding="utf-8"))
+    assert result == {
+        "status": "success",
+        "watchlist_count": 2,
+        "scored_count": 2,
+        "score_dates": ["2026-08-27"],
+        "analysis_results_preserved": 1,
+    }
+    assert saved["generated_at"] == "2026-08-26T17:46:19"
+    assert [item["symbol"] for item in saved["watchlist"]] == [
+        "002594.SZ",
+        "600368.SH",
+    ]
+    assert [item["target"]["symbol"] for item in saved["results"]] == [
+        "002594.SZ"
+    ]
+    assert saved["watchlist_scores_generated_at"]
+
+
+def test_refresh_watchlist_scores_rejects_partial_score_output(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    analysis_path = tmp_path / "analysis.json"
+    original = '{"generated_at":"2026-08-26T17:46:19","watchlist":[],"results":[]}'
+    analysis_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_ANALYSIS_PATH", analysis_path)
+    monkeypatch.setattr(
+        services,
+        "_stock_basic_for_similar_patterns",
+        lambda: pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        services,
+        "_similar_pattern_watchlist_profiles",
+        lambda basic=None, include_scores=True: [
+            {"symbol": "600368.SH", "score_date": "2026-08-27"}
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="买入分或持有分缺失"):
+        services.refresh_similar_pattern_watchlist_scores()
+
+    assert analysis_path.read_text(encoding="utf-8") == original
 
 
 def test_vector_cache_builder_uses_thread_pool_in_daemon_process(monkeypatch, tmp_path) -> None:

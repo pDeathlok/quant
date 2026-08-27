@@ -14,6 +14,12 @@ if str(RESEARCH_SCRIPTS) not in sys.path:
 import refresh_b1_feature_cache as b1_refresh  # noqa: E402
 import train_b1_tushare_models as b1_training  # noqa: E402
 from quant.ml.feature_coverage import RequiredFeatureCoverageError  # noqa: E402
+from quant.application.left_side_ranking import (  # noqa: E402
+    DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+)
+from quant.features.canonical_factor_names import (  # noqa: E402
+    FORBIDDEN_COMPATIBILITY_ALIASES,
+)
 from train_b1_tushare_models import (  # noqa: E402
     B1_LONG_WEEKLY_AVAILABLE,
     B1_LONG_WEEKLY_DATE,
@@ -74,6 +80,14 @@ def test_b1_refresh_reports_latest_required_feature_coverage() -> None:
     assert report["status"] == "valid"
     assert report["target_date"] == "2026-08-12"
     assert report["coverage"] == {"weekly_ma233": 0.5}
+
+
+def test_b1_refresh_uses_active_unified_left_project_factor_contract() -> None:
+    required, release_id = b1_refresh._released_b1_required_features()
+
+    assert required == list(b1_refresh.PROJECT_FACTOR_COLUMNS)
+    assert release_id == DEFAULT_LEFT_SIDE_RANKING_CONFIG.release_id
+    assert set(required).isdisjoint(FORBIDDEN_COMPATIBILITY_ALIASES)
 
 
 def test_b1_refresh_rejects_latest_all_null_required_feature() -> None:

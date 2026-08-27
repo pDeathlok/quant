@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -132,8 +132,15 @@
                     <th>收盘</th>
                     <th>命中</th>
                     <th>策略</th>
-                    <th>买入分</th>
-                    <th>持有分</th>
+                    <th data-short-sort-column="model_score_normalized">
+                      <button class="table-sort-button" type="button" data-short-score-sort="model_score_normalized">模型分 <span aria-hidden="true">↕</span></button>
+                    </th>
+                    <th data-short-sort-column="buy_score_normalized">
+                      <button class="table-sort-button" type="button" data-short-score-sort="buy_score_normalized">买入分 <span aria-hidden="true">↕</span></button>
+                    </th>
+                    <th data-short-sort-column="hold_score_normalized">
+                      <button class="table-sort-button" type="button" data-short-score-sort="hold_score_normalized">持有分 <span aria-hidden="true">↕</span></button>
+                    </th>
                     <th>历史均值</th>
                     <th>PF</th>
                     <th>日期</th>
@@ -162,6 +169,18 @@
             <span>口径说明</span>
           </div>
           <ul id="notes" class="notes"></ul>
+        </section>
+
+        <section class="panel score-probability-panel" aria-labelledby="scoreProbabilityTitle">
+          <div class="panel-head">
+            <div>
+              <h3 id="scoreProbabilityTitle">分数分档对应概率</h3>
+              <span id="scoreProbabilityMeta">严格样本外历史频率</span>
+            </div>
+          </div>
+          <div id="scoreProbabilityBands" class="score-probability-grid">
+            <div class="empty-state">等待加载分档概率</div>
+          </div>
         </section>
       </main>
 
@@ -1151,6 +1170,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1"></script>
   </body>
 </html>

@@ -20,6 +20,7 @@ from quant.application.workspace_refresh import (
     refresh_daily_workspaces,
 )
 from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
 from quant.application.selector_ranking import (
     DEFAULT_SELECTOR_RANKING_CONFIG,
     SelectorRankingSource,
@@ -654,9 +655,19 @@ def build_features(
 ) -> dict:
     started = time.monotonic()
     start_date = incremental_start_date or _incremental_feature_start()
+    two_unified_rankers_active = (
+        DEFAULT_SELECTOR_RANKING_CONFIG.source
+        == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+        and DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled
+    )
+    default_factor_schema = (
+        PROJECT_FACTOR_SCHEMA_VERSION
+        if two_unified_rankers_active
+        else LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
+    )
     production_factor_mode = os.getenv(
         "ROUTINE_PRODUCTION_FACTOR_SCHEMA",
-        LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION,
+        default_factor_schema,
     )
     production_factor_schema = resolve_project_factor_schema(production_factor_mode)
     command = [

@@ -74,6 +74,7 @@ const state = {
   operationPlansLoading: false,
   operationPlansLoaded: false,
   operationPlanFilter: "active",
+  shortSort: { key: "model_score_normalized", direction: "desc" },
 };
 
 const API_BASE = "/api";
@@ -106,6 +107,32 @@ const REFRESH_SCOPE_LABELS = {
   similar: "自选池",
   plans: "操作计划",
 };
+const SHORT_STRATEGY_SIDE_BY_GROUP = Object.freeze({
+  B1: "left",
+  SB1: "left",
+  SUPER_B1: "left",
+  LOW_PULLBACK: "left",
+  B2: "right",
+  B3: "right",
+  STRONG_K: "right",
+  DOUBLE_YANG: "right",
+  CHANGAN: "right",
+  KENGQI: "right",
+  VEGAS: "right",
+  TRIPLE_VOLUME_BREAKOUT: "right",
+  SUPPORT_PULLBACK: "mixed",
+  RHYTHM_PLATFORM: "mixed",
+});
+const SHORT_STRATEGY_SIDE_META = Object.freeze({
+  left: { badge: "左", label: "左侧策略" },
+  right: { badge: "右", label: "右侧策略" },
+  mixed: { badge: "混", label: "混合策略（归右侧统一模型）" },
+});
+const SHORT_SCORE_SORT_FIELDS = new Set([
+  "model_score_normalized",
+  "buy_score_normalized",
+  "hold_score_normalized",
+]);
 const REFRESH_BUTTON_LABELS = {
   refreshAllButton: "更新全部",
   refreshLatestButton: "更新本页",
@@ -824,9 +851,11 @@ function runDirectWorkspaceRefresh(key, operation) {
 function renderShortPage() {
   renderHeader();
   renderStrategyFilters();
+  renderShortScoreSortHeaders();
   renderStockRows();
   renderStockDetail();
   renderNotes();
+  renderScoreProbabilityBands();
   renderCalendar();
   renderDateStatus();
 }
@@ -2137,17 +2166,82 @@ function monthLabel(month) {
 function filteredStocks() {
   const rows = state.payload?.stocks || [];
   const q = state.query.trim().toLowerCase();
-  if (!q) return rows;
-  return rows.filter((item) => (
+  const filtered = q ? rows.filter((item) => (
     item.symbol.toLowerCase().includes(q)
     || (item.name || "").toLowerCase().includes(q)
     || (item.industry || "").toLowerCase().includes(q)
     || item.matched_families.join(",").toLowerCase().includes(q)
-  ));
+  )) : [...rows];
+  const sortKey = SHORT_SCORE_SORT_FIELDS.has(state.shortSort?.key)
+    ? state.shortSort.key
+    : "model_score_normalized";
+  const direction = state.shortSort?.direction === "asc" ? 1 : -1;
+  return filtered.sort((left, right) => {
+    const leftValue = Number(left?.[sortKey]);
+    const rightValue = Number(right?.[sortKey]);
+    const leftMissing = left?.[sortKey] == null || !Number.isFinite(leftValue);
+    const rightMissing = right?.[sortKey] == null || !Number.isFinite(rightValue);
+    if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+    if (!leftMissing && leftValue !== rightValue) return direction * (leftValue - rightValue);
+    return String(left.symbol || "").localeCompare(String(right.symbol || ""));
+  });
+}
+
+function renderShortScoreSortHeaders() {
+  document.querySelectorAll("[data-short-score-sort]").forEach((button) => {
+    const active = button.dataset.shortScoreSort === state.shortSort?.key;
+    const direction = active ? state.shortSort.direction : null;
+    const indicator = button.querySelector("span");
+    if (indicator) indicator.textContent = direction === "desc" ? "↓" : direction === "asc" ? "↑" : "↕";
+    button.classList.toggle("active", active);
+    const header = button.closest("th");
+    if (header) header.setAttribute("aria-sort", direction === "desc" ? "descending" : direction === "asc" ? "ascending" : "none");
+  });
+}
+
+function shortScoreRankText(item, prefix) {
+  const rawRank = item?.[`${prefix}_score_rank`];
+  const rawCount = item?.[`${prefix}_score_rank_count`];
+  const rank = rawRank == null ? Number.NaN : Number(rawRank);
+  const count = rawCount == null ? Number.NaN : Number(rawCount);
+  if (!Number.isFinite(rank) || !Number.isFinite(count) || count <= 0) return "暂无排名";
+  return `第 ${rank} / ${count}`;
+}
+
+function shortScoreValue(item, prefix) {
+  const rawValue = item?.[`${prefix}_score_normalized`];
+  const value = rawValue == null ? Number.NaN : Number(rawValue);
+  return Number.isFinite(value) ? value.toFixed(1) : "—";
 }
 
 function selectedStock() {
   return (state.payload?.stocks || []).find((item) => item.symbol === state.selectedSymbol) || filteredStocks()[0] || null;
+}
+
+function shortStrategySide(item, group) {
+  const payloadSide = item.matched_group_sides?.[group];
+  if (SHORT_STRATEGY_SIDE_META[payloadSide]) return payloadSide;
+  const configuredSide = (state.payload?.available_strategies || [])
+    .find((strategy) => strategy.key === group)?.side;
+  if (SHORT_STRATEGY_SIDE_META[configuredSide]) return configuredSide;
+  return SHORT_STRATEGY_SIDE_BY_GROUP[group] || "";
+}
+
+function renderShortStrategyTags(item) {
+  const labels = Array.isArray(item.matched_families) ? item.matched_families : [];
+  const groups = Array.isArray(item.matched_groups) ? item.matched_groups : [];
+  return labels.map((family, index) => {
+    const group = groups[index] || "";
+    const side = shortStrategySide(item, group);
+    const meta = SHORT_STRATEGY_SIDE_META[side];
+    if (!meta) return `<span class="tag">${escapeHtml(family)}</span>`;
+    return `
+      <span class="tag short-strategy-tag short-strategy-${side}" data-strategy-side="${side}" title="${escapeHtml(meta.label)}" aria-label="${escapeHtml(family)}，${escapeHtml(meta.label)}">
+        <small aria-hidden="true">${meta.badge}</small>
+        <span>${escapeHtml(family)}</span>
+      </span>
+    `;
+  }).join("");
 }
 
 function renderHeader() {
@@ -2333,12 +2427,12 @@ function renderStockRows() {
   const rows = filteredStocks();
   const body = document.querySelector("#stockRows");
   if (state.loading) {
-    body.innerHTML = `<tr><td colspan="11" class="empty-cell">正在加载股票池...</td></tr>`;
+    body.innerHTML = `<tr><td colspan="12" class="empty-cell">正在加载股票池...</td></tr>`;
     document.querySelector("#stockCount").textContent = "加载中";
     return;
   }
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="11" class="empty-cell">当前筛选条件下没有股票</td></tr>`;
+    body.innerHTML = `<tr><td colspan="12" class="empty-cell">当前筛选条件下没有股票</td></tr>`;
     document.querySelector("#stockCount").textContent = "0 只股票";
     return;
   }
@@ -2353,17 +2447,23 @@ function renderStockRows() {
       <td>${item.industry || "-"}</td>
       <td>${fmtPrice(item.close)}</td>
       <td>${item.matched_count}</td>
-      <td>${item.matched_families.map((family) => `<span class="tag">${family}</span>`).join("")}</td>
-      <td title="评分数据 ${item.score_date || item.date || "-"} · ${item.score_feature_source === "live_daily" ? "当日日线特征" : "历史模型特征"}">
+      <td>${renderShortStrategyTags(item)}</td>
+      <td title="${item.model_score_source_label || "统一模型"} · 评分数据 ${item.ranking_score_date || item.date || "-"}">
         <span class="score-stack">
-          <strong>${Number(item.opportunity_score ?? item.selector_score ?? 0).toFixed(1)}</strong>
-          <em>${item.score_band || ""} ${item.score_percentile_label || ""}</em>
+          <strong>${shortScoreValue(item, "model")}</strong>
+          <em>${shortScoreRankText(item, "model")} · ${item.model_score_source_label || "统一模型"}</em>
         </span>
       </td>
       <td title="评分数据 ${item.score_date || item.date || "-"} · ${item.score_feature_source === "live_daily" ? "当日日线特征" : "历史模型特征"}">
         <span class="score-stack">
-          <strong>${Number(item.holding_score ?? 0).toFixed(1)}</strong>
-          <em>${item.score_risk_note || ""}</em>
+          <strong>${shortScoreValue(item, "buy")}</strong>
+          <em>${shortScoreRankText(item, "buy")} · ${item.score_band || "历史标尺"}</em>
+        </span>
+      </td>
+      <td title="评分数据 ${item.score_date || item.date || "-"} · ${item.score_feature_source === "live_daily" ? "当日日线特征" : "历史模型特征"}">
+        <span class="score-stack">
+          <strong>${shortScoreValue(item, "hold")}</strong>
+          <em>${shortScoreRankText(item, "hold")}</em>
         </span>
       </td>
       <td>${fmtPct(item.best_avg_return_pct)}</td>
@@ -2402,7 +2502,7 @@ function renderStockDetail() {
     return;
   }
   title.textContent = `${stock.symbol} ${stock.name || ""}`;
-  meta.textContent = `行业 ${stock.industry || "-"} · 收盘 ${fmtPrice(stock.close)} · 买入分 ${Number(stock.opportunity_score ?? stock.selector_score ?? 0).toFixed(1)}（${stock.score_band || "-"}，${stock.score_percentile_label || "-"}） · 持有分 ${Number(stock.holding_score ?? 0).toFixed(1)} · ${stock.score_usage_hint || ""} · ${stock.score_risk_note || ""} · 命中 ${stock.matched_count} 个策略组 · ${stock.matched_families.join(" / ")} · ${stock.rank_reason || ""}`;
+  meta.textContent = `行业 ${stock.industry || "-"} · 收盘 ${fmtPrice(stock.close)} · 模型分 ${shortScoreValue(stock, "model")}（${shortScoreRankText(stock, "model")}，${stock.model_score_source_label || "统一模型"}） · 买入分 ${shortScoreValue(stock, "buy")}（${shortScoreRankText(stock, "buy")}） · 持有分 ${shortScoreValue(stock, "hold")}（${shortScoreRankText(stock, "hold")}） · ${stock.score_usage_hint || ""} · ${stock.score_risk_note || ""} · 命中 ${stock.matched_count} 个策略组 · ${stock.matched_families.join(" / ")} · ${stock.rank_reason || ""}`;
   body.innerHTML = stock.signals.map((signal) => {
     const metrics = signal.metrics || {};
     return `
@@ -2445,6 +2545,50 @@ function renderStockDetail() {
 
 function renderNotes() {
   document.querySelector("#notes").innerHTML = (state.payload?.notes || []).map((item) => `<li>${item}</li>`).join("");
+}
+
+function renderScoreProbabilityBands() {
+  const wrap = document.querySelector("#scoreProbabilityBands");
+  const meta = document.querySelector("#scoreProbabilityMeta");
+  if (!wrap || !meta) return;
+  if (state.loading && !state.payload) {
+    meta.textContent = "正在加载严格样本外统计";
+    wrap.innerHTML = `<div class="empty-state">正在加载分档概率...</div>`;
+    return;
+  }
+  const payload = state.payload?.score_probability_bands;
+  if (!payload?.available) {
+    meta.textContent = "当前校准与活动模型不匹配";
+    wrap.innerHTML = `<div class="empty-state">${escapeHtml(payload?.reason || "分档概率暂不可用")}</div>`;
+    return;
+  }
+  meta.textContent = `${payload.method === "strict_out_of_sample_observed_frequency_by_display_score_band" ? "严格样本外历史频率" : "历史分档频率"} · 不是收益承诺`;
+  wrap.innerHTML = (payload.calibrations || []).map((calibration) => `
+    <article class="score-probability-card">
+      <div class="score-probability-card-head">
+        <div>
+          <strong>${escapeHtml(calibration.label || "分数")}</strong>
+          <span>${escapeHtml(calibration.target_label || "历史命中概率")}</span>
+        </div>
+        <em>${escapeHtml(calibration.evaluation_scope || "样本外")}</em>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>分档</th><th>概率</th><th>样本数</th></tr></thead>
+          <tbody>
+            ${(calibration.bands || []).map((band) => `
+              <tr>
+                <td>${escapeHtml(band.label || "-")}</td>
+                <td><strong>${Number(band.probability_pct || 0).toFixed(1)}%</strong></td>
+                <td>${Number(band.sample_count || 0).toLocaleString("zh-CN")}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+      <p>${escapeHtml(calibration.target_definition || "")}</p>
+    </article>
+  `).join("");
 }
 
 function filteredOperationPlans() {
@@ -3736,6 +3880,21 @@ document.querySelector("#searchInput").addEventListener("input", (event) => {
   renderStockRows();
   renderStockDetail();
   renderHeader();
+});
+
+document.querySelectorAll("[data-short-score-sort]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const key = button.dataset.shortScoreSort;
+    if (!SHORT_SCORE_SORT_FIELDS.has(key)) return;
+    state.shortSort = {
+      key,
+      direction: state.shortSort?.key === key && state.shortSort.direction === "desc"
+        ? "asc"
+        : "desc",
+    };
+    renderShortScoreSortHeaders();
+    renderStockRows();
+  });
 });
 
 document.querySelector("#clearFilters").addEventListener("click", async () => {

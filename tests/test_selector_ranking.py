@@ -11,9 +11,11 @@ import yaml
 import joblib
 import numpy as np
 
+from quant.application import selector_ranking as selector_ranking_module
 from quant.application.daily_dependencies import (
     build_default_daily_dependency_registry,
 )
+from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
 from quant.application.selector_ranking import (
     NORMALIZED_RANKING_SCORE_FIELD,
     RANKING_NORMALIZATION_SCHEMA_VERSION,
@@ -290,6 +292,101 @@ def test_unified_adapter_fails_closed_on_missing_eligible_score(tmp_path: Path) 
 
     with pytest.raises(RuntimeError, match="coverage is incomplete"):
         apply_selector_ranking_source(rows, "2026-08-12", config=config)
+
+
+def test_full_materialization_accepts_left_candidate_consumed_by_right_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _promoted_config(tmp_path)
+    monkeypatch.setattr(
+        selector_ranking_module,
+        "load_right_side_ranking_scores",
+        lambda *args, **kwargs: (
+            {"000001.SZ": (0.9, 90.0)},
+            {"artifact_sha256": "right"},
+        ),
+    )
+    monkeypatch.setattr(
+        selector_ranking_module,
+        "load_left_side_ranking_scores",
+        lambda *args, **kwargs: (
+            {
+                "000001.SZ": (0.8, 80.0),
+                "000002.SZ": (0.7, 70.0),
+            },
+            {"artifact_sha256": "left"},
+        ),
+    )
+    rows = [
+        {
+            "symbol": "000001.SZ",
+            "selector_score": 0.0,
+            "signals": [
+                {"strategy_key": "B2"},
+                {"strategy_key": "B1"},
+            ],
+        },
+        {
+            "symbol": "000002.SZ",
+            "selector_score": 0.0,
+            "signals": [
+                {
+                    "strategy_key": "LOW_PULLBACK",
+                    "strategy_group": "LOW_PULLBACK",
+                }
+            ],
+        },
+    ]
+
+    result = apply_selector_ranking_source(
+        rows,
+        "2026-08-12",
+        config=config,
+        left_config=DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+        require_all_ranked_candidates=True,
+    )
+
+    assert result[0]["ranking_source"] == "right_side_unified"
+    assert result[1]["ranking_source"] == "left_side_unified"
+
+
+def test_full_materialization_still_rejects_absent_left_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _promoted_config(tmp_path)
+    monkeypatch.setattr(
+        selector_ranking_module,
+        "load_right_side_ranking_scores",
+        lambda *args, **kwargs: ({}, {"artifact_sha256": "right"}),
+    )
+    monkeypatch.setattr(
+        selector_ranking_module,
+        "load_left_side_ranking_scores",
+        lambda *args, **kwargs: (
+            {
+                "000001.SZ": (0.8, 80.0),
+                "000099.SZ": (0.7, 70.0),
+            },
+            {"artifact_sha256": "left"},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="did not materialize"):
+        apply_selector_ranking_source(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "selector_score": 0.0,
+                    "signals": [{"strategy_key": "B1"}],
+                }
+            ],
+            "2026-08-12",
+            config=config,
+            left_config=DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+            require_all_ranked_candidates=True,
+        )
 
 
 def test_unified_adapter_rejects_missing_operator_approval(

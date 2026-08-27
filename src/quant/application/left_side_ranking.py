@@ -158,11 +158,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_left_side_ranking_scores(
+def _load_left_side_ranking_frame(
     signal_date: str | pd.Timestamp,
     *,
     config: LeftSideRankingConfig,
-) -> tuple[dict[str, tuple[float, float]], dict[str, Any]]:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     if not config.enabled:
         raise RuntimeError("left-side unified ranking is disabled")
     try:
@@ -205,6 +205,49 @@ def load_left_side_ranking_scores(
         (normalized < 0.0) | (normalized > 100.0)
     ).any():
         raise RuntimeError("left-side scores are outside their contracts")
+    return frame, manifest
+
+
+def load_left_side_ranking_candidates(
+    signal_date: str | pd.Timestamp,
+    *,
+    config: LeftSideRankingConfig,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Load the validated score rows needed to materialize selector candidates."""
+
+    frame, manifest = _load_left_side_ranking_frame(signal_date, config=config)
+    missing = set(LEFT_SIDE_SIGNALS) - set(frame.columns)
+    if missing:
+        raise RuntimeError(
+            f"left-side score output missing strategy flags: {sorted(missing)}"
+        )
+    candidates = frame[
+        [
+            "symbol",
+            "date",
+            *LEFT_SIDE_SIGNALS,
+            config.score_field,
+            config.normalized_score_field,
+        ]
+    ].copy()
+    candidates[list(LEFT_SIDE_SIGNALS)] = (
+        candidates[list(LEFT_SIDE_SIGNALS)].fillna(False).astype(bool)
+    )
+    if not candidates[list(LEFT_SIDE_SIGNALS)].any(axis=1).all():
+        raise RuntimeError("left-side score output contains candidates without a strategy")
+    return candidates, manifest
+
+
+def load_left_side_ranking_scores(
+    signal_date: str | pd.Timestamp,
+    *,
+    config: LeftSideRankingConfig,
+) -> tuple[dict[str, tuple[float, float]], dict[str, Any]]:
+    frame, manifest = _load_left_side_ranking_frame(signal_date, config=config)
+    raw = pd.to_numeric(frame[config.score_field], errors="coerce").to_numpy(float)
+    normalized = pd.to_numeric(
+        frame[config.normalized_score_field], errors="coerce"
+    ).to_numpy(float)
     return dict(
         zip(frame["symbol"].astype(str), zip(raw, normalized), strict=True)
     ), manifest
@@ -219,5 +262,6 @@ __all__ = [
     "LeftSideRankingConfig",
     "LeftSideRankingPaths",
     "load_left_side_ranking_config",
+    "load_left_side_ranking_candidates",
     "load_left_side_ranking_scores",
 ]

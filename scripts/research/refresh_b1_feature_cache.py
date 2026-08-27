@@ -22,12 +22,14 @@ from time import perf_counter
 import joblib
 import numpy as np
 import pandas as pd
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "research"))
 
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
 from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 from quant.data.source_merge import normalize_tushare_daily
 from quant.features.daily_factor_layer import attach_daily_base_factors
@@ -75,6 +77,22 @@ def _released_b1_required_features(
     config_path: Path = CONFIG_PATH,
 ) -> tuple[list[str], str]:
     """Read the required columns from the artifacts pinned for production."""
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    release_payload = payload.get("release") or {}
+    if release_payload.get("ranking_source") == "left_side_unified":
+        if release_payload.get("legacy_model_lifecycle") != "rollback_only":
+            raise RuntimeError(
+                "Unified left B1 release must mark legacy models rollback_only"
+            )
+        if not DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled:
+            raise RuntimeError("Unified left B1 release is not enabled")
+        required = list(PROJECT_FACTOR_COLUMNS)
+        assert_no_forbidden_factor_names(
+            required,
+            context="active unified-left project factors",
+        )
+        return required, DEFAULT_LEFT_SIDE_RANKING_CONFIG.release_id
 
     release = load_strategy_release(config_path)
     model_dir = Path(release.model_dir)

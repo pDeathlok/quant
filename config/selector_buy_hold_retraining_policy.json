@@ -1,0 +1,39 @@
+{
+  "schema_version": "selector-buy-hold-retraining-policy-v1",
+  "active_release_id": "selector-buy-hold-registry-v3-20260827",
+  "active_manifest": "models/production/selector_buy_hold_registry_v3/manifest.json",
+  "rollback_manifest": "models/production/selector_buy_hold/manifest.json",
+  "discovery_factor_contract": "complete_canonical_registry",
+  "production_materializer_gate": true,
+  "schedule": {
+    "cadence": "annual_challenger",
+    "preferred_month": 1,
+    "daily_retraining_enabled": false,
+    "monthly_retraining_enabled": false,
+    "monthly_monitoring_only": [
+      "model_input_coverage",
+      "score_distribution_drift",
+      "daily_spearman_when_labels_mature",
+      "decile_spread_when_labels_mature"
+    ]
+  },
+  "training_windows": {
+    "primary": "expanding_all_history",
+    "shadow_challenger": "rolling_60_months",
+    "forced_short_window_replacement": false
+  },
+  "promotion_gates": {
+    "buy_daily_spearman_non_inferior": true,
+    "hold_daily_spearman_non_inferior": true,
+    "buy_decile_spread_positive": true,
+    "hold_decile_spread_positive": true,
+    "forbidden_alias_intersection_empty": true,
+    "exact_date_live_schema_complete": true,
+    "production_postflight_required": true
+  },
+  "generation_command": "python scripts/research/train_selector_buy_hold_registry_models.py --folds B,C --n-jobs 6 --promote",
+  "evidence": {
+    "refresh_ablation": "reports/research/selector_buy_hold_refresh_ablation_v1/report.json",
+    "production_training_report": "reports/research/selector_buy_hold_registry_v3/training_report.json"
+  }
+}

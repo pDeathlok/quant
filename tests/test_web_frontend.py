@@ -199,6 +199,32 @@ def test_short_strategy_stocks_link_to_xueqiu_in_a_new_tab() -> None:
     assert "20260811-short-xueqiu-v1" in INDEX_HTML
 
 
+def test_short_strategy_column_marks_left_right_and_mixed_groups() -> None:
+    assert "const SHORT_STRATEGY_SIDE_BY_GROUP = Object.freeze({" in APP_JS
+    for group in ("B1", "SB1", "SUPER_B1", "LOW_PULLBACK"):
+        assert f'{group}: "left"' in APP_JS
+    for group in (
+        "B2",
+        "B3",
+        "STRONG_K",
+        "DOUBLE_YANG",
+        "CHANGAN",
+        "KENGQI",
+        "VEGAS",
+        "TRIPLE_VOLUME_BREAKOUT",
+    ):
+        assert f'{group}: "right"' in APP_JS
+    for group in ("SUPPORT_PULLBACK", "RHYTHM_PLATFORM"):
+        assert f'{group}: "mixed"' in APP_JS
+    assert "function renderShortStrategyTags(item)" in APP_JS
+    assert 'data-strategy-side="${side}"' in APP_JS
+    assert "${renderShortStrategyTags(item)}" in APP_JS
+    assert "#stockRows .short-strategy-left" in STYLES_CSS
+    assert "#stockRows .short-strategy-right" in STYLES_CSS
+    assert "#stockRows .short-strategy-mixed" in STYLES_CSS
+    assert "20260827-short-side-badges-v1" in INDEX_HTML
+
+
 def test_chan_mobile_toolbar_keeps_refresh_buttons_readable() -> None:
     assert ".chan-toolbar .toolbar-actions {\n    display: grid;" in STYLES_CSS
     assert ".chan-toolbar #chanDateSlot {\n    grid-column: 1 / -1;" in STYLES_CSS
@@ -381,6 +407,22 @@ def test_watchlist_reuses_selector_buy_and_hold_scores() -> None:
     assert "item.holding_score ?? item.hold_score" in APP_JS
     assert 'class="similar-score-cell"' in APP_JS
     assert 'colspan="11"' in INDEX_HTML
+
+
+def test_short_selector_normalizes_ranks_sorts_and_explains_score_bands() -> None:
+    for field in (
+        "model_score_normalized",
+        "buy_score_normalized",
+        "hold_score_normalized",
+    ):
+        assert f'data-short-score-sort="{field}"' in INDEX_HTML
+    assert "shortSort: { key: \"model_score_normalized\", direction: \"desc\" }" in APP_JS
+    assert "function renderShortScoreSortHeaders()" in APP_JS
+    assert "function shortScoreRankText(item, prefix)" in APP_JS
+    assert "function renderScoreProbabilityBands()" in APP_JS
+    assert 'id="scoreProbabilityBands"' in INDEX_HTML
+    assert "score-probability-grid" in STYLES_CSS
+    assert "20260827-short-side-badges-v1-score-normalization-v1" in INDEX_HTML
 
 
 def test_watchlist_rows_support_persistent_drag_order_and_pin_menu() -> None:

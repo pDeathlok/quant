@@ -579,7 +579,7 @@ def apply_selector_ranking_source(
         right_scores = {}
         right_artifact_sha = ""
 
-    left_members = {
+    left_members = set(LEFT_GROUP_MEMBERS) | {
         member
         for members in LEFT_GROUP_MEMBERS.values()
         for member in members
@@ -605,7 +605,12 @@ def apply_selector_ranking_source(
                 f"{missing[:20]}"
             )
         if require_all_ranked_candidates:
-            unconsumed = sorted(set(left_scores) - left_eligible_symbols)
+            # A candidate that also has a right-side signal is intentionally
+            # consumed by the right ranker under the configured precedence.
+            consumed = left_eligible_symbols | (
+                set(left_scores) & right_eligible_symbols
+            )
+            unconsumed = sorted(set(left_scores) - consumed)
             if unconsumed:
                 raise RuntimeError(
                     "selector did not materialize all left-side ranked candidates: "

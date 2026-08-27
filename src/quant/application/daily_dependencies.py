@@ -31,6 +31,9 @@ from quant.features.factor_registry import (
     LONG_PRODUCTION_FACTOR_SCHEMA_VERSION,
 )
 from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
+from quant.features.selector_buy_hold_factor_contract import (
+    SELECTOR_BUY_HOLD_ARTIFACT_SCHEMA_VERSION,
+)
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION,
     RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
@@ -44,7 +47,9 @@ from quant.research.right_side_unified_features import (
 )
 
 
-REGISTRY_SCHEMA_VERSION = "daily_dependency_registry_v4_canonical_alias_free"
+REGISTRY_SCHEMA_VERSION = (
+    "daily_dependency_registry_v5_selector_buy_hold_materialized"
+)
 PRODUCTION_PROJECT_FACTOR_SCHEMA = PROJECT_FACTOR_SCHEMA_VERSION
 RIGHT_SIDE_SHADOW_PROJECT_FACTOR_SCHEMA = PROJECT_FACTOR_SCHEMA_VERSION
 RIGHT_SIDE_SHADOW_RULE_FACTOR_SCHEMA = RULE_FEATURE_SCHEMA_VERSION
@@ -1039,7 +1044,10 @@ def build_default_daily_dependency_registry(
             "feature.selector_live", Layer.FEATURE, "webapp.services.selector",
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
             (_edge("data.market_daily"), _edge("data.daily_basic"),
-             _edge("feature.strategy_signals")),
+             _edge("feature.strategy_signals"),
+             _edge("feature.long_snapshot"),
+             *((_edge("feature.right_side_unified"),) if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED else ()),
+             *((_edge("feature.left_side_unified"),) if left_side_enabled else ())),
             _exact(_result("selector_extended", "signal_date")),
             _daily_incremental(calendar_days=130, keys=("date", "symbol"), projection=True),
             "build_selector_live_features", result_aliases=("selector_core", "selector_extended"),
@@ -1467,11 +1475,13 @@ def build_default_daily_dependency_registry(
             ),
             result_aliases=("selector_core", "selector_extended"), ui_step="selector_core", ui_order=70,
             artifact=ArtifactSpec(
-                ("models/production/selector_buy_hold/buy.joblib",
-                 "models/production/selector_buy_hold/hold.joblib"),
+                ("models/production/selector_buy_hold_registry_v3/buy.joblib",
+                 "models/production/selector_buy_hold_registry_v3/hold.joblib"),
                 "bundle_features", "feature.selector_live",
-                manifest_path="models/production/selector_buy_hold/manifest.json",
-                expected_schema="selector_buy_hold_return_model_v1",
+                manifest_path=(
+                    "models/production/selector_buy_hold_registry_v3/manifest.json"
+                ),
+                expected_schema=SELECTOR_BUY_HOLD_ARTIFACT_SCHEMA_VERSION,
             ), final_gate=True,
         ),
         DependencyNode(
