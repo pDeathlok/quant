@@ -145,8 +145,8 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
     availability_pattern = re.compile(
         r"market daily availability retry: "
         r"trade_date=(\d{8}) "
-        r"failed_attempts=(\d+)/(\d+) "
-        r"retry_in_seconds=([0-9.]+)"
+        r"failed_attempts=(\d+)(?:/(\d+))? "
+        r"retry_in_seconds=([0-9.]+)(?: deadline=(\S+))?"
     )
     assert process.stdout is not None
     for line in process.stdout:
@@ -162,15 +162,17 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
             continue
         availability_match = availability_pattern.search(line)
         if availability_match and progress_callback is not None:
-            trade_date, failed_attempts, tolerated_failures, retry_seconds = (
+            trade_date, failed_attempts, tolerated_failures, retry_seconds, deadline = (
                 availability_match.groups()
             )
+            attempts_text = f"{failed_attempts}/{tolerated_failures}" if tolerated_failures else failed_attempts
             progress_callback(
                 percent=10,
                 message=(
                     f"{trade_date} 日线尚未完整发布；"
-                    f"已失败 {failed_attempts}/{tolerated_failures} 次，"
+                    f"已失败 {attempts_text} 次，"
                     f"{retry_seconds} 秒后重试"
+                    + ("，截止北京时间 17:20" if deadline else "")
                 ),
             )
     returncode = process.wait()
@@ -217,6 +219,7 @@ def refresh_daily_basic_data(dry_run: bool = True, progress_callback=None) -> di
         workers=int(os.getenv("ROUTINE_DAILY_BASIC_WORKERS", "4")),
         sleep_between=float(os.getenv("ROUTINE_DAILY_BASIC_SLEEP", "0.25")),
         retries=int(os.getenv("ROUTINE_DAILY_BASIC_RETRIES", "3")),
+        progress_callback=progress_callback,
     )
     failed = int(manifest.get("failed") or 0)
     return {

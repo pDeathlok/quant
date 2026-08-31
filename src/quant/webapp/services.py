@@ -5317,7 +5317,33 @@ def _run_post_snapshot_cache_cleanup(results: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
-def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELECTOR_LIMIT) -> dict[str, Any]:
+def _selector_row_side(row: dict[str, Any]) -> str | None:
+    """Map a selector row to the model side that owns its displayed ranking."""
+
+    ranking_source = str(row.get("ranking_source") or "").strip().lower()
+    if ranking_source == "left_side_unified":
+        return "left"
+    if ranking_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED.value:
+        return "right"
+    group_sides = {
+        str(value or "").strip().lower()
+        for value in (row.get("matched_group_sides") or {}).values()
+    }
+    if group_sides & {"right", "mixed"}:
+        return "right"
+    if "left" in group_sides:
+        return "left"
+    return None
+
+
+def _display_selector_payload(
+    payload: dict[str, Any],
+    limit: int = DEFAULT_SELECTOR_LIMIT,
+    side: str = "all",
+) -> dict[str, Any]:
+    normalized_side = str(side or "all").strip().lower()
+    if normalized_side not in {"all", "left", "right"}:
+        raise ValueError(f"unknown selector side: {side}")
     rows = [dict(row) for row in payload.get("stocks") or []]
     complete_total = int(payload.get("total_stock_count") or len(rows))
     display_rows = [row for row in rows if _row_display_quality_gate(row)]
@@ -5340,6 +5366,11 @@ def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELE
         display_rows,
         str(payload.get("signal_date") or "") or None,
     )
+    all_actionable_total = len(display_rows)
+    if normalized_side != "all":
+        display_rows = [
+            row for row in display_rows if _selector_row_side(row) == normalized_side
+        ]
     display_rows = sorted(
         display_rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -5353,14 +5384,20 @@ def _display_selector_payload(payload: dict[str, Any], limit: int = DEFAULT_SELE
     out = dict(payload)
     out["stocks"] = display
     out["total_stock_count"] = total
+    out["all_actionable_stock_count"] = all_actionable_total
     out["complete_stock_count"] = complete_total
+    out["short_side_filter"] = normalized_side
     out["display_limit"] = limit
     out["is_truncated"] = total > len(display)
     out["score_presentation"] = {
         "schema_version": "selector-score-presentation-v1",
         "range": [0.0, 100.0],
         "direction": "higher_is_better",
-        "rank_scope": "current_actionable_candidate_pool",
+        "rank_scope": (
+            "current_strategy_side_actionable_candidate_pool"
+            if normalized_side != "all"
+            else "current_actionable_candidate_pool"
+        ),
         "rank_method": "competition_rank_descending",
         "fields": {
             "model": "model_score_normalized",
@@ -5470,7 +5507,7 @@ def _selector_score_probability_bands() -> dict[str, Any]:
 
     unavailable = {
         "available": False,
-        "schema_version": "selector-score-probability-bands-v1",
+        "schema_version": "selector-score-probability-bands-v2",
         "reason": "分档概率校准不可用或已过期",
         "calibrations": [],
     }
@@ -5478,17 +5515,20 @@ def _selector_score_probability_bands() -> dict[str, Any]:
         payload = json.loads(
             SELECTOR_SCORE_PROBABILITY_BANDS.read_text(encoding="utf-8")
         )
-        if payload.get("schema_version") != (
-            "selector-score-probability-bands-v1"
-        ):
+        if payload.get("schema_version") != "selector-score-probability-bands-v2":
             return unavailable
         calibrations = payload.get("calibrations")
         if not isinstance(calibrations, list) or not calibrations:
             return unavailable
         source_hashes: dict[Path, str] = {}
+        calibration_keys: set[str] = set()
         for calibration in calibrations:
             if not isinstance(calibration, dict):
                 return unavailable
+            calibration_key = str(calibration.get("key") or "")
+            if not calibration_key or calibration_key in calibration_keys:
+                return unavailable
+            calibration_keys.add(calibration_key)
             source = calibration.get("source")
             bands = calibration.get("bands")
             if not isinstance(source, dict) or not isinstance(bands, list):
@@ -5508,9 +5548,21 @@ def _selector_score_probability_bands() -> dict[str, Any]:
                     source_hashes[source_path] = digest
                 if digest != str(source.get(hash_field) or ""):
                     return unavailable
-            for band in bands:
+            previous_max = 0.0
+            for index, band in enumerate(bands):
+                minimum = _safe_float((band or {}).get("min_score"), None)
+                maximum = _safe_float((band or {}).get("max_score"), None)
                 probability = _safe_float((band or {}).get("probability_pct"), None)
                 sample_count = int((band or {}).get("sample_count") or 0)
+                if minimum is None or maximum is None:
+                    return unavailable
+                if not 0.0 <= minimum < maximum <= 100.0:
+                    return unavailable
+                if abs(minimum - previous_max) > 1e-9:
+                    return unavailable
+                if index == len(bands) - 1 and abs(maximum - 100.0) > 1e-9:
+                    return unavailable
+                previous_max = maximum
                 if probability is None or not 0.0 <= probability <= 100.0:
                     return unavailable
                 if sample_count <= 0:
@@ -10463,6 +10515,7 @@ def get_stock_selector_payload(
     include_extended: bool = False,
     use_cache: bool = True,
     full_snapshot: bool = False,
+    side: str = "all",
 ) -> dict[str, Any]:
     extended_filter = _selected_extended_keys(strategies)
     effective_include_extended = include_extended or bool(extended_filter)
@@ -10477,7 +10530,7 @@ def get_stock_selector_payload(
     if use_cache:
         cached = _read_selector_snapshot(signal_date, strategies, effective_include_extended)
         if cached is not None:
-            return cached if full_snapshot else _display_selector_payload(cached)
+            return cached if full_snapshot else _display_selector_payload(cached, side=side)
 
     plan = get_b1_plan(signal_date=signal_date)
     effective_signal_date = signal_date or plan.get("signal_date")
@@ -10663,6 +10716,6 @@ def get_stock_selector_payload(
     }
     if full_snapshot:
         _write_selector_snapshot(payload, strategies, effective_include_extended)
-    out = payload if full_snapshot else _display_selector_payload(payload)
+    out = payload if full_snapshot else _display_selector_payload(payload, side=side)
     out["cache"] = {"hit": False, "backend": "generated"}
     return out

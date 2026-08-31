@@ -6,6 +6,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from quant.features.active_market_value import (
+    ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS,
+)
+from quant.features.candlestick_context import (
+    CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS,
+)
+from quant.features.market_breadth import (
+    MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS,
+)
+from quant.features.canonical_factor_names import FORBIDDEN_COMPATIBILITY_ALIASES
 from quant.features.factor_registry import (
     CHAN_LIVE_FACTOR_COLUMNS,
     FACTOR_REGISTRY,
@@ -25,7 +35,6 @@ from quant.features.factor_registry import (
     SEMANTIC_CATEGORIES,
     validate_registry,
 )
-from quant.features.canonical_factor_names import FORBIDDEN_COMPATIBILITY_ALIASES
 from quant.research.left_side_unified_features import (
     LEFT_SIDE_RULE_FEATURE_COLUMNS,
     LEFT_SIDE_SIGNALS,
@@ -175,11 +184,21 @@ def test_registry_governance_separates_canonical_alias_and_lifecycle() -> None:
     role_counts = pd.Series([definition.role for definition in FACTOR_REGISTRY]).value_counts()
 
     assert len(FACTOR_REGISTRY) == (
-        597 + len(LEFT_SIDE_RULE_FEATURE_COLUMNS) + len(LEFT_SIDE_SIGNALS)
+        597
+        + len(LEFT_SIDE_RULE_FEATURE_COLUMNS)
+        + len(LEFT_SIDE_SIGNALS)
+        + len(ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS)
+        + len(MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS)
+        + len(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS)
     )
     assert role_counts.to_dict() == {
         "feature": 583 + len(LEFT_SIDE_RULE_FEATURE_COLUMNS),
         "strategy_identity": 14 + len(LEFT_SIDE_SIGNALS),
+        "research_feature": (
+            len(ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS)
+            + len(MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS)
+            + len(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS)
+        ),
     }
     assert FACTOR_ALIAS_TARGETS == {}
     assert FORBIDDEN_COMPATIBILITY_ALIASES.isdisjoint(definitions)
@@ -191,6 +210,15 @@ def test_registry_governance_separates_canonical_alias_and_lifecycle() -> None:
     assert not set(LONG_PRODUCTION_FACTOR_COLUMNS) & set(LONG_RESEARCH_FACTOR_COLUMNS)
     assert definitions["rsi_6"].lifecycle == "research_candidate"
     assert definitions["selector_return_1d"].lifecycle == "production_model"
+    for name in ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS:
+        assert definitions[name].role == "research_feature"
+        assert definitions[name].lifecycle == "research_candidate"
+    for name in MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS:
+        assert definitions[name].role == "research_feature"
+        assert definitions[name].lifecycle == "research_candidate"
+    for name in CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS:
+        assert definitions[name].role == "research_feature"
+        assert definitions[name].lifecycle == "research_candidate"
     assert definitions["short_balance"].family == "margin"
     assert definitions["small_net_amount_ratio"].family == "moneyflow"
 

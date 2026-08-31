@@ -2191,6 +2191,57 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
+.stock-pool-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.short-side-filter {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.short-side-filter button {
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.short-side-filter button:hover:not(:disabled) {
+  color: var(--ink);
+  background: rgba(150, 64, 38, 0.08);
+}
+
+.short-side-filter button.active {
+  color: #fff;
+  background: var(--accent);
+  box-shadow: 0 1px 2px rgba(54, 43, 36, 0.18);
+}
+
+.short-side-filter button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.short-side-filter button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 .table-wrap {
   overflow: auto;
   max-height: 420px;
@@ -2374,6 +2425,7 @@ th {
 }
 
 .score-probability-card-head span,
+.score-probability-card-head small,
 .score-probability-card-head em,
 .score-probability-card p {
   color: var(--muted);
@@ -2382,13 +2434,18 @@ th {
   line-height: 1.45;
 }
 
+.score-probability-card-head small {
+  color: var(--ink);
+  font-weight: 650;
+}
+
 .score-probability-card-head em {
   max-width: 46%;
   text-align: right;
 }
 
 .score-probability-card .table-wrap {
-  max-height: none;
+  max-height: 360px;
 }
 
 .score-probability-card th,
@@ -2403,6 +2460,32 @@ th {
 
 .score-probability-card td strong {
   color: var(--accent);
+}
+
+.score-probability-card tr.current-score-band td {
+  background: rgba(185, 44, 35, 0.07);
+}
+
+.score-probability-card tr.current-score-band td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+  font-weight: 700;
+}
+
+.score-probability-card td b {
+  display: inline-flex;
+  min-width: 24px;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: rgba(185, 44, 35, 0.1);
+  font-size: 11px;
+}
+
+.score-probability-card td.score-probability-empty {
+  padding-block: 24px;
+  color: var(--muted);
+  text-align: center;
 }
 
 .score-probability-card p {
@@ -5273,6 +5356,21 @@ tbody tr.selected-row:hover td {
   .panel-head,
   .signal-card {
     padding-inline: 12px;
+  }
+
+  .stock-pool-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .stock-pool-heading {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .stock-pool-head > #stockCount {
+    width: 100%;
+    text-align: right;
   }
 }
 

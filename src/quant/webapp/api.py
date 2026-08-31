@@ -359,11 +359,15 @@ def convertible_bond_allotments(
 @router.get("/selector/stocks")
 def stock_selector(
     strategies: str | None = None,
+    side: str = "all",
     signal_date: str | None = None,
     include_extended: bool = False,
     refresh: bool = False,
 ) -> dict[str, Any]:
     try:
+        normalized_side = side.strip().lower()
+        if normalized_side not in {"all", "left", "right"}:
+            raise HTTPException(status_code=400, detail=f"未知短线策略侧: {side}")
         if signal_date and date.fromisoformat(signal_date) < SELECTOR_REPLAY_MIN_DATE:
             raise HTTPException(status_code=400, detail="复盘查询暂从 2026-06-01 开始")
         selected = [item.strip() for item in strategies.split(",")] if strategies else None
@@ -372,6 +376,7 @@ def stock_selector(
             signal_date=signal_date,
             include_extended=include_extended,
             use_cache=not refresh,
+            side=normalized_side,
         )
     except HTTPException:
         raise

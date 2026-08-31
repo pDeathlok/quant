@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -119,8 +119,15 @@
 
         <section class="split">
           <div class="panel">
-            <div class="panel-head">
-              <h3>股票池</h3>
+            <div class="panel-head stock-pool-head">
+              <div class="stock-pool-heading">
+                <h3>股票池</h3>
+                <div id="shortSideFilter" class="short-side-filter" role="group" aria-label="按短线模型侧筛选">
+                  <button class="active" type="button" data-short-side="all" aria-pressed="true">全部</button>
+                  <button type="button" data-short-side="left" aria-pressed="false" title="只看左侧统一模型候选">左侧</button>
+                  <button type="button" data-short-side="right" aria-pressed="false" title="右侧统一模型候选，包含混合策略">右侧（含混）</button>
+                </div>
+              </div>
               <span id="stockCount"></span>
             </div>
             <div class="table-wrap tall">
@@ -1170,6 +1177,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1"></script>
   </body>
 </html>

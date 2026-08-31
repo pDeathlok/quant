@@ -129,6 +129,15 @@ rolling_std(x, n) = n 日滚动标准差
 | `price_level` | 当前收盘价水平 | 本地派生 | `C` |
 | `price_log` | 收盘价对数水平 | 本地派生 | `log(C+1)` |
 
+### 5.1 K 线收盘与上影线语境
+
+| 变量 | 中文含义 | 来源 | 计算逻辑 |
+|---|---|---|---|
+| `rs_close_pos` | 收盘价位于当日振幅中的位置 | 本地派生、生产已物化 | `(C-L)/(H-L)` |
+| `rs_upper_shadow_pct` | 上影线相对昨收比例（百分数） | 本地派生、生产已物化 | `(H-max(O,C))/pre_close*100` |
+| `rs_upper_shadow_range_share` | 上影线占当日完整振幅的比例 | 本地派生、研究特征 | `(H-max(O,C))/(H-L)` |
+| `rs_upper_shadow_body_ratio` | 上影线与实体长度之比 | 本地派生、研究特征 | `(H-max(O,C))/abs(C-O)`；十字星实体为 0 时记为空值 |
+
 ## 6. 成交量与量价因子
 
 | 变量 | 中文含义 | 来源 | 计算逻辑 |
@@ -143,6 +152,7 @@ rolling_std(x, n) = n 日滚动标准差
 | `volume_ema20` | 20 日成交量指数均线 | 本地派生 | `ewm_mean(V, span=20)` |
 | `volume_relative_5d` | 成交量相对 5 日均量 | 本地派生 | `V/rolling_mean(V,5)` |
 | `volume_relative_20d` | 成交量相对 20 日均量 | 本地派生 | `V/rolling_mean(V,20)` |
+| `rs_volume_ratio_prev20` | 当日成交量相对此前 20 日均量，不含当日 | 本地派生、研究特征 | `V/rolling_mean(V.shift(1),20)` |
 | `volume_relative_60d` | 成交量相对 60 日均量，替代旧 `turnover_ratio` 命名 | 本地派生 | `V/rolling_mean(V,60)` |
 | `volume_change_1d` | 成交量 1 日变化率 | 本地派生 | `V.pct_change(1)` |
 | `volume_change_3d` | 成交量 3 日变化率 | 本地派生 | `V.pct_change(3)` |

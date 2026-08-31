@@ -622,6 +622,56 @@ def test_refresh_data_reports_market_availability_retry_progress(monkeypatch) ->
     ]
 
 
+def test_refresh_data_reports_tushare_deadline_wait_progress(monkeypatch) -> None:
+    progress = []
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO(
+                "market daily availability retry: trade_date=20260828 "
+                "failed_attempts=4 retry_in_seconds=600 "
+                "deadline=2026-08-28T17:20:00+08:00 error=not ready\n"
+                + json.dumps({
+                    "status": "success", "expected_trade_date": "20260828",
+                    "dataset_trade_date": "20260828",
+                })
+            )
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260828")
+
+    result = pipeline.refresh_data(
+        dry_run=False, progress_callback=lambda **kwargs: progress.append(kwargs),
+    )
+
+    assert result["status"] == "success"
+    assert progress == [{
+        "percent": 10,
+        "message": "20260828 日线尚未完整发布；已失败 4 次，600 秒后重试，截止北京时间 17:20",
+    }]
+
+
+def test_daily_basic_wait_progress_callback_reaches_web_coordinator(monkeypatch) -> None:
+    progress = []
+
+    def fake_refresh(**kwargs):
+        kwargs["progress_callback"](percent=36, message="waiting until 17:20")
+        return {"failed": 0}
+
+    monkeypatch.setattr(pipeline, "_incremental_daily_basic_start", lambda: "20260828")
+    monkeypatch.setattr("quant.routine.daily_basic_refresh.refresh_daily_basic", fake_refresh)
+
+    result = pipeline.refresh_daily_basic_data(
+        dry_run=False, progress_callback=lambda **kwargs: progress.append(kwargs),
+    )
+
+    assert result["status"] == "success"
+    assert progress[-1] == {"percent": 36, "message": "waiting until 17:20"}
+
+
 def test_strategy_signal_cache_reports_family_and_z_skill_progress(monkeypatch) -> None:
     progress: list[tuple[int, str]] = []
 

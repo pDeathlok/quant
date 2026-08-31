@@ -29,6 +29,27 @@ class FactorCalculatorDefinition:
 
 
 _BASE_CALCULATORS: dict[str, dict[str, Any]] = {
+    "market_breadth_research": {
+        "entrypoint": "quant.features.market_breadth.compute_market_breadth_features",
+        "dependencies": (), "factor_dependencies": (), "partition_axis": "dataset",
+        "executor": "serial", "default_workers": 1, "max_workers": 1,
+        "max_pending_multiplier": 1, "materialization": "on_demand",
+        "routine_node": "",
+    },
+    "active_market_value_research": {
+        "entrypoint": "quant.features.active_market_value.build_active_market_value_feature_frames",
+        "dependencies": (), "factor_dependencies": (), "partition_axis": "dataset",
+        "executor": "serial", "default_workers": 1, "max_workers": 1,
+        "max_pending_multiplier": 1, "materialization": "on_demand",
+        "routine_node": "",
+    },
+    "candlestick_context_research": {
+        "entrypoint": "quant.features.candlestick_context.compute_candlestick_context_features",
+        "dependencies": (), "factor_dependencies": (), "partition_axis": "symbol",
+        "executor": "processes", "default_workers": 4, "max_workers": 8,
+        "max_pending_multiplier": 2, "materialization": "on_demand",
+        "routine_node": "",
+    },
     "project_daily": {
         "entrypoint": "quant.features.project_factor_layer.calculate_project_factor_frame",
         "dependencies": (), "factor_dependencies": (), "partition_axis": "symbol",

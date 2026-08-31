@@ -6,6 +6,7 @@ import io
 import signal
 import sys
 import threading
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -915,6 +916,116 @@ def _load_issue(refresh: bool = False, fetcher: TushareDataFetcher | None = None
     return frame, meta
 
 
+def _cninfo_disclosure_page(
+    session: Any,
+    *,
+    payload: dict[str, Any],
+    keyword: str,
+    page: int,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "http://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+        "User-Agent": "Mozilla/5.0",
+    }
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.post(
+                url,
+                data={**payload, "pageNum": str(page)},
+                headers=headers,
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or "announcements" not in data:
+                raise ValueError("巨潮公告响应缺少 announcements")
+            return data
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(0.4 * attempt)
+    raise RuntimeError(
+        f"巨潮公告分页失败: keyword={keyword} page={page} attempts={attempts}: {last_error}"
+    ) from last_error
+
+
+def _poll_cninfo_pipeline_announcements(
+    *,
+    keyword: str,
+    start: date,
+    end: date,
+    session: Any | None = None,
+) -> pd.DataFrame:
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError("缺少 requests，无法刷新巨潮公告") from exc
+    client = session or requests.Session()
+    payload = {
+        "pageNum": "1",
+        "pageSize": "30",
+        "column": "szse",
+        "tabName": "fulltext",
+        "plate": "",
+        "stock": "",
+        "searchkey": keyword,
+        "secid": "",
+        "category": "category_kzzq_szsh",
+        "trade": "",
+        "seDate": f"{start:%Y-%m-%d}~{end:%Y-%m-%d}",
+        "sortName": "",
+        "sortType": "",
+        "isHLtitle": "true",
+    }
+    first_page = _cninfo_disclosure_page(
+        client,
+        payload=payload,
+        keyword=keyword,
+        page=1,
+    )
+    total = max(0, int(first_page.get("totalAnnouncement") or 0))
+    page_count = max(1, math.ceil(total / int(payload["pageSize"])))
+    announcements = list(first_page.get("announcements") or [])
+    for page in range(2, page_count + 1):
+        page_payload = _cninfo_disclosure_page(
+            client,
+            payload=payload,
+            keyword=keyword,
+            page=page,
+        )
+        announcements.extend(page_payload.get("announcements") or [])
+    if not announcements:
+        return pd.DataFrame(
+            columns=["代码", "简称", "公告标题", "公告时间", "公告链接"]
+        )
+    frame = pd.DataFrame(announcements)
+    frame["公告时间"] = pd.to_datetime(
+        frame.get("announcementTime"),
+        unit="ms",
+        utc=True,
+        errors="coerce",
+    ).dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+    frame["公告链接"] = [
+        (
+            "http://www.cninfo.com.cn/new/disclosure/detail?"
+            f"stockCode={row.get('secCode')}&announcementId={row.get('announcementId')}"
+            f"&orgId={row.get('orgId')}&announcementTime={row.get('公告时间')}"
+        )
+        for _, row in frame.iterrows()
+    ]
+    return frame.rename(
+        columns={
+            "secCode": "代码",
+            "secName": "简称",
+            "announcementTitle": "公告标题",
+        }
+    )[["代码", "简称", "公告标题", "公告时间", "公告链接"]]
+
+
 def _load_pipeline_candidates(refresh: bool = False, today: date | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
     meta: dict[str, Any] = {
         "source": str(CB_PIPELINE_PATH),
@@ -925,19 +1036,14 @@ def _load_pipeline_candidates(refresh: bool = False, today: date | None = None) 
     }
     if refresh:
         try:
-            import akshare as ak
-
             end = today or date.today()
             start = end - timedelta(days=900)
             frames = []
             for keyword in ["可转债", "可转换公司债券"]:
-                frame = ak.stock_zh_a_disclosure_report_cninfo(
-                    symbol="",
-                    market="沪深京",
+                frame = _poll_cninfo_pipeline_announcements(
                     keyword=keyword,
-                    category="可转债",
-                    start_date=start.strftime("%Y%m%d"),
-                    end_date=end.strftime("%Y%m%d"),
+                    start=start,
+                    end=end,
                 )
                 if frame is not None and not frame.empty:
                     frames.append(frame)

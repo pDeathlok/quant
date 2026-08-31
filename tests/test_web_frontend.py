@@ -225,6 +225,20 @@ def test_short_strategy_column_marks_left_right_and_mixed_groups() -> None:
     assert "20260827-short-side-badges-v1" in INDEX_HTML
 
 
+def test_short_stock_pool_can_filter_left_or_right_model_side() -> None:
+    assert 'id="shortSideFilter"' in INDEX_HTML
+    assert 'data-short-side="all"' in INDEX_HTML
+    assert 'data-short-side="left"' in INDEX_HTML
+    assert 'data-short-side="right"' in INDEX_HTML
+    assert "右侧（含混）" in INDEX_HTML
+    assert 'shortSideFilter: "all"' in APP_JS
+    assert 'query.set("side", state.shortSideFilter)' in APP_JS
+    assert 'document.querySelectorAll("[data-short-side]")' in APP_JS
+    assert 'state.shortSideFilter = "all";' in APP_JS
+    assert ".short-side-filter button.active" in STYLES_CSS
+    assert "20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1" in INDEX_HTML
+
+
 def test_chan_mobile_toolbar_keeps_refresh_buttons_readable() -> None:
     assert ".chan-toolbar .toolbar-actions {\n    display: grid;" in STYLES_CSS
     assert ".chan-toolbar #chanDateSlot {\n    grid-column: 1 / -1;" in STYLES_CSS
@@ -420,9 +434,15 @@ def test_short_selector_normalizes_ranks_sorts_and_explains_score_bands() -> Non
     assert "function renderShortScoreSortHeaders()" in APP_JS
     assert "function shortScoreRankText(item, prefix)" in APP_JS
     assert "function renderScoreProbabilityBands()" in APP_JS
+    assert "function currentProbabilityBands(calibration, scores)" in APP_JS
+    assert "当前池 ${scores.length} 只" in APP_JS
+    assert 'data-current-count="${band.current_count}"' in APP_JS
+    assert "仅显示当前股票池覆盖分档及相邻一档" in APP_JS
     assert 'id="scoreProbabilityBands"' in INDEX_HTML
     assert "score-probability-grid" in STYLES_CSS
+    assert ".score-probability-card tr.current-score-band td" in STYLES_CSS
     assert "20260827-short-side-badges-v1-score-normalization-v1" in INDEX_HTML
+    assert "fine-score-bands-v1" in INDEX_HTML
 
 
 def test_watchlist_rows_support_persistent_drag_order_and_pin_menu() -> None:

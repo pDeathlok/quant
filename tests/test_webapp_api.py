@@ -69,22 +69,119 @@ def test_selector_score_presentation_normalizes_and_ranks_all_three_scores() -> 
     )
 
 
+def test_selector_side_filter_splits_model_scales_and_reranks_pool(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_row_display_quality_gate", lambda _row: True)
+    monkeypatch.setattr(
+        services,
+        "apply_selector_ranking_source",
+        lambda rows, *_args, **_kwargs: rows,
+    )
+    monkeypatch.setattr(services, "_diversify_default_rows", lambda rows, _limit: rows)
+    common = {
+        "matched_count": 1,
+        "best_profit_factor": 1.5,
+        "buy_score_source": "historical_return_model",
+        "hold_score_source": "historical_return_model",
+        "opportunity_score": 60.0,
+        "holding_score": 55.0,
+    }
+    payload = {
+        "signal_date": "2026-08-28",
+        "total_stock_count": 9,
+        "snapshot_scope": {"strategies": ["ALL"]},
+        "stocks": [
+            {
+                **common,
+                "symbol": "000001.SZ",
+                "selector_score": 70.0,
+                "ranking_source": "left_side_unified",
+                "ranking_score_normalized": 82.0,
+                "matched_group_sides": {"B1": "left"},
+            },
+            {
+                **common,
+                "symbol": "000002.SZ",
+                "selector_score": 80.0,
+                "ranking_source": "right_side_unified",
+                "ranking_score_normalized": 98.0,
+                "matched_group_sides": {"VEGAS": "right"},
+            },
+            {
+                **common,
+                "symbol": "000003.SZ",
+                "selector_score": 75.0,
+                "ranking_source": "right_side_unified",
+                "ranking_score_normalized": 88.0,
+                "matched_group_sides": {"SUPPORT_PULLBACK": "mixed"},
+            },
+        ],
+    }
+
+    left = services._display_selector_payload(payload, limit=10, side="left")
+    right = services._display_selector_payload(payload, limit=10, side="right")
+
+    assert [row["symbol"] for row in left["stocks"]] == ["000001.SZ"]
+    assert {row["symbol"] for row in right["stocks"]} == {
+        "000002.SZ",
+        "000003.SZ",
+    }
+    assert right["total_stock_count"] == 2
+    assert right["all_actionable_stock_count"] == 3
+    assert right["complete_stock_count"] == 9
+    assert right["short_side_filter"] == "right"
+    assert all(row["model_score_rank_count"] == 2 for row in right["stocks"])
+    assert right["score_presentation"]["rank_scope"] == (
+        "current_strategy_side_actionable_candidate_pool"
+    )
+    assert services._selector_row_side(
+        {"matched_group_sides": {"RHYTHM_PLATFORM": "mixed"}}
+    ) == "right"
+
+
+def test_selector_api_passes_and_validates_side_filter(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_selector_payload(**kwargs):
+        captured.update(kwargs)
+        return {"signal_date": "2026-08-28", "stocks": []}
+
+    monkeypatch.setattr(webapp_api, "get_stock_selector_payload", fake_selector_payload)
+
+    response = client.get("/api/selector/stocks?side=right")
+    invalid = client.get("/api/selector/stocks?side=middle")
+
+    assert response.status_code == 200
+    assert captured["side"] == "right"
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "未知短线策略侧: middle"
+
+
 def test_selector_score_probability_bands_match_active_artifacts() -> None:
     services._selector_score_probability_bands.cache_clear()
 
     payload = services._selector_score_probability_bands()
 
     assert payload["available"] is True
-    assert payload["schema_version"] == "selector-score-probability-bands-v1"
+    assert payload["schema_version"] == "selector-score-probability-bands-v2"
     assert {item["key"] for item in payload["calibrations"]} == {
         "model_right",
         "model_left",
         "buy",
         "hold",
     }
-    assert all(
-        len(item["bands"]) == 5 for item in payload["calibrations"]
-    )
+    by_key = {item["key"]: item for item in payload["calibrations"]}
+    assert len(by_key["model_right"]["bands"]) == 20
+    assert len(by_key["model_left"]["bands"]) == 20
+    assert len(by_key["buy"]["bands"]) == 17
+    assert len(by_key["hold"]["bands"]) == 17
+    for calibration in by_key.values():
+        bands = calibration["bands"]
+        assert bands[0]["min_score"] == 0.0
+        assert bands[-1]["max_score"] == 100.0
+        assert all(
+            left["max_score"] == right["min_score"]
+            for left, right in zip(bands, bands[1:])
+        )
 
 
 def test_materialize_left_side_ranked_candidates_adds_missing_groups(

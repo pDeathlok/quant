@@ -210,7 +210,7 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 5. 检查 `http://127.0.0.1:8088/api/health` 和前端首页 `http://127.0.0.1:8088/`，确认前后端已就绪。
 6. 触发 `POST /api/selector/refresh-latest`，作用域默认 `all`。
 7. 轮询 `/api/selector/refresh-latest/status` 并打印进度。
-8. 若终态为 `failed/error`，自动再次触发刷新。服务端会优先复用已有的断点续跑能力。
+8. 当日 Tushare 数据为空、行数不足或关键字段覆盖率未达标时，每 10 分钟重新获取一次，直到北京时间 17:20；不足 10 分钟时缩短最后一次等待，在 17:20 做最终检查，仍缺失才失败。此类等待不消耗总入口的 3 次普通错误重试额度；日线和 `daily_basic` 在当前步骤内等待并更新进度，不重复启动整套策略计算。数据已齐、正在计算的任务不会因超过 17:20 被中断。权限、网络及计算错误仍按原有普通重试规则处理，其他 `failed/error` 终态重试继续复用服务端断点。
 9. 每次终态都会保存独立的 `data/routine/<运行时间>_<run_id>/manifest.json`，其中包含每一步的状态、起止时间、耗时、结果和错误；`latest_refresh_status.json` 只作为最新状态指针。
 10. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应正式文件存在且非空时才删除。已被合并可转债日线覆盖的逐日请求缓存会删除；B1 时间戳研究报告每类保留最近 2 版，可重建的超大 trade-samples 只保留最新 1 版，内容相同的 `latest` 文件使用硬链接去重。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
 11. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
@@ -281,13 +281,13 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_DAILY_FINAL_RETRY_ROUNDS` | `2` | 最终失败较多时谨慎增加 |
 | `ROUTINE_DAILY_FINAL_RETRY_WORKERS` | `4` | 限频时降低 |
 | `ROUTINE_DAILY_FINAL_RETRY_SLEEP` | `0.8` | 最终重试仍限频时提高 |
-| `ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES` | `12` | 最新交易日日线为空或覆盖率不足时允许连续失败 12 次，第 13 次仍失败才终止 |
-| `ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL` | `300` | 最新交易日日线可用性探测间隔，单位秒 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES` | `12` | 历史日线或非缺失错误的可用性探测失败预算；当日缺失改用 17:20 截止规则 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL` | `300` | 历史日线或非缺失错误的可用性探测间隔，单位秒；当日缺失固定每 600 秒重试 |
 | `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.995` | 单交易日全市场行情覆盖率门禁；低于阈值阻断发布 |
 | `MARKET_DATA_SQL_BATCH_SIZE` | `5000` | 统一行情表批量 upsert 行数；遇到 `max_allowed_packet` 限制时降低 |
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日拉取的并发数；限频时降低 |
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔；限频时提高 |
-| `ROUTINE_DAILY_BASIC_RETRIES` | `3` | `daily_basic` 单日失败重试次数 |
+| `ROUTINE_DAILY_BASIC_RETRIES` | `3` | `daily_basic` 普通失败重试次数；当日字段/行数缺失每 600 秒重试至北京时间 17:20 |
 | `ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE` | `0.98` | `daily_basic` 相对当日正式行情股票数的最低覆盖率 |
 | `ROUTINE_TRADABILITY_MIN_COVERAGE_RATE` | `0.98` | `stk_limit` 对当日有效证券范围的覆盖率门禁；低于门槛不发布 |
 | `ROUTINE_TRADABILITY_RETRIES` | `3` | 可交易性三个 Tushare 接口的单日重试次数 |

@@ -26,6 +26,11 @@ import yaml
 from quant.data import MarketDataStore, MarketDataStoreConfig
 from quant.data.atomic_io import atomic_link_or_copy, atomic_write_json, atomic_write_parquet
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.candlestick_context import (
+    CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION,
+    CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS,
+    compute_candlestick_context_features,
+)
 from quant.features.canonical_factor_names import (
     assert_no_forbidden_factor_names,
     find_forbidden_aliases_in_payload,
@@ -505,6 +510,7 @@ def _empty_feature_frame() -> pd.DataFrame:
         "trade_date",
         "date",
         *RIGHT_SIDE_SHADOW_FACTOR_COLUMNS,
+        *CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS,
         "factor_schema_version",
         "right_side_feature_schema_version",
         *RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
@@ -539,6 +545,9 @@ def _build_shadow_symbol_feature(
             normalized,
             canonical_factors=project,
         ).reset_index(drop=True)
+        candle_context = compute_candlestick_context_features(
+            normalized
+        ).reset_index(drop=True)
         missing_rules = set(RULE_FEATURE_COLUMNS) - set(rules.columns)
         if missing_rules:
             raise ValueError(
@@ -565,6 +574,7 @@ def _build_shadow_symbol_feature(
                     ]
                 ],
                 rules[list(RULE_FEATURE_COLUMNS)],
+                candle_context[list(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS)],
             ],
             axis=1,
         )
@@ -751,6 +761,12 @@ def build_right_side_shadow_features(
         "signal_candidate_count": int(len(signals)),
         "computed_candidate_count": int(len(frame)),
         "empty_candidate_set": bool(frame.empty),
+        "candle_context_feature_schema_version": (
+            CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION
+        ),
+        "candle_context_research_feature_columns": list(
+            CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS
+        ),
         "output": str(config.paths.feature_output),
         "output_sha256": _sha256(config.paths.feature_output),
         **right_side_shadow_contract_payload(),

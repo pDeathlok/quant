@@ -20,6 +20,7 @@ OUTPUT_PATH = ROOT / "docs" / "factor_catalog.md"
 LAYER_ORDER = (
     "project_daily",
     "project_daily_candidate",
+    "candlestick_context_research",
     "right_side_rule",
     "right_side_identity",
     "selector_live",
@@ -29,7 +30,12 @@ LAYER_ORDER = (
     "long_external_candidate",
 )
 
-ROLE_ORDER = ("feature", "compatibility_alias", "strategy_identity")
+ROLE_ORDER = (
+    "feature",
+    "research_feature",
+    "compatibility_alias",
+    "strategy_identity",
+)
 LIFECYCLE_ORDER = (
     "production_model",
     "production_materialized",

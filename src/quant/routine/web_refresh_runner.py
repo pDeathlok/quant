@@ -11,7 +11,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, TextIO
 from urllib.parse import urlparse
@@ -23,6 +23,12 @@ from quant.routine.cache_retention import run_cache_cleanup
 from quant.routine.rotating_logs import (
     DEFAULT_WEBAPP_LOG_BACKUP_COUNT,
     DEFAULT_WEBAPP_LOG_MAX_BYTES,
+)
+from quant.routine.tushare_availability import (
+    is_tushare_data_missing,
+    market_now,
+    tushare_retry_deadline,
+    tushare_retry_delay,
 )
 
 
@@ -459,6 +465,13 @@ def ensure_local_service(
 
 
 def summarize_error(status: Mapping[str, Any]) -> str | None:
+    results = status.get("result")
+    if isinstance(results, Mapping):
+        for key, payload in results.items():
+            if isinstance(payload, Mapping) and payload.get("status") in {"failed", "error"}:
+                detail = payload.get("error_summary")
+                if isinstance(detail, str) and detail.strip():
+                    return f"{key}: {detail.strip().splitlines()[0]}"
     error = status.get("error")
     if isinstance(error, str) and error.strip():
         return error.strip().splitlines()[0]
@@ -475,10 +488,42 @@ def summarize_error(status: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _tushare_missing_error(status: Mapping[str, Any]) -> str | None:
+    results = status.get("result")
+    if isinstance(results, Mapping):
+        for payload in results.values():
+            if not isinstance(payload, Mapping) or payload.get("status") not in {"failed", "error"}:
+                continue
+            if payload.get("data_missing") is False:
+                return None
+            details = [payload.get(key) for key in ("error_summary", "error", "stderr_tail")]
+            critical_errors = payload.get("critical_errors")
+            if isinstance(critical_errors, list):
+                details.extend(critical_errors)
+            if payload.get("data_missing") is True:
+                return next((value for value in details if isinstance(value, str) and value), "Tushare data incomplete")
+            for detail in details:
+                if isinstance(detail, str) and detail.strip():
+                    last_line = detail.strip().splitlines()[-1]
+                    if is_tushare_data_missing(last_line):
+                        return last_line
+    error = status.get("error")
+    if isinstance(error, str) and error.strip():
+        last_line = error.strip().splitlines()[-1]
+        if is_tushare_data_missing(last_line):
+            return last_line
+    return None
+
+
 def extract_failed_count(status: Mapping[str, Any]) -> int | None:
     results = status.get("result")
     if not isinstance(results, Mapping):
         return None
+    for payload in results.values():
+        if isinstance(payload, Mapping) and payload.get("status") in {"failed", "error"}:
+            failed = payload.get("failed")
+            if isinstance(failed, int):
+                return failed
     refresh_data = results.get("refresh_data")
     if isinstance(refresh_data, Mapping):
         failed = refresh_data.get("failed")
@@ -549,6 +594,7 @@ def _run_refresh_workflow_locked(
     sleep_fn: Callable[[float], None] = time.sleep,
     monotonic_fn: Callable[[], float] = time.monotonic,
     print_fn: Callable[[str], None] = print,
+    now_fn: Callable[[], datetime] = market_now,
 ) -> dict[str, Any]:
     env_values = load_env_file(config.env_path)
     os.environ.update(env_values)
@@ -593,7 +639,9 @@ def _run_refresh_workflow_locked(
         print_fn(f"[service] 运行日志: {config.service_log_path}")
 
     attempts = 0
-    while attempts < config.max_attempts:
+    ordinary_failures = 0
+    deadline = tushare_retry_deadline(decision.trade_date, now_fn())
+    while True:
         try:
             status = client.get_status()
         except Exception as exc:
@@ -613,7 +661,7 @@ def _run_refresh_workflow_locked(
             print_fn("[refresh] 检测到已有运行中的刷新任务，转为接管监控")
         else:
             attempts += 1
-            print_fn(f"[refresh] 提交刷新，第 {attempts}/{config.max_attempts} 次")
+            print_fn(f"[refresh] 提交刷新，第 {attempts} 次（普通错误最多 {config.max_attempts} 次）")
             status = client.start_refresh(config.scope)
             print_fn(
                 "[refresh] "
@@ -629,7 +677,8 @@ def _run_refresh_workflow_locked(
                 print_fn=print_fn,
             )
         except Exception as exc:
-            if attempts >= config.max_attempts:
+            ordinary_failures += 1
+            if ordinary_failures >= config.max_attempts:
                 raise
             print_fn(f"[retry] 监控失败: {exc}")
             ensure_local_service(
@@ -665,7 +714,21 @@ def _run_refresh_workflow_locked(
                 "manifest_path": terminal.get("manifest_path"),
             }
 
-        if attempts >= config.max_attempts:
+        missing_error = _tushare_missing_error(terminal)
+        retry_delay = config.retry_delay_seconds
+        if missing_error and deadline is not None:
+            retry_delay = tushare_retry_delay(deadline, now_fn())
+            if retry_delay is None:
+                print_fn(f"[retry] 已到北京时间 17:20 截止时间，Tushare 数据仍缺失：{missing_error}")
+            else:
+                print_fn(
+                    f"[retry] Tushare 数据尚未完整，{retry_delay:g} 秒后重试，"
+                    f"截止北京时间 17:20，不占普通错误重试次数：{missing_error}"
+                )
+        else:
+            ordinary_failures += 1
+
+        if retry_delay is None or ordinary_failures >= config.max_attempts:
             return {
                 "status": str(terminal.get("status") or "failed"),
                 "trade_date": decision.trade_date,
@@ -678,10 +741,11 @@ def _run_refresh_workflow_locked(
                 "manifest_path": terminal.get("manifest_path"),
             }
 
-        print_fn(
-            "[retry] "
-            f"检测到终态 {terminal.get('status')}，准备在 {config.retry_delay_seconds:.0f}s 后自动重试"
-        )
+        if not (missing_error and deadline is not None):
+            print_fn(
+                "[retry] "
+                f"检测到终态 {terminal.get('status')}，准备在 {retry_delay:.0f}s 后自动重试"
+            )
         ensure_local_service(
             config=config,
             client=client,
@@ -691,9 +755,7 @@ def _run_refresh_workflow_locked(
             monotonic_fn=monotonic_fn,
             print_fn=print_fn,
         )
-        sleep_fn(config.retry_delay_seconds)
-
-    raise RuntimeError("刷新重试流程意外结束")
+        sleep_fn(retry_delay)
 
 
 def run_refresh_workflow(
@@ -704,6 +766,7 @@ def run_refresh_workflow(
     sleep_fn: Callable[[float], None] = time.sleep,
     monotonic_fn: Callable[[], float] = time.monotonic,
     print_fn: Callable[[str], None] = print,
+    now_fn: Callable[[], datetime] = market_now,
 ) -> dict[str, Any]:
     lock_path = config.runner_lock_path or config.project_root / ".run" / "daily_web_refresh.lock"
     try:
@@ -716,6 +779,7 @@ def run_refresh_workflow(
                 sleep_fn=sleep_fn,
                 monotonic_fn=monotonic_fn,
                 print_fn=print_fn,
+                now_fn=now_fn,
             )
     except RefreshRunnerBusyError as exc:
         print_fn(f"[lock] {exc}")
@@ -739,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="状态长时间无变化时的超时秒数",
     )
     parser.add_argument("--retry-delay", type=float, default=5.0, help="失败后重试前等待秒数")
-    parser.add_argument("--max-attempts", type=int, default=3, help="最多触发刷新次数")
+    parser.add_argument("--max-attempts", type=int, default=3, help="普通失败最多尝试次数；当日 Tushare 缺失每 10 分钟重试至北京时间 17:20")
     parser.add_argument("--log-file", default=str(DEFAULT_LOG_PATH), help="服务启动日志路径")
     parser.add_argument("--pid-file", default=str(DEFAULT_PID_PATH), help="常驻后台服务 pid 文件路径")
     restart_group = parser.add_mutually_exclusive_group()

@@ -1,5 +1,21 @@
 """Project-wide feature and variable library."""
 
+from .active_market_value import (
+    ACTIVE_MARKET_VALUE_FEATURE_SCHEMA_VERSION,
+    ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS,
+    KEY_INDEX_ACTIVE_MARKET_VALUE_FEATURE_COLUMNS,
+    KEY_INDEX_SPECS,
+    MARKET_ACTIVE_MARKET_VALUE_FEATURE_COLUMNS,
+    MIN_INDEX_CONSTITUENT_COVERAGE,
+    STOCK_ACTIVE_MARKET_VALUE_FEATURE_COLUMNS,
+    ActiveMarketValueFrames,
+    attach_active_market_value_features,
+    build_active_market_value_feature_frames,
+    compute_active_share_ratio,
+    compute_key_index_active_market_value_features,
+    compute_market_active_market_value_features,
+    compute_stock_active_market_value_features,
+)
 from .variable_library import (
     PROJECT_FACTOR_COLUMNS,
     EXTRA_FEATURE_COLUMNS,
@@ -7,6 +23,14 @@ from .variable_library import (
     calculate_project_extra_features,
     load_daily_basic_features,
     merge_daily_basic_features,
+)
+from .market_breadth import (
+    MARKET_BREADTH_FEATURE_SCHEMA_VERSION,
+    MARKET_BREADTH_HIGH_LOW_WINDOWS,
+    MARKET_BREADTH_MA_WINDOWS,
+    MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS,
+    attach_market_breadth_features,
+    compute_market_breadth_features,
 )
 from .market_regime import classify_market_regime
 from .factor_registry import (
@@ -41,7 +65,27 @@ from .right_side_factor_contract import (
 )
 
 __all__ = [
+    "ACTIVE_MARKET_VALUE_FEATURE_SCHEMA_VERSION",
+    "ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS",
+    "KEY_INDEX_ACTIVE_MARKET_VALUE_FEATURE_COLUMNS",
+    "KEY_INDEX_SPECS",
+    "MARKET_ACTIVE_MARKET_VALUE_FEATURE_COLUMNS",
+    "MIN_INDEX_CONSTITUENT_COVERAGE",
+    "STOCK_ACTIVE_MARKET_VALUE_FEATURE_COLUMNS",
+    "ActiveMarketValueFrames",
+    "attach_active_market_value_features",
+    "build_active_market_value_feature_frames",
+    "compute_active_share_ratio",
+    "compute_key_index_active_market_value_features",
+    "compute_market_active_market_value_features",
+    "compute_stock_active_market_value_features",
     "PROJECT_FACTOR_COLUMNS",
+    "MARKET_BREADTH_FEATURE_SCHEMA_VERSION",
+    "MARKET_BREADTH_HIGH_LOW_WINDOWS",
+    "MARKET_BREADTH_MA_WINDOWS",
+    "MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS",
+    "attach_market_breadth_features",
+    "compute_market_breadth_features",
     "EXTRA_FEATURE_COLUMNS",
     "calc_bbi",
     "calculate_project_extra_features",

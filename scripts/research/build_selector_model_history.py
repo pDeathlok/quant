@@ -35,6 +35,24 @@ DEFAULT_DAILY = PROJECT_ROOT / "data/raw/daily_partitioned/year_month=*/data.par
 DEFAULT_OUTPUT = PROJECT_ROOT / "data/research/selector_model_history_2020.parquet"
 
 
+def candlestick_context_expressions() -> list[pl.Expr]:
+    """Return Polars expressions matching the governed pandas calculator."""
+
+    upper_shadow = pl.col("high") - pl.max_horizontal("open", "close")
+    return [
+        (upper_shadow / (pl.col("high") - pl.col("low"))).alias(
+            "rs_upper_shadow_range_share"
+        ),
+        (
+            upper_shadow / (pl.col("close") - pl.col("open")).abs()
+        ).alias("rs_upper_shadow_body_ratio"),
+        (
+            pl.col("volume")
+            / pl.col("volume").shift(1).rolling_mean(20).over("symbol")
+        ).alias("rs_volume_ratio_prev20"),
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build selector model history from cached strategy candidates.")
     parser.add_argument("--start-date", default="2020-01-01")
@@ -247,6 +265,7 @@ def build_forward_labels(candidates: pd.DataFrame, args: argparse.Namespace) -> 
             for window in (5, 20)
         ],
         close_position.alias("selector_close_pos"),
+        *candlestick_context_expressions(),
         *[
             close_position.rolling_mean(window).over("symbol").alias(f"selector_close_pos_mean_{window}d")
             for window in (5, 20)

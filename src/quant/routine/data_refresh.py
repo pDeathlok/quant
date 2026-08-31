@@ -26,6 +26,13 @@ from quant.data.source_merge import (
 )
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.routine.paths import DAILY_DIR, PROJECT_ROOT
+from quant.routine.tushare_availability import (
+    RETRY_INTERVAL_SECONDS,
+    is_tushare_data_missing,
+    market_now,
+    tushare_retry_deadline,
+    tushare_retry_delay,
+)
 
 AUDIT_ROOT = PROJECT_ROOT / "data/raw/source_audit"
 
@@ -422,12 +429,12 @@ def _wait_for_market_daily_availability(
     retry_failures: int,
     retry_interval_seconds: float,
     sleep_fn: Callable[[float], None] = time.sleep,
+    now_fn: Callable[[], datetime] = market_now,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Probe the newest market date until it is complete enough to publish.
 
-    The first request is immediate. ``retry_failures`` controls how many failed
-    probes are tolerated before one final request is made, so the default of 12
-    permits failures 1-12 and reports failure only when probe 13 also fails.
+    Today's missing data is probed every ten minutes through 17:20 Shanghai
+    time. Historical dates and other errors retain the count-based budget.
     """
 
     if retry_failures < 0:
@@ -448,7 +455,11 @@ def _wait_for_market_daily_availability(
     limiter = RequestLimiter(sleep_between)
     total_attempts = retry_failures + 1
     last_error = ""
-    for attempt in range(1, total_attempts + 1):
+    deadline = tushare_retry_deadline(trade_date, now_fn())
+    attempt = 0
+    ordinary_failures = 0
+    while True:
+        attempt += 1
         try:
             frame = _fetch_market_daily_once(tushare, trade_date, limiter)
             market = normalize_tushare_market_daily(
@@ -468,13 +479,33 @@ def _wait_for_market_daily_availability(
                 "attempts": attempt,
                 "failed_attempts": attempt - 1,
                 "retry_failures_allowed": retry_failures,
-                "retry_interval_seconds": retry_interval_seconds,
+                "retry_interval_seconds": RETRY_INTERVAL_SECONDS if deadline else retry_interval_seconds,
+                "availability_deadline": deadline.isoformat() if deadline else None,
                 "coverage": coverage,
             }
         except Exception as exc:
             last_error = str(exc)
+            if is_tushare_data_missing(last_error) and deadline is not None:
+                delay = tushare_retry_delay(deadline, now_fn())
+                if delay is None:
+                    raise MarketDataNotReadyError(
+                        f"Tushare daily for {trade_date} still incomplete at "
+                        f"{deadline.isoformat()} after {attempt} probes: {last_error}"
+                    ) from exc
+                print(
+                    "market daily availability retry: "
+                    f"trade_date={trade_date} failed_attempts={attempt} "
+                    f"retry_in_seconds={delay:g} deadline={deadline.isoformat()} "
+                    f"error={last_error[:240]}",
+                    flush=True,
+                )
+                sleep_fn(delay)
+                continue
+            ordinary_failures += 1
             failed_attempts = attempt
-            if failed_attempts > retry_failures:
+            if ordinary_failures > retry_failures:
+                if not is_tushare_data_missing(last_error):
+                    raise
                 break
             print(
                 "market daily availability retry: "

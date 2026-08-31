@@ -17,6 +17,12 @@ def test_factor_calculator_registry_covers_and_orders_daily_factors() -> None:
     ids = [item.calculator_id for item in plan]
 
     assert ids.index("project_daily") < ids.index("right_side_rule")
+    research_plan = build_factor_execution_plan(
+        ["rs_upper_shadow_range_share", "rs_volume_ratio_prev20"]
+    )
+    assert [item.calculator_id for item in research_plan] == [
+        "candlestick_context_research"
+    ]
     assert all(item.produces for item in FACTOR_CALCULATORS)
 
 

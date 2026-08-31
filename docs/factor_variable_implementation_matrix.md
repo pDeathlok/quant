@@ -179,7 +179,9 @@ PE / PE_TTM 理论上对盈利公司应存在，但 Tushare daily_basic 中实�
 | `close_ma20_ratio`, `close_ma60_ratio` | 收盘价相对均线位置 | 待实现-有数据 | `close/ma_n` | 可由已实现字段组合，尚未单独落列 |
 | `ma_bull`, `ma_divergence` | 均线多头排列、均线乖离 | 待实现-有数据 | `ma5>ma10>ma20>ma60`，`(ma5-ma20)/ma20` | 尚未单独落列 |
 | `macd_cross`, `macd_hist_change` | MACD 金叉/柱体变化 | 待实现-有数据 | `dif>dea and dif.shift(1)<=dea.shift(1)`，`macd_hist.diff()` | 当前先加入 MACD 基础三列 |
-| `gap_open`, `upper_shadow`, `lower_shadow`, `body_ratio` | K 线形态 | 待实现-有数据 | 开盘跳空、上下影线、实体占比 | 文档规划中，尚未进入 B1 |
+| `rs_upper_shadow_pct` | 上影线相对昨收 | 已实现-生产物化 | `(high-max(open,close))/pre_close*100` | 已在右侧规则层；左侧随研究 sidecar 物化 |
+| `rs_upper_shadow_range_share`, `rs_upper_shadow_body_ratio` | 上影线占振幅、上影线/实体 | 已实现-研究候选 | `(high-max(open,close))/(high-low)`，`(high-max(open,close))/abs(close-open)` | 等待重训及样本外验证后再晋级模型输入 |
+| `gap_open`, `lower_shadow`, `body_ratio` | 其余 K 线形态 | 待实现-有数据 | 开盘跳空、下影线、实体占比 | 尚未单独落列 |
 
 ### 4.2 流动性、成交额、冲击成本
 

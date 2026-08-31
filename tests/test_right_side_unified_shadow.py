@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from quant.features.candlestick_context import (
+    CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS,
+)
 from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
 from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_ARTIFACT_SCHEMA_VERSION,
@@ -265,6 +268,7 @@ def test_shadow_feature_frame_requires_complete_exact_date_candidate_coverage(
 
     assert len(result) == 1
     assert set(RIGHT_SIDE_SHADOW_FACTOR_COLUMNS) <= set(result.columns)
+    assert set(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS) <= set(result.columns)
     assert result["B2"].tolist() == [True]
     assert result["right_side_feature_schema_version"].eq(
         RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION

@@ -23,6 +23,11 @@ from quant.application.left_side_ranking import (
 from quant.data.atomic_io import atomic_link_or_copy, atomic_write_json, atomic_write_parquet
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 from quant.data.source_merge import normalize_tushare_daily
+from quant.features.candlestick_context import (
+    CANDLE_CONTEXT_FEATURE_COLUMNS,
+    CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION,
+    compute_candlestick_context_features,
+)
 from quant.features.canonical_factor_names import (
     assert_no_forbidden_factor_names,
     find_forbidden_aliases_in_payload,
@@ -215,6 +220,9 @@ def _build_symbol_feature(
     left_current = compute_left_side_rule_features(rule_history).tail(1).reset_index(
         drop=True
     )
+    candle_context_current = compute_candlestick_context_features(
+        rule_history
+    ).tail(1).reset_index(drop=True)
     range_ = (rule_history["high"] - rule_history["low"]).replace(0.0, np.nan)
     shared_current = pd.DataFrame(
         {
@@ -240,6 +248,7 @@ def _build_symbol_feature(
             ],
             shared_current[list(LEFT_SIDE_SHARED_RULE_REQUIREMENTS)],
             left_current[list(LEFT_SIDE_RULE_FEATURE_COLUMNS)],
+            candle_context_current[list(CANDLE_CONTEXT_FEATURE_COLUMNS)],
         ],
         axis=1,
     )
@@ -267,6 +276,7 @@ def build_left_side_feature_frame(
         "trade_date",
         "date",
         *LEFT_SIDE_FACTOR_COLUMNS,
+        *CANDLE_CONTEXT_FEATURE_COLUMNS,
         "factor_schema_version",
         "left_side_feature_schema_version",
         *LEFT_SIDE_SIGNALS,
@@ -356,6 +366,7 @@ def _feature_input_fingerprint(
         PROJECT_ROOT / "src/quant/data/source_merge.py",
         PROJECT_ROOT / "src/quant/features/project_factor_layer.py",
         PROJECT_ROOT / "src/quant/features/variable_library.py",
+        PROJECT_ROOT / "src/quant/features/candlestick_context.py",
         PROJECT_ROOT / "src/quant/research/left_side_unified_features.py",
     )
     return _fingerprint(paths, {
@@ -573,6 +584,10 @@ def build_left_side_production_features(
         "candidate_coverage_status": "complete",
         "signal_candidate_count": len(signals),
         "computed_candidate_count": len(frame),
+        "candle_context_feature_schema_version": (
+            CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION
+        ),
+        "candle_context_feature_columns": list(CANDLE_CONTEXT_FEATURE_COLUMNS),
         "output_sha256": _sha256(config.paths.feature_output),
         "source_input_fingerprint": _feature_input_fingerprint(target, config),
         **left_side_contract_payload(),

@@ -74,6 +74,7 @@ const state = {
   operationPlansLoading: false,
   operationPlansLoaded: false,
   operationPlanFilter: "active",
+  shortSideFilter: "all",
   shortSort: { key: "model_score_normalized", direction: "desc" },
 };
 
@@ -850,6 +851,7 @@ function runDirectWorkspaceRefresh(key, operation) {
 
 function renderShortPage() {
   renderHeader();
+  renderShortSideFilter();
   renderStrategyFilters();
   renderShortScoreSortHeaders();
   renderStockRows();
@@ -873,6 +875,7 @@ async function loadSelector(options = {}) {
   const params = selectedStrategyParam();
   if (params) query.set("strategies", params);
   if (!params) query.set("include_extended", "true");
+  if (state.shortSideFilter !== "all") query.set("side", state.shortSideFilter);
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
   const suffix = query.toString();
@@ -2215,7 +2218,8 @@ function shortScoreValue(item, prefix) {
 }
 
 function selectedStock() {
-  return (state.payload?.stocks || []).find((item) => item.symbol === state.selectedSymbol) || filteredStocks()[0] || null;
+  const rows = filteredStocks();
+  return rows.find((item) => item.symbol === state.selectedSymbol) || rows[0] || null;
 }
 
 function shortStrategySide(item, group) {
@@ -2260,14 +2264,27 @@ function renderHeader() {
   } else {
     const shown = filteredStocks().length;
     const total = Number(state.payload?.total_stock_count || shown);
+    const allActionable = Number(state.payload?.all_actionable_stock_count || total);
     const complete = Number(state.payload?.complete_stock_count || total);
     const limit = Number(state.payload?.display_limit || shown);
-    document.querySelector("#stockCount").textContent = complete > total
+    const sideLabel = state.shortSideFilter === "left" ? "左侧" : "右侧";
+    document.querySelector("#stockCount").textContent = state.shortSideFilter !== "all"
+      ? `展示 ${shown} / ${sideLabel}可操作 ${total} / 全部 ${allActionable} / 完整 ${complete} 只`
+      : complete > total
       ? `展示 ${shown} / 可操作 ${total} / 完整 ${complete} 只`
       : total > shown || total > limit
       ? `展示 ${shown} / 可操作 ${total} 只`
       : `${shown} 只股票`;
   }
+}
+
+function renderShortSideFilter() {
+  document.querySelectorAll("[data-short-side]").forEach((button) => {
+    const active = button.dataset.shortSide === state.shortSideFilter;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = state.loading;
+  });
 }
 
 function renderCalendar() {
@@ -2547,6 +2564,55 @@ function renderNotes() {
   document.querySelector("#notes").innerHTML = (state.payload?.notes || []).map((item) => `<li>${item}</li>`).join("");
 }
 
+function shortCalibrationScores(calibration) {
+  const field = calibration.score_field || ({
+    model_right: "model_score_normalized",
+    model_left: "model_score_normalized",
+    buy: "buy_score_normalized",
+    hold: "hold_score_normalized",
+  })[calibration.key];
+  return filteredStocks()
+    .filter((item) => (
+      calibration.key === "model_right"
+        ? item.ranking_source === "right_side_unified"
+        : calibration.key === "model_left"
+        ? item.ranking_source === "left_side_unified"
+        : true
+    ))
+    .map((item) => Number(item?.[field]))
+    .filter(Number.isFinite);
+}
+
+function scoreInProbabilityBand(score, band, isLast) {
+  const minimum = Number(band.min_score);
+  const maximum = Number(band.max_score);
+  return score >= minimum && (isLast ? score <= maximum : score < maximum);
+}
+
+function currentProbabilityBands(calibration, scores) {
+  const bands = (calibration.bands || []).map((band, index, allBands) => ({
+    ...band,
+    current_count: scores.filter((score) => scoreInProbabilityBand(score, band, index === allBands.length - 1)).length,
+  }));
+  const occupied = bands
+    .map((band, index) => band.current_count > 0 ? index : -1)
+    .filter((index) => index >= 0);
+  if (!occupied.length) return [];
+  const start = Math.max(0, Math.min(...occupied) - 1);
+  const end = Math.min(bands.length, Math.max(...occupied) + 2);
+  return bands.slice(start, end);
+}
+
+function visibleScoreCalibrations(calibrations) {
+  if (state.shortSideFilter === "left") {
+    return calibrations.filter((item) => item.key !== "model_right");
+  }
+  if (state.shortSideFilter === "right") {
+    return calibrations.filter((item) => item.key !== "model_left");
+  }
+  return calibrations;
+}
+
 function renderScoreProbabilityBands() {
   const wrap = document.querySelector("#scoreProbabilityBands");
   const meta = document.querySelector("#scoreProbabilityMeta");
@@ -2563,32 +2629,41 @@ function renderScoreProbabilityBands() {
     return;
   }
   meta.textContent = `${payload.method === "strict_out_of_sample_observed_frequency_by_display_score_band" ? "严格样本外历史频率" : "历史分档频率"} · 不是收益承诺`;
-  wrap.innerHTML = (payload.calibrations || []).map((calibration) => `
-    <article class="score-probability-card">
+  wrap.innerHTML = visibleScoreCalibrations(payload.calibrations || []).map((calibration) => {
+    const scores = shortCalibrationScores(calibration);
+    const bands = currentProbabilityBands(calibration, scores);
+    const scoreRange = scores.length
+      ? `${Math.min(...scores).toFixed(1)}–${Math.max(...scores).toFixed(1)} 分`
+      : "暂无对应评分";
+    return `
+    <article class="score-probability-card" data-calibration-key="${escapeHtml(calibration.key || "")}">
       <div class="score-probability-card-head">
         <div>
           <strong>${escapeHtml(calibration.label || "分数")}</strong>
           <span>${escapeHtml(calibration.target_label || "历史命中概率")}</span>
+          <small>当前池 ${scores.length} 只 · ${scoreRange}</small>
         </div>
         <em>${escapeHtml(calibration.evaluation_scope || "样本外")}</em>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>分档</th><th>概率</th><th>样本数</th></tr></thead>
+          <thead><tr><th>分档</th><th>历史概率</th><th>历史样本</th><th>当前池</th></tr></thead>
           <tbody>
-            ${(calibration.bands || []).map((band) => `
-              <tr>
+            ${bands.length ? bands.map((band) => `
+              <tr class="${band.current_count > 0 ? "current-score-band" : ""}" data-score-band="${escapeHtml(band.label || "")}" data-current-count="${band.current_count}">
                 <td>${escapeHtml(band.label || "-")}</td>
                 <td><strong>${Number(band.probability_pct || 0).toFixed(1)}%</strong></td>
                 <td>${Number(band.sample_count || 0).toLocaleString("zh-CN")}</td>
+                <td>${band.current_count > 0 ? `<b>${band.current_count}</b>` : "—"}</td>
               </tr>
-            `).join("")}
+            `).join("") : `<tr><td colspan="4" class="score-probability-empty">当前股票池暂无这类评分，请切换上方模型侧查看</td></tr>`}
           </tbody>
         </table>
       </div>
-      <p>${escapeHtml(calibration.target_definition || "")}</p>
+      <p>${escapeHtml(calibration.target_definition || "")}。仅显示当前股票池覆盖分档及相邻一档。</p>
     </article>
-  `).join("");
+  `;
+  }).join("");
 }
 
 function filteredOperationPlans() {
@@ -3880,6 +3955,7 @@ document.querySelector("#searchInput").addEventListener("input", (event) => {
   renderStockRows();
   renderStockDetail();
   renderHeader();
+  renderScoreProbabilityBands();
 });
 
 document.querySelectorAll("[data-short-score-sort]").forEach((button) => {
@@ -3897,12 +3973,23 @@ document.querySelectorAll("[data-short-score-sort]").forEach((button) => {
   });
 });
 
+document.querySelectorAll("[data-short-side]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const side = button.dataset.shortSide;
+    if (!new Set(["all", "left", "right"]).has(side) || side === state.shortSideFilter) return;
+    state.shortSideFilter = side;
+    state.selectedSymbol = null;
+    await loadSelector().catch(showError);
+  });
+});
+
 document.querySelector("#clearFilters").addEventListener("click", async () => {
   if (selectorFilterReloadTimer !== null) {
     window.clearTimeout(selectorFilterReloadTimer);
     selectorFilterReloadTimer = null;
   }
   state.selectedStrategies.clear();
+  state.shortSideFilter = "all";
   state.query = "";
   document.querySelector("#searchInput").value = "";
   await loadSelector().catch(showError);

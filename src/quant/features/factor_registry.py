@@ -6,9 +6,21 @@ from dataclasses import asdict, dataclass, replace
 
 import pandas as pd
 
+from quant.features.active_market_value import (
+    ACTIVE_MARKET_VALUE_FEATURE_SCHEMA_VERSION,
+    ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS,
+)
+from quant.features.candlestick_context import (
+    CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION,
+    CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS,
+)
 from quant.features.factor_governance import (
     factor_governance_config_sha256,
     load_factor_governance_config,
+)
+from quant.features.market_breadth import (
+    MARKET_BREADTH_FEATURE_SCHEMA_VERSION,
+    MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS,
 )
 from quant.features.long_external_factors import LONG_EXTERNAL_FACTOR_COLUMNS
 from quant.features.project_factor_layer import PROJECT_FACTOR_SCHEMA_VERSION
@@ -514,6 +526,9 @@ FACTOR_LEVELS = frozenset(
 )
 
 _LAYER_CALCULATOR = {
+    "market_breadth_research": "market_breadth_research",
+    "active_market_value_research": "active_market_value_research",
+    "candlestick_context_research": "candlestick_context_research",
     "project_daily": "project_daily",
     "project_daily_candidate": "project_daily_candidate",
     "right_side_rule": "right_side_rule",
@@ -527,6 +542,9 @@ _LAYER_CALCULATOR = {
     "long_external_candidate": "long_external",
 }
 _CALCULATION_OWNER = {
+    "market_breadth_research": "factor_core_research",
+    "active_market_value_research": "factor_core_research",
+    "candlestick_context_research": "factor_core_research",
     "project_daily": "factor_core",
     "project_daily_candidate": "factor_core_research",
     "right_side_rule": "rule_feature_engine",
@@ -628,6 +646,8 @@ def _semantic_category(definition: FactorDefinition) -> str:
     if any(token in name for token in ("open", "high", "low", "close", "gap", "body", "shadow", "price", "support", "center")):
         return "price_structure"
     family_defaults = {
+        "active_market_value": "volume_liquidity",
+        "market_breadth": "relative_cross_section",
         "analyst_expectation": "analyst_expectation",
         "asset_quality": "balance_sheet_quality",
         "cashflow_quality": "cashflow_quality",
@@ -749,6 +769,97 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                     if canonical_name != name
                     else "production_materialized"
                 ),
+            )
+        )
+        existing.add(name)
+    for name in MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="market_breadth",
+                frequency="daily",
+                source="market_daily_full_cross_section",
+                point_in_time=True,
+                consumers=(
+                    "right_side_unified_research",
+                    "left_side_unified_research",
+                    "selector_buy_hold_research",
+                    "market_regime_research",
+                ),
+                role="research_feature",
+                canonical_name=name,
+                layer="market_breadth_research",
+                calculation_entrypoint=(
+                    "quant.features.market_breadth."
+                    "compute_market_breadth_features"
+                ),
+                calculation_version=MARKET_BREADTH_FEATURE_SCHEMA_VERSION,
+                refresh_cadence="on_demand",
+                lifecycle="research_candidate",
+            )
+        )
+        existing.add(name)
+    for name in ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="active_market_value",
+                frequency="daily",
+                source=(
+                    "tushare_daily_basic+index_daily+index_dailybasic+index_weight"
+                ),
+                point_in_time=True,
+                consumers=(
+                    "right_side_unified_research",
+                    "left_side_unified_research",
+                    "selector_buy_hold_research",
+                    "market_regime_research",
+                ),
+                role="research_feature",
+                canonical_name=name,
+                layer="active_market_value_research",
+                calculation_entrypoint=(
+                    "quant.features.active_market_value."
+                    "build_active_market_value_feature_frames"
+                ),
+                calculation_version=ACTIVE_MARKET_VALUE_FEATURE_SCHEMA_VERSION,
+                refresh_cadence="on_demand",
+                lifecycle="research_candidate",
+            )
+        )
+        existing.add(name)
+    for name in CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="candlestick_context",
+                frequency="daily",
+                source=(
+                    "quant.features.candlestick_context."
+                    "compute_candlestick_context_features"
+                ),
+                point_in_time=True,
+                consumers=(
+                    "right_side_unified_research",
+                    "left_side_unified_research",
+                    "selector_buy_hold_research",
+                ),
+                role="research_feature",
+                canonical_name=name,
+                layer="candlestick_context_research",
+                calculation_entrypoint=(
+                    "quant.features.candlestick_context."
+                    "compute_candlestick_context_features"
+                ),
+                calculation_version=CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION,
+                refresh_cadence="on_demand",
+                lifecycle="research_candidate",
             )
         )
         existing.add(name)

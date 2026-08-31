@@ -1,6 +1,7 @@
 import sys
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -15,6 +16,61 @@ def isolate_convertible_bond_watchlist(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "CB_WATCHLIST_PATH", tmp_path / "missing_watchlist.csv")
     monkeypatch.setattr(module, "CB_PIPELINE_ISSUE_SIZE_PATH", tmp_path / "missing_issue_size.parquet")
     monkeypatch.setattr(module, "DAILY_BASIC_DIR", tmp_path / "missing_daily_basic")
+
+
+def test_cninfo_pipeline_poll_retries_transient_non_json_page(monkeypatch) -> None:
+    import quant.routine.convertible_bond_allotment as module
+
+    responses = [
+        SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: (_ for _ in ()).throw(ValueError("empty response")),
+        ),
+        SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "totalAnnouncement": 1,
+                "announcements": [
+                    {
+                        "secCode": "300001",
+                        "secName": "测试股份",
+                        "announcementTitle": "向不特定对象发行可转换公司债券注册稿",
+                        "announcementTime": 1787932800000,
+                        "announcementId": "123",
+                        "orgId": "org-1",
+                    }
+                ],
+            },
+        ),
+    ]
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return responses.pop(0)
+
+    session = FakeSession()
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    frame = module._poll_cninfo_pipeline_announcements(
+        keyword="可转债",
+        start=date(2026, 1, 1),
+        end=date(2026, 8, 29),
+        session=session,
+    )
+
+    assert len(session.calls) == 2
+    assert session.calls[0][1]["data"]["pageNum"] == "1"
+    assert frame[["代码", "简称", "公告标题"]].to_dict("records") == [
+        {
+            "代码": "300001",
+            "简称": "测试股份",
+            "公告标题": "向不特定对象发行可转换公司债券注册稿",
+        }
+    ]
 
 
 def test_convertible_bond_allotment_merges_basic_and_issue(monkeypatch, tmp_path):

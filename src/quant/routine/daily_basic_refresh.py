@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
@@ -15,6 +16,13 @@ from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_wri
 from quant.data.tushare_fetcher import TushareDataFetcher, validate_daily_basic_frame
 from quant.routine.data_refresh import RequestLimiter, _is_retryable_error
 from quant.routine.paths import PROJECT_ROOT
+from quant.routine.tushare_availability import (
+    RETRY_INTERVAL_SECONDS,
+    is_tushare_data_missing,
+    market_now,
+    tushare_retry_deadline,
+    tushare_retry_delay,
+)
 
 
 DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
@@ -434,10 +442,15 @@ def fetch_one_trade_date(
     availability_retry_failures: int = 0,
     availability_retry_interval: float = 60.0,
     daily_dir: Path = DAILY_DIR,
+    *,
+    now_fn: Callable[[], datetime] = market_now,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    progress_callback=None,
 ) -> dict:
     attempts = max(1, retries + 1)
     maximum_attempts = attempts + max(0, availability_retry_failures)
     last_error = ""
+    deadline = tushare_retry_deadline(trade_date, now_fn())
     output_path = output_dir / f"{trade_date}.parquet"
     provenance_path = _daily_basic_provenance_path(output_path)
     cache_path = cache_dir / f"tushare_daily_basic_{trade_date}.parquet"
@@ -487,7 +500,10 @@ def fetch_one_trade_date(
                 "requires_source_refresh": False,
                 "error": None,
             }
-    for attempt in range(1, maximum_attempts + 1):
+    attempt = 0
+    ordinary_failures = 0
+    while True:
+        attempt += 1
         try:
             limiter.wait()
             fetcher = TushareDataFetcher(cache_dir=cache_dir)
@@ -502,7 +518,7 @@ def fetch_one_trade_date(
                     trade_date,
                     daily_dir,
                 )
-                if availability_retry_failures > 0 and attempt == maximum_attempts:
+                if deadline is None and availability_retry_failures > 0 and attempt == maximum_attempts:
                     df, delayed_features = _derive_delayed_daily_basic_features(
                         df,
                         trade_date,
@@ -586,12 +602,31 @@ def fetch_one_trade_date(
             }
         except Exception as exc:
             last_error = str(exc)
+            data_missing = is_tushare_data_missing(last_error)
+            if data_missing and deadline is not None:
+                delay = tushare_retry_delay(deadline, now_fn())
+                if delay is not None:
+                    message = (
+                        f"Tushare daily_basic {trade_date} 数据尚未完整；"
+                        f"{delay:g} 秒后重试，截止北京时间 17:20；{last_error}"
+                    )
+                    print(message, flush=True)
+                    if progress_callback is not None:
+                        progress_callback(percent=36, message=message)
+                    sleep_fn(delay)
+                    continue
+            else:
+                ordinary_failures += 1
             retryable = _is_retryable_error(last_error) or "daily_basic" in last_error
             availability_retry = (
                 "feature coverage" in last_error
                 and attempt <= availability_retry_failures
             )
-            if attempt >= maximum_attempts or (not retryable and not availability_retry):
+            if (
+                (data_missing and deadline is not None)
+                or ordinary_failures >= maximum_attempts
+                or (not retryable and not availability_retry)
+            ):
                 repair_reason = _source_refresh_failure_reason(last_error)
                 _write_source_refresh_marker(
                     output_path,
@@ -612,34 +647,14 @@ def fetch_one_trade_date(
                     "repair_changed_rows": 0,
                     "repair_changed_columns": [],
                     "requires_source_refresh": True,
+                    "data_missing": data_missing,
+                    "availability_deadline": deadline.isoformat() if deadline else None,
                     "error": last_error,
                 }
             if availability_retry:
-                time.sleep(max(0.0, availability_retry_interval))
+                sleep_fn(max(0.0, availability_retry_interval))
             else:
-                time.sleep(min(retry_max_delay, retry_base_delay * (2 ** (attempt - 1))))
-    repair_reason = _source_refresh_failure_reason(last_error or "unknown error")
-    _write_source_refresh_marker(
-        output_path,
-        trade_date,
-        reason=repair_reason,
-        error=last_error or "unknown error",
-    )
-    return {
-        "trade_date": trade_date,
-        "source": "tushare",
-        "status": "failed",
-        "rows": 0,
-        "path": str(output_path),
-        "attempts": maximum_attempts,
-        "repair_requested": repair_requested,
-        "repair_status": "pending",
-        "repair_reason": repair_reason,
-        "repair_changed_rows": 0,
-        "repair_changed_columns": [],
-        "requires_source_refresh": True,
-        "error": last_error or "unknown error",
-    }
+                sleep_fn(min(retry_max_delay, retry_base_delay * (2 ** (ordinary_failures - 1))))
 
 
 def refresh_daily_basic(
@@ -652,6 +667,7 @@ def refresh_daily_basic(
     retries: int = 3,
     retry_base_delay: float = 2.0,
     retry_max_delay: float = 60.0,
+    progress_callback=None,
 ) -> dict:
     expected_rows_by_date = load_trade_date_symbol_counts(
         daily_dir,
@@ -694,6 +710,7 @@ def refresh_daily_basic(
                 availability_retry_failures if trade_date == max(trade_dates) else 0,
                 availability_retry_interval,
                 daily_dir,
+                progress_callback=progress_callback,
             )
             for trade_date in trade_dates
         ]
@@ -726,6 +743,8 @@ def refresh_daily_basic(
         and not audit.get("repair_requested")
     )
     pending_repair_dates = list_pending_daily_basic_repairs(output_dir)
+    failures = [audit for audit in audits if audit.get("status") == "failed"]
+    deadline = tushare_retry_deadline(max(trade_dates), market_now())
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_policy": "tushare_only_daily_basic",
@@ -739,7 +758,10 @@ def refresh_daily_basic(
         "minimum_coverage_rate": minimum_coverage_rate,
         "required_feature_coverage": DAILY_BASIC_FEATURE_COVERAGE,
         "availability_retry_failures": availability_retry_failures,
-        "availability_retry_interval_seconds": availability_retry_interval,
+        "availability_retry_interval_seconds": RETRY_INTERVAL_SECONDS if deadline else availability_retry_interval,
+        "availability_deadline": deadline.isoformat() if deadline else None,
+        "data_missing": bool(failures) and all(audit.get("data_missing") for audit in failures),
+        "error_summary": "; ".join(str(audit.get("error")) for audit in failures) or None,
         "repair_requested_dates": repair_requested_dates,
         "repaired_dates": repaired_dates,
         "downstream_refresh_dates": repaired_dates,
