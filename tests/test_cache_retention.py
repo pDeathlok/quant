@@ -24,6 +24,13 @@ def _write_with_mtime(path: Path, modified_at: datetime, size: int = 16) -> None
     os.utime(path, (timestamp, timestamp))
 
 
+def _write_factor_symbol(schema_dir: Path, symbol: str, *, size: int = 16) -> None:
+    symbol_dir = schema_dir / symbol
+    symbol_dir.mkdir(parents=True, exist_ok=True)
+    (symbol_dir / "state.json").write_text("{}", encoding="utf-8")
+    (symbol_dir / "2026.parquet").write_bytes(b"x" * size)
+
+
 def test_cleanup_daily_caches_applies_requested_retention_rules(tmp_path: Path) -> None:
     long_cache = tmp_path / "data/research/long_dividend_quality"
     expired_return = long_cache / "daily_returns_expired.parquet"
@@ -148,6 +155,103 @@ def test_cleanup_daily_caches_keeps_two_complete_long_cache_versions(tmp_path: P
     assert summary["long_strategy"]["deleted_files"] == 2
 
 
+def test_cleanup_daily_caches_removes_replaced_factor_schema_only_after_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    factor_root = tmp_path / "data/features/daily_factor_layer"
+    for index in range(4):
+        _write_factor_symbol(factor_root / "signal-v1", f"old-{index}", size=20)
+        _write_factor_symbol(factor_root / "signal-v2", f"new-{index}", size=30)
+    monkeypatch.setattr(cache_retention, "_current_factor_schema_version", lambda: "signal-v2")
+
+    summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
+
+    assert not (factor_root / "signal-v1").exists()
+    assert (factor_root / "signal-v2").exists()
+    factor_summary = summary["daily_factor_schemas"]
+    assert factor_summary["current_ready"] is True
+    assert factor_summary["deleted_directories"] == 1
+    assert factor_summary["reclaimed_bytes"] == 4 * (20 + 2)
+    assert summary["storage"]["logical_bytes_reduced"] >= factor_summary["reclaimed_bytes"]
+
+
+def test_cleanup_daily_caches_preserves_previous_factor_schema_during_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    factor_root = tmp_path / "data/features/daily_factor_layer"
+    for index in range(10):
+        _write_factor_symbol(factor_root / "signal-v1", f"old-{index}")
+    for index in range(5):
+        _write_factor_symbol(factor_root / "signal-v2", f"new-{index}")
+    monkeypatch.setattr(cache_retention, "_current_factor_schema_version", lambda: "signal-v2")
+
+    summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
+
+    assert (factor_root / "signal-v1").exists()
+    assert (factor_root / "signal-v2").exists()
+    assert summary["daily_factor_schemas"]["current_ready"] is False
+    assert summary["daily_factor_schemas"]["deleted_directories"] == 0
+
+
+def test_cleanup_daily_caches_expires_rebuildable_root_and_probe_requests(
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "data/cache"
+    expired = cache_root / "sh600000_20100101_20260520_qfq.parquet"
+    protected = cache_root / "sz002594_20100101_20260520_qfq.parquet"
+    recent = cache_root / "sh600519_20100101_20260714_qfq.parquet"
+    unrelated = cache_root / "research_input.parquet"
+    _write_with_mtime(expired, datetime(2026, 6, 1), size=41)
+    _write_with_mtime(protected, datetime(2026, 1, 1), size=42)
+    _write_with_mtime(recent, datetime(2026, 7, 14), size=43)
+    _write_with_mtime(unrelated, datetime(2025, 1, 1), size=44)
+
+    probe = cache_root / "source_merge/tushare_live_probe/tushare_daily_basic_20260712.parquet"
+    raw = tmp_path / "data/raw/daily_basic/20260712.parquet"
+    _write_with_mtime(probe, datetime(2026, 7, 12), size=45)
+    _write_with_mtime(raw, datetime(2026, 7, 12), size=46)
+
+    summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
+
+    assert not expired.exists()
+    assert protected.exists()
+    assert recent.exists()
+    assert unrelated.exists()
+    assert not probe.exists()
+    assert summary["root_market_request_cache"]["deleted_files"] == 1
+    assert summary["root_market_request_cache"]["protected_production_files"] == 1
+    assert summary["tushare_live_probe"]["deleted_files"] == 1
+
+
+def test_cleanup_daily_caches_removes_only_old_abandoned_build_outputs(
+    tmp_path: Path,
+) -> None:
+    factor_root = tmp_path / "data/features/daily_factor_layer"
+    old_temp = factor_root / "current/000001.SZ/.state.tmp.parquet"
+    recent_temp = factor_root / "current/000002.SZ/.state.tmp.parquet"
+    old_build = (
+        tmp_path
+        / "data/research/similar_patterns/vector_cache/config/_matrix_cache_v1"
+        / ".fingerprint.building-123-abcd"
+    )
+    _write_with_mtime(old_temp, datetime(2026, 7, 10), size=51)
+    _write_with_mtime(recent_temp, datetime(2026, 7, 14), size=52)
+    _write_with_mtime(old_build / "vectors.npy", datetime(2026, 7, 10), size=53)
+    os.utime(old_build, (datetime(2026, 7, 10).timestamp(),) * 2)
+
+    summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
+
+    assert not old_temp.exists()
+    assert recent_temp.exists()
+    assert not old_build.exists()
+    abandoned = summary["abandoned_cache_builds"]
+    assert abandoned["deleted_files"] == 1
+    assert abandoned["deleted_directories"] == 1
+    assert abandoned["reclaimed_bytes"] == 51 + 53
+
+
 def test_cleanup_daily_caches_removes_cb_requests_covered_by_consolidated_data(
     tmp_path: Path,
 ) -> None:
@@ -170,6 +274,33 @@ def test_cleanup_daily_caches_removes_cb_requests_covered_by_consolidated_data(
         "protected_outside_consolidated_range"
     ] == 1
     assert summary["convertible_bond_request_cache"]["reclaimed_bytes"] == 51
+
+
+def test_cleanup_daily_caches_hardlinks_identical_protected_cb_requests(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "data/convertible_bond/tushare/tushare_cache"
+    first = cache_dir / "tushare_cb_daily_20170101_all_all_all.parquet"
+    second = cache_dir / "tushare_cb_daily_20170102_all_all_all.parquet"
+    different = cache_dir / "tushare_cb_daily_20170103_all_all_all.parquet"
+    _write_with_mtime(first, datetime(2026, 7, 10), size=61)
+    _write_with_mtime(second, datetime(2026, 7, 11), size=61)
+    different.parent.mkdir(parents=True, exist_ok=True)
+    different.write_bytes(b"y" * 61)
+
+    summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
+
+    first_stat = first.stat()
+    second_stat = second.stat()
+    assert (first_stat.st_dev, first_stat.st_ino) == (
+        second_stat.st_dev,
+        second_stat.st_ino,
+    )
+    assert different.stat().st_ino != first_stat.st_ino
+    cb_cache = summary["convertible_bond_request_cache"]
+    assert cb_cache["protected_outside_consolidated_range"] == 3
+    assert cb_cache["deduplicated_files"] == 1
+    assert cb_cache["deduplicated_bytes"] == 61
 
 
 def test_cleanup_daily_caches_caps_and_hardlinks_b1_research_reports(

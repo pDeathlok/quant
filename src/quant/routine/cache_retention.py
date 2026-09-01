@@ -3,8 +3,11 @@ from __future__ import annotations
 import filecmp
 import hashlib
 import json
+import math
+import os
 import re
 import shutil
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -16,8 +19,19 @@ LONG_CACHE_PATTERNS = (
 )
 LONG_CACHE_RETENTION_VERSIONS = 2
 TUSHARE_SINGLE_SYMBOL_CACHE_RETENTION_DAYS = 7
+ROOT_MARKET_REQUEST_CACHE_RETENTION_DAYS = 30
+TUSHARE_LIVE_PROBE_RETENTION_DAYS = 2
+ABANDONED_CACHE_RETENTION_DAYS = 2
+FACTOR_SCHEMA_MIN_COVERAGE_RATIO = 0.98
 TUSHARE_SINGLE_SYMBOL_CACHE_PATTERN = re.compile(
     r"^tushare_\d{6}\.(?:SH|SZ|BJ)_\d{8}_\d{8}_(?:None|qfq|hfq)\.parquet$"
+)
+ROOT_MARKET_REQUEST_CACHE_PATTERN = re.compile(
+    r"^(?:(?:sh|sz|bj)\d{6}|tushare_\d{6}\.(?:SH|SZ|BJ))_"
+    r"\d{8}_\d{8}_(?:None|qfq|hfq)\.parquet$"
+)
+ROOT_MARKET_REQUEST_CACHE_PROTECTED_PATTERN = re.compile(
+    r"^(?:sz002594|tushare_002594\.SZ)_"
 )
 TUSHARE_DAILY_BASIC_CACHE_PATTERN = re.compile(
     r"^tushare_daily_basic_(\d{8})\.parquet$"
@@ -87,6 +101,82 @@ SQL_SNAPSHOT_TABLES = (
 )
 
 
+@dataclass(frozen=True)
+class _StoragePathSpec:
+    name: str
+    relative_path: str
+    direct_files_only: bool = False
+
+
+MANAGED_CACHE_STORAGE_PATHS = (
+    _StoragePathSpec("root_market_requests", "data/cache", direct_files_only=True),
+    _StoragePathSpec("source_merge_requests", "data/cache/source_merge"),
+    _StoragePathSpec("daily_factor_layer", "data/features/daily_factor_layer"),
+    _StoragePathSpec(
+        "similar_pattern_vectors",
+        "data/research/similar_patterns/vector_cache",
+    ),
+    _StoragePathSpec("long_strategy", "data/research/long_dividend_quality"),
+    _StoragePathSpec(
+        "convertible_bond_requests",
+        "data/convertible_bond/tushare/tushare_cache",
+    ),
+    _StoragePathSpec("selector_snapshots", "data/selector_snapshots"),
+    _StoragePathSpec("workspace_snapshots", "data/workspace_snapshots"),
+    _StoragePathSpec("source_audit", "data/raw/source_audit"),
+    _StoragePathSpec("routine_runs", "data/routine"),
+    _StoragePathSpec(
+        "b1_versioned_reports",
+        "reports/b1/research/xgb_project_vars_strategy",
+    ),
+)
+
+
+def _storage_for_path(path: Path, *, direct_files_only: bool) -> dict[str, int]:
+    if not path.exists():
+        return {"files": 0, "logical_bytes": 0, "allocated_bytes": 0}
+    candidates = path.iterdir() if direct_files_only else path.rglob("*")
+    files = 0
+    logical_bytes = 0
+    allocated_bytes = 0
+    seen_inodes: set[tuple[int, int]] = set()
+    for child in candidates:
+        if not child.is_file() or child.is_symlink():
+            continue
+        try:
+            stat = child.stat()
+        except OSError:
+            continue
+        files += 1
+        logical_bytes += int(stat.st_size)
+        inode = (int(stat.st_dev), int(stat.st_ino))
+        if inode in seen_inodes:
+            continue
+        seen_inodes.add(inode)
+        allocated_bytes += int(getattr(stat, "st_blocks", 0)) * 512
+    return {
+        "files": files,
+        "logical_bytes": logical_bytes,
+        "allocated_bytes": allocated_bytes,
+    }
+
+
+def _managed_cache_storage(root: Path) -> dict[str, Any]:
+    categories = {
+        spec.name: _storage_for_path(
+            root / spec.relative_path,
+            direct_files_only=spec.direct_files_only,
+        )
+        for spec in MANAGED_CACHE_STORAGE_PATHS
+    }
+    return {
+        "files": sum(item["files"] for item in categories.values()),
+        "logical_bytes": sum(item["logical_bytes"] for item in categories.values()),
+        "allocated_bytes": sum(item["allocated_bytes"] for item in categories.values()),
+        "categories": categories,
+    }
+
+
 def _directory_size(path: Path) -> int:
     total = 0
     for child in path.rglob("*"):
@@ -96,6 +186,272 @@ def _directory_size(path: Path) -> int:
             except OSError:
                 continue
     return total
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _deduplicate_identical_files(
+    paths: Iterable[Path],
+    *,
+    error_prefix: str,
+    errors: list[str],
+) -> dict[str, int]:
+    size_groups: dict[int, list[Path]] = {}
+    for path in paths:
+        try:
+            if path.is_file() and not path.is_symlink():
+                size_groups.setdefault(path.stat().st_size, []).append(path)
+        except OSError as exc:
+            errors.append(f"{error_prefix}:{path.name}:{exc}")
+
+    deduplicated_files = 0
+    deduplicated_bytes = 0
+    for size, candidates in size_groups.items():
+        if len(candidates) < 2:
+            continue
+        digest_groups: dict[str, list[Path]] = {}
+        for path in candidates:
+            try:
+                digest_groups.setdefault(_file_sha256(path), []).append(path)
+            except OSError as exc:
+                errors.append(f"{error_prefix}:{path.name}:{exc}")
+        for duplicates in digest_groups.values():
+            if len(duplicates) < 2:
+                continue
+            canonical = duplicates[0]
+            for path in duplicates[1:]:
+                temp_path = path.with_name(f".{path.name}.dedup-{os.getpid()}")
+                try:
+                    canonical_stat = canonical.stat()
+                    path_stat = path.stat()
+                    if (canonical_stat.st_dev, canonical_stat.st_ino) == (
+                        path_stat.st_dev,
+                        path_stat.st_ino,
+                    ):
+                        continue
+                    if not filecmp.cmp(canonical, path, shallow=False):
+                        continue
+                    os.link(canonical, temp_path)
+                    os.replace(temp_path, path)
+                    deduplicated_files += 1
+                    if path_stat.st_nlink == 1:
+                        deduplicated_bytes += size
+                except OSError as exc:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    errors.append(f"{error_prefix}:{path.name}:{exc}")
+    return {
+        "deduplicated_files": deduplicated_files,
+        "deduplicated_bytes": deduplicated_bytes,
+    }
+
+
+def _current_factor_schema_version() -> str:
+    from quant.features.daily_factor_layer import SIGNAL_FACTOR_LAYER_VERSION
+
+    return str(SIGNAL_FACTOR_LAYER_VERSION)
+
+
+def _factor_schema_symbol_count(path: Path) -> int:
+    if not path.is_dir() or path.is_symlink():
+        return 0
+    return sum(
+        1
+        for child in path.iterdir()
+        if child.is_dir()
+        and not child.is_symlink()
+        and (child / "state.json").is_file()
+        and any(child.glob("[0-9][0-9][0-9][0-9].parquet"))
+    )
+
+
+def _cleanup_factor_schema_caches(root: Path, errors: list[str]) -> dict[str, Any]:
+    factor_root = root / "data/features/daily_factor_layer"
+    current_version = _current_factor_schema_version()
+    directories = sorted(
+        (
+            path
+            for path in factor_root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        ),
+        key=lambda path: path.name,
+    ) if factor_root.exists() else []
+    symbol_counts = {
+        path.name: _factor_schema_symbol_count(path)
+        for path in directories
+    }
+    current_count = symbol_counts.get(current_version, 0)
+    previous_counts = [
+        count
+        for version, count in symbol_counts.items()
+        if version != current_version and count > 0
+    ]
+    required_count = (
+        max(1, math.ceil(max(previous_counts) * FACTOR_SCHEMA_MIN_COVERAGE_RATIO))
+        if previous_counts
+        else 1
+    )
+    current_ready = current_count >= required_count
+    deleted_directories = 0
+    reclaimed_bytes = 0
+    if current_ready:
+        for path in directories:
+            if path.name == current_version:
+                continue
+            try:
+                size = _directory_size(path)
+                shutil.rmtree(path)
+                deleted_directories += 1
+                reclaimed_bytes += size
+            except OSError as exc:
+                errors.append(f"daily_factor_schema:{path.name}:{exc}")
+    return {
+        "current_version": current_version,
+        "current_symbol_count": current_count,
+        "required_symbol_count": required_count,
+        "coverage_threshold": FACTOR_SCHEMA_MIN_COVERAGE_RATIO,
+        "current_ready": current_ready,
+        "schema_symbol_counts": symbol_counts,
+        "deleted_directories": deleted_directories,
+        "reclaimed_bytes": reclaimed_bytes,
+    }
+
+
+def _cleanup_root_market_request_cache(
+    root: Path,
+    today: date,
+    errors: list[str],
+) -> dict[str, Any]:
+    cache_dir = root / "data/cache"
+    cutoff = today - timedelta(days=ROOT_MARKET_REQUEST_CACHE_RETENTION_DAYS)
+    deleted_files = 0
+    reclaimed_bytes = 0
+    protected_files = 0
+    for path in sorted(cache_dir.glob("*.parquet")):
+        if ROOT_MARKET_REQUEST_CACHE_PATTERN.fullmatch(path.name) is None:
+            continue
+        if ROOT_MARKET_REQUEST_CACHE_PROTECTED_PATTERN.match(path.name):
+            protected_files += 1
+            continue
+        try:
+            if datetime.fromtimestamp(path.stat().st_mtime).date() >= cutoff:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            deleted_files += 1
+            reclaimed_bytes += size
+        except OSError as exc:
+            errors.append(f"root_market_request:{path.name}:{exc}")
+    return {
+        "retention_days": ROOT_MARKET_REQUEST_CACHE_RETENTION_DAYS,
+        "cutoff_date": cutoff.isoformat(),
+        "protected_production_files": protected_files,
+        "deleted_files": deleted_files,
+        "reclaimed_bytes": reclaimed_bytes,
+    }
+
+
+def _cleanup_daily_basic_cache_directory(
+    cache_dir: Path,
+    raw_dir: Path,
+    *,
+    cutoff: date,
+    error_prefix: str,
+    errors: list[str],
+) -> dict[str, int]:
+    deleted_files = 0
+    reclaimed_bytes = 0
+    protected_files = 0
+    for path in sorted(cache_dir.glob("tushare_daily_basic_*.parquet")):
+        match = TUSHARE_DAILY_BASIC_CACHE_PATTERN.fullmatch(path.name)
+        if match is None:
+            continue
+        trade_date_text = match.group(1)
+        try:
+            trade_date = datetime.strptime(trade_date_text, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if trade_date >= cutoff:
+            continue
+        raw_path = raw_dir / f"{trade_date_text}.parquet"
+        try:
+            if not raw_path.is_file() or raw_path.stat().st_size <= 0:
+                protected_files += 1
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            deleted_files += 1
+            reclaimed_bytes += size
+        except OSError as exc:
+            errors.append(f"{error_prefix}:{path.name}:{exc}")
+    return {
+        "deleted_files": deleted_files,
+        "protected_without_raw": protected_files,
+        "reclaimed_bytes": reclaimed_bytes,
+    }
+
+
+def _cleanup_abandoned_cache_builds(
+    root: Path,
+    today: date,
+    errors: list[str],
+) -> dict[str, Any]:
+    cutoff = today - timedelta(days=ABANDONED_CACHE_RETENTION_DAYS)
+    deleted_files = 0
+    deleted_directories = 0
+    reclaimed_bytes = 0
+    cache_roots = (
+        root / "data/features/daily_factor_layer",
+        root / "data/research/similar_patterns/vector_cache",
+    )
+    for cache_root in cache_roots:
+        if not cache_root.exists():
+            continue
+        for path in sorted(cache_root.rglob("*"), reverse=True):
+            name = path.name
+            is_temp_file = path.is_file() and (
+                name.endswith(".tmp")
+                or ".tmp." in name
+                or name.endswith(".tmp.parquet")
+                or name.endswith(".partial")
+            )
+            is_build_directory = (
+                path.is_dir()
+                and not path.is_symlink()
+                and name.startswith(".")
+                and ".building-" in name
+            )
+            if not is_temp_file and not is_build_directory:
+                continue
+            try:
+                modified_date = datetime.fromtimestamp(path.stat().st_mtime).date()
+                if modified_date >= cutoff:
+                    continue
+                size = path.stat().st_size if is_temp_file else _directory_size(path)
+                if is_temp_file:
+                    path.unlink()
+                    deleted_files += 1
+                else:
+                    shutil.rmtree(path)
+                    deleted_directories += 1
+                reclaimed_bytes += size
+            except OSError as exc:
+                errors.append(f"abandoned_cache_build:{path.name}:{exc}")
+    return {
+        "retention_days": ABANDONED_CACHE_RETENTION_DAYS,
+        "cutoff_date": cutoff.isoformat(),
+        "deleted_files": deleted_files,
+        "deleted_directories": deleted_directories,
+        "reclaimed_bytes": reclaimed_bytes,
+    }
 
 
 def _parse_snapshot_date(value: object) -> date | None:
@@ -412,6 +768,7 @@ def _cleanup_cb_daily_request_cache(root: Path, errors: list[str]) -> dict[str, 
     deleted_files = 0
     reclaimed_bytes = 0
     protected_files = 0
+    retained_paths: list[Path] = []
     cache_dir = data_dir / "tushare_cache"
     for path in sorted(cache_dir.glob("tushare_cb_daily_*.parquet")):
         match = TUSHARE_CB_DAILY_CACHE_PATTERN.fullmatch(path.name)
@@ -423,6 +780,7 @@ def _cleanup_cb_daily_request_cache(root: Path, errors: list[str]) -> dict[str, 
             continue
         if not any(start <= request_date <= end for start, end in consolidated_ranges):
             protected_files += 1
+            retained_paths.append(path)
             continue
         try:
             size = path.stat().st_size
@@ -431,6 +789,11 @@ def _cleanup_cb_daily_request_cache(root: Path, errors: list[str]) -> dict[str, 
             reclaimed_bytes += size
         except OSError as exc:
             errors.append(f"tushare_cb_daily:{path.name}:{exc}")
+    deduplication = _deduplicate_identical_files(
+        retained_paths,
+        error_prefix="tushare_cb_daily_dedup",
+        errors=errors,
+    )
     return {
         "consolidated_ranges": [
             {"start": start.isoformat(), "end": end.isoformat()}
@@ -438,7 +801,8 @@ def _cleanup_cb_daily_request_cache(root: Path, errors: list[str]) -> dict[str, 
         ],
         "deleted_files": deleted_files,
         "protected_outside_consolidated_range": protected_files,
-        "reclaimed_bytes": reclaimed_bytes,
+        **deduplication,
+        "reclaimed_bytes": reclaimed_bytes + deduplication["deduplicated_bytes"],
     }
 
 
@@ -609,6 +973,11 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
     root = project_root.resolve()
     today = reference_date or date.today()
     errors: list[str] = []
+    storage_before = _managed_cache_storage(root)
+
+    factor_schemas = _cleanup_factor_schema_caches(root, errors)
+    root_market_requests = _cleanup_root_market_request_cache(root, today, errors)
+    abandoned_cache_builds = _cleanup_abandoned_cache_builds(root, today, errors)
 
     long_cache_dir = root / "data/research/long_dividend_quality"
     deleted_long_files = 0
@@ -695,31 +1064,21 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
             errors.append(f"tushare_single_symbol:{path.name}:{exc}")
 
     daily_basic_raw_dir = root / "data/raw/daily_basic"
-    deleted_daily_basic_files = 0
-    reclaimed_daily_basic_bytes = 0
-    protected_daily_basic_files = 0
-    for path in sorted(tushare_cache_dir.glob("tushare_daily_basic_*.parquet")):
-        match = TUSHARE_DAILY_BASIC_CACHE_PATTERN.fullmatch(path.name)
-        if match is None:
-            continue
-        trade_date_text = match.group(1)
-        try:
-            trade_date = datetime.strptime(trade_date_text, "%Y%m%d").date()
-        except ValueError:
-            continue
-        if trade_date >= tushare_cutoff:
-            continue
-        raw_path = daily_basic_raw_dir / f"{trade_date_text}.parquet"
-        try:
-            if not raw_path.is_file() or raw_path.stat().st_size <= 0:
-                protected_daily_basic_files += 1
-                continue
-            size = path.stat().st_size
-            path.unlink()
-            deleted_daily_basic_files += 1
-            reclaimed_daily_basic_bytes += size
-        except OSError as exc:
-            errors.append(f"tushare_daily_basic:{path.name}:{exc}")
+    daily_basic_cache = _cleanup_daily_basic_cache_directory(
+        tushare_cache_dir,
+        daily_basic_raw_dir,
+        cutoff=tushare_cutoff,
+        error_prefix="tushare_daily_basic",
+        errors=errors,
+    )
+    live_probe_cutoff = today - timedelta(days=TUSHARE_LIVE_PROBE_RETENTION_DAYS)
+    live_probe_cache = _cleanup_daily_basic_cache_directory(
+        root / "data/cache/source_merge/tushare_live_probe",
+        daily_basic_raw_dir,
+        cutoff=live_probe_cutoff,
+        error_prefix="tushare_live_probe",
+        errors=errors,
+    )
 
     snapshots = _cleanup_snapshot_files(root, today, errors)
     source_audit = _cleanup_timestamped_directories(
@@ -754,20 +1113,40 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
     sql_snapshots = _cleanup_sql_snapshots(root, today, errors)
 
     reclaimed_bytes = (
-        reclaimed_long_bytes
+        factor_schemas["reclaimed_bytes"]
+        + root_market_requests["reclaimed_bytes"]
+        + abandoned_cache_builds["reclaimed_bytes"]
+        + reclaimed_long_bytes
         + reclaimed_vector_bytes
         + reclaimed_smoke_bytes
         + reclaimed_tushare_bytes
-        + reclaimed_daily_basic_bytes
+        + daily_basic_cache["reclaimed_bytes"]
+        + live_probe_cache["reclaimed_bytes"]
         + snapshots["reclaimed_bytes"]
         + source_audit["reclaimed_bytes"]
         + routine_runs["reclaimed_bytes"]
         + convertible_bond_requests["reclaimed_bytes"]
         + b1_research_reports["reclaimed_bytes"]
     )
+    storage_after = _managed_cache_storage(root)
     return {
         "status": "success" if not errors else "partial",
         "reference_date": today.isoformat(),
+        "storage": {
+            "before": storage_before,
+            "after": storage_after,
+            "logical_bytes_reduced": max(
+                0,
+                storage_before["logical_bytes"] - storage_after["logical_bytes"],
+            ),
+            "allocated_bytes_reduced": max(
+                0,
+                storage_before["allocated_bytes"] - storage_after["allocated_bytes"],
+            ),
+        },
+        "daily_factor_schemas": factor_schemas,
+        "root_market_request_cache": root_market_requests,
+        "abandoned_cache_builds": abandoned_cache_builds,
         "long_strategy": {
             "retention_versions": LONG_CACHE_RETENTION_VERSIONS,
             "kept_versions": [key for key, _ in ordered_groups[-LONG_CACHE_RETENTION_VERSIONS:]],
@@ -792,9 +1171,12 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
         "tushare_daily_basic": {
             "retention_days": TUSHARE_SINGLE_SYMBOL_CACHE_RETENTION_DAYS,
             "cutoff_date": tushare_cutoff.isoformat(),
-            "deleted_files": deleted_daily_basic_files,
-            "protected_without_raw": protected_daily_basic_files,
-            "reclaimed_bytes": reclaimed_daily_basic_bytes,
+            **daily_basic_cache,
+        },
+        "tushare_live_probe": {
+            "retention_days": TUSHARE_LIVE_PROBE_RETENTION_DAYS,
+            "cutoff_date": live_probe_cutoff.isoformat(),
+            **live_probe_cache,
         },
         "snapshots": snapshots,
         "source_audit": source_audit,
