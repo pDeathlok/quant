@@ -43,7 +43,7 @@ from quant.features.daily_factor_layer import (
 B1_GATE_CACHE = PROJECT_ROOT / "data/features/b1/b1_gate_candidates.parquet"
 B1_GATE_MANIFEST = PROJECT_ROOT / "data/features/b1/b1_gate_manifest.json"
 CACHE_IDENTITY_SCHEMA_VERSION = 2
-DEFAULT_BATCH_SIZE = 1
+DEFAULT_BATCH_SIZE = 16
 HASH_CHUNK_SIZE = 1024 * 1024
 
 # A fast-path hit is valid only while every implementation/configuration input
@@ -89,8 +89,7 @@ def parse_args() -> argparse.Namespace:
             os.getenv("ROUTINE_SIGNAL_PROCESS_BATCH_SIZE", DEFAULT_BATCH_SIZE)
         ),
         help=(
-            "每个进程任务包含的股票数；默认1保持已验证吞吐，"
-            "可在目标机器基准后调大。"
+            "每个进程任务包含的股票数；默认16用于摊薄进程调度和序列化开销。"
         ),
     )
     parser.add_argument(
@@ -232,10 +231,9 @@ def _partitioned_source_identity(
 ) -> dict[str, Any]:
     """Fingerprint exactly the parquet partitions read by this refresh.
 
-    SQL rows do not currently expose a revision/high-watermark column, so a
-    correctness-preserving fast path is deliberately disabled for SQL-backed
-    reads. Parquet hashes are cached by size+mtime; on a normal day only the
-    current month needs to be re-hashed.
+    This is the compatibility fallback for stores created before durable
+    dataset revisions were introduced. Parquet hashes are cached by
+    size+mtime; on a normal day only the current month needs to be re-hashed.
     """
 
     if sql_url:
@@ -284,6 +282,38 @@ def _partitioned_source_identity(
         "fingerprint": fingerprint,
         "reason": None,
         "partitions": partitions,
+    }
+
+
+def _revision_source_identity(
+    revision: int | None,
+    *,
+    history_start: pd.Timestamp,
+    processed_through: pd.Timestamp,
+) -> dict[str, Any]:
+    """Build a constant-time source identity from the canonical dataset revision."""
+
+    if revision is None:
+        return {
+            "fingerprint": None,
+            "reason": "dataset_revision_unavailable",
+            "source_type": "dataset_revision",
+            "revision": None,
+            "partitions": {},
+        }
+    payload = {
+        "history_start": pd.Timestamp(history_start).strftime("%Y-%m-%d"),
+        "processed_through": pd.Timestamp(processed_through).strftime(
+            "%Y-%m-%d"
+        ),
+        "revision": int(revision),
+    }
+    return {
+        "fingerprint": _stable_json_fingerprint(payload),
+        "reason": None,
+        "source_type": "dataset_revision",
+        "revision": int(revision),
+        "partitions": {},
     }
 
 
@@ -896,23 +926,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         factor_mode=args.factor_mode,
     )
     latest_before = store.latest_dataset_trade_date(args.daily_dir.name)
+    revision_before = store.dataset_revision(args.daily_dir.name)
     source_identity = {
         "fingerprint": None,
         "reason": "source_latest_unavailable",
         "partitions": {},
     }
     if latest_before is not None and pd.notna(latest_before):
-        source_identity = _partitioned_source_identity(
-            args.daily_dir,
+        source_identity = _revision_source_identity(
+            revision_before,
             history_start=history_start,
             processed_through=latest_before.normalize(),
-            previous=(
-                previous_identity.get("source")
-                if isinstance(previous_identity, dict)
-                else None
-            ),
-            sql_url=store.config.sql_url,
         )
+        if source_identity.get("fingerprint") is None:
+            source_identity = _partitioned_source_identity(
+                args.daily_dir,
+                history_start=history_start,
+                processed_through=latest_before.normalize(),
+                previous=(
+                    previous_identity.get("source")
+                    if isinstance(previous_identity, dict)
+                    else None
+                ),
+                sql_url=store.config.sql_url,
+            )
     timings["identity_seconds"] = perf_counter() - identity_started
 
     if not args.force_refresh:
@@ -954,7 +991,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if pd.isna(processed_through):
         raise RuntimeError("Canonical daily rows have no valid trade date")
     processed_through = processed_through.normalize()
-    if store.config.sql_url:
+    revision_after_read = store.dataset_revision(args.daily_dir.name)
+    if revision_before is not None and revision_after_read != revision_before:
+        raise RuntimeError("canonical market source changed during market read")
+    revision_identity = _revision_source_identity(
+        revision_after_read,
+        history_start=history_start,
+        processed_through=processed_through,
+    )
+    if revision_identity.get("fingerprint") is not None:
+        source_identity = revision_identity
+    elif store.config.sql_url:
         sql_identity_started = perf_counter()
         source_identity = _market_frame_source_identity(
             market,
@@ -1141,7 +1188,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     # Re-evaluate the source before taking the publish lock. A concurrent
     # source write must never overwrite the last-known-good cache set.
-    if not store.config.sql_url:
+    if source_identity.get("source_type") == "dataset_revision":
+        final_source_identity = _revision_source_identity(
+            store.dataset_revision(args.daily_dir.name),
+            history_start=history_start,
+            processed_through=processed_through,
+        )
+        _assert_source_unchanged(
+            source_identity,
+            final_source_identity,
+            phase="during signal refresh",
+        )
+        source_identity = final_source_identity
+    elif not store.config.sql_url:
         final_source_identity = _partitioned_source_identity(
             args.daily_dir,
             history_start=history_start,
@@ -1219,7 +1278,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(
                 "signal cache baseline changed during refresh; retry on latest"
             )
-        if not store.config.sql_url:
+        if source_identity.get("source_type") == "dataset_revision":
+            source_revision_started = perf_counter()
+            locked_source_identity = _revision_source_identity(
+                store.dataset_revision(args.daily_dir.name),
+                history_start=history_start,
+                processed_through=processed_through,
+            )
+            timings["source_revision_check_seconds"] = (
+                perf_counter() - source_revision_started
+            )
+            _assert_source_unchanged(
+                source_identity,
+                locked_source_identity,
+                phase="before signal publish",
+            )
+        elif not store.config.sql_url:
             locked_source_identity = _partitioned_source_identity(
                 args.daily_dir,
                 history_start=history_start,
@@ -1233,9 +1307,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 phase="before signal publish",
             )
         else:
-            # SQL has no source revision column, so recompute the semantic
-            # fingerprint while holding the publication lock. This closes the
-            # gap between the final source check and the manifest commit.
+            # Compatibility path for a SQL store that has not yet received a
+            # write through MarketDataStore and therefore has no revision.
             source_recheck_started = perf_counter()
             locked_market = store.read_market_range(
                 args.daily_dir.name,

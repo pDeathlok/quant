@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -46,7 +47,6 @@ from quant.features.left_side_factor_contract import (
 )
 from quant.features.project_factor_layer import (
     PROJECT_FACTOR_SCHEMA_VERSION,
-    calculate_project_market_factors,
 )
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 from quant.research.left_side_unified_features import (
@@ -60,12 +60,22 @@ from quant.routine.paths import PROJECT_ROOT
 
 
 LEFT_SIDE_NORMALIZATION_SCHEMA_VERSION = "daily-cross-section-percentile-v1"
-LEFT_SIDE_PRODUCTION_FEATURE_BUILDER_VERSION = "left-side-production-feature-builder-v3"
+LEFT_SIDE_PRODUCTION_FEATURE_BUILDER_VERSION = "left-side-production-feature-builder-v4"
 LEFT_SIDE_PRODUCTION_SCORE_BUILDER_VERSION = "left-side-production-score-builder-v2"
 DEFAULT_RESEARCH_MODEL = (
     PROJECT_ROOT
     / "models/research/left_side_unified_v3_group4_input_parity/next_close/h5/"
     "good_path5/C/unified_left_long_task_deep.joblib"
+)
+LEFT_SIDE_REQUIRED_PROJECT_VALUE_COLUMNS = (
+    "turnover_rate",
+    "turnover_rate_f",
+    "ts_volume_ratio",
+    "total_share",
+    "float_share",
+    "free_share",
+    "total_mv",
+    "circ_mv",
 )
 
 
@@ -143,10 +153,10 @@ def load_left_side_signal_universe(
         return pd.DataFrame(columns=["symbol", "date", *LEFT_SIDE_SIGNALS])
     keys["symbol"] = keys["symbol"].astype(str)
     output = keys.copy()
-    gate_keys = set(zip(gate["symbol"].astype(str), gate["date"], strict=False))
+    gate_keys = set(zip(gate["symbol"].astype(str), gate["date"]))
     output["B1"] = [
         (symbol, date) in gate_keys
-        for symbol, date in zip(output["symbol"], output["date"], strict=True)
+        for symbol, date in zip(output["symbol"], output["date"])
     ]
     family_flags = family[["symbol", "date"]].copy()
     family_flags["symbol"] = family_flags["symbol"].astype(str)
@@ -195,6 +205,7 @@ def load_left_side_signal_universe(
 def _build_symbol_feature(
     symbol: str,
     daily: pd.DataFrame,
+    project_current: pd.DataFrame,
     signal_values: Mapping[str, Any],
     target: pd.Timestamp,
 ) -> pd.DataFrame:
@@ -203,14 +214,9 @@ def _build_symbol_feature(
     ).reset_index(drop=True)
     if normalized.empty or not normalized["date"].dt.normalize().eq(target).any():
         raise RuntimeError(f"left-side market target row missing: {symbol}")
-    project = calculate_project_market_factors(
-        normalized,
-        symbol=symbol,
-        factor_schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
-    ).reset_index(drop=True)
-    for column in PROJECT_FACTOR_COLUMNS:
-        if column not in project:
-            project[column] = np.nan
+    project_current = project_current.reset_index(drop=True).copy()
+    if len(project_current) != 1:
+        raise RuntimeError(f"left-side project feature row is not unique: {symbol}")
     # The 27 unique left rules need at most 60 sessions.  Keep a generous
     # 260-session causal window instead of re-running their Python state loop
     # over the six-year project-factor history.  The two shared right fields
@@ -232,8 +238,6 @@ def _build_symbol_feature(
             ).tail(1).to_numpy(),
         }
     )
-    project["date"] = pd.to_datetime(project["date"], errors="coerce").dt.normalize()
-    project_current = project[project["date"].eq(target)].tail(1).reset_index(drop=True)
     base = pd.concat(
         [
             project_current[
@@ -265,6 +269,7 @@ def _build_symbol_feature(
 def build_left_side_feature_frame(
     market: pd.DataFrame,
     signals: pd.DataFrame,
+    project_features: pd.DataFrame,
     *,
     target_date: str | pd.Timestamp,
     workers: int = 1,
@@ -289,6 +294,39 @@ def build_left_side_feature_frame(
             "_symbol", sort=False
         )
     }
+    project = project_features.copy()
+    required_project = {
+        "ts_code",
+        "symbol",
+        "trade_date",
+        "date",
+        "factor_schema_version",
+        *PROJECT_FACTOR_COLUMNS,
+    }
+    missing_project_columns = required_project - set(project.columns)
+    if missing_project_columns:
+        raise RuntimeError(
+            "left-side project feature cache missing: "
+            f"{sorted(missing_project_columns)}"
+        )
+    project["symbol"] = project["symbol"].astype(str)
+    project["date"] = pd.to_datetime(
+        project["date"], errors="coerce"
+    ).dt.normalize()
+    project = project[project["date"].eq(target)].copy()
+    if project.duplicated(["symbol", "date"]).any():
+        raise RuntimeError("left-side project feature cache contains duplicate keys")
+    by_project_symbol = {
+        str(symbol): frame.reset_index(drop=True)
+        for symbol, frame in project.groupby("symbol", sort=False)
+    }
+    expected_symbols = set(signals["symbol"].astype(str))
+    missing_project_symbols = expected_symbols - set(by_project_symbol)
+    if missing_project_symbols:
+        raise RuntimeError(
+            "left-side project feature cache has incomplete candidate coverage: "
+            f"{sorted(missing_project_symbols)[:20]}"
+        )
     if not 1 <= workers <= 32:
         raise ValueError("left-side production factor workers must be in [1, 32]")
 
@@ -299,6 +337,7 @@ def build_left_side_feature_frame(
                 _build_symbol_feature(
                     symbol,
                     by_symbol.get(symbol, pd.DataFrame()),
+                    by_project_symbol.get(symbol, pd.DataFrame()),
                     signal.to_dict(),
                     target,
                 ),
@@ -352,20 +391,29 @@ def _feature_input_fingerprint(
     target: pd.Timestamp,
     config: LeftSideRankingConfig,
 ) -> str:
-    month = (
-        config.paths.market_data_root
-        / "daily_partitioned"
-        / f"year_month={target.strftime('%Y%m')}"
-        / "data.parquet"
+    store = MarketDataStore(
+        MarketDataStoreConfig.from_env(root=config.paths.market_data_root)
     )
+    market_revision = store.dataset_revision("daily")
+    fallback_partitions: tuple[Path, ...] = ()
+    if market_revision is None:
+        start_month = (target - pd.DateOffset(months=18)).strftime("%Y%m")
+        end_month = target.strftime("%Y%m")
+        partition_root = config.paths.market_data_root / "daily_partitioned"
+        fallback_partitions = tuple(
+            path
+            for path in sorted(partition_root.glob("year_month=*/data.parquet"))
+            if start_month <= path.parent.name.partition("=")[2] <= end_month
+        )
     paths = (
         config.paths.b1_gate_cache,
         config.paths.family_signal_cache,
         config.paths.signal_cache,
-        month,
+        config.paths.project_feature_cache,
+        config.paths.project_feature_manifest,
+        *fallback_partitions,
+        Path(__file__),
         PROJECT_ROOT / "src/quant/data/source_merge.py",
-        PROJECT_ROOT / "src/quant/features/project_factor_layer.py",
-        PROJECT_ROOT / "src/quant/features/variable_library.py",
         PROJECT_ROOT / "src/quant/features/candlestick_context.py",
         PROJECT_ROOT / "src/quant/research/left_side_unified_features.py",
     )
@@ -374,7 +422,102 @@ def _feature_input_fingerprint(
         "builder_version": LEFT_SIDE_PRODUCTION_FEATURE_BUILDER_VERSION,
         "feature_schema_version": LEFT_SIDE_FEATURE_SCHEMA_VERSION,
         "factor_contract_sha256": LEFT_SIDE_FACTOR_CONTRACT_SHA256,
+        "market_dataset_revision": market_revision,
     })
+
+
+def _load_project_feature_cache(
+    target: pd.Timestamp,
+    signals: pd.DataFrame,
+    config: LeftSideRankingConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Validate and load the shared exact-date project-factor sidecar."""
+
+    manifest = _load_json(config.paths.project_feature_manifest)
+    if manifest.get("status") != "success":
+        raise RuntimeError("left-side project feature cache did not succeed")
+    if manifest.get("target_date") != target.date().isoformat():
+        raise RuntimeError("left-side project feature cache is stale")
+    if manifest.get("candidate_coverage_status") != "complete":
+        raise RuntimeError("left-side project feature candidate coverage is incomplete")
+    if manifest.get("factor_schema_version") != PROJECT_FACTOR_SCHEMA_VERSION:
+        raise RuntimeError("left-side project feature schema mismatch")
+    expected_sha256 = str(manifest.get("output_sha256") or "")
+    if not expected_sha256 or expected_sha256 != _sha256(
+        config.paths.project_feature_cache
+    ):
+        raise RuntimeError("left-side project feature checksum mismatch")
+
+    features = pd.read_parquet(config.paths.project_feature_cache)
+    required = {
+        "ts_code",
+        "symbol",
+        "trade_date",
+        "date",
+        "factor_schema_version",
+        *PROJECT_FACTOR_COLUMNS,
+    }
+    missing_columns = required - set(features.columns)
+    if missing_columns:
+        raise RuntimeError(
+            "left-side project feature cache missing columns: "
+            f"{sorted(missing_columns)}"
+        )
+    features["symbol"] = features["symbol"].astype(str)
+    features["date"] = pd.to_datetime(
+        features["date"], errors="coerce"
+    ).dt.normalize()
+    features = features[features["date"].eq(target)].copy()
+    if features.duplicated(["symbol", "date"]).any():
+        raise RuntimeError("left-side project feature cache contains duplicate keys")
+    schemas = set(features["factor_schema_version"].dropna().astype(str))
+    if features.empty or schemas != {PROJECT_FACTOR_SCHEMA_VERSION}:
+        raise RuntimeError("left-side project feature cache row schema mismatch")
+    all_null = [
+        column
+        for column in PROJECT_FACTOR_COLUMNS
+        if features[column].notna().sum() == 0
+    ]
+    if all_null:
+        raise RuntimeError(
+            "left-side project feature cache has all-null factors: "
+            f"{all_null[:20]}"
+        )
+    incomplete_values = features[
+        list(LEFT_SIDE_REQUIRED_PROJECT_VALUE_COLUMNS)
+    ].isna().any(axis=1)
+    if incomplete_values.any():
+        samples = features.loc[
+            incomplete_values,
+            "symbol",
+        ].astype(str).head(20).tolist()
+        raise RuntimeError(
+            "left-side project feature cache has incomplete daily_basic values: "
+            f"count={int(incomplete_values.sum())} samples={samples}"
+        )
+
+    expected_symbols = set(signals["symbol"].astype(str))
+    available_symbols = set(features["symbol"])
+    missing_symbols = expected_symbols - available_symbols
+    policy_excluded = {
+        str(symbol)
+        for symbol in manifest.get("policy_excluded_candidate_symbols") or []
+    }
+    unexplained = missing_symbols - policy_excluded
+    if unexplained:
+        raise RuntimeError(
+            "left-side project feature cache has unexplained missing candidates: "
+            f"{sorted(unexplained)[:20]}"
+        )
+    excluded = sorted(missing_symbols & policy_excluded)
+    eligible_signals = signals[
+        ~signals["symbol"].astype(str).isin(excluded)
+    ].reset_index(drop=True)
+    eligible_symbols = set(eligible_signals["symbol"].astype(str))
+    features = features[
+        features["symbol"].isin(eligible_symbols)
+    ].reset_index(drop=True)
+    return features, eligible_signals, excluded
 
 
 def _score_input_fingerprint(
@@ -543,6 +686,12 @@ def build_left_side_production_features(
 ) -> dict[str, Any]:
     target = pd.to_datetime(target_date, errors="raise").normalize()
     signals = load_left_side_signal_universe(target, config=config)
+    project_features, eligible_signals, policy_excluded = (
+        _load_project_feature_cache(target, signals, config)
+        if not signals.empty
+        else (pd.DataFrame(), signals, [])
+    )
+    signals = eligible_signals
     symbols = sorted(signals["symbol"].astype(str).unique()) if not signals.empty else []
     store = MarketDataStore(
         MarketDataStoreConfig(backend="parquet", root=config.paths.market_data_root)
@@ -550,7 +699,7 @@ def build_left_side_production_features(
     market = (
         store.read_market_range(
             "daily",
-            start_date=(target - pd.DateOffset(years=6)).strftime("%Y%m%d"),
+            start_date=(target - pd.DateOffset(months=18)).strftime("%Y%m%d"),
             end_date=target.strftime("%Y%m%d"),
             symbols=symbols,
             columns=(
@@ -573,6 +722,7 @@ def build_left_side_production_features(
     frame = build_left_side_feature_frame(
         market,
         signals,
+        project_features,
         target_date=target,
         workers=config.factor_workers,
     )
@@ -584,6 +734,11 @@ def build_left_side_production_features(
         "candidate_coverage_status": "complete",
         "signal_candidate_count": len(signals),
         "computed_candidate_count": len(frame),
+        "policy_excluded_candidate_count": len(policy_excluded),
+        "policy_excluded_candidate_symbols": policy_excluded,
+        "project_feature_cache_sha256": _sha256(
+            config.paths.project_feature_cache
+        ),
         "candle_context_feature_schema_version": (
             CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION
         ),
@@ -670,9 +825,14 @@ def run_left_side_production(
     target_date: str,
     *,
     config: LeftSideRankingConfig = DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+    factor_workers: int | None = None,
 ) -> dict[str, Any]:
     if not config.enabled:
         raise RuntimeError("left-side unified ranking is disabled")
+    if factor_workers is not None:
+        if not 1 <= factor_workers <= 32:
+            raise ValueError("left-side production factor_workers must be in [1, 32]")
+        config = replace(config, factor_workers=factor_workers)
     target = pd.to_datetime(target_date, errors="raise").normalize()
     feature_fingerprint = _feature_input_fingerprint(target, config)
     feature_checkpoint_reused = False

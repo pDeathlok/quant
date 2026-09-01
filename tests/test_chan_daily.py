@@ -84,6 +84,30 @@ def test_summarize_chan_daily_counts_signals():
     assert summary["buy3_confirm"] >= 1
 
 
+def test_incremental_evaluation_matches_full_output_for_requested_dates():
+    daily = _make_chan_third_buy_frame()
+    evaluate_from = pd.to_datetime(daily["date"].iloc[-8])
+
+    full = add_chan_daily_signals(daily)
+    incremental = add_chan_daily_signals(daily, evaluate_from=evaluate_from)
+    columns = [
+        "chan_buy1_watch",
+        "chan_buy2_confirm",
+        "chan_buy3_confirm",
+        "signal_chan_daily_long",
+        "signal_chan_daily_exit",
+        "chan_center_low",
+        "chan_center_high",
+        "chan_stroke_amplitude",
+        "chan_score",
+    ]
+    selected = full["date"].ge(evaluate_from)
+    pd.testing.assert_frame_equal(
+        incremental.loc[selected, columns].reset_index(drop=True),
+        full.loc[selected, columns].reset_index(drop=True),
+    )
+
+
 def test_trailing_stop_uses_peak_confirmed_before_current_daily_bar():
     frame = pd.DataFrame(
         {

@@ -14,6 +14,7 @@ from quant.application.daily_dependencies import (
     PRODUCTION_PROJECT_FACTOR_SCHEMA,
     ArtifactSpec,
     Cadence,
+    DataQualityPolicy,
     DependencyEdge,
     DependencyNode,
     DependencyRegistry,
@@ -166,6 +167,69 @@ def test_freshness_audit_aggregates_exact_and_poll_failures() -> None:
         "actual": "2026-08-11",
     }
     assert failures["data.polled"]["actual"] is None
+
+
+def test_final_gate_fails_closed_when_quality_evidence_is_missing_or_failed() -> None:
+    source = replace(
+        _node("data.source", Layer.DATA_SOURCE, final_gate=True),
+        quality=DataQualityPolicy(
+            fail_closed=True,
+            expected_key_mode="listed_universe",
+            maximum_unresolved_missing=0,
+        ),
+        result_aliases=("refresh_source",),
+    )
+    product = _node(
+        "product.output",
+        Layer.PRODUCT,
+        inputs=(DependencyEdge(source.node_id),),
+    )
+    registry = DependencyRegistry(
+        (source, product),
+        {"demo": (product.node_id,)},
+    )
+    target = date(2026, 8, 31)
+    states = {source.node_id: NodeState(source.node_id, watermark=target)}
+
+    missing = runtime.audit_required_freshness(
+        registry,
+        "demo",
+        target,
+        states,
+        results={},
+    )
+    failed = runtime.audit_required_freshness(
+        registry,
+        "demo",
+        target,
+        states,
+        results={
+            "refresh_source": {
+                "quality_evidence": {
+                    "status": "failed",
+                    "unresolved_missing_symbols": 1,
+                }
+            }
+        },
+    )
+    passed = runtime.audit_required_freshness(
+        registry,
+        "demo",
+        target,
+        states,
+        results={
+            "refresh_source": {
+                "quality_evidence": {
+                    "status": "success",
+                    "unresolved_missing_symbols": 0,
+                }
+            }
+        },
+    )
+
+    assert missing["failures"][-1]["mode"] == "data_quality"
+    assert failed["failures"][-1]["actual"]["unresolved_missing_symbols"] == 1
+    assert passed["status"] == "success"
 
 
 def test_required_json_predicate_is_part_of_freshness_evidence(

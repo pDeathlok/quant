@@ -980,31 +980,36 @@ def test_allotment_scope_refreshes_daily_basic_inputs(monkeypatch) -> None:
 
 
 def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -> None:
-    rendezvous = threading.Barrier(3, timeout=3)
+    rendezvous = threading.Barrier(2, timeout=3)
     active = 0
     max_active = 0
     active_lock = threading.Lock()
     worker_args: dict[str, int] = {}
 
-    def parallel_output(payload: dict):
+    def parallel_output(payload: dict, *, rendezvous_required: bool):
         def run(*args, **kwargs):
             nonlocal active, max_active
             with active_lock:
                 active += 1
                 max_active = max(max_active, active)
-            rendezvous.wait()
+            if rendezvous_required:
+                rendezvous.wait()
             with active_lock:
                 active -= 1
             return payload
 
         return run
 
-    chan_body = parallel_output({"status": "success"})
+    chan_body = parallel_output(
+        {"status": "success"}, rendezvous_required=True
+    )
     right_body = parallel_output(
-        {"status": "success", "target_date": "2026-07-23", "selector_adapter": {"status": "success"}}
+        {"status": "success", "target_date": "2026-07-23", "selector_adapter": {"status": "success"}},
+        rendezvous_required=True,
     )
     left_body = parallel_output(
-        {"status": "success", "target_date": "2026-07-23", "adapter": {"status": "success"}}
+        {"status": "success", "target_date": "2026-07-23", "adapter": {"status": "success"}},
+        rendezvous_required=False,
     )
 
     def chan(*, progress_callback, workers: int):
@@ -1015,7 +1020,8 @@ def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -
         worker_args["right_side"] = factor_workers
         return right_body()
 
-    def left(target_date: str):
+    def left(target_date: str, *, factor_workers: int):
+        worker_args["left_side"] = factor_workers
         return left_body()
 
     monkeypatch.setenv("ROUTINE_MODEL_SCORE_WORKERS", "99")
@@ -1031,12 +1037,40 @@ def test_global_refresh_parallelizes_outputs_and_caps_cpu_workers(monkeypatch) -
     services._run_latest_refresh_job("all", run_id="parallel-daily-outputs")
 
     assert status["status"] == "success"
-    assert max_active == 3
-    assert worker_args == {"chan": 4, "right_side": 6}
+    assert max_active == 2
+    assert worker_args == {"chan": 4, "right_side": 6, "left_side": 2}
+    assert status["result"]["output_dag"]["resource_usage"][
+        "max_cpu_slots"
+    ] == 10
     assert status["result"]["generate_daily_plan"]["status"] == "success"
     assert status["result"]["generate_dashboard"]["status"] == "retired"
     assert status["result"]["model_score"]["status"] == "retired"
     assert status["result"]["refresh_chan_model_scores"]["status"] == "success"
+
+
+def test_global_refresh_builds_selector_snapshot_once(monkeypatch) -> None:
+    status = _stub_successful_global_refresh(monkeypatch)
+    calls: list[dict[str, object]] = []
+
+    def selector(**kwargs):
+        calls.append(kwargs)
+        return {"signal_date": "2026-07-23", "stocks": []}
+
+    monkeypatch.setattr(services, "get_stock_selector_payload", selector)
+    services._run_latest_refresh_job("short", run_id="selector-single-pass")
+
+    assert status["status"] == "success", status.get("error")
+    assert calls == [
+        {
+            "signal_date": "2026-07-23",
+            "include_extended": True,
+            "use_cache": False,
+            "full_snapshot": True,
+        }
+    ]
+    assert status["result"]["selector_core"]["execution_mode"] == (
+        "covered_by_selector_extended_single_pass"
+    )
 
 
 def test_global_refresh_overlaps_both_unified_rankers_with_chan(
@@ -1045,26 +1079,29 @@ def test_global_refresh_overlaps_both_unified_rankers_with_chan(
     from quant.routine import right_side_unified_production
 
     right_side_started = threading.Event()
-    left_side_started = threading.Event()
+    chan_started = threading.Event()
     worker_args: dict[str, int] = {}
 
     def chan(*, progress_callback, workers: int):
         worker_args["chan"] = workers
+        chan_started.set()
         assert right_side_started.wait(timeout=3)
-        assert left_side_started.wait(timeout=3)
         return {"status": "success"}
 
     def right_side(target_date: str, *, factor_workers: int):
         worker_args["right_side"] = factor_workers
         right_side_started.set()
+        assert chan_started.wait(timeout=3)
         return {
             "status": "success",
             "target_date": target_date,
             "selector_adapter": {"status": "success"},
         }
 
-    def left_side(target_date: str):
-        left_side_started.set()
+    def left_side(target_date: str, *, factor_workers: int):
+        worker_args["left_side"] = factor_workers
+        assert right_side_started.is_set()
+        assert chan_started.is_set()
         return {
             "status": "success",
             "target_date": target_date,
@@ -1081,7 +1118,7 @@ def test_global_refresh_overlaps_both_unified_rankers_with_chan(
     services._run_latest_refresh_job("all", run_id="parallel-right-side")
 
     assert status["status"] == "success", status.get("error")
-    assert worker_args == {"chan": 4, "right_side": 6}
+    assert worker_args == {"chan": 4, "right_side": 6, "left_side": 2}
     assert status["result"]["right_side_unified_features"] == {
         "status": "success",
         "target_date": "2026-07-23",
@@ -1680,7 +1717,7 @@ def test_input_resume_marks_only_reused_steps_as_checkpoints(
     assert step_map["refresh_data"]["checkpoint_reused"] is True
     assert step_map["refresh_data"]["elapsed_seconds"] == 0.0
     assert step_map["signal_cache"]["checkpoint_reused"] is False
-    assert "feature_cache" not in step_map
+    assert step_map["feature_cache"]["checkpoint_reused"] is False
     assert "model_score" not in step_map
     assert step_map["daily_plan"]["checkpoint_reused"] is False
 

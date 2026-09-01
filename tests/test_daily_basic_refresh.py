@@ -194,6 +194,84 @@ def test_complete_local_daily_basic_is_validated_without_refetching(
     assert result["attempts"] == 0
 
 
+def test_forced_recent_recheck_bypasses_local_file_and_reports_source_change(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "daily_basic"
+    output_dir.mkdir()
+    previous = _complete_daily_basic()
+    previous.loc[0, "turnover_rate"] = 1.0
+    previous.to_parquet(output_dir / "20260722.parquet", index=False)
+    official = _complete_daily_basic()
+    official.loc[0, "turnover_rate"] = 2.0
+    calls = 0
+
+    class Fetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date: str) -> pd.DataFrame:
+            nonlocal calls
+            calls += 1
+            return official.copy()
+
+    monkeypatch.setattr(daily_basic_refresh, "TushareDataFetcher", Fetcher)
+
+    result = daily_basic_refresh.fetch_one_trade_date(
+        "20260722",
+        output_dir,
+        tmp_path / "cache",
+        daily_basic_refresh.RequestLimiter(0),
+        retries=0,
+        retry_base_delay=0,
+        retry_max_delay=0,
+        expected_rows=4,
+        minimum_coverage_rate=1.0,
+        expected_symbols=set(official["ts_code"]),
+        force_source_refresh=True,
+    )
+
+    assert result["status"] == "success"
+    assert result["source"] == "tushare"
+    assert result["source_rechecked"] is True
+    assert result["source_changed_rows"] == 1
+    assert "turnover_rate" in result["source_changed_columns"]
+    assert calls == 1
+
+
+def test_daily_basic_rejects_wrong_symbol_set_even_when_row_count_matches(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    wrong = _complete_daily_basic()
+    wrong.loc[0, "ts_code"] = "999999.SZ"
+
+    class Fetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date: str) -> pd.DataFrame:
+            return wrong.copy()
+
+    monkeypatch.setattr(daily_basic_refresh, "TushareDataFetcher", Fetcher)
+    result = daily_basic_refresh.fetch_one_trade_date(
+        "20260722",
+        tmp_path / "daily_basic",
+        tmp_path / "cache",
+        daily_basic_refresh.RequestLimiter(0),
+        retries=0,
+        retry_base_delay=0,
+        retry_max_delay=0,
+        expected_rows=4,
+        minimum_coverage_rate=1.0,
+        expected_symbols={f"00000{i}.SZ" for i in range(1, 5)},
+    )
+
+    assert result["status"] == "failed"
+    assert "missing expected market symbols" in result["error"]
+
+
 def test_latest_daily_basic_derives_delayed_volume_ratio_from_daily(
     monkeypatch,
     tmp_path: Path,
@@ -393,8 +471,11 @@ def test_refresh_manifest_exposes_durable_repair_queue(
 
     monkeypatch.setattr(
         daily_basic_refresh,
-        "load_trade_date_symbol_counts",
-        lambda *_args, **_kwargs: {"20260721": 4, "20260722": 4},
+        "load_trade_date_symbol_sets",
+        lambda *_args, **_kwargs: {
+            "20260721": {f"00000{i}.SZ" for i in range(1, 5)},
+            "20260722": {f"00000{i}.SZ" for i in range(1, 5)},
+        },
     )
 
     def fake_fetch(trade_date: str, *_args, **_kwargs) -> dict:

@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -65,7 +65,7 @@ TUSHARE_DAILY_ROW_LIMIT = 6000
 DEFAULT_BATCH_MAX_TRADE_DATES = 30
 DEFAULT_BATCH_MIN_COVERAGE_RATE = 0.995
 DEFAULT_AVAILABILITY_RETRIES = 12
-DEFAULT_AVAILABILITY_RETRY_INTERVAL_SECONDS = 300.0
+DEFAULT_AVAILABILITY_RETRY_INTERVAL_SECONDS = 600.0
 MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
@@ -82,6 +82,9 @@ def _validate_market_batch_coverage(
     target_symbols: set[str],
     trade_dates: list[str],
     minimum_rate: float,
+    *,
+    confirmed_absences_by_date: Mapping[str, set[str]] | None = None,
+    strict_dates: set[str] | None = None,
 ) -> dict[str, Any]:
     if not 0 < minimum_rate <= 1:
         raise ValueError(f"market batch minimum coverage must be in (0, 1], got {minimum_rate}")
@@ -90,23 +93,37 @@ def _validate_market_batch_coverage(
         raise MarketBatchCoverageError("market batch has no expected symbols")
 
     date_values = market["trade_date"].astype(str)
-    details: dict[str, dict[str, int | float]] = {}
+    details: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
+    confirmed_absences_by_date = confirmed_absences_by_date or {}
+    strict_dates = strict_dates or set()
     for trade_date in trade_dates:
         actual_symbols = set(
             market.loc[date_values == trade_date, "ts_code"].dropna().astype(str)
         ) & target_symbols
+        confirmed_absences = (
+            set(confirmed_absences_by_date.get(trade_date, set()))
+            & (target_symbols - actual_symbols)
+        )
+        unresolved_symbols = target_symbols - actual_symbols - confirmed_absences
         actual = len(actual_symbols)
-        coverage_rate = actual / expected
-        missing = expected - actual
+        effective = actual + len(confirmed_absences)
+        coverage_rate = effective / expected
         details[trade_date] = {
             "symbols": actual,
-            "missing_symbols": missing,
+            "confirmed_no_trade_symbols": len(confirmed_absences),
+            "confirmed_no_trade_symbol_list": sorted(confirmed_absences),
+            "unresolved_missing_symbols": len(unresolved_symbols),
+            "unresolved_missing_symbol_list": sorted(unresolved_symbols),
             "coverage_rate": round(coverage_rate, 6),
         }
-        if coverage_rate < minimum_rate:
+        strict_failure = trade_date in strict_dates and bool(unresolved_symbols)
+        if strict_failure or coverage_rate < minimum_rate:
             failures.append(
-                f"{trade_date}: {actual}/{expected} ({coverage_rate:.2%}), missing={missing}"
+                f"{trade_date}: actual={actual}/{expected}, "
+                f"confirmed_no_trade={len(confirmed_absences)}, "
+                f"unresolved_missing={len(unresolved_symbols)} "
+                f"({coverage_rate:.2%})"
             )
 
     if failures:
@@ -116,6 +133,7 @@ def _validate_market_batch_coverage(
         )
     return {
         "minimum_rate": minimum_rate,
+        "strict_dates": sorted(strict_dates),
         "expected_symbols": expected,
         "trade_dates": details,
     }
@@ -374,6 +392,30 @@ def _is_fully_suspended(tushare: TushareDataFetcher, symbol: str, start_date: st
     return end_date in suspend_dates
 
 
+def _confirm_suspended_symbols(
+    tushare: TushareDataFetcher,
+    symbols: set[str],
+    trade_date: str,
+    *,
+    limiter: RequestLimiter | None = None,
+) -> set[str]:
+    """Resolve a small missing cross-section against Tushare suspension data."""
+
+    max_checks = max(
+        0,
+        int(os.getenv("ROUTINE_DAILY_MAX_SUSPENSION_CHECKS", "100")),
+    )
+    if not symbols or len(symbols) > max_checks:
+        return set()
+    confirmed: set[str] = set()
+    for symbol in sorted(symbols):
+        if limiter is not None:
+            limiter.wait()
+        if _is_fully_suspended(tushare, symbol, trade_date, trade_date):
+            confirmed.add(symbol)
+    return confirmed
+
+
 def _fetch_market_daily_with_retries(
     tushare: TushareDataFetcher,
     trade_date: str,
@@ -467,11 +509,20 @@ def _wait_for_market_daily_availability(
                 name_by_symbol=name_by_symbol,
             )
             market = market[market["ts_code"].isin(target_symbols)].copy()
+            actual_symbols = set(market["ts_code"].dropna().astype(str))
+            confirmed_suspended = _confirm_suspended_symbols(
+                tushare,
+                target_symbols - actual_symbols,
+                trade_date,
+                limiter=limiter,
+            )
             coverage = _validate_market_batch_coverage(
                 market,
                 target_symbols,
                 [trade_date],
-                minimum_coverage_rate,
+                1.0,
+                confirmed_absences_by_date={trade_date: confirmed_suspended},
+                strict_dates={trade_date},
             )
             return frame, {
                 "status": "available",
@@ -481,6 +532,7 @@ def _wait_for_market_daily_availability(
                 "retry_failures_allowed": retry_failures,
                 "retry_interval_seconds": RETRY_INTERVAL_SECONDS if deadline else retry_interval_seconds,
                 "availability_deadline": deadline.isoformat() if deadline else None,
+                "strict_completeness": True,
                 "coverage": coverage,
             }
         except Exception as exc:
@@ -537,6 +589,7 @@ def _refresh_symbols_by_trade_date(
     retry_jitter: float,
     prefetched_market_frames: dict[str, pd.DataFrame] | None = None,
     prefetched_request_count: int = 0,
+    confirmed_absences_by_date: Mapping[str, set[str]] | None = None,
 ) -> tuple[list[DailyRefreshAudit], int, dict[str, Any]]:
     """Refresh raw daily bars with one Tushare request per open trade date."""
 
@@ -599,13 +652,25 @@ def _refresh_symbols_by_trade_date(
             str(DEFAULT_BATCH_MIN_COVERAGE_RATE),
         )
     )
+    latest_trade_date = max(trade_dates)
     coverage = _validate_market_batch_coverage(
         market,
         target_symbols,
         trade_dates,
         minimum_coverage_rate,
+        confirmed_absences_by_date=confirmed_absences_by_date,
+        strict_dates={latest_trade_date},
     )
     row_counts = market.groupby("ts_code", sort=False).size().to_dict()
+    latest_symbols = set(
+        market.loc[
+            market["trade_date"].astype(str).eq(latest_trade_date),
+            "ts_code",
+        ].dropna().astype(str)
+    )
+    confirmed_latest_absences = set(
+        (confirmed_absences_by_date or {}).get(latest_trade_date, set())
+    )
 
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=output_dir.parent))
     dataset = output_dir.name
@@ -620,7 +685,16 @@ def _refresh_symbols_by_trade_date(
     for symbol, name in symbols:
         key = normalize_ts_code(symbol)
         rows = int(row_counts.get(key, 0))
-        if rows == 0:
+        if key not in latest_symbols and key in confirmed_latest_absences:
+            audits.append(
+                _status_audit(
+                    key,
+                    SUSPENDED_STATUS,
+                    f"{latest_trade_date} 已通过 Tushare suspend_d 确认停牌",
+                    attempts=1,
+                )
+            )
+        elif rows == 0:
             audits.append(
                 _status_audit(
                     key,
@@ -981,6 +1055,14 @@ def refresh_daily_data(
                 retry_jitter=retry_jitter,
                 prefetched_market_frames={expected_trade_date: prefetched_market},
                 prefetched_request_count=market_daily_requests,
+                confirmed_absences_by_date={
+                    expected_trade_date: set(
+                        availability_probe["coverage"]["trade_dates"]
+                        [expected_trade_date].get(
+                            "confirmed_no_trade_symbol_list", []
+                        )
+                    )
+                },
             )
             refresh_mode = "batch_by_trade_date"
         except (MarketDataNotReadyError, MarketBatchCoverageError):
@@ -1087,6 +1169,10 @@ def refresh_daily_data(
         "refresh_mode": refresh_mode,
         "market_daily_requests": market_daily_requests,
         "batch_storage": batch_storage,
+        "dataset_revision": batch_storage.get("dataset_revision"),
+        "source_changed_dates": batch_storage.get("changed_partitions", []),
+        "source_changed_symbols": batch_storage.get("changed_keys", []),
+        "source_changed_symbol_count": batch_storage.get("changed_key_count", 0),
         "batch_fallback_reason": batch_fallback_reason,
         "output_dir": str(output_dir),
         "storage_backend": os.getenv("MARKET_DATA_BACKEND", "mysql"),
@@ -1112,9 +1198,38 @@ def refresh_daily_data(
         "suspended_no_data": int((audit_df["status"] == SUSPENDED_STATUS).sum()),
         "retried_symbols": int(((audit_df["attempts"] > 1) & (audit_df["status"] != "failed")).sum()),
     }
+    latest_coverage = (
+        (availability_probe.get("coverage") or {}).get("trade_dates") or {}
+    ).get(expected_trade_date or "", {})
+    manifest["quality_evidence"] = {
+        "status": (
+            "success"
+            if int(latest_coverage.get("unresolved_missing_symbols") or 0) == 0
+            else "failed"
+        ),
+        "strict_completeness": True,
+        "expected_symbols": (availability_probe.get("coverage") or {}).get(
+            "expected_symbols"
+        ),
+        "actual_symbols": latest_coverage.get("symbols"),
+        "confirmed_no_trade_symbols": latest_coverage.get(
+            "confirmed_no_trade_symbols", 0
+        ),
+        "confirmed_no_trade_symbol_list": latest_coverage.get(
+            "confirmed_no_trade_symbol_list", []
+        ),
+        "unresolved_missing_symbols": latest_coverage.get(
+            "unresolved_missing_symbols", 0
+        ),
+        "unresolved_missing_symbol_list": latest_coverage.get(
+            "unresolved_missing_symbol_list", []
+        ),
+    }
     manifest["status"] = (
         "success"
-        if manifest["failed"] == 0 and freshness_error is None
+        if manifest["failed"] == 0
+        and freshness_error is None
+        and manifest["quality_evidence"]["status"] == "success"
         else "failed"
     )
     manifest_path = audit_dir / "manifest.json"

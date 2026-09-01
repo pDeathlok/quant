@@ -912,6 +912,7 @@ def audit_required_freshness(
     states: Mapping[str, NodeState],
     *,
     effective_feature_requirements: Mapping[str, Iterable[str]] | None = None,
+    results: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
@@ -947,6 +948,47 @@ def audit_required_freshness(
                     "actual": actual,
                 }
             )
+        if node.quality.fail_closed:
+            quality_payload = None
+            for alias in node.result_aliases:
+                candidate = _lookup(results or {}, alias)
+                if isinstance(candidate, Mapping):
+                    evidence = candidate.get(node.quality.evidence_field)
+                    if isinstance(evidence, Mapping):
+                        quality_payload = evidence
+                        break
+            quality_status = (
+                str(quality_payload.get("status") or "")
+                if quality_payload is not None
+                else "missing"
+            )
+            unresolved = (
+                int(quality_payload.get("unresolved_missing_symbols") or 0)
+                if quality_payload is not None
+                else None
+            )
+            if (
+                quality_status != "success"
+                or unresolved is None
+                or unresolved > node.quality.maximum_unresolved_missing
+            ):
+                failures.append(
+                    {
+                        "node_id": node_id,
+                        "mode": "data_quality",
+                        "expected": {
+                            "status": "success",
+                            "maximum_unresolved_missing": (
+                                node.quality.maximum_unresolved_missing
+                            ),
+                        },
+                        "actual": (
+                            dict(quality_payload)
+                            if quality_payload is not None
+                            else None
+                        ),
+                    }
+                )
     return {
         "status": "success" if not failures else "failed",
         "checked_nodes": checked,
@@ -1116,6 +1158,7 @@ def publish_daily_dependency_snapshot(
         target,
         states,
         effective_feature_requirements=effective_requirements,
+        results=results,
     )
     refresh_entries = [
         entry

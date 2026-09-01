@@ -149,6 +149,18 @@ class IncrementalPolicy:
 
 
 @dataclass(frozen=True)
+class DataQualityPolicy:
+    fail_closed: bool = False
+    evidence_field: str = "quality_evidence"
+    expected_key_mode: str = "none"
+    absence_resolver: str | None = None
+    maximum_unresolved_missing: int = 0
+    required_columns: tuple[str, ...] = ()
+    minimum_column_coverage: tuple[tuple[str, float], ...] = ()
+    require_official_or_deterministic: bool = False
+
+
+@dataclass(frozen=True)
 class ArtifactSpec:
     artifact_paths: tuple[str, ...]
     extractor: str
@@ -169,6 +181,7 @@ class DependencyNode:
     freshness: FreshnessPolicy
     incremental: IncrementalPolicy
     operation_id: str
+    quality: DataQualityPolicy = DataQualityPolicy()
     contract_version: str = "1"
     contract_sources: tuple[str, ...] = ()
     outputs: tuple[str, ...] = ()
@@ -703,6 +716,16 @@ def build_default_daily_dependency_registry(
             _exact(_result("refresh_data", "dataset_trade_date")),
             _daily_incremental(keys=("trade_date", "ts_code")),
             "refresh_data",
+            quality=DataQualityPolicy(
+                fail_closed=True,
+                expected_key_mode="listed_universe",
+                absence_resolver="tushare_suspend_d",
+                maximum_unresolved_missing=0,
+                required_columns=(
+                    "ts_code", "trade_date", "open", "high", "low", "close", "vol",
+                ),
+                require_official_or_deterministic=True,
+            ),
             contract_sources=(
                 "src/quant/routine/data_refresh.py",
                 "src/quant/data/market_data_store.py",
@@ -722,6 +745,16 @@ def build_default_daily_dependency_registry(
                               context_lookback_sessions=20,
                               poll_overlap_calendar_days=45),
             "refresh_daily_basic",
+            quality=DataQualityPolicy(
+                fail_closed=True,
+                expected_key_mode="market_daily_symbols",
+                maximum_unresolved_missing=0,
+                required_columns=(
+                    "ts_code", "trade_date", "turnover_rate", "turnover_rate_f",
+                    "volume_ratio", "total_mv", "circ_mv",
+                ),
+                require_official_or_deterministic=True,
+            ),
             contract_sources=(
                 "src/quant/routine/daily_basic_refresh.py",
                 "src/quant/routine/data_refresh.py",
@@ -973,8 +1006,8 @@ def build_default_daily_dependency_registry(
         ),
         DependencyNode(
             "feature.project_daily", Layer.FEATURE, "features.project_factor_layer",
-            Lifecycle.RETIRED if two_unified_rankers_active else Lifecycle.PRODUCTION,
-            Cadence.ON_DEMAND if two_unified_rankers_active else Cadence.TRADE_DAILY,
+            Lifecycle.PRODUCTION,
+            Cadence.TRADE_DAILY,
             (_edge("data.market_daily"), _edge("data.daily_basic"),
              _edge("feature.strategy_signals")),
             _exact(
@@ -1076,7 +1109,7 @@ def build_default_daily_dependency_registry(
                 ),
             ),
             _daily_incremental(calendar_days=120, keys=("date", "symbol"), projection=True),
-            "build_chan_live_features",
+            "refresh_chan_model_scores",
             contract_sources=(
                 "scripts/research/refresh_chan_model_live_scores.py",
                 "src/quant/strategies/custom/chan_daily.py",
@@ -1281,7 +1314,7 @@ def build_default_daily_dependency_registry(
                 ),
             ),
             _daily_incremental(years=6, keys=("date", "symbol")),
-            "build_right_side_unified_production_features",
+            "run_right_side_unified",
             contract_sources=(
                 "configs/strategies/right_side_ranking_selector.yaml",
                 "src/quant/application/selector_ranking.py",
@@ -1334,7 +1367,7 @@ def build_default_daily_dependency_registry(
                 ),
             ),
             _daily_incremental(keys=("date", "symbol")),
-            "score_right_side_unified_production",
+            "run_right_side_unified",
             contract_sources=(
                 "configs/strategies/right_side_ranking_selector.yaml",
                 "src/quant/application/selector_ranking.py",
@@ -1368,7 +1401,11 @@ def build_default_daily_dependency_registry(
             "routine.left_side_unified_production",
             Lifecycle.PRODUCTION if left_side_enabled else Lifecycle.RETIRED,
             Cadence.TRADE_DAILY if left_side_enabled else Cadence.ON_DEMAND,
-            (_edge("data.market_daily"), _edge("feature.strategy_signals")),
+            (
+                _edge("data.market_daily"),
+                _edge("feature.strategy_signals"),
+                _edge("feature.project_daily"),
+            ),
             _exact(
                 _file("data/features/left_side_unified/latest_features.parquet"),
                 _json(
@@ -1384,8 +1421,8 @@ def build_default_daily_dependency_registry(
                     expected_value=LEFT_SIDE_FACTOR_CONTRACT_SHA256,
                 ),
             ),
-            _daily_incremental(years=6, keys=("date", "symbol")),
-            "build_left_side_production_features",
+            _daily_incremental(calendar_days=550, keys=("date", "symbol")),
+            "run_left_side_unified",
             contract_sources=(
                 "configs/strategies/left_side_unified.yaml",
                 "configs/strategies/b1_selected.yaml",
@@ -1428,7 +1465,7 @@ def build_default_daily_dependency_registry(
                 ),
             ),
             _daily_incremental(keys=("date", "symbol")),
-            "score_left_side_production",
+            "run_left_side_unified",
             contract_sources=(
                 "configs/strategies/left_side_unified.yaml",
                 "configs/strategies/b1_selected.yaml",
@@ -1467,7 +1504,7 @@ def build_default_daily_dependency_registry(
              *((_edge("score.right_side_unified"),) if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED else ()),
              *((_edge("score.left_side_unified"),) if left_side_enabled else ())),
             _exact(_result("selector_extended", "signal_date")),
-            _daily_incremental(keys=("date", "symbol")), "score_selector_buy_hold",
+            _daily_incremental(keys=("date", "symbol")), "build_selector_payload",
             contract_sources=(
                 "src/quant/webapp/services.py",
                 "src/quant/application/selector_ranking.py",
@@ -1499,7 +1536,7 @@ def build_default_daily_dependency_registry(
                     expected_value="valid",
                 ),
             ),
-            _daily_incremental(keys=("date", "symbol")), "score_chan_release",
+            _daily_incremental(keys=("date", "symbol")), "refresh_chan_model_scores",
             contract_sources=("scripts/research/refresh_chan_model_live_scores.py",),
             result_aliases=("refresh_chan_model_scores",), ui_step="chan_model_strategy", ui_order=75,
             artifact=ArtifactSpec(
@@ -1718,7 +1755,7 @@ def build_default_daily_dependency_registry(
                 ),
             ),
             _daily_incremental(keys=("date", "symbol")),
-            "validate_right_side_unified_selector_adapter",
+            "run_right_side_unified",
             contract_sources=(
                 "configs/strategies/right_side_ranking_selector.yaml",
                 "src/quant/application/selector_ranking.py",
@@ -1751,7 +1788,7 @@ def build_default_daily_dependency_registry(
                 ),
             ),
             _daily_incremental(keys=("date", "symbol")),
-            "validate_left_side_selector_adapter",
+            "run_left_side_unified",
             contract_sources=(
                 "configs/strategies/left_side_unified.yaml",
                 "src/quant/application/left_side_ranking.py",
@@ -1781,17 +1818,33 @@ def build_default_daily_dependency_registry(
         ),
         DependencyNode(
             "product.selector_core", Layer.PRODUCT, "webapp.services.selector",
-            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("score.selector"),),
+            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
+            (
+                _edge("score.selector"),
+                *((_edge("product.right_side_unified_adapter"),)
+                  if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+                  else ()),
+                *((_edge("product.left_side_unified_adapter"),)
+                  if left_side_enabled else ()),
+            ),
             _exact(_result("selector_core", "signal_date")), _daily_incremental(),
-            "build_selector_core", result_aliases=("selector_core",),
+            "build_selector_payload", result_aliases=("selector_core",),
             contract_sources=("src/quant/webapp/services.py",),
             ui_step="selector_core", ui_order=71, final_gate=True,
         ),
         DependencyNode(
             "product.selector_extended", Layer.PRODUCT, "webapp.services.selector",
-            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("score.selector"),),
+            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
+            (
+                _edge("score.selector"),
+                *((_edge("product.right_side_unified_adapter"),)
+                  if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED
+                  else ()),
+                *((_edge("product.left_side_unified_adapter"),)
+                  if left_side_enabled else ()),
+            ),
             _exact(_result("selector_extended", "signal_date")), _daily_incremental(),
-            "build_selector_extended", result_aliases=("selector_extended",),
+            "build_selector_payload", result_aliases=("selector_extended",),
             contract_sources=(
                 "src/quant/webapp/services.py",
                 "configs/strategies/triple_volume_breakout.yaml",
@@ -1921,6 +1974,7 @@ __all__ = [
     "Cadence",
     "ChangeSet",
     "ColumnMode",
+    "DataQualityPolicy",
     "DEFAULT_DAILY_DEPENDENCY_REGISTRY",
     "DependencyEdge",
     "DependencyNode",

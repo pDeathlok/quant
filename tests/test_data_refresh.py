@@ -359,20 +359,22 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
     assert ping_an["trade_date"].tolist() == ["20260604", "20260605", "20260606"]
     assert mao_tai["trade_date"].tolist() == ["20260605", "20260606"]
     assert pd.read_parquet(output_dir / "000001.SZ.parquet")["trade_date"].tolist() == ["20260604"]
-    assert manifest["batch_storage"] == {
-        "rows": 4,
-        "sql_rows": 0,
-        "parquet_partitions": 1,
-        "table": "market_daily",
-        "coverage": {
-                "minimum_rate": 0.995,
-            "expected_symbols": 2,
-            "trade_dates": {
-                "20260605": {"symbols": 2, "missing_symbols": 0, "coverage_rate": 1.0},
-                "20260606": {"symbols": 2, "missing_symbols": 0, "coverage_rate": 1.0},
-            },
-        },
-    }
+    storage = manifest["batch_storage"]
+    assert storage["rows"] == 4
+    assert storage["sql_rows"] == 0
+    assert storage["parquet_partitions"] == 1
+    assert storage["table"] == "market_daily"
+    assert storage["dataset_revision"] == 2
+    assert storage["changed_partitions"] == ["20260605", "20260606"]
+    assert storage["changed_keys"] == ["000001.SZ", "600519.SH"]
+    assert storage["coverage"]["minimum_rate"] == 0.995
+    assert storage["coverage"]["strict_dates"] == ["20260606"]
+    for trade_date in ("20260605", "20260606"):
+        detail = storage["coverage"]["trade_dates"][trade_date]
+        assert detail["symbols"] == 2
+        assert detail["confirmed_no_trade_symbols"] == 0
+        assert detail["unresolved_missing_symbols"] == 0
+        assert detail["coverage_rate"] == 1.0
     assert sorted((tmp_path / "daily_partitioned").glob("year_month=*/data.parquet"))
 
 
@@ -465,6 +467,70 @@ def test_market_daily_batch_rejects_incomplete_symbol_coverage() -> None:
             ["20260605"],
             minimum_rate=0.8,
         )
+
+
+def test_market_daily_availability_rejects_any_unexplained_missing_symbol(
+    monkeypatch,
+) -> None:
+    class DummyPro:
+        def daily(self, **kwargs):
+            return pd.DataFrame(
+                {"ts_code": ["000001.SZ"], "trade_date": [kwargs["trade_date"]]}
+            )
+
+        def suspend_d(self, **kwargs):
+            return pd.DataFrame()
+
+    class DummyFetcher:
+        pro = DummyPro()
+
+    monkeypatch.setenv("ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE", "0.995")
+    with pytest.raises(data_refresh.MarketDataNotReadyError, match="incomplete"):
+        data_refresh._wait_for_market_daily_availability(
+            DummyFetcher(),
+            "20260605",
+            [("000001.SZ", "A"), ("000002.SZ", "B")],
+            sleep_between=0,
+            retry_failures=0,
+            retry_interval_seconds=0,
+        )
+
+
+def test_market_daily_availability_accepts_source_confirmed_suspension() -> None:
+    class DummyPro:
+        def daily(self, **kwargs):
+            return pd.DataFrame(
+                {"ts_code": ["000001.SZ"], "trade_date": [kwargs["trade_date"]]}
+            )
+
+        def suspend_d(self, **kwargs):
+            return pd.DataFrame(
+                {
+                    "trade_date": [kwargs["start_date"]],
+                    "suspend_type": ["S"],
+                }
+            )
+
+        def trade_cal(self, **kwargs):
+            return pd.DataFrame({"cal_date": [kwargs["start_date"]]})
+
+    class DummyFetcher:
+        pro = DummyPro()
+
+    _, probe = data_refresh._wait_for_market_daily_availability(
+        DummyFetcher(),
+        "20260605",
+        [("000001.SZ", "A"), ("000002.SZ", "B")],
+        sleep_between=0,
+        retry_failures=0,
+        retry_interval_seconds=0,
+    )
+
+    detail = probe["coverage"]["trade_dates"]["20260605"]
+    assert detail["symbols"] == 1
+    assert detail["confirmed_no_trade_symbol_list"] == ["000002.SZ"]
+    assert detail["unresolved_missing_symbols"] == 0
+    assert detail["coverage_rate"] == 1.0
 
 
 def test_refresh_daily_data_writes_failed_symbols(monkeypatch, tmp_path):

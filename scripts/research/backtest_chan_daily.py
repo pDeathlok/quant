@@ -68,7 +68,7 @@ def _build_candidate_for_symbol(
         daily = read_daily_file(path, source_frame=source_frame)
         if len(daily) < min_rows:
             return None, None
-        signal_frame = add_chan_daily_signals(daily)
+        signal_frame = add_chan_daily_signals(daily, evaluate_from=start_ts)
         signals = signal_frame[
             (signal_frame["date"] >= start_ts)
             & (

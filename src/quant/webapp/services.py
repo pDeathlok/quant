@@ -27,8 +27,6 @@ import numpy as np
 import pandas as pd
 
 from quant.features.factor_execution import (
-    allocate_worker_budget,
-    calculator_execution_settings,
     configured_worker_budget,
 )
 import yaml
@@ -8902,7 +8900,6 @@ def _run_latest_refresh_job(
     run_id: str | None = None,
 ) -> None:
     from quant.routine.pipeline import (
-        build_features,
         generate_dashboard,
         generate_daily_plan,
         refresh_chan_model_scores,
@@ -8912,7 +8909,6 @@ def _run_latest_refresh_job(
         refresh_reference_inputs,
         publish_daily_dependency_contract,
         resolve_daily_dependency_source_options,
-        refresh_strategy_signal_cache,
         score_latest_models,
     )
 
@@ -9307,6 +9303,33 @@ def _run_latest_refresh_job(
             planned_refresh_nodes.update(inherited_refresh_nodes)
         dependency_preflight["retry_identity_stable"] = retry_identity_stable
         dependency_preflight["refresh_node_ids"] = sorted(planned_refresh_nodes)
+        dag_mode = os.getenv("ROUTINE_DAG_EXECUTOR", "shadow").strip().lower()
+        if dag_mode not in {"legacy", "shadow", "enabled"}:
+            raise RuntimeError(
+                "ROUTINE_DAG_EXECUTOR must be legacy, shadow, or enabled"
+            )
+        if dag_mode == "enabled":
+            raise RuntimeError(
+                "DAG cutover is not enabled until every production operation "
+                "has a non-shadow adapter"
+            )
+        if dag_mode == "shadow":
+            from quant.routine.production_dag import build_daily_dag_plan
+
+            dag_plan = build_daily_dag_plan(
+                expected_signal_date,
+                refresh_scope,
+                project_root=PROJECT_ROOT,
+            )
+            dag_plan["planned_refresh_node_ids"] = sorted(
+                planned_refresh_nodes
+            )
+            dependency_preflight["dag_executor"] = dag_plan
+        else:
+            dependency_preflight["dag_executor"] = {
+                "status": "skipped",
+                "mode": "legacy",
+            }
         planned_refresh_ui_steps = {
             str(item.get("ui_step"))
             for contract_payload in (
@@ -9719,6 +9742,8 @@ def _run_latest_refresh_job(
                     == len(PROJECT_FACTOR_COLUMNS)
                     and payload.get("factor_schema_version")
                     == PROJECT_FACTOR_SCHEMA_VERSION
+                    and payload.get("output_sha256")
+                    == _file_sha256(parquet_path)
                     and pd.notna(target)
                     and target.normalize() == expected_incremental_date
                     and parquet_current
@@ -9778,74 +9803,106 @@ def _run_latest_refresh_job(
                 checkpoint_reused=True,
             )
 
-        # The signal pass owns the exact B1 gate for the new date. Run it first
-        # so feature refresh computes the expensive 159-column frame only for
-        # gate hits, while preserving a full-scan fallback for stale manifests.
+        feature_stage_nodes: list[str] = []
         if not signal_ready:
-            _set_refresh_progress(
-                step_key="signal_cache",
-                message="正在增量构建全市场规则信号与 B1 门控",
-                percent=46,
-                complete_previous=False,
-            )
-            results["signal_cache"] = refresh_strategy_signal_cache(
-                progress_callback=lambda percent, message: _set_refresh_progress(
-                    step_key="signal_cache",
-                    message=message,
-                    percent=max(46, min(68, percent)),
-                    complete_previous=False,
-                ),
-            )
-            if results["signal_cache"].get("status") == "failed":
-                raise RuntimeError(
-                    results["signal_cache"].get("stderr_tail")
-                    or "策略规则信号重建失败"
-                )
-            _set_refresh_progress(
-                step_key="signal_cache",
-                step_status="success",
-                message="策略规则信号与 B1 门控构建完成",
-                percent=68,
-                complete_previous=False,
-            )
-
+            feature_stage_nodes.append("feature.strategy_signals")
         if not feature_ready:
-            _set_refresh_progress(
-                step_key="feature_cache",
-                message="正在按 B1 门控增量构建特征缓存",
-                percent=35,
-                complete_previous=False,
-            )
-            results["feature_cache"] = build_features(
-                incremental_start_date=daily_basic_repair_start,
-                progress_callback=lambda percent, message: _set_refresh_progress(
-                    step_key="feature_cache",
-                    message=message,
+            feature_stage_nodes.append("feature.project_daily")
+        if feature_stage_nodes:
+            from quant.routine.dag_executor import ResourceBudget
+            from quant.routine.production_dag import execute_daily_operations
+
+            feature_stage_steps = {
+                "refresh_strategy_signal_cache": (
+                    "signal_cache",
+                    "正在增量构建全市场规则信号与 B1 门控",
+                    46,
+                ),
+                "refresh_active_project_features": (
+                    "feature_cache",
+                    "正在按全体消费方候选并集构建共享项目特征",
+                    35,
+                ),
+            }
+
+            def feature_stage_progress(
+                operation_id: str,
+                status: str,
+                details: Mapping[str, Any],
+            ) -> None:
+                if status != "running" or operation_id not in feature_stage_steps:
+                    return
+                step_key, message, percent = feature_stage_steps[operation_id]
+                _set_refresh_progress(
+                    step_key=step_key,
+                    message=(
+                        f"{message}；授予 "
+                        f"{details.get('granted_workers')} 个 worker"
+                    ),
                     percent=percent,
                     complete_previous=False,
-                ),
-            )
-            if results["feature_cache"].get("status") == "failed":
-                raise RuntimeError(
-                    results["feature_cache"].get("stderr_tail")
-                    or "B1 特征缓存刷新失败"
                 )
-            _set_refresh_progress(
-                step_key="feature_cache",
-                step_status="success",
-                message="B1 特征缓存刷新完成",
-                percent=45,
-                complete_previous=False,
-            )
 
-        # Generate independent outputs together after both upstream caches are
-        # complete. Model and Chan scoring are capped at four workers each.
-        # The right-side build waits for the short-lived model score to release
-        # its workers, then overlaps its six workers with Chan's four so the
-        # sustained CPU budget still fits the 10-core production host.
+            feature_stage = execute_daily_operations(
+                expected_signal_date,
+                refresh_scope,
+                feature_stage_nodes,
+                project_root=PROJECT_ROOT,
+                budget=ResourceBudget(
+                    cpu_slots=configured_worker_budget(),
+                    io_slots=4,
+                    memory_mb=max(
+                        4096,
+                        int(os.getenv("ROUTINE_MEMORY_BUDGET_MB", "4096")),
+                    ),
+                ),
+                dirty_partitions=daily_basic_repair_dates,
+                progress_callback=feature_stage_progress,
+            )
+            if feature_stage["status"] != "success":
+                errors = [
+                    result.error
+                    for result in feature_stage["operations"].values()
+                    if result.error
+                ]
+                raise RuntimeError(
+                    "信号/共享特征 DAG 失败: " + " | ".join(errors[:5])
+                )
+            results["feature_stage_dag"] = {
+                "status": "success",
+                "resource_usage": feature_stage["resource_usage"],
+                "elapsed_seconds": feature_stage["elapsed_seconds"],
+                "operations": sorted(feature_stage["operations"]),
+            }
+            if not signal_ready:
+                results["signal_cache"] = dict(
+                    feature_stage["node_results"]["feature.strategy_signals"]
+                )
+                _set_refresh_progress(
+                    step_key="signal_cache",
+                    step_status="success",
+                    message="策略规则信号与 B1 门控构建完成",
+                    percent=68,
+                    complete_previous=False,
+                )
+            if not feature_ready:
+                results["feature_cache"] = dict(
+                    feature_stage["node_results"]["feature.project_daily"]
+                )
+                _set_refresh_progress(
+                    step_key="feature_cache",
+                    step_status="success",
+                    message="共享项目特征缓存刷新完成",
+                    percent=68,
+                    complete_previous=False,
+                )
+
+        # Run CPU-heavy output operations through the resource-bounded DAG.
+        # Operation contracts own worker grants; nested routines may not
+        # expand them from environment variables.
         _set_refresh_progress(
             step_key="daily_plan",
-            message="正在并行生成每日计划、Dashboard、模型分与缠论评分",
+            message="正在按 DAG 资源预算生成模型与策略输出",
             percent=50,
             complete_previous=False,
         )
@@ -9873,29 +9930,7 @@ def _run_latest_refresh_job(
                 complete_previous=False,
                 checkpoint_reused=True,
             )
-        _set_refresh_progress(
-            step_key="chan_model_strategy",
-            message="正在并行刷新缠论实时评分",
-            percent=72,
-            complete_previous=False,
-        )
         worker_budget = configured_worker_budget()
-        model_score_request = max(
-            1, int(os.getenv("ROUTINE_MODEL_SCORE_WORKERS", "4"))
-        )
-        chan_execution = calculator_execution_settings("chan_live")
-        chan_score_request = min(
-            chan_execution.max_workers,
-            max(
-                1,
-                int(
-                    os.getenv(
-                        "ROUTINE_CHAN_WORKERS",
-                        str(chan_execution.default_workers),
-                    )
-                ),
-            ),
-        )
         right_side_enabled = (
             DEFAULT_SELECTOR_RANKING_CONFIG.source
             == SelectorRankingSource.RIGHT_SIDE_UNIFIED
@@ -9904,269 +9939,197 @@ def _run_latest_refresh_job(
         legacy_strategy_model_score_required = not (
             right_side_enabled and left_side_enabled
         )
-        right_side_execution = calculator_execution_settings("right_side_rule")
-        right_side_request = min(
-            right_side_execution.max_workers,
-            max(
-                1,
-                int(
-                    os.getenv(
-                        "ROUTINE_RIGHT_SIDE_WORKERS",
-                        str(right_side_execution.default_workers),
-                    )
-                ),
-            ),
-        )
-        model_phase = allocate_worker_budget(
-            {"model_score": model_score_request, "chan": chan_score_request},
-            total_budget=worker_budget,
-        )
-        right_side_phase = allocate_worker_budget(
-            {"right_side": right_side_request, "chan": chan_score_request},
-            total_budget=worker_budget,
-        )
-        chan_score_workers = min(model_phase["chan"], right_side_phase["chan"])
-        model_score_workers = min(
-            model_score_request,
-            max(1, worker_budget - chan_score_workers),
-        )
-        right_side_workers = min(
-            right_side_request,
-            max(1, worker_budget - chan_score_workers),
-        )
-        model_score_gate = threading.Event()
-        model_score_failures: list[BaseException] = []
-        if model_score_ready or not legacy_strategy_model_score_required:
-            model_score_gate.set()
         if not legacy_strategy_model_score_required:
             results["model_score"] = {
                 "status": "retired",
                 "reason": "two_unified_short_rankers_active",
                 "active_consumers": 0,
             }
-
-        def score_models_then_release_workers() -> dict[str, Any]:
-            try:
-                payload = score_latest_models(workers=model_score_workers)
-                if payload.get("status") == "failed":
-                    model_score_failures.append(
-                        RuntimeError(
-                            payload.get("stderr_tail")
-                            or "当日策略模型分计算失败"
-                        )
-                    )
-                return payload
-            except BaseException as exc:
-                model_score_failures.append(exc)
-                raise
-            finally:
-                model_score_gate.set()
-
-        def build_right_side_after_model_score() -> dict[str, Any]:
-            model_score_gate.wait()
-            if model_score_failures:
-                return {
-                    "status": "cancelled",
-                    "reason": "策略模型分失败，取消右侧统一因子构建",
-                }
-            from quant.routine.right_side_unified_production import (
-                run_right_side_unified_production,
+        elif not model_score_ready:
+            model_score_workers = min(
+                max(1, int(os.getenv("ROUTINE_MODEL_SCORE_WORKERS", "4"))),
+                worker_budget,
             )
-
-            return run_right_side_unified_production(
-                expected_signal_date,
-                factor_workers=right_side_workers,
+            results["model_score"] = score_latest_models(
+                workers=model_score_workers
             )
+            if results["model_score"].get("status") == "failed":
+                raise RuntimeError(
+                    results["model_score"].get("stderr_tail")
+                    or "当日策略模型分计算失败"
+                )
 
-        def build_left_side_after_signal_cache() -> dict[str, Any]:
-            from quant.routine.left_side_unified_production import (
-                run_left_side_production,
-            )
+        from quant.application.daily_dependencies import (
+            DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+        )
+        from quant.routine.dag_executor import DailyDagExecutor, ResourceBudget
+        from quant.routine.default_operations import (
+            DEFAULT_DAILY_OPERATION_REGISTRY,
+        )
 
-            return run_left_side_production(expected_signal_date)
-
+        selected_output_nodes = ["feature.chan_live", "score.chan"]
         if right_side_enabled:
-            _set_refresh_progress(
-                step_key="right_side_unified_features",
-                message="等待模型评分释放资源后，并行构建右侧统一因子",
-                percent=72,
-                complete_previous=False,
+            selected_output_nodes.extend(
+                (
+                    "feature.right_side_unified",
+                    "score.right_side_unified",
+                    "product.right_side_unified_adapter",
+                )
             )
         if left_side_enabled:
+            selected_output_nodes.extend(
+                (
+                    "feature.left_side_unified",
+                    "score.left_side_unified",
+                    "product.left_side_unified_adapter",
+                )
+            )
+
+        operation_steps = {
+            "refresh_chan_model_scores": "chan_model_strategy",
+            "run_right_side_unified": "right_side_unified_features",
+            "run_left_side_unified": "left_side_unified_features",
+        }
+
+        def output_dag_progress(
+            operation_id: str,
+            status: str,
+            details: Mapping[str, Any],
+        ) -> None:
+            if status != "running":
+                return
+            step_key = operation_steps.get(operation_id)
+            if step_key is None:
+                return
             _set_refresh_progress(
-                step_key="left_side_unified_features",
-                message="正在构建左侧统一因子与排序分",
+                step_key=step_key,
+                message=(
+                    f"正在执行 {operation_id}，"
+                    f"授予 {details.get('granted_workers')} 个 worker"
+                ),
                 percent=72,
                 complete_previous=False,
             )
 
-        with ThreadPoolExecutor(
-            max_workers=4 + int(right_side_enabled) + int(left_side_enabled),
-            thread_name_prefix="quant-daily-output",
-        ) as executor:
-            output_futures = {
-                executor.submit(
-                    refresh_chan_model_scores,
-                    progress_callback=lambda percent, message: _set_refresh_progress(
-                        step_key="chan_model_strategy",
-                        message=message,
-                        percent=percent,
-                        complete_previous=False,
-                    ),
-                    workers=chan_score_workers,
-                ): ("refresh_chan_model_scores", "缠论实时评分刷新失败"),
+        output_dag = DailyDagExecutor(
+            DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+            DEFAULT_DAILY_OPERATION_REGISTRY,
+            project_root=PROJECT_ROOT,
+            budget=ResourceBudget(
+                cpu_slots=worker_budget,
+                io_slots=4,
+                memory_mb=max(
+                    4096,
+                    int(os.getenv("ROUTINE_MEMORY_BUDGET_MB", "4096")),
+                ),
+            ),
+            progress_callback=output_dag_progress,
+        ).execute(
+            target_trade_date=expected_signal_date,
+            scope=refresh_scope,
+            node_ids=selected_output_nodes,
+        )
+        if output_dag["status"] != "success":
+            errors = [
+                result.error
+                for result in output_dag["operations"].values()
+                if result.error
+            ]
+            raise RuntimeError(
+                "每日输出 DAG 失败: " + " | ".join(errors[:5])
+            )
+        results["output_dag"] = {
+            "status": "success",
+            "resource_usage": output_dag["resource_usage"],
+            "elapsed_seconds": output_dag["elapsed_seconds"],
+            "operations": sorted(output_dag["operations"]),
+        }
+        node_results = output_dag["node_results"]
+        chan_payload = dict(node_results["score.chan"])
+        results["refresh_chan_model_scores"] = chan_payload
+        _set_refresh_progress(
+            step_key="chan_model_strategy",
+            step_status="success",
+            message="缠论实时评分刷新完成",
+            percent=72,
+            complete_previous=False,
+        )
+
+        if right_side_enabled:
+            right_payload = dict(node_results["score.right_side_unified"])
+            results["right_side_unified_features"] = {
+                "status": "success",
+                "target_date": right_payload.get("target_date"),
+                "factor_workers": right_payload.get("granted_workers"),
             }
-            if not left_side_enabled:
-                output_futures[executor.submit(generate_daily_plan)] = (
-                    "generate_daily_plan",
-                    "最新策略每日计划生成失败",
+            results["right_side_unified_scores"] = right_payload
+            results["right_side_unified_adapter"] = {
+                **(right_payload.get("selector_adapter") or {}),
+                "status": "success",
+            }
+            for step_key, message, percent in (
+                ("right_side_unified_features", "右侧生产因子构建完成", 72),
+                ("right_side_unified_score", "右侧统一排序分计算完成", 76),
+                ("right_side_unified_adapter", "右侧 selector 排序适配校验完成", 78),
+            ):
+                _set_refresh_progress(
+                    step_key=step_key,
+                    step_status="success",
+                    message=message,
+                    percent=percent,
+                    complete_previous=False,
                 )
-                output_futures[
-                    executor.submit(generate_dashboard, allow_incompatible=True)
-                ] = ("generate_dashboard", "B1 Dashboard 生成失败")
-            else:
-                results["generate_dashboard"] = {
-                    "status": "retired",
-                    "reason": "left_side_unified_replaces_legacy_b1_model_dashboard",
-                    "active_consumers": 0,
-                }
-            if not model_score_ready and legacy_strategy_model_score_required:
-                output_futures[
-                    executor.submit(score_models_then_release_workers)
-                ] = ("model_score", "当日策略模型分计算失败")
-            if right_side_enabled:
-                output_futures[
-                    executor.submit(build_right_side_after_model_score)
-                ] = ("right_side_unified", "右侧统一生产排序失败")
-            if left_side_enabled:
-                output_futures[
-                    executor.submit(build_left_side_after_signal_cache)
-                ] = ("left_side_unified", "左侧统一生产排序失败")
 
-            completed_daily_outputs: set[str] = set()
-            for future in as_completed(output_futures):
-                result_key, failure_message = output_futures[future]
-                payload = future.result()
-                if payload.get("status") == "failed":
-                    raise RuntimeError(
-                        payload.get("stderr_tail")
-                        or payload.get("error")
-                        or failure_message
-                    )
-                if result_key == "right_side_unified":
-                    if payload.get("status") == "cancelled":
-                        continue
-                    results["right_side_unified_features"] = {
-                        "status": "success",
-                        "target_date": payload.get("target_date"),
-                        "factor_workers": right_side_workers,
-                    }
-                    results["right_side_unified_scores"] = payload
-                    results["right_side_unified_adapter"] = {
-                        **(payload.get("selector_adapter") or {}),
-                        "status": "success",
-                    }
-                    for step_key, message, percent in (
-                        (
-                            "right_side_unified_features",
-                            "右侧生产因子构建完成",
-                            72,
-                        ),
-                        (
-                            "right_side_unified_score",
-                            "右侧统一排序分计算完成",
-                            76,
-                        ),
-                        (
-                            "right_side_unified_adapter",
-                            "右侧 selector 排序适配校验完成",
-                            78,
-                        ),
-                    ):
-                        _set_refresh_progress(
-                            step_key=step_key,
-                            step_status="success",
-                            message=message,
-                            percent=percent,
-                            complete_previous=False,
-                        )
-                    continue
-                if result_key == "left_side_unified":
-                    results["left_side_unified_features"] = {
-                        "status": "success",
-                        "target_date": payload.get("target_date"),
-                        "checkpoint_reused": payload.get("checkpoint_reused", False),
-                    }
-                    results["left_side_unified_scores"] = payload
-                    results["left_side_unified_adapter"] = {
-                        **(payload.get("adapter") or {}),
-                        "status": "success",
-                    }
-                    plan_payload = generate_daily_plan()
-                    results["generate_daily_plan"] = {
-                        **plan_payload,
-                        "status": "success",
-                        "ranking_source": "left_side_unified",
-                    }
-                    for step_key, message, percent in (
-                        ("left_side_unified_features", "左侧生产因子构建完成", 73),
-                        ("left_side_unified_score", "左侧统一排序分计算完成", 77),
-                        ("left_side_unified_adapter", "左侧 selector 排序适配校验完成", 79),
-                    ):
-                        _set_refresh_progress(
-                            step_key=step_key,
-                            step_status="success",
-                            message=message,
-                            percent=percent,
-                            complete_previous=False,
-                        )
-                    _set_refresh_progress(
-                        step_key="daily_plan",
-                        step_status="success",
-                        message="左侧统一排序每日计划已生成；旧B1模型看板已退役",
-                        percent=80,
-                        complete_previous=False,
-                    )
-                    continue
+        if left_side_enabled:
+            left_payload = dict(node_results["score.left_side_unified"])
+            results["left_side_unified_features"] = {
+                "status": "success",
+                "target_date": left_payload.get("target_date"),
+                "checkpoint_reused": left_payload.get(
+                    "checkpoint_reused", False
+                ),
+                "factor_workers": left_payload.get("granted_workers"),
+            }
+            results["left_side_unified_scores"] = left_payload
+            results["left_side_unified_adapter"] = {
+                **(left_payload.get("adapter") or {}),
+                "status": "success",
+            }
+            results["generate_dashboard"] = {
+                "status": "retired",
+                "reason": "left_side_unified_replaces_legacy_b1_model_dashboard",
+                "active_consumers": 0,
+            }
+            for step_key, message, percent in (
+                ("left_side_unified_features", "左侧生产因子构建完成", 73),
+                ("left_side_unified_score", "左侧统一排序分计算完成", 77),
+                ("left_side_unified_adapter", "左侧 selector 排序适配校验完成", 79),
+            ):
+                _set_refresh_progress(
+                    step_key=step_key,
+                    step_status="success",
+                    message=message,
+                    percent=percent,
+                    complete_previous=False,
+                )
 
-                results[result_key] = payload
-                if result_key == "model_score":
-                    _set_refresh_progress(
-                        step_key="model_score",
-                        step_status="success",
-                        message="当日策略模型分计算完成",
-                        percent=70,
-                        complete_previous=False,
-                    )
-                elif result_key == "refresh_chan_model_scores":
-                    _set_refresh_progress(
-                        step_key="chan_model_strategy",
-                        step_status="success",
-                        message="缠论实时评分刷新完成",
-                        percent=72,
-                        complete_previous=False,
-                    )
-                elif result_key in {
-                    "generate_daily_plan",
-                    "generate_dashboard",
-                }:
-                    completed_daily_outputs.add(result_key)
-                    if completed_daily_outputs == {
-                        "generate_daily_plan",
-                        "generate_dashboard",
-                    }:
-                        _set_refresh_progress(
-                            step_key="daily_plan",
-                            step_status="success",
-                            message=(
-                                "最新策略每日计划已生成；正式 B1 历史看板因模型兼容门禁保留上一有效版本"
-                                if results["generate_dashboard"].get("status")
-                                == "skipped"
-                                else "最新策略每日计划与 Dashboard 已生成"
-                            ),
-                            percent=72,
-                            complete_previous=False,
-                        )
+        plan_payload = generate_daily_plan()
+        results["generate_daily_plan"] = {
+            **plan_payload,
+            "status": "success",
+            **({"ranking_source": "left_side_unified"} if left_side_enabled else {}),
+        }
+        if not left_side_enabled:
+            results["generate_dashboard"] = generate_dashboard(
+                allow_incompatible=True
+            )
+        _set_refresh_progress(
+            step_key="daily_plan",
+            step_status="success",
+            message="最新策略每日计划与模型输出已生成",
+            percent=80,
+            complete_previous=False,
+        )
         _set_refresh_progress(
             step_key="selector_core",
             message="正在准备选股模型所需的当日长线因子截面",
@@ -10183,22 +10146,19 @@ def _run_latest_refresh_job(
         )
         _clear_selector_caches()
 
-        _set_refresh_progress(step_key="selector_core", message="正在计算核心策略股票池", percent=80)
-        core_payload = get_stock_selector_payload(use_cache=False)
-        if str(core_payload.get("signal_date") or "") != expected_signal_date:
-            raise RuntimeError(
-                "核心策略结果日期未更新到最新交易日: "
-                f"expected={expected_signal_date} actual={core_payload.get('signal_date')}"
-            )
-        results["selector_core"] = {
-            "status": "success",
-            "signal_date": core_payload.get("signal_date"),
-            "stocks": len(core_payload.get("stocks") or []),
-        }
-
-        _set_refresh_progress(step_key="selector_extended", message="正在计算全市场扩展策略信号", percent=90)
+        _set_refresh_progress(
+            step_key="selector_core",
+            message="正在一次性计算核心与全市场扩展策略股票池",
+            percent=80,
+        )
+        _set_refresh_progress(
+            step_key="selector_extended",
+            message="正在计算全市场扩展策略信号",
+            percent=85,
+            complete_previous=False,
+        )
         full_payload = get_stock_selector_payload(
-            signal_date=core_payload.get("signal_date"),
+            signal_date=expected_signal_date,
             include_extended=True,
             use_cache=False,
             full_snapshot=True,
@@ -10208,6 +10168,19 @@ def _run_latest_refresh_job(
                 "扩展策略结果日期未更新到最新交易日: "
                 f"expected={expected_signal_date} actual={full_payload.get('signal_date')}"
             )
+        results["selector_core"] = {
+            "status": "success",
+            "signal_date": full_payload.get("signal_date"),
+            "stocks": len(full_payload.get("stocks") or []),
+            "execution_mode": "covered_by_selector_extended_single_pass",
+        }
+        _set_refresh_progress(
+            step_key="selector_core",
+            step_status="success",
+            message="核心策略节点已由统一全量快照覆盖",
+            percent=89,
+            complete_previous=False,
+        )
         results["selector_extended"] = {
             "status": "success",
             "signal_date": full_payload.get("signal_date"),

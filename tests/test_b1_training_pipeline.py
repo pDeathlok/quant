@@ -119,7 +119,7 @@ def _project_feature_row(symbol: str, target_date: pd.Timestamp) -> dict[str, ob
     return row
 
 
-def test_active_candidate_sidecar_unions_b1_and_z_without_duplicate_work() -> None:
+def test_active_candidate_sidecar_unions_all_consumers_without_duplicate_work() -> None:
     target_date = pd.Timestamp("2026-08-12")
     b1_gate = pd.DataFrame(
         {"symbol": ["000001.SZ"], "date": [target_date]}
@@ -130,35 +130,54 @@ def test_active_candidate_sidecar_unions_b1_and_z_without_duplicate_work() -> No
             "date": [target_date, target_date],
         }
     )
+    family_gate = pd.DataFrame(
+        {
+            "symbol": ["000002.SZ", "000003.SZ"],
+            "date": [target_date, target_date],
+        }
+    )
 
     assert b1_refresh._additional_only_symbols(
         b1_gate,
         z_gate,
-        target_date,
-    ) == ["000002.SZ"]
+        family_gate,
+        target_date=target_date,
+    ) == ["000002.SZ", "000003.SZ"]
 
     active, stats = b1_refresh._assemble_active_candidate_cache(
         pd.DataFrame([_project_feature_row("000001.SZ", target_date)]),
-        pd.DataFrame([_project_feature_row("000002.SZ", target_date)]),
+        pd.DataFrame(
+            [
+                _project_feature_row("000002.SZ", target_date),
+                _project_feature_row("000003.SZ", target_date),
+            ]
+        ),
         b1_gate,
         z_gate,
+        family_gate,
         target_date=target_date,
         factor_schema_version=b1_refresh.resolve_project_factor_schema(),
     )
 
-    assert active["symbol"].tolist() == ["000001.SZ", "000002.SZ"]
+    assert active["symbol"].tolist() == [
+        "000001.SZ",
+        "000002.SZ",
+        "000003.SZ",
+    ]
     assert active.set_index("symbol")["candidate_sources"].to_dict() == {
         "000001.SZ": "b1,z_skill",
-        "000002.SZ": "z_skill",
+        "000002.SZ": "family,z_skill",
+        "000003.SZ": "family",
     }
     assert set(b1_refresh.PROJECT_FACTOR_COLUMNS) <= set(active.columns)
     assert stats == {
         "target_date": "2026-08-12",
         "b1_candidate_count": 1,
+        "family_candidate_count": 2,
         "z_candidate_count": 2,
-        "union_candidate_count": 2,
-        "overlap_candidate_count": 1,
-        "computed_candidate_count": 2,
+        "union_candidate_count": 3,
+        "overlap_candidate_count": 2,
+        "computed_candidate_count": 3,
         "missing_candidate_count": 0,
         "missing_candidate_symbols": [],
         "missing_candidate_samples": [],

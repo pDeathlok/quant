@@ -11,6 +11,7 @@ the same deterministic train/test/oot split policy used by model training.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -59,6 +60,9 @@ from train_b1_tushare_models import assign_symbol_splits, build_dataset
 DEFAULT_ADDITIONAL_GATE_CACHE = (
     PROJECT_ROOT / "data/features/z_skill_daily_candidates.parquet"
 )
+DEFAULT_FAMILY_GATE_CACHE = (
+    PROJECT_ROOT / "data/features/b1/b1_family_rule_candidates.parquet"
+)
 DEFAULT_ACTIVE_FEATURE_CACHE = (
     PROJECT_ROOT / "data/features/b1/active_candidate_project_features.parquet"
 )
@@ -71,6 +75,14 @@ def _parse_date(value: str) -> pd.Timestamp:
     if value.isdigit() and len(value) == 8:
         return pd.to_datetime(value, format="%Y%m%d")
     return pd.to_datetime(value)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _released_b1_required_features(
@@ -168,11 +180,14 @@ def _gate_symbols_on_date(
 
 def _additional_only_symbols(
     b1_gate: pd.DataFrame,
-    additional_gate: pd.DataFrame,
+    *additional_gates: pd.DataFrame,
     target_date: pd.Timestamp,
 ) -> list[str]:
+    additional_symbols: set[str] = set()
+    for gate in additional_gates:
+        additional_symbols.update(_gate_symbols_on_date(gate, target_date))
     return sorted(
-        _gate_symbols_on_date(additional_gate, target_date)
+        additional_symbols
         - _gate_symbols_on_date(b1_gate, target_date)
     )
 
@@ -329,9 +344,10 @@ def _build_additional_candidate_features(
 
 def _assemble_active_candidate_cache(
     b1_features: pd.DataFrame,
-    z_features: pd.DataFrame,
+    supplemental_features: pd.DataFrame,
     b1_gate: pd.DataFrame,
     z_gate: pd.DataFrame,
+    family_gate: pd.DataFrame,
     *,
     target_date: pd.Timestamp,
     factor_schema_version: str,
@@ -340,24 +356,31 @@ def _assemble_active_candidate_cache(
 
     b1_symbols = _gate_symbols_on_date(b1_gate, target_date)
     z_symbols = _gate_symbols_on_date(z_gate, target_date)
-    union_symbols = b1_symbols | z_symbols
+    family_symbols = _gate_symbols_on_date(family_gate, target_date)
+    union_symbols = b1_symbols | z_symbols | family_symbols
     source = pd.DataFrame({"symbol": sorted(union_symbols)})
     source["date"] = target_date
     if not source.empty:
         source["candidate_source_b1"] = source["symbol"].isin(b1_symbols)
         source["candidate_source_z"] = source["symbol"].isin(z_symbols)
-        source["candidate_sources"] = np.select(
-            [
-                source["candidate_source_b1"] & source["candidate_source_z"],
-                source["candidate_source_b1"],
-                source["candidate_source_z"],
-            ],
-            ["b1,z_skill", "b1", "z_skill"],
-            default="",
+        source["candidate_source_family"] = source["symbol"].isin(
+            family_symbols
+        )
+        source["candidate_sources"] = source.apply(
+            lambda row: ",".join(
+                label
+                for label, column in (
+                    ("b1", "candidate_source_b1"),
+                    ("family", "candidate_source_family"),
+                    ("z_skill", "candidate_source_z"),
+                )
+                if bool(row[column])
+            ),
+            axis=1,
         )
 
     feature_frames = []
-    for frame in (b1_features, z_features):
+    for frame in (b1_features, supplemental_features):
         if frame.empty:
             continue
         current = frame[
@@ -384,6 +407,7 @@ def _assemble_active_candidate_cache(
             "factor_schema_version",
             *PROJECT_FACTOR_COLUMNS,
             "candidate_source_b1",
+            "candidate_source_family",
             "candidate_source_z",
             "candidate_sources",
         ]
@@ -418,6 +442,7 @@ def _assemble_active_candidate_cache(
             "factor_schema_version",
             *PROJECT_FACTOR_COLUMNS,
             "candidate_source_b1",
+            "candidate_source_family",
             "candidate_source_z",
             "candidate_sources",
         ]
@@ -429,9 +454,18 @@ def _assemble_active_candidate_cache(
     stats: dict[str, object] = {
         "target_date": target_date.strftime("%Y-%m-%d"),
         "b1_candidate_count": len(b1_symbols),
+        "family_candidate_count": len(family_symbols),
         "z_candidate_count": len(z_symbols),
         "union_candidate_count": len(union_symbols),
-        "overlap_candidate_count": len(b1_symbols & z_symbols),
+        "overlap_candidate_count": sum(
+            (
+                int(symbol in b1_symbols)
+                + int(symbol in family_symbols)
+                + int(symbol in z_symbols)
+            )
+            >= 2
+            for symbol in union_symbols
+        ),
         "computed_candidate_count": len(produced_symbols),
         "missing_candidate_count": len(union_symbols - produced_symbols),
         "missing_candidate_symbols": sorted(union_symbols - produced_symbols),
@@ -456,7 +490,7 @@ def _validate_active_candidate_coverage(
     unexplained = missing - explained
     if unexplained:
         raise RuntimeError(
-            "Active B1/Z candidate feature cache has unexplained missing symbols: "
+            "Active candidate feature cache has unexplained missing symbols: "
             f"count={len(unexplained)} samples={sorted(unexplained)[:20]}"
         )
     union_count = int(stats.get("union_candidate_count") or 0)
@@ -504,6 +538,12 @@ def parse_args() -> argparse.Namespace:
         help="Additional exact-date candidate rows to include in the shared sidecar.",
     )
     parser.add_argument(
+        "--family-gate-cache",
+        type=Path,
+        default=DEFAULT_FAMILY_GATE_CACHE,
+        help="Exact-date family candidate rows consumed by shared feature users.",
+    )
+    parser.add_argument(
         "--active-feature-out",
         type=Path,
         default=DEFAULT_ACTIVE_FEATURE_CACHE,
@@ -549,6 +589,7 @@ def main() -> None:
     gate_source_symbol_count: int | None = None
     b1_gate_rows = pd.DataFrame(columns=["symbol", "date"])
     additional_gate_rows = pd.DataFrame(columns=["symbol", "date"])
+    family_gate_rows = pd.DataFrame(columns=["symbol", "date"])
     additional_gate_mode = "disabled"
     additional_gate_reason: str | None = None
     source_store = MarketDataStore(
@@ -619,6 +660,12 @@ def main() -> None:
             additional_gate_mode = "missing"
             additional_gate_reason = f"missing {args.additional_gate_cache}"
             raise
+    if gate_mode == "signal_gate" and args.family_gate_cache is not None:
+        family_gate_rows = _read_required_additional_gate(
+            args.family_gate_cache,
+            start_date=start_ts,
+            end_date=actual_source_latest,
+        )
 
     if candidate_symbols == []:
         incremental = pd.DataFrame()
@@ -648,13 +695,16 @@ def main() -> None:
         )
 
     additional_symbols: list[str] = []
-    if pd.notna(actual_source_latest) and not additional_gate_rows.empty:
-        # B1 current candidates have already paid for the canonical factor build in
-        # build_dataset.  Calculate only the Z-only symbols here.
+    if pd.notna(actual_source_latest) and (
+        not additional_gate_rows.empty or not family_gate_rows.empty
+    ):
+        # B1 candidates have already paid for the canonical factor build in
+        # build_dataset. Calculate the family/Z-only union exactly once here.
         additional_symbols = _additional_only_symbols(
             b1_gate_rows,
             additional_gate_rows,
-            actual_source_latest,
+            family_gate_rows,
+            target_date=actual_source_latest,
         )
     if pd.notna(actual_source_latest):
         additional = _build_additional_candidate_features(
@@ -787,6 +837,7 @@ def main() -> None:
         additional,
         active_b1_gate,
         additional_gate_rows,
+        family_gate_rows,
         target_date=actual_source_latest,
         factor_schema_version=factor_schema_version,
     )
@@ -847,6 +898,7 @@ def main() -> None:
     if not args.live_only:
         atomic_write_parquet(combined, args.dataset_out, index=False)
     atomic_write_parquet(active_features, args.active_feature_out, index=False)
+    active_manifest["output_sha256"] = _sha256(args.active_feature_out)
     atomic_write_json(active_manifest, args.active_feature_manifest)
 
     result = {

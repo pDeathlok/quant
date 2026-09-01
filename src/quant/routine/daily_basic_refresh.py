@@ -406,27 +406,46 @@ def load_trade_dates_from_daily(daily_dir: Path, start_date: str, end_date: str 
     return sorted(load_trade_date_symbol_counts(daily_dir, start_date, end_date))
 
 
-def load_trade_date_symbol_counts(
+def load_trade_date_symbol_sets(
     daily_dir: Path,
     start_date: str,
     end_date: str | None,
-) -> dict[str, int]:
-    counts: dict[str, set[str]] = {}
+) -> dict[str, set[str]]:
+    symbols_by_date: dict[str, set[str]] = {}
     partition_root = daily_dir.parent / f"{daily_dir.name}_partitioned"
     for path in partition_root.glob("year_month=*/data.parquet"):
         try:
             frame = pd.read_parquet(path, columns=["trade_date", "ts_code"])
         except Exception as exc:
-            raise RuntimeError(f"failed to read canonical daily partition {path}: {exc}") from exc
-        frame["trade_date"] = frame["trade_date"].astype(str)
+            raise RuntimeError(
+                f"failed to read canonical daily partition {path}: {exc}"
+            ) from exc
+        frame["trade_date"] = (
+            frame["trade_date"].astype(str).str.replace("-", "", regex=False)
+        )
         frame = frame[frame["trade_date"] >= start_date]
         if end_date:
             frame = frame[frame["trade_date"] <= end_date]
         for trade_date, group in frame.groupby("trade_date", sort=False):
-            counts.setdefault(str(trade_date), set()).update(
+            symbols_by_date.setdefault(str(trade_date), set()).update(
                 group["ts_code"].dropna().astype(str)
             )
-    return {trade_date: len(symbols) for trade_date, symbols in counts.items()}
+    return symbols_by_date
+
+
+def load_trade_date_symbol_counts(
+    daily_dir: Path,
+    start_date: str,
+    end_date: str | None,
+) -> dict[str, int]:
+    return {
+        trade_date: len(symbols)
+        for trade_date, symbols in load_trade_date_symbol_sets(
+            daily_dir,
+            start_date,
+            end_date,
+        ).items()
+    }
 
 
 def fetch_one_trade_date(
@@ -438,11 +457,13 @@ def fetch_one_trade_date(
     retry_base_delay: float,
     retry_max_delay: float,
     expected_rows: int | None = None,
-    minimum_coverage_rate: float = 0.98,
+    minimum_coverage_rate: float = 1.0,
     availability_retry_failures: int = 0,
     availability_retry_interval: float = 60.0,
     daily_dir: Path = DAILY_DIR,
     *,
+    expected_symbols: set[str] | None = None,
+    force_source_refresh: bool = False,
     now_fn: Callable[[], datetime] = market_now,
     sleep_fn: Callable[[float], None] = time.sleep,
     progress_callback=None,
@@ -459,17 +480,21 @@ def fetch_one_trade_date(
         repair_marker
         and repair_marker.get("requires_source_refresh") is True
     )
-    repair_frame: pd.DataFrame | None = None
-    if repair_requested and output_path.exists():
+    previous_frame: pd.DataFrame | None = None
+    if (repair_requested or force_source_refresh) and output_path.exists():
         try:
-            repair_frame = pd.read_parquet(output_path)
+            previous_frame = pd.read_parquet(output_path)
         except Exception:
-            repair_frame = None
+            previous_frame = None
     minimum_rows = max(
         1,
         math.ceil((expected_rows or 1) * minimum_coverage_rate),
     )
-    if output_path.exists() and not _requires_source_refresh(output_path):
+    if (
+        output_path.exists()
+        and not force_source_refresh
+        and not _requires_source_refresh(output_path)
+    ):
         try:
             local = validate_daily_basic_frame(
                 pd.read_parquet(output_path),
@@ -482,24 +507,32 @@ def fetch_one_trade_date(
             # been fetched and atomically written below.
             pass
         else:
-            return {
-                "trade_date": trade_date,
-                "source": "local_validated",
-                "status": "success",
-                "rows": len(local),
-                "expected_rows": expected_rows,
-                "minimum_rows": minimum_rows,
-                "coverage_rate": (
-                    round(len(local) / expected_rows, 6) if expected_rows else None
-                ),
-                "feature_coverage": local.attrs.get("feature_coverage", {}),
-                "path": str(output_path),
-                "attempts": 0,
-                "repair_requested": False,
-                "repair_status": "not_required",
-                "requires_source_refresh": False,
-                "error": None,
-            }
+            local_symbols = set(local["ts_code"].dropna().astype(str))
+            unresolved_symbols = set(expected_symbols or ()) - local_symbols
+            if not unresolved_symbols:
+                return {
+                    "trade_date": trade_date,
+                    "source": "local_validated",
+                    "status": "success",
+                    "rows": len(local),
+                    "expected_rows": expected_rows,
+                    "minimum_rows": minimum_rows,
+                    "coverage_rate": (
+                        round(len(local) / expected_rows, 6) if expected_rows else None
+                    ),
+                    "feature_coverage": local.attrs.get("feature_coverage", {}),
+                    "path": str(output_path),
+                    "attempts": 0,
+                    "repair_requested": False,
+                    "repair_status": "not_required",
+                    "source_rechecked": False,
+                    "source_changed_rows": 0,
+                    "source_changed_columns": [],
+                    "requires_source_refresh": False,
+                    "error": None,
+                }
+    if force_source_refresh:
+        cache_path.unlink(missing_ok=True)
     attempt = 0
     ordinary_failures = 0
     while True:
@@ -531,6 +564,14 @@ def fetch_one_trade_date(
                     minimum_rows=minimum_rows,
                     required_feature_coverage=DAILY_BASIC_FEATURE_COVERAGE,
                 )
+                actual_symbols = set(df["ts_code"].dropna().astype(str))
+                unresolved_symbols = set(expected_symbols or ()) - actual_symbols
+                if unresolved_symbols:
+                    raise ValueError(
+                        "Tushare daily_basic missing expected market symbols for "
+                        f"{trade_date}: count={len(unresolved_symbols)} "
+                        f"sample={sorted(unresolved_symbols)[:20]}"
+                    )
                 df.attrs["derived_features"] = derived_features
             except ValueError:
                 # The fetcher's basic schema check intentionally accepts small
@@ -558,11 +599,11 @@ def fetch_one_trade_date(
                 cache_path.unlink(missing_ok=True)
             else:
                 provenance_path.unlink(missing_ok=True)
-            repair_changed_rows = 0
-            repair_changed_columns: list[str] = []
-            if repair_requested and not estimated_features:
-                repair_changed_rows, repair_changed_columns = _repair_diff(
-                    repair_frame,
+            source_changed_rows = 0
+            source_changed_columns: list[str] = []
+            if (repair_requested or force_source_refresh) and not estimated_features:
+                source_changed_rows, source_changed_columns = _repair_diff(
+                    previous_frame,
                     df,
                     repair_marker or {},
                 )
@@ -595,8 +636,11 @@ def fetch_one_trade_date(
                     if repair_requested
                     else current_marker.get("reason")
                 ),
-                "repair_changed_rows": repair_changed_rows,
-                "repair_changed_columns": repair_changed_columns,
+                "repair_changed_rows": source_changed_rows if repair_requested else 0,
+                "repair_changed_columns": source_changed_columns if repair_requested else [],
+                "source_rechecked": force_source_refresh,
+                "source_changed_rows": source_changed_rows,
+                "source_changed_columns": source_changed_columns,
                 "requires_source_refresh": bool(estimated_features),
                 "error": None,
             }
@@ -669,17 +713,26 @@ def refresh_daily_basic(
     retry_max_delay: float = 60.0,
     progress_callback=None,
 ) -> dict:
-    expected_rows_by_date = load_trade_date_symbol_counts(
+    expected_symbols_by_date = load_trade_date_symbol_sets(
         daily_dir,
         start_date,
         end_date,
     )
-    trade_dates = sorted(expected_rows_by_date)
+    expected_rows_by_date = {
+        trade_date: len(symbols)
+        for trade_date, symbols in expected_symbols_by_date.items()
+    }
+    trade_dates = sorted(expected_symbols_by_date)
     if not trade_dates:
         raise RuntimeError(f"No trade dates found in {daily_dir}")
     minimum_coverage_rate = float(
-        os.getenv("ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE", "0.98")
+        os.getenv("ROUTINE_DAILY_BASIC_MIN_COVERAGE_RATE", "1.0")
     )
+    source_recheck_count = max(
+        1,
+        int(os.getenv("ROUTINE_DAILY_BASIC_SOURCE_RECHECK_DATES", "5")),
+    )
+    source_recheck_dates = set(trade_dates[-source_recheck_count:])
     availability_retry_failures = int(
         os.getenv("ROUTINE_DAILY_BASIC_AVAILABILITY_RETRY_FAILURES", "2")
     )
@@ -710,6 +763,8 @@ def refresh_daily_basic(
                 availability_retry_failures if trade_date == max(trade_dates) else 0,
                 availability_retry_interval,
                 daily_dir,
+                expected_symbols=expected_symbols_by_date.get(trade_date),
+                force_source_refresh=trade_date in source_recheck_dates,
                 progress_callback=progress_callback,
             )
             for trade_date in trade_dates
@@ -735,6 +790,11 @@ def refresh_daily_basic(
         str(audit["trade_date"])
         for audit in audits
         if audit.get("repair_status") == "repaired"
+    )
+    source_changed_dates = sorted(
+        str(audit["trade_date"])
+        for audit in audits
+        if int(audit.get("source_changed_rows") or 0) > 0
     )
     newly_flagged_dates = sorted(
         str(audit["trade_date"])
@@ -764,7 +824,11 @@ def refresh_daily_basic(
         "error_summary": "; ".join(str(audit.get("error")) for audit in failures) or None,
         "repair_requested_dates": repair_requested_dates,
         "repaired_dates": repaired_dates,
-        "downstream_refresh_dates": repaired_dates,
+        "source_recheck_dates": sorted(source_recheck_dates),
+        "source_changed_dates": source_changed_dates,
+        "downstream_refresh_dates": sorted(
+            set(repaired_dates) | set(source_changed_dates)
+        ),
         "newly_flagged_dates": newly_flagged_dates,
         "pending_repair_dates": pending_repair_dates,
         "repair_queue_size": len(pending_repair_dates),
@@ -776,6 +840,24 @@ def refresh_daily_basic(
         "workers": workers,
         "min_request_interval_seconds": sleep_between,
         "retries": retries,
+    }
+    latest_audit = next(
+        (
+            audit
+            for audit in audits
+            if str(audit.get("trade_date")) == max(trade_dates)
+        ),
+        {},
+    )
+    manifest["quality_evidence"] = {
+        "status": "success" if latest_audit.get("status") == "success" else "failed",
+        "strict_row_coverage": True,
+        "expected_symbols": expected_rows_by_date[max(trade_dates)],
+        "actual_rows": latest_audit.get("rows"),
+        "coverage_rate": latest_audit.get("coverage_rate"),
+        "feature_coverage": latest_audit.get("feature_coverage", {}),
+        "source": latest_audit.get("source"),
+        "deterministic_derived_features": latest_audit.get("derived_features", {}),
     }
     manifest_path = audit_dir / "manifest.json"
     atomic_write_json(manifest, manifest_path)

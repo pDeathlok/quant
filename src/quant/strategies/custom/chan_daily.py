@@ -131,10 +131,16 @@ def _build_strokes(high: pd.Series, low: pd.Series, fractals: pd.DataFrame, min_
     return strokes
 
 
-def _latest_center(strokes: list[dict], params: ChanDailyParams) -> dict | None:
-    if len(strokes) < 3:
+def _latest_center(
+    strokes: list[dict],
+    params: ChanDailyParams,
+    *,
+    through: int | None = None,
+) -> dict | None:
+    end = len(strokes) if through is None else min(through, len(strokes))
+    if end < 3:
         return None
-    recent = strokes[-params.center_lookback_strokes :]
+    recent = strokes[max(0, end - params.center_lookback_strokes) : end]
     best: dict | None = None
     for offset in range(0, len(recent) - 2):
         group = recent[offset : offset + 3]
@@ -167,6 +173,8 @@ def _last_same_direction(strokes: list[dict], direction: str, before: int | None
 def add_chan_daily_signals(
     df: pd.DataFrame,
     params: ChanDailyParams = DEFAULT_CHAN_DAILY_PARAMS,
+    *,
+    evaluate_from: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """Add daily Chan-theory structure signals.
 
@@ -240,6 +248,11 @@ def add_chan_daily_signals(
     buy_plan_arr = np.full(n, "", dtype=object)
     sell_plan_arr = np.full(n, "", dtype=object)
     note_arr = np.full(n, "", dtype=object)
+    evaluation_start_index = 0
+    if evaluate_from is not None:
+        evaluation_start_index = int(
+            out["date"].searchsorted(pd.Timestamp(evaluate_from), side="left")
+        )
 
     for stroke in strokes:
         end_idx = stroke["end_idx"]
@@ -298,7 +311,9 @@ def add_chan_daily_signals(
     for i in range(n):
         while stroke_cursor < len(strokes) and strokes[stroke_cursor]["end_idx"] <= i:
             stroke_cursor += 1
-            center = _latest_center(strokes[:stroke_cursor], params)
+            center = _latest_center(strokes, params, through=stroke_cursor)
+        if i < evaluation_start_index:
+            continue
         if center:
             center_low_arr[i] = center["low"]
             center_high_arr[i] = center["high"]

@@ -35,6 +35,7 @@ def is_tushare_data_missing(error: str) -> bool:
         "daily_basic model feature coverage below threshold",
         "daily_basic missing model feature columns",
         "daily_basic missing required columns",
+        "daily_basic missing expected market symbols",
         "daily returned no market rows",
         "daily market coverage below",
         "daily market response missing required columns",

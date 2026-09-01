@@ -47,7 +47,9 @@ from quant.routine.strategies import StrategyConfig, load_strategy_configs
 
 def _incremental_daily_start(lookback_days: int | None = None) -> str:
     if lookback_days is None:
-        lookback_days = int(os.getenv("ROUTINE_DAILY_LOOKBACK_DAYS", "0"))
+        # Re-fetch a short rolling window so vendor corrections to already
+        # published bars become explicit ChangeSets for downstream caches.
+        lookback_days = int(os.getenv("ROUTINE_DAILY_LOOKBACK_DAYS", "10"))
     daily_dir = PROJECT_ROOT / "data/raw/daily"
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     latest = store.latest_dataset_trade_date(daily_dir.name)
@@ -120,7 +122,7 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         "--availability-retry-failures",
         os.getenv("ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES", "12"),
         "--availability-retry-interval",
-        os.getenv("ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL", "300"),
+        os.getenv("ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL", "600"),
     ]
     if dry_run:
         return {
@@ -655,6 +657,7 @@ def build_features(
     progress_callback=None,
     *,
     incremental_start_date: str | None = None,
+    workers: int | None = None,
 ) -> dict:
     started = time.monotonic()
     start_date = incremental_start_date or _incremental_feature_start()
@@ -679,7 +682,11 @@ def build_features(
         "--incremental-start-date",
         start_date,
         "--workers",
-        os.getenv("ROUTINE_FEATURE_WORKERS", "8"),
+        str(
+            workers
+            if workers is not None
+            else int(os.getenv("ROUTINE_FEATURE_WORKERS", "8"))
+        ),
         "--executor",
         os.getenv("ROUTINE_FEATURE_EXECUTOR", "processes"),
         "--no-adaptive-workers",

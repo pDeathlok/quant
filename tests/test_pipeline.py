@@ -588,7 +588,7 @@ def test_refresh_data_reports_market_availability_retry_progress(monkeypatch) ->
     class FakeProcess:
         def __init__(self, command, **kwargs) -> None:
             assert command[command.index("--availability-retry-failures") + 1] == "12"
-            assert command[command.index("--availability-retry-interval") + 1] == "300"
+            assert command[command.index("--availability-retry-interval") + 1] == "600"
             self.stdout = io.StringIO(
                 "\n".join(
                     [

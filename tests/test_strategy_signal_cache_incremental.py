@@ -150,6 +150,39 @@ def test_sql_frame_identity_is_order_independent_and_detects_late_correction() -
     assert after_correction["fingerprint"] != first["fingerprint"]
 
 
+def test_dataset_revision_identity_is_constant_time_and_range_scoped() -> None:
+    first = signal_cache._revision_source_identity(
+        12,
+        history_start=pd.Timestamp("2026-01-01"),
+        processed_through=pd.Timestamp("2026-08-12"),
+    )
+    repeated = signal_cache._revision_source_identity(
+        12,
+        history_start=pd.Timestamp("2026-01-01"),
+        processed_through=pd.Timestamp("2026-08-12"),
+    )
+    corrected = signal_cache._revision_source_identity(
+        13,
+        history_start=pd.Timestamp("2026-01-01"),
+        processed_through=pd.Timestamp("2026-08-12"),
+    )
+    different_range = signal_cache._revision_source_identity(
+        12,
+        history_start=pd.Timestamp("2025-12-01"),
+        processed_through=pd.Timestamp("2026-08-12"),
+    )
+
+    assert first["source_type"] == "dataset_revision"
+    assert first["fingerprint"] == repeated["fingerprint"]
+    assert first["fingerprint"] != corrected["fingerprint"]
+    assert first["fingerprint"] != different_range["fingerprint"]
+    assert signal_cache._revision_source_identity(
+        None,
+        history_start=pd.Timestamp("2026-01-01"),
+        processed_through=pd.Timestamp("2026-08-12"),
+    )["fingerprint"] is None
+
+
 def test_exact_identity_fast_path_reuses_outputs_and_rejects_output_change(
     tmp_path: Path,
 ) -> None:

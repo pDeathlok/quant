@@ -10,9 +10,16 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+
+from quant.data.dataset_revision_store import (
+    DatasetRevisionStore,
+    PartitionRevisionInput,
+)
 
 
 @dataclass(frozen=True)
@@ -57,7 +64,7 @@ class MarketDataStore:
         frame: pd.DataFrame,
         dataset: str = "daily",
         partition_column: str = "trade_date",
-    ) -> dict[str, int | str]:
+    ) -> dict[str, Any]:
         """Idempotently persist a cross-sectional market batch in one SQL transaction and date partitions."""
 
         if frame.empty:
@@ -72,22 +79,75 @@ class MarketDataStore:
             normalized[partition_column].astype(str).str.replace("-", "", regex=False)
         )
         normalized = normalized.drop_duplicates(["ts_code", partition_column], keep="last")
+        trade_dates = sorted(normalized[partition_column].unique().tolist())
+        try:
+            existing = self.read_market_range(
+                dataset,
+                start_date=trade_dates[0],
+                end_date=trade_dates[-1],
+                columns=tuple(normalized.columns),
+            )
+        except Exception:
+            # Older canonical partitions can predate newly added columns. Read
+            # their available schema and let the comparison align columns.
+            existing = self.read_market_range(
+                dataset,
+                start_date=trade_dates[0],
+                end_date=trade_dates[-1],
+            )
+        changed_keys = self._changed_market_keys(
+            existing,
+            normalized,
+            partition_column,
+        )
+        partition_inputs = {
+            str(partition): PartitionRevisionInput(
+                row_count=len(group),
+                content_sha256=self._stable_frame_sha256(group),
+            )
+            for partition, group in normalized.groupby(partition_column, sort=True)
+        }
 
         sql_rows = 0
         if self.config.backend in {"mysql", "sql"}:
             if self.config.sql_url:
-                sql_rows = self._write_sql_batch(normalized, dataset, partition_column)
+                sql_rows = self._write_sql_batch(
+                    normalized,
+                    dataset,
+                    partition_column,
+                    replace_partitions=True,
+                )
             elif not self.config.mirror_parquet:
                 raise ValueError("MARKET_DATA_SQL_URL is required when MARKET_DATA_BACKEND=mysql")
         parquet_partitions = 0
         if self.config.backend not in {"mysql", "sql"} or self.config.mirror_parquet:
             parquet_partitions = self._write_partitioned_parquet(normalized, dataset, partition_column)
+        revision = self._revision_store().commit(
+            self._dataset_table_name(dataset),
+            partition_inputs,
+            watermark=max(trade_dates),
+        )
         return {
             "rows": int(len(normalized)),
             "sql_rows": int(sql_rows),
             "parquet_partitions": int(parquet_partitions),
             "table": self._dataset_table_name(dataset),
+            "dataset_revision": revision.revision,
+            "dataset_content_sha256": revision.content_sha256,
+            "changed_partitions": list(revision.changed_partitions),
+            "changed_keys": sorted(changed_keys),
+            "changed_key_count": len(changed_keys),
         }
+
+    def dataset_revision(self, dataset: str = "daily") -> int | None:
+        revision = self._revision_store().get(self._dataset_table_name(dataset))
+        return revision.revision if revision is not None else None
+
+    def _revision_store(self) -> DatasetRevisionStore:
+        return DatasetRevisionStore(
+            sql_url=self.config.sql_url if self.config.backend in {"mysql", "sql"} else None,
+            metadata_path=self.config.root / ".dataset_revisions.json",
+        )
 
     def read_frame(self, dataset: str, key: str) -> pd.DataFrame:
         if self.config.backend in {"mysql", "sql"}:
@@ -190,6 +250,17 @@ class MarketDataStore:
             partition_dir.mkdir(parents=True, exist_ok=True)
             if path.exists():
                 existing = pd.read_parquet(path)
+                replaced_values = set(
+                    incoming[partition_column]
+                    .astype(str)
+                    .str.replace("-", "", regex=False)
+                )
+                existing_values = (
+                    existing[partition_column]
+                    .astype(str)
+                    .str.replace("-", "", regex=False)
+                )
+                existing = existing[~existing_values.isin(replaced_values)]
                 combined = pd.concat([existing, incoming], ignore_index=True, sort=False)
             else:
                 combined = incoming.copy()
@@ -331,6 +402,7 @@ class MarketDataStore:
         dataset: str,
         partition_column: str,
         update_existing: bool = True,
+        replace_partitions: bool = False,
     ) -> int:
         from sqlalchemy import Date, DateTime, Float, MetaData, String, Table, inspect
         from sqlalchemy.dialects.mysql import VARCHAR
@@ -387,7 +459,14 @@ class MarketDataStore:
             records = sql_frame.astype(object).where(pd.notna(sql_frame), None).to_dict("records")
             chunk_size = max(100, int(os.getenv("MARKET_DATA_SQL_BATCH_SIZE", "5000")))
             with self._sql_write_lock, engine.begin() as conn:
-                if engine.dialect.name == "mysql":
+                if replace_partitions:
+                    dates = sorted(sql_frame[partition_column].unique().tolist())
+                    conn.execute(
+                        table.delete().where(table.c[partition_column].in_(dates))
+                    )
+                    for offset in range(0, len(records), chunk_size):
+                        conn.execute(table.insert(), records[offset : offset + chunk_size])
+                elif engine.dialect.name == "mysql":
                     from sqlalchemy.dialects.mysql import insert as mysql_insert
 
                     statement = mysql_insert(table)
@@ -503,6 +582,85 @@ class MarketDataStore:
             combined = combined.drop_duplicates(keys, keep="last")
         sort_columns = [column for column in ("date", "trade_date") if column in combined.columns]
         return combined.sort_values(sort_columns).reset_index(drop=True) if sort_columns else combined.reset_index(drop=True)
+
+    @staticmethod
+    def _normalized_hash_frame(
+        frame: pd.DataFrame,
+        columns: list[str],
+    ) -> pd.DataFrame:
+        normalized = frame[columns].copy()
+        for column in columns:
+            if column in {"date", "trade_date", "ann_date", "end_date"}:
+                dates = pd.to_datetime(normalized[column], errors="coerce")
+                normalized[column] = dates.dt.strftime("%Y%m%d").fillna("")
+                continue
+            numeric = pd.to_numeric(normalized[column], errors="coerce")
+            non_null = normalized[column].notna().sum()
+            if non_null and numeric.notna().sum() == non_null:
+                normalized[column] = numeric.astype("float64").round(12)
+            else:
+                normalized[column] = normalized[column].fillna("").astype(str)
+        sort_columns = [
+            column for column in ("trade_date", "date", "ts_code") if column in columns
+        ]
+        if sort_columns:
+            normalized = normalized.sort_values(sort_columns, kind="stable")
+        return normalized.reset_index(drop=True)
+
+    @classmethod
+    def _stable_frame_sha256(cls, frame: pd.DataFrame) -> str:
+        if frame.empty:
+            return hashlib.sha256(b"").hexdigest()
+        columns = sorted(frame.columns)
+        normalized = cls._normalized_hash_frame(frame, columns)
+        row_hashes = pd.util.hash_pandas_object(
+            normalized,
+            index=False,
+        )
+        digest = hashlib.sha256()
+        digest.update("\x1f".join(columns).encode("utf-8"))
+        digest.update(row_hashes.to_numpy().tobytes())
+        return digest.hexdigest()
+
+    @classmethod
+    def _changed_market_keys(
+        cls,
+        existing: pd.DataFrame,
+        incoming: pd.DataFrame,
+        partition_column: str,
+    ) -> set[str]:
+        keys = ["ts_code", partition_column]
+        if existing.empty:
+            return set(incoming["ts_code"].dropna().astype(str))
+        columns = sorted(set(existing.columns) | set(incoming.columns))
+
+        def hashes(frame: pd.DataFrame) -> dict[tuple[str, str], str]:
+            aligned = frame.copy()
+            for column in columns:
+                if column not in aligned:
+                    aligned[column] = pd.NA
+            aligned["ts_code"] = aligned["ts_code"].astype(str)
+            aligned[partition_column] = (
+                aligned[partition_column].astype(str).str.replace("-", "", regex=False)
+            )
+            normalized = cls._normalized_hash_frame(aligned[columns], columns)
+            row_hashes = pd.util.hash_pandas_object(normalized, index=False)
+            return {
+                (str(symbol), str(trade_date)): str(row_hash)
+                for symbol, trade_date, row_hash in zip(
+                    normalized["ts_code"],
+                    normalized[partition_column],
+                    row_hashes,
+                )
+            }
+
+        before = hashes(existing)
+        after = hashes(incoming)
+        changed_rows = set(before) ^ set(after)
+        changed_rows.update(
+            key for key in set(before) & set(after) if before[key] != after[key]
+        )
+        return {symbol for symbol, _ in changed_rows}
 
     @staticmethod
     def _table_name(dataset: str, key: str) -> str:
