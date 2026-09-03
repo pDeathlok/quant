@@ -5168,6 +5168,46 @@ def _write_selector_snapshot_batch(
         ]
         if failed:
             raise RuntimeError(f"selector snapshot rejected: incomplete model scores: {failed[:20]}")
+        expected_date = pd.to_datetime(payload.get("signal_date"), errors="coerce")
+        if pd.isna(expected_date):
+            raise RuntimeError("selector snapshot rejected: missing signal date")
+        expected_date = expected_date.normalize()
+        stale: list[str] = []
+        for row in payload.get("stocks") or []:
+            quality = row.get("feature_quality") or {}
+            provenance_dates = {
+                "row": row.get("date"),
+                "market": row.get("market_data_date"),
+                "score": row.get("score_date"),
+                "feature": quality.get("date"),
+            }
+            if any(
+                pd.isna(parsed := pd.to_datetime(value, errors="coerce"))
+                or parsed.normalize() != expected_date
+                for value in provenance_dates.values()
+            ):
+                stale.append(str(row.get("symbol") or ""))
+                continue
+            layer_coverage = quality.get("layer_coverage") or {}
+            if any(
+                details.get("status") == "complete"
+                and (
+                    pd.isna(
+                        parsed := pd.to_datetime(
+                            details.get("date"), errors="coerce"
+                        )
+                    )
+                    or parsed.normalize() != expected_date
+                )
+                for details in layer_coverage.values()
+                if isinstance(details, dict)
+            ):
+                stale.append(str(row.get("symbol") or ""))
+        if stale:
+            raise RuntimeError(
+                "selector snapshot rejected: stale temporal provenance: "
+                f"expected={expected_date.date().isoformat()} symbols={stale[:20]}"
+            )
     prepared = [
         _prepare_selector_snapshot_write(payload, strategies, include_extended)
         for payload, strategies, include_extended in snapshots
@@ -7980,6 +8020,7 @@ def _apply_exact_selector_market_values(
             failed.append(symbol)
             continue
         row["close"] = float(close)
+        row["market_data_date"] = expected.date().isoformat()
     if failed:
         raise RuntimeError(
             "selector snapshot rejected: incomplete exact-date market values: "

@@ -298,6 +298,7 @@ def test_selector_snapshot_uses_exact_date_feature_close() -> None:
     services._apply_exact_selector_market_values(rows, features, "2026-09-03")
 
     assert rows[0]["close"] == 15.63
+    assert rows[0]["market_data_date"] == "2026-09-03"
 
 
 def test_selector_snapshot_rejects_stale_market_values() -> None:

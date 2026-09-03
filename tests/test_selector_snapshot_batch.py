@@ -85,7 +85,17 @@ def _selector_payload() -> dict:
         "generated_at": "2026-08-12T18:30:00",
         "available_strategies": [{"key": "B2"}, {"key": "B1"}],
         "stocks": [
-            {"symbol": symbol, "model_score_available": True, "feature_quality": {"status": "complete"}}
+            {
+                "symbol": symbol,
+                "date": "2026-08-12",
+                "market_data_date": "2026-08-12",
+                "score_date": "2026-08-12",
+                "model_score_available": True,
+                "feature_quality": {
+                    "status": "complete",
+                    "date": "2026-08-12",
+                },
+            }
             for symbol in ("000001.SZ", "000002.SZ")
         ],
     }
@@ -96,12 +106,33 @@ def _install_filtered_payload_stub(monkeypatch) -> None:
         return {
             **payload,
             "stocks": [{
-                "symbol": f"{strategies[0]}-candidate", "model_score_available": True,
-                "feature_quality": {"status": "complete"},
+                "symbol": f"{strategies[0]}-candidate",
+                "date": payload["signal_date"],
+                "market_data_date": payload["signal_date"],
+                "score_date": payload["signal_date"],
+                "model_score_available": True,
+                "feature_quality": {
+                    "status": "complete",
+                    "date": payload["signal_date"],
+                },
             }],
         }
 
     monkeypatch.setattr(services, "_filtered_selector_payload", filtered)
+
+
+def test_snapshot_writer_rejects_stale_temporal_provenance(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(services, "SELECTOR_SNAPSHOT_DIR", tmp_path / "snapshots")
+    payload = _selector_payload()
+    payload["stocks"][0]["market_data_date"] = "2026-08-11"
+
+    with pytest.raises(RuntimeError, match="stale temporal provenance"):
+        services._write_selector_snapshot_batch([(payload, None, True)])
+
+    assert not (tmp_path / "snapshots").exists()
 
 
 def test_strategy_pool_snapshots_batch_files_sql_and_cache_invalidation(
