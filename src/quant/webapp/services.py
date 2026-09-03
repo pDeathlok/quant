@@ -7955,6 +7955,38 @@ def _require_exact_selector_row_dates(
         )
 
 
+def _apply_exact_selector_market_values(
+    rows: list[dict[str, Any]],
+    feature_rows_by_symbol: dict[str, dict[str, Any]],
+    signal_date: str,
+) -> None:
+    expected = pd.Timestamp(signal_date).normalize()
+    failed: list[str] = []
+    for row in rows:
+        symbol = str(row.get("symbol") or "")
+        source = feature_rows_by_symbol.get(symbol) or {}
+        source_date = pd.to_datetime(
+            source.get("_score_feature_date", source.get("date")),
+            errors="coerce",
+        )
+        close = _safe_float(source.get("close"))
+        if (
+            pd.isna(source_date)
+            or source_date.normalize() != expected
+            or close is None
+            or not np.isfinite(close)
+            or close <= 0.0
+        ):
+            failed.append(symbol)
+            continue
+        row["close"] = float(close)
+    if failed:
+        raise RuntimeError(
+            "selector snapshot rejected: incomplete exact-date market values: "
+            f"expected={expected.date().isoformat()} symbols={failed[:20]}"
+        )
+
+
 def _primary_family(row: dict[str, Any]) -> str:
     signals = row.get("signals") or []
     if signals:
@@ -10673,7 +10705,13 @@ def get_stock_selector_payload(
         reverse=True,
     )
     _require_exact_selector_row_dates(rows, effective_signal_date)
-    rows = _apply_historical_score_normalization(rows)
+    score_feature_rows = _selector_feature_rows_for_score_rows(rows)
+    _apply_exact_selector_market_values(
+        rows,
+        score_feature_rows,
+        str(effective_signal_date),
+    )
+    rows = _apply_historical_score_normalization(rows, score_feature_rows)
     rows = apply_selector_ranking_source(
         rows,
         effective_signal_date,

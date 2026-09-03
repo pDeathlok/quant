@@ -286,6 +286,34 @@ def test_selector_snapshot_rejects_non_current_row_dates() -> None:
         )
 
 
+def test_selector_snapshot_uses_exact_date_feature_close() -> None:
+    rows = [{"symbol": "603368.SH", "date": "2026-09-03", "close": 15.74}]
+    features = {
+        "603368.SH": {
+            "_score_feature_date": "2026-09-03",
+            "close": 15.63,
+        }
+    }
+
+    services._apply_exact_selector_market_values(rows, features, "2026-09-03")
+
+    assert rows[0]["close"] == 15.63
+
+
+def test_selector_snapshot_rejects_stale_market_values() -> None:
+    with pytest.raises(RuntimeError, match="incomplete exact-date market values"):
+        services._apply_exact_selector_market_values(
+            [{"symbol": "603368.SH", "date": "2026-09-03", "close": 15.74}],
+            {
+                "603368.SH": {
+                    "_score_feature_date": "2026-08-24",
+                    "close": 15.74,
+                }
+            },
+            "2026-09-03",
+        )
+
+
 def test_operation_plan_crud_persists_tomorrow_and_long_term(monkeypatch, tmp_path) -> None:
     plan_path = tmp_path / "operation_plans.json"
     monkeypatch.setattr(services, "OPERATION_PLANS_PATH", plan_path)
