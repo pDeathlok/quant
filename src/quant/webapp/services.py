@@ -7896,8 +7896,17 @@ def build_selector_stock_row(
         resonance_weight=_score_mode_resonance_weight("hold"),
     )
     score_info = _score_interpretation(float(historical_buy_score), float(historical_hold_score))
+    source_signal_date = str(stock.get("date") or "") or None
+    snapshot_date = str(signal_date or source_signal_date or "") or None
+    source_date_fields = (
+        {"source_signal_date": source_signal_date}
+        if source_signal_date and source_signal_date != snapshot_date
+        else {}
+    )
     return {
         **{key: value for key, value in stock.items() if key != "signals"},
+        "date": snapshot_date,
+        **source_date_fields,
         "matched_count": len(groups),
         "matched_families": group_labels,
         "matched_groups": groups,
@@ -7921,6 +7930,29 @@ def build_selector_stock_row(
         "rank_reason": f"按 {ordered_signals[0].get('strategy_name')} 领衔，叠加 {len(groups)} 个策略组共振；当前买入分按未来 5 日冲高目标做历史校准",
         "signals": ordered_signals,
     }
+
+
+def _require_exact_selector_row_dates(
+    rows: list[dict[str, Any]],
+    signal_date: str | None,
+) -> None:
+    if not rows:
+        return
+    expected = pd.to_datetime(signal_date, errors="coerce")
+    if pd.isna(expected):
+        raise RuntimeError("selector snapshot requires an exact signal date")
+    expected = expected.normalize()
+    mismatched = [
+        str(row.get("symbol") or "")
+        for row in rows
+        if pd.isna(actual := pd.to_datetime(row.get("date"), errors="coerce"))
+        or actual.normalize() != expected
+    ]
+    if mismatched:
+        raise RuntimeError(
+            "selector snapshot rejected: non-current row dates: "
+            f"expected={expected.date().isoformat()} symbols={mismatched[:20]}"
+        )
 
 
 def _primary_family(row: dict[str, Any]) -> str:
@@ -10640,6 +10672,7 @@ def get_stock_selector_payload(
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
+    _require_exact_selector_row_dates(rows, effective_signal_date)
     rows = _apply_historical_score_normalization(rows)
     rows = apply_selector_ranking_source(
         rows,

@@ -248,6 +248,44 @@ def test_materialize_left_side_ranked_candidates_adds_missing_groups(
     assert stocks["000002.SZ"]["close"] == 12.34
 
 
+def test_selector_stock_row_scores_current_snapshot_when_plan_date_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(services, "_fill_stock_profile", lambda stock, *args: stock)
+    stock = {
+        "symbol": "603368.SH",
+        "date": "2026-08-24",
+        "signals": [],
+    }
+    signal = services._enrich_signal_group(
+        {
+            "strategy_key": "B1",
+            "strategy_family": "B1",
+            "strategy_group": "B1",
+            "strategy_name": "B1",
+            "metrics": {},
+        }
+    )
+
+    row = services.build_selector_stock_row(
+        stock,
+        [signal],
+        signal_date="2026-09-03",
+    )
+
+    assert row is not None
+    assert row["date"] == "2026-09-03"
+    assert row["source_signal_date"] == "2026-08-24"
+
+
+def test_selector_snapshot_rejects_non_current_row_dates() -> None:
+    with pytest.raises(RuntimeError, match="non-current row dates"):
+        services._require_exact_selector_row_dates(
+            [{"symbol": "603368.SH", "date": "2026-08-24"}],
+            "2026-09-03",
+        )
+
+
 def test_operation_plan_crud_persists_tomorrow_and_long_term(monkeypatch, tmp_path) -> None:
     plan_path = tmp_path / "operation_plans.json"
     monkeypatch.setattr(services, "OPERATION_PLANS_PATH", plan_path)
