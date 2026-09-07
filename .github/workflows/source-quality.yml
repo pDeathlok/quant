@@ -22,9 +22,6 @@ env:
 jobs:
   regression:
     runs-on: ubuntu-24.04
-    env:
-      MARKET_DATA_ROOT: ${{ runner.temp }}/quant-ci/raw
-      DAILY_FACTOR_ROOT: ${{ runner.temp }}/quant-ci/factors
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -35,6 +32,10 @@ jobs:
           - python: "3.13"
             constraints: requirements/constraints-ci-py313.txt
     steps:
+      - name: Configure isolated data roots
+        run: |
+          printf 'MARKET_DATA_ROOT=%s/quant-ci/raw\nDAILY_FACTOR_ROOT=%s/quant-ci/factors\n' \
+            "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
