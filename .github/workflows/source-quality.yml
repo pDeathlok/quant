@@ -53,6 +53,14 @@ jobs:
           -r requirements/ci.txt -c ${{ matrix.constraints }}
       - name: Check resolved dependencies
         run: python -m pip check
+      - name: Install live model test runtime
+        if: matrix.python == '3.13'
+        run: |
+          python -m pip --isolated install --disable-pip-version-check \
+            --index-url https://pypi.org/simple \
+            -c requirements/constraints-ci-py313.txt xgboost==3.2.0
+          python -m pip check
+          python -m pip show xgboost
       - name: Record actual runtime in the job log
         run: python scripts/ci/runtime_snapshot.py
       - name: Check syntax and undefined names

@@ -201,3 +201,13 @@ compilation passed. The whole research test suite was not run.
 The new source coverage and identity regressions run in both CI versions.
 Live model/reference and owner lifecycle regressions also run in the Python
 3.13 job, which includes the supported strategy runtime.
+
+The first remote run passed Python 3.9, but the expanded Python 3.13 model
+test collection exposed a missing CI-only XGBoost dependency. The model job
+now installs the locally observed XGBoost 3.2.0 and checks resolved dependencies;
+the production dependency declaration is unchanged.
+
+An additional clean-tree Web selection passed 122 tests. Two tests require
+untracked local calibration/model or historical market artifacts and failed
+identically on the original main commit 3fe59ba. They are existing clean-checkout
+test limitations, not regressions introduced by this patch.
