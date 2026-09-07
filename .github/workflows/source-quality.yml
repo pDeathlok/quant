@@ -17,13 +17,14 @@ env:
   PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
   MARKET_DATA_BACKEND: file
   MARKET_DATA_SQL_URL: ""
-  MARKET_DATA_ROOT: ${{ runner.temp }}/quant-ci/raw
-  DAILY_FACTOR_ROOT: ${{ runner.temp }}/quant-ci/factors
   TUSHARE_TOKEN: ""
 
 jobs:
   regression:
     runs-on: ubuntu-24.04
+    env:
+      MARKET_DATA_ROOT: ${{ runner.temp }}/quant-ci/raw
+      DAILY_FACTOR_ROOT: ${{ runner.temp }}/quant-ci/factors
     timeout-minutes: 20
     strategy:
       fail-fast: false
