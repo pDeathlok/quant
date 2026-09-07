@@ -319,15 +319,51 @@ def _write_strategy_outputs(scored: pd.DataFrame, output_dir: Path, top_n: int) 
     }
 
 
+def _load_scored_training_reference(
+    path: Path, models: dict[str, dict[str, Any]], end: str,
+) -> pd.DataFrame:
+    reference = pd.read_parquet(path)
+    required = {"date", "symbol", "split"}
+    if reference.empty or not required.issubset(reference.columns):
+        raise ValueError("Chan training reference is empty or missing date/symbol/split")
+    if not reference["split"].isin(["train", "test", "oot"]).all():
+        raise ValueError("Chan training reference must not contain live or unknown splits")
+    if not reference["split"].eq("train").any():
+        raise ValueError("Chan training reference has no train rows")
+    reference = reference.copy()
+    reference["date"] = pd.to_datetime(reference["date"], errors="raise").dt.normalize()
+    reference["symbol"] = reference["symbol"].map(normalize_ts_code)
+    if reference["date"].isna().any() or reference.duplicated(["date", "symbol"]).any():
+        raise ValueError("Chan training reference has invalid or duplicate keys")
+    if reference["date"].max() >= pd.Timestamp(end):
+        raise ValueError("Chan live target must be after the frozen training reference")
+    # Match training preprocessing, never derive calibration from live candidates.
+    for column in ["top_list_count", "top_net_amount_ratio", "top_net_rate"]:
+        if column in reference.columns:
+            reference[column] = pd.to_numeric(reference[column], errors="coerce").fillna(0.0)
+    return _add_predictions(reference, models)
+
+
 def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     _load_env(PROJECT_ROOT / ".env")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.scored_path.parent.mkdir(parents=True, exist_ok=True)
+    models = _load_models(args.model_dir)
+    reference_path = getattr(args, "reference_dataset", None) or (
+        args.report_dir / "model_filter/chan_model_dataset.parquet"
+    )
+    reference = _load_scored_training_reference(reference_path, models, args.end)
+    reference_end = reference["date"].max()
+    requested_start = args.start
+    # Cache invalidation must not turn labeled model data into unlabeled live rows.
+    args.start = max(
+        pd.Timestamp(args.start), reference_end + pd.Timedelta(days=1),
+    ).strftime("%Y-%m-%d")
 
     if args.rebuild_candidates:
         candidate_path = args.report_dir / "chan_daily_candidates.parquet"
-        incremental_start = args.start if candidate_path.exists() else args.candidate_start_date
+        incremental_start = args.start
         fresh_candidates = build_candidates(
             args.daily_dir,
             incremental_start,
@@ -372,7 +408,6 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
         start=args.start,
         end=args.end,
     )
-    models = _load_models(args.model_dir)
     live_scored = _add_predictions(live, models) if not live.empty else live
     feature_coverage = dict(live_scored.attrs.get("feature_coverage") or {})
     if live_scored.empty:
@@ -403,16 +438,19 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
     historical = pd.read_parquet(args.scored_path) if args.scored_path.exists() else pd.DataFrame()
     if not historical.empty:
         historical["date"] = pd.to_datetime(historical["date"], errors="coerce")
+        historical["symbol"] = historical["symbol"].map(normalize_ts_code)
         start_ts = pd.Timestamp(args.start)
         end_ts = pd.Timestamp(args.end)
-        historical = historical[~historical["date"].between(start_ts, end_ts)].copy()
-    combined = pd.concat([historical, live_scored], ignore_index=True, sort=False)
+        historical = historical[
+            historical["date"].gt(reference_end)
+            & ~historical["date"].between(start_ts, end_ts)
+        ].copy()
+    combined = pd.concat([reference, historical, live_scored], ignore_index=True, sort=False)
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
     combined = combined.sort_values(["date", "symbol"]).reset_index(drop=True)
+    strategy_meta = _write_strategy_outputs(combined, args.output_dir, args.top_n)
     atomic_write_parquet(combined, args.scored_path, index=False)
     atomic_write_csv(combined, args.scored_path.with_suffix(".csv"), index=False)
-
-    strategy_meta = _write_strategy_outputs(combined, args.output_dir, args.top_n)
 
     snapshot_results: list[dict[str, Any]] = []
     if args.backfill_snapshots:
@@ -431,6 +469,7 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
 
     result = {
         "status": "success",
+        "requested_start": requested_start,
         "start": args.start,
         "end": args.end,
         "live_rows": int(len(live_scored)),
@@ -438,6 +477,13 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
         "combined_rows": int(len(combined)),
         "combined_max_date": combined["date"].max().strftime("%Y-%m-%d") if not combined.empty else None,
         "strategy": strategy_meta,
+        "training_reference": {
+            "path": str(reference_path),
+            "rows": len(reference),
+            "train_rows": int(reference["split"].eq("train").sum()),
+            "last_date": reference_end.strftime("%Y-%m-%d"),
+            "scored_with_current_models": True,
+        },
         "snapshots": snapshot_results,
         "candidate_refresh": candidate_metrics,
         "feature_coverage": feature_coverage,
@@ -449,6 +495,9 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
             "status": "success",
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "processed_through": args.end,
+            "requested_start": requested_start,
+            "effective_start": args.start,
+            "training_reference": result["training_reference"],
             "daily_dir": str(args.daily_dir),
             "daily_basic_dir": str(args.daily_basic_dir),
             "live_rows": result["live_rows"],
@@ -470,6 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--daily-dir", type=Path, default=DEFAULT_DAILY_DIR)
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--reference-dataset", type=Path, default=None)
     parser.add_argument("--top-list-dir", type=Path, default=DEFAULT_TOP_LIST_DIR)
     parser.add_argument("--daily-basic-dir", type=Path, default=DEFAULT_DAILY_BASIC_DIR)
     parser.add_argument("--scored-path", type=Path, default=DEFAULT_SCORED_PATH)

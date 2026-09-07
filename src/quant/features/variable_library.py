@@ -584,6 +584,10 @@ _DAILY_BASIC_ROLLING_LOOKBACK = 20
 _DAILY_BASIC_INITIAL_HISTORY_FILES = 32
 
 
+def _daily_basic_date_keys(dates: pd.Series) -> pd.Series:
+    return pd.to_datetime(dates.astype("string"), format="mixed", errors="raise").dt.strftime("%Y%m%d")
+
+
 def _daily_basic_file_date(path) -> pd.Timestamp | None:
     match = _DAILY_BASIC_DATE_PATTERN.search(path.stem)
     if match is None:
@@ -618,7 +622,7 @@ def _bounded_daily_basic_frames(
     if keys.empty:
         return [], 0
     keys["ts_code"] = keys["ts_code"].astype(str)
-    keys["trade_date"] = keys["trade_date"].astype(str)
+    keys["trade_date"] = _daily_basic_date_keys(keys["trade_date"])
     target_symbols = set(keys["ts_code"])
     target_dates = set(keys["trade_date"])
     start = pd.to_datetime(keys["trade_date"].min(), format="%Y%m%d", errors="coerce")
@@ -657,7 +661,7 @@ def _bounded_daily_basic_frames(
     if frames:
         current = pd.concat(frames, ignore_index=True, sort=False)
         if {"ts_code", "trade_date"} <= set(current.columns):
-            current_keys = current["trade_date"].astype(str).isin(target_dates)
+            current_keys = _daily_basic_date_keys(current["trade_date"]).isin(target_dates)
             target_present = set(current.loc[current_keys, "ts_code"].astype(str))
     if not target_present:
         return frames, files_read
@@ -729,9 +733,10 @@ def load_daily_basic_features(
     if not frames:
         return pd.DataFrame()
 
-    out = pd.concat(frames, ignore_index=True).drop_duplicates(["ts_code", "trade_date"], keep="last")
+    out = pd.concat(frames, ignore_index=True)
+    out["trade_date"] = _daily_basic_date_keys(out["trade_date"])
+    out = out.dropna(subset=["ts_code", "trade_date"]).drop_duplicates(["ts_code", "trade_date"], keep="last")
     out = out.rename(columns={"volume_ratio": "ts_volume_ratio"})
-    out["trade_date"] = out["trade_date"].astype(str)
     out = out.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
 
     for col in ["total_mv", "circ_mv"]:
@@ -773,6 +778,169 @@ def load_daily_basic_features(
     return result
 
 
+def _daily_basic_coverage_details(
+    frame: pd.DataFrame,
+    missing_source: pd.Series,
+    null_turnover: pd.Series,
+) -> str:
+    missing = missing_source | null_turnover
+    symbols = frame["ts_code"] if "ts_code" in frame else pd.Series("<unknown>", index=frame.index)
+    dates = frame["trade_date"] if "trade_date" in frame else pd.Series("<unknown>", index=frame.index)
+    diagnostics = pd.DataFrame({
+        "symbol": symbols,
+        "date": dates.fillna("<unknown>"),
+        "missing": missing,
+        "missing_source_rows": missing_source,
+        "turnover_rate_null_rows": null_turnover,
+    })
+    absent = diagnostics.loc[missing]
+    known_dates = dates.loc[missing].dropna()
+    date_range = f"{known_dates.min()}..{known_dates.max()}" if len(known_dates) else "<unknown>"
+    by_date = diagnostics.groupby("date", sort=True).agg(
+        total_rows=("missing", "size"),
+        missing_rows=("missing", "sum"),
+        missing_source_rows=("missing_source_rows", "sum"),
+        turnover_rate_null_rows=("turnover_rate_null_rows", "sum"),
+    )
+    by_date = by_date.loc[by_date["missing_rows"] > 0].sort_values(
+        "missing_rows", ascending=False, kind="stable",
+    )
+    samples = list(absent[["symbol", "date"]].drop_duplicates().head(5).itertuples(index=False, name=None))
+    return (
+        f"total_rows={len(frame)} missing_rows={int(missing.sum())} "
+        f"missing_symbols={absent['symbol'].nunique()} missing_date_range={date_range} "
+        f"missing_source_rows={int(missing_source.sum())} "
+        f"turnover_rate_null_rows={int(null_turnover.sum())} "
+        f"by_date={by_date.head(10).to_dict(orient='index')} "
+        f"omitted_dates={max(0, len(by_date) - 10)} samples={samples}"
+    )
+
+
+def _read_daily_basic_source_keys(path, trade_date: str, symbols: list[str]) -> pd.DataFrame:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    columns = ["ts_code", "trade_date", "turnover_rate"]
+    schema = pq.read_schema(path)
+    if not {"ts_code", "trade_date"} <= set(schema.names):
+        raise RuntimeError(f"daily_basic source missing identity columns: {path}")
+    date_type = schema.field("trade_date").type
+    date = pd.Timestamp(trade_date)
+    if pa.types.is_integer(date_type) or pa.types.is_floating(date_type):
+        date_values = [int(trade_date)]
+    elif pa.types.is_timestamp(date_type):
+        date_values = [date.to_pydatetime()]
+    elif pa.types.is_date(date_type):
+        date_values = [date.date()]
+    else:
+        date_values = [trade_date, date.strftime("%Y-%m-%d"), date.strftime("%Y-%m-%d 00:00:00")]
+    frame = pd.read_parquet(
+        path,
+        columns=[column for column in columns if column in schema.names],
+        filters=[("ts_code", "in", symbols), ("trade_date", "in", date_values)],
+    )
+    return frame.reindex(columns=columns)
+
+
+class DailyBasicSourceCoverageError(RuntimeError):
+    """Raw daily_basic coverage is below the per-date preflight threshold."""
+
+
+def validate_daily_basic_source_keys(
+    target_keys: pd.DataFrame,
+    daily_basic_dir,
+    *,
+    min_match_rate: float = 0.98,
+) -> dict:
+    """Validate raw turnover coverage per target date, without rolling features.
+
+    Counts refer to unique canonical symbol/date keys. Return aggregate counts,
+    ``matched_rate`` and a ``by_date`` mapping of the same counts and rates.
+    Empty candidates succeed at 100% without reading any source. Missing source
+    rows and present rows with null turnover are disjoint failure categories.
+    Only threshold failures raise ``DailyBasicSourceCoverageError``; snapshot,
+    schema and I/O errors propagate unchanged and must not trigger source retries.
+    """
+    from quant.data.market_snapshot import current_market_snapshot
+
+    if not 0.0 <= min_match_rate <= 1.0:
+        raise ValueError("min_match_rate must be between 0 and 1")
+    summary = {
+        "total_rows": 0,
+        "matched_rows": 0,
+        "missing_rows": 0,
+        "missing_source_rows": 0,
+        "turnover_rate_null_rows": 0,
+        "matched_rate": 1.0,
+        "min_match_rate": min_match_rate,
+        "by_date": {},
+    }
+    if target_keys.empty:
+        return summary
+    keys = target_keys.copy()
+    if "ts_code" not in keys and "symbol" in keys:
+        keys["ts_code"] = keys["symbol"]
+    if "trade_date" not in keys and "date" in keys:
+        keys["trade_date"] = keys["date"]
+    if not {"ts_code", "trade_date"} <= set(keys.columns):
+        raise ValueError("daily_basic target keys require ts_code and trade_date")
+    keys = keys[["ts_code", "trade_date"]].copy()
+    keys["trade_date"] = _daily_basic_date_keys(keys["trade_date"])
+    if keys.isna().any().any():
+        raise ValueError("daily_basic target keys cannot contain null identities")
+    keys["ts_code"] = keys["ts_code"].astype(str)
+    keys = keys.drop_duplicates().reset_index(drop=True)
+    snapshot = current_market_snapshot()
+    files = [] if snapshot is not None else [
+        (path, _daily_basic_file_date(path)) for path in sorted(daily_basic_dir.glob("*.parquet"))
+    ]
+    columns = ["ts_code", "trade_date", "turnover_rate"]
+    for trade_date, daily_keys in keys.groupby("trade_date", sort=True):
+        symbols = sorted(daily_keys["ts_code"].unique())
+        if snapshot is not None:
+            frames = [snapshot.read(
+                "daily_basic", start_date=trade_date, end_date=trade_date,
+                symbols=symbols, columns=columns,
+            )]
+        else:
+            frames = [
+                _read_daily_basic_source_keys(path, trade_date, symbols)
+                for path, file_date in files
+                if pd.isna(file_date) or file_date == pd.Timestamp(trade_date)
+            ]
+        source = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
+        source = source.reindex(columns=columns)
+        source["trade_date"] = _daily_basic_date_keys(source["trade_date"])
+        source = source.dropna(subset=["ts_code", "trade_date"])
+        source = source.drop_duplicates(["ts_code", "trade_date"], keep="last")
+        merged = daily_keys.merge(
+            source, on=["ts_code", "trade_date"], how="left",
+            validate="one_to_one", indicator=True,
+        )
+        missing_source = merged.pop("_merge").eq("left_only")
+        null_turnover = merged["turnover_rate"].replace([np.inf, -np.inf], np.nan).isna() & ~missing_source
+        missing = missing_source | null_turnover
+        counts = {
+            "total_rows": len(merged),
+            "matched_rows": int((~missing).sum()),
+            "missing_rows": int(missing.sum()),
+            "missing_source_rows": int(missing_source.sum()),
+            "turnover_rate_null_rows": int(null_turnover.sum()),
+        }
+        matched_rate = counts["matched_rows"] / counts["total_rows"]
+        if matched_rate < min_match_rate:
+            raise DailyBasicSourceCoverageError(
+                "daily_basic source coverage below required threshold: "
+                f"date={trade_date} matched={matched_rate:.2%} required={min_match_rate:.2%} "
+                + _daily_basic_coverage_details(merged, missing_source, null_turnover)
+            )
+        summary["by_date"][trade_date] = {**counts, "matched_rate": matched_rate}
+        for name, count in counts.items():
+            summary[name] += count
+    summary["matched_rate"] = summary["matched_rows"] / summary["total_rows"]
+    return summary
+
+
 def merge_daily_basic_features(
     data: pd.DataFrame,
     daily_basic_dir,
@@ -782,9 +950,9 @@ def merge_daily_basic_features(
     """Merge project daily_basic variables onto a daily feature frame."""
     out = data.copy()
     if "trade_date" not in out.columns and "date" in out.columns:
-        out["trade_date"] = pd.to_datetime(out["date"]).dt.strftime("%Y%m%d")
+        out["trade_date"] = _daily_basic_date_keys(out["date"])
     if "trade_date" in out.columns:
-        out["trade_date"] = out["trade_date"].astype(str)
+        out["trade_date"] = _daily_basic_date_keys(out["trade_date"])
     if "ts_code" not in out.columns and "symbol" in out.columns:
         out["ts_code"] = out["symbol"].astype(str)
 
@@ -799,23 +967,43 @@ def merge_daily_basic_features(
         if min_match_rate is not None and len(out):
             raise RuntimeError(
                 "daily_basic feature coverage below required threshold: "
-                f"matched=0.00% required={min_match_rate:.2%}"
+                f"matched=0.00% required={min_match_rate:.2%} "
+                + _daily_basic_coverage_details(
+                    out,
+                    pd.Series(True, index=out.index),
+                    pd.Series(False, index=out.index),
+                )
             )
         return data
 
     existing_daily_basic_cols = [
-        col for col in daily_basic.columns
+        col for col in set(daily_basic.columns) | set(DAILY_BASIC_PROJECT_FACTOR_COLUMNS)
         if col not in {"ts_code", "trade_date"} and col in out.columns
     ]
     if existing_daily_basic_cols:
         out = out.drop(columns=existing_daily_basic_cols)
 
-    merged = out.merge(daily_basic, on=["ts_code", "trade_date"], how="left")
+    daily_basic = daily_basic.copy()
+    daily_basic["trade_date"] = _daily_basic_date_keys(daily_basic["trade_date"])
+    daily_basic = daily_basic.dropna(subset=["ts_code", "trade_date"])
+    indicator = "_daily_basic_merge"
+    while indicator in out.columns or indicator in daily_basic.columns:
+        indicator += "_"
+    merged = out.merge(
+        daily_basic, on=["ts_code", "trade_date"], how="left",
+        validate="many_to_one", indicator=indicator,
+    )
+    missing_source = merged.pop(indicator).eq("left_only")
+    null_turnover = (
+        merged["turnover_rate"].isna() if "turnover_rate" in merged
+        else pd.Series(True, index=merged.index)
+    ) & ~missing_source
     matched = merged["turnover_rate"].notna().mean() if "turnover_rate" in merged.columns else 0.0
     print(f"merged daily_basic features: rows={len(daily_basic)} matched_rate={matched:.2%}", flush=True)
     if min_match_rate is not None and len(merged) and matched < min_match_rate:
         raise RuntimeError(
             "daily_basic feature coverage below required threshold: "
-            f"matched={matched:.2%} required={min_match_rate:.2%}"
+            f"matched={matched:.2%} required={min_match_rate:.2%} "
+            + _daily_basic_coverage_details(merged, missing_source, null_turnover)
         )
     return merged.replace([np.inf, -np.inf], np.nan)

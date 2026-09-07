@@ -166,7 +166,12 @@ def test_strict_native_adapter_passes_full_rebuild_and_worker_budget(adapter, mo
     )
     assert adapter(context).status == "success"
     command, kwargs = calls[0]
-    assert "19900101" in command
+    if adapter is refresh_active_project_features:
+        assert "19900101" not in command
+        assert command[command.index("--incremental-start-date") + 1] == context.target_trade_date
+        assert command[command.index("--target-trade-date") + 1] == context.target_trade_date
+    else:
+        assert "19900101" in command
     assert "2" in command
     assert kwargs["env"]["OMP_NUM_THREADS"] == "1"
     assert kwargs["cwd"] == tmp_path

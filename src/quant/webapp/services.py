@@ -392,6 +392,8 @@ LONG_LIVE_DAILY_BASIC_LOOKBACK_MONTHS = 96
 _REFRESH_LOCK = threading.Lock()
 _REFRESH_CONTEXT = threading.local()
 _REFRESH_ACTIVE_PROCS: dict[str, mp.Process] = {}
+_REFRESH_JOB_THREADS: dict[str, threading.Thread] = {}
+REFRESH_HEARTBEAT_SECONDS = 30.0
 _SIMILAR_PATTERN_REFRESH_GUARD = threading.Lock()
 _SIMILAR_PATTERN_REFRESH_INFLIGHT: tuple[
     tuple[tuple[str, ...], bool],
@@ -965,8 +967,39 @@ def _clear_active_worker(worker_key: str) -> None:
             _persist_refresh_status_unlocked()
 
 
+def _refresh_job_active_unlocked(status: dict[str, Any]) -> bool:
+    owner = _REFRESH_JOB_THREADS.get(str(status.get("run_id") or ""))
+    return owner is not None and owner.is_alive()
+
+
+def _refresh_status_for_client_unlocked(status: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(status)
+    payload["job_active"] = _refresh_job_active_unlocked(status)
+    started = _parse_refresh_timestamp(status.get("started_at"))
+    if payload["job_active"] and started is not None:
+        if (datetime.now() - started).total_seconds() > REFRESH_RUNNING_STALE_SECONDS:
+            payload["execution_warning"] = "Refresh exceeds runtime budget; owner still active, retry blocked"
+    return payload
+
+
+def _refresh_job_heartbeat(run_id: str, stopped: threading.Event) -> None:
+    while not stopped.wait(REFRESH_HEARTBEAT_SECONDS):
+        with _REFRESH_LOCK:
+            if _REFRESH_STATUS.get("run_id") != run_id:
+                return
+            if not _refresh_job_active_unlocked(_REFRESH_STATUS):
+                return
+            # Liveness is not factor progress and must not alter step timings.
+            _REFRESH_STATUS["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+            _persist_refresh_status_unlocked()
+
+
 def _is_refresh_status_stale(status: dict[str, Any]) -> bool:
     if status.get("status") not in {"running", "queued"}:
+        return False
+    # A status reader cannot cancel a Python thread or release its publication.
+    # Only abandoned owners may be expired; active jobs finish their own lifecycle.
+    if _refresh_job_active_unlocked(status):
         return False
     started = _parse_refresh_timestamp(status.get("started_at"))
     if started is None:
@@ -9029,6 +9062,36 @@ def _run_latest_refresh_job(
     run_id: str | None = None,
 ) -> None:
     refresh_run_id = run_id or _new_refresh_run_id(_normalize_refresh_scope(scope))
+    owner = threading.current_thread()
+    with _REFRESH_LOCK:
+        if any(thread.is_alive() for thread in _REFRESH_JOB_THREADS.values()):
+            return
+        _REFRESH_JOB_THREADS[refresh_run_id] = owner
+    stopped = threading.Event()
+    heartbeat = threading.Thread(
+        target=_refresh_job_heartbeat,
+        args=(refresh_run_id, stopped),
+        name=f"quant-refresh-heartbeat-{refresh_run_id}",
+        daemon=True,
+    )
+    try:
+        heartbeat.start()
+        _run_latest_refresh_job_owned(scope, resume_status, refresh_run_id)
+    finally:
+        stopped.set()
+        if heartbeat.ident is not None:
+            heartbeat.join(timeout=5)
+        with _REFRESH_LOCK:
+            if _REFRESH_JOB_THREADS.get(refresh_run_id) is owner:
+                del _REFRESH_JOB_THREADS[refresh_run_id]
+
+
+def _run_latest_refresh_job_owned(
+    scope: str = "all",
+    resume_status: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> None:
+    refresh_run_id = run_id or _new_refresh_run_id(_normalize_refresh_scope(scope))
     with _REFRESH_LOCK:
         if _REFRESH_STATUS.get("run_id") == refresh_run_id and _REFRESH_STATUS.get("status") in {"success", "failed"}:
             return
@@ -10713,7 +10776,9 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
     run_id = _new_refresh_run_id(refresh_scope)
     with _REFRESH_LOCK:
         current_status = _ensure_refresh_scope(dict(_REFRESH_STATUS))
-        if current_status.get("status") == "running":
+        if _refresh_job_active_unlocked(current_status):
+            return _refresh_status_for_client_unlocked(current_status)
+        if current_status.get("status") in {"running", "queued"}:
             if _is_refresh_status_stale(current_status):
                 current_status = _expire_stale_refresh_status_unlocked(current_status)
                 if _refresh_resume_ready(current_status, refresh_scope):
@@ -10761,6 +10826,7 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
                 "started_at": attempt_started_at,
                 "finished_at": None,
                 "updated_at": attempt_started_at,
+                "heartbeat_at": None,
                 "message": (
                     f"{refresh_label}检测到同日成功基线，已进入增量校验队列"
                     if reuse_completed
@@ -10794,7 +10860,7 @@ def get_latest_refresh_status() -> dict[str, Any]:
                 return dict(_expire_stale_refresh_status_unlocked(persisted))
         if _is_refresh_status_stale(_REFRESH_STATUS):
             return dict(_expire_stale_refresh_status_unlocked(_REFRESH_STATUS))
-        return _ensure_refresh_scope(_REFRESH_STATUS)
+        return _refresh_status_for_client_unlocked(_ensure_refresh_scope(_REFRESH_STATUS))
 
 
 def _selected_extended_keys(strategies: list[str] | None) -> set[str]:

@@ -46,6 +46,8 @@ def test_deadline_uses_shanghai_time_and_shortens_last_wait():
 
 @pytest.mark.parametrize("error, expected", [
     ("Tushare daily_basic model feature coverage below threshold for 20260828", True),
+    ("Tushare daily_basic live source coverage below threshold for 20260828", True),
+    ("daily_basic feature coverage below required threshold: matched=91.77%", False),
     ("Tushare daily_basic returned 0 rows for 20260828; minimum is 1", True),
     ("Tushare daily_basic returned 100 rows for 20260828; minimum is 5400", True),
     ("Tushare daily returned no market rows for 20260828", True),

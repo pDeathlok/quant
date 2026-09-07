@@ -60,7 +60,33 @@ def test_all_five_core_operations_have_complete_declared_inputs_and_model_contra
     chan = DEFAULT_DAILY_OPERATION_REGISTRY.definitions["refresh_chan_model_scores"]
     assert "data.top_list" in chan.input_ids
     assert "reports/chan_daily/model_filter/live_refresh_manifest.json" in chan.cache.output_paths
+    assert "reports/chan_daily/model_filter/chan_model_dataset.parquet" in chan.cache.contract_paths
     assert "score.chan" in chan.produces
+
+
+def test_chan_training_reference_changes_checkpoint_identity(tmp_path):
+    from dataclasses import replace
+
+    relative = "reports/chan_daily/model_filter/chan_model_dataset.parquet"
+    definition = DEFAULT_DAILY_OPERATION_REGISTRY.definitions["refresh_chan_model_scores"]
+    assert relative in definition.cache.contract_paths
+    definition = replace(definition, cache=replace(
+        definition.cache, contract_paths=(relative,), optional_contract_paths=(),
+        environment_keys=(), track_python_imports=False,
+    ))
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"frozen-reference-v1")
+    store = CheckpointStore(tmp_path, tmp_path / "checkpoints")
+    context = OperationContext(
+        "2026-09-07", "all", 1, {},
+        upstream_fingerprints={node: "source-v1" for node in definition.input_ids},
+    )
+    first, payload = store.build_identity(definition, context)
+    assert relative in payload["contract_hashes"]
+    path.write_bytes(b"frozen-reference-v2")
+    second, _ = store.build_identity(definition, context)
+    assert first != second
 
 
 def test_wrapper_import_changes_actual_implementation_identity(tmp_path, monkeypatch):

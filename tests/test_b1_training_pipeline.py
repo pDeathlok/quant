@@ -237,13 +237,8 @@ def test_live_only_feature_refresh_rejects_missing_unified_gate(
         def __init__(self, config) -> None:
             pass
 
-        def read_market_range(self, *args, **kwargs):
-            return pd.DataFrame(
-                {
-                    "ts_code": ["000001.SZ"],
-                    "trade_date": ["20260812"],
-                }
-            )
+        def latest_dataset_trade_date(self, dataset):
+            return pd.Timestamp("2026-08-12")
 
     monkeypatch.setattr(b1_refresh, "parse_args", lambda: args)
     monkeypatch.setattr(b1_refresh, "MarketDataStore", FakeStore)
@@ -254,6 +249,142 @@ def test_live_only_feature_refresh_rejects_missing_unified_gate(
     )
 
     with pytest.raises(RuntimeError, match="requires the exact-date unified signal gate"):
+        b1_refresh.main()
+
+
+def _live_refresh_setup(monkeypatch, tmp_path, *, empty=False):
+    import json
+
+    target = pd.Timestamp("2026-09-07")
+    gates = {
+        "b1": [("000001.SZ", target), ("000004.SZ", pd.Timestamp("2020-01-02"))],
+        "z": [("000001.SZ", target), ("000002.SZ", target)],
+        "family": [("000002.SZ", target), ("000003.SZ", target)],
+    }
+    for name, rows in gates.items():
+        pd.DataFrame([] if empty else rows, columns=["symbol", "date"]).to_parquet(tmp_path / f"{name}.parquet")
+    (tmp_path / "gate.json").write_text(json.dumps({
+        "status": "success", "processed_through_date": "2026-09-07", "source_symbol_count": 4,
+    }))
+    monkeypatch.setattr(sys, "argv", [
+        "refresh_b1_feature_cache.py", "--live-only", "--incremental-start-date", "19900101",
+        "--target-trade-date", "20260907", "--daily-dir", str(tmp_path / "daily"),
+        "--daily-basic-dir", str(tmp_path / "basic"),
+        "--gate-cache", str(tmp_path / "b1.parquet"), "--gate-manifest", str(tmp_path / "gate.json"),
+        "--additional-gate-cache", str(tmp_path / "z.parquet"),
+        "--family-gate-cache", str(tmp_path / "family.parquet"),
+        "--active-feature-out", str(tmp_path / "active.parquet"),
+        "--active-feature-manifest", str(tmp_path / "active.json"),
+        "--dataset-out", str(tmp_path / "training.parquet"), "--workers", "2",
+    ])
+
+    class FakeStore:
+        def __init__(self, config):
+            pass
+
+        def latest_dataset_trade_date(self, dataset):
+            return target
+
+        def read_market_range(self, *args, **kwargs):
+            pytest.fail("Finding the latest date must not materialize market history")
+
+    monkeypatch.setattr(b1_refresh, "MarketDataStore", FakeStore)
+    monkeypatch.setattr(b1_refresh, "build_dataset", lambda *a, **kw: pytest.fail("Live refresh must not call training builder"))
+    monkeypatch.setattr(b1_refresh, "_released_b1_required_features", lambda: (["close"], "test-release"))
+    return target
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_live_refresh_is_exact_date_single_union_and_preserves_history(monkeypatch, tmp_path, capsys, empty):
+    import json
+
+    target = _live_refresh_setup(monkeypatch, tmp_path, empty=empty)
+    training = tmp_path / "training.parquet"
+    training.write_bytes(b"untouched historical training cache")
+    events = []
+    expected_symbols = [] if empty else ["000001.SZ", "000002.SZ", "000003.SZ"]
+
+    def preflight(keys, directory, **kwargs):
+        events.append("preflight")
+        assert keys["ts_code"].tolist() == expected_symbols
+        assert set(keys["trade_date"]) == (set() if empty else {"20260907"})
+        assert kwargs["min_match_rate"] == 0.98
+        return {"status": "success", "row_count": len(keys)}
+
+    def build(directory, actual_date, symbols, **kwargs):
+        events.append("build")
+        assert events == ["preflight", "build"]
+        assert actual_date == target and symbols == expected_symbols
+        assert kwargs["workers"] == 2
+        return pd.DataFrame([_project_feature_row(symbol, target) for symbol in symbols])
+
+    def merge(frame, directory, **kwargs):
+        events.append("merge")
+        assert len(frame) == len(expected_symbols)
+        assert set(frame["trade_date"]) == {"20260907"}
+        return frame
+
+    monkeypatch.setattr(b1_refresh, "validate_daily_basic_source_keys", preflight)
+    monkeypatch.setattr(b1_refresh, "_build_additional_candidate_features", build)
+    monkeypatch.setattr(b1_refresh, "merge_daily_basic_features", merge)
+    b1_refresh.main()
+
+    assert events == (["preflight", "build"] if empty else ["preflight", "build", "merge"])
+    assert training.read_bytes() == b"untouched historical training cache"
+    output = pd.read_parquet(tmp_path / "active.parquet")
+    assert output["symbol"].tolist() == expected_symbols
+    manifest = json.loads((tmp_path / "active.json").read_text())
+    assert manifest["target_date"] == "2026-09-07"
+    assert manifest["union_candidate_count"] == len(expected_symbols)
+    assert manifest["candidate_coverage_status"] == "complete"
+    printed = capsys.readouterr().out
+    assert '"incremental_start_date": "2026-09-07"' in printed
+    assert '"requested_incremental_start_date": "1990-01-01"' in printed
+
+
+def test_live_refresh_rejects_missing_source_before_calculation(monkeypatch, tmp_path):
+    _live_refresh_setup(monkeypatch, tmp_path)
+
+    def missing(*args, **kwargs):
+        raise b1_refresh.DailyBasicSourceCoverageError("daily_basic missing 000001.SZ@20260907")
+
+    monkeypatch.setattr(b1_refresh, "validate_daily_basic_source_keys", missing)
+    monkeypatch.setattr(b1_refresh, "_build_additional_candidate_features", lambda *a, **kw: pytest.fail("No heavy work after missing source"))
+    with pytest.raises(RuntimeError, match="Tushare daily_basic live source coverage below threshold"):
+        b1_refresh.main()
+    assert not (tmp_path / "active.parquet").exists()
+
+
+def test_live_refresh_does_not_reclassify_snapshot_failure(monkeypatch, tmp_path):
+    _live_refresh_setup(monkeypatch, tmp_path)
+
+    def corrupt(*args, **kwargs):
+        raise RuntimeError("Sealed snapshot integrity failure")
+
+    monkeypatch.setattr(b1_refresh, "validate_daily_basic_source_keys", corrupt)
+    with pytest.raises(RuntimeError, match="^Sealed snapshot integrity failure$"):
+        b1_refresh.main()
+
+
+def test_live_refresh_rejects_stale_canonical_date(monkeypatch, tmp_path):
+    _live_refresh_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(b1_refresh.MarketDataStore, "latest_dataset_trade_date", lambda *args: pd.Timestamp("2026-09-04"))
+    with pytest.raises(RuntimeError, match="Feature source freshness mismatch"):
+        b1_refresh.main()
+    assert not (tmp_path / "active.parquet").exists()
+
+
+def test_historical_refresh_keeps_requested_rebuild_start(monkeypatch, tmp_path):
+    _live_refresh_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", [value for value in sys.argv if value != "--live-only"])
+
+    def history(directory, start_date, **kwargs):
+        assert start_date == "19900101"
+        assert kwargs["symbols"] == ["000001.SZ", "000004.SZ"]
+        raise RuntimeError("historical builder reached")
+
+    monkeypatch.setattr(b1_refresh, "build_dataset", history)
+    with pytest.raises(RuntimeError, match="historical builder reached"):
         b1_refresh.main()
 
 

@@ -219,6 +219,7 @@ def test_failed_count_includes_top_level_failure_without_failed_result_step() ->
 
 
 def test_ensure_local_service_checks_frontend_and_starts_stack(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(runner, "is_service_port_listening", lambda _: False)
     responses = [
         FakeResponse({"status": "ok", "service": "quant-webapp"}),
         FakeResponse(""),
@@ -348,7 +349,8 @@ def test_ensure_local_service_treats_busy_existing_port_as_recoverable(
             return 1
 
     monkeypatch.setattr(runner, "resolve_service_python", lambda project_root: Path("/test/python"))
-    monkeypatch.setattr(runner, "is_service_port_listening", lambda base_url: True)
+    listening = iter([False, True])
+    monkeypatch.setattr(runner, "is_service_port_listening", lambda base_url: next(listening))
     monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     config = runner.RefreshRunnerConfig(
         project_root=tmp_path,
@@ -368,6 +370,24 @@ def test_ensure_local_service_treats_busy_existing_port_as_recoverable(
     assert process is None
     assert not (tmp_path / "service.pid").exists()
     assert any("端口仍有服务监听" in line for line in logs)
+
+
+def test_busy_service_health_failure_does_not_spawn_or_replace_pid(monkeypatch, tmp_path):
+    def fail_health(*args):
+        raise TimeoutError("busy health endpoint")
+
+    monkeypatch.setattr(runner, "check_local_web_stack", fail_health)
+    monkeypatch.setattr(runner, "is_service_port_listening", lambda _: True)
+    monkeypatch.setattr(
+        runner.subprocess, "Popen",
+        lambda *args, **kwargs: pytest.fail("Do not start a duplicate service"),
+    )
+    pid_path = tmp_path / "service.pid"
+    pid_path.write_text("12345\n", encoding="utf-8")
+    config = runner.RefreshRunnerConfig(project_root=tmp_path, service_pid_path=pid_path)
+
+    assert runner.ensure_local_service(config, object(), print_fn=lambda _: None) is None
+    assert pid_path.read_text(encoding="utf-8") == "12345\n"
 
 
 def test_ensure_local_service_restarts_launchd_managed_service(
@@ -437,7 +457,7 @@ def test_run_refresh_workflow_fails_when_trade_day_unknown(tmp_path: Path) -> No
     logs: list[str] = []
     env_path = tmp_path / ".env"
     env_path.write_text("", encoding="utf-8")
-    config = runner.RefreshRunnerConfig(env_path=env_path)
+    config = runner.RefreshRunnerConfig(project_root=tmp_path, env_path=env_path)
 
     def failing_fetcher():
         raise RuntimeError("network unavailable")
@@ -469,3 +489,22 @@ def test_run_cache_cleanup_reports_error_without_raising(tmp_path: Path) -> None
         "reclaimed_bytes": 0,
         "errors": ["permission denied"],
     }
+def test_cli_flushes_progress_output(monkeypatch, capsys):
+    import builtins
+
+    original_print = builtins.print
+    calls = []
+
+    def recording_print(*args, **kwargs):
+        calls.append(kwargs.get("flush", False))
+        original_print(*args, **kwargs)
+
+    def workflow(*, config, print_fn):
+        print_fn("still calculating")
+        return {"status": "success"}
+
+    monkeypatch.setattr(runner, "run_refresh_workflow", workflow)
+    monkeypatch.setattr(builtins, "print", recording_print)
+    assert runner.main([]) == 0
+    assert calls[0] is True
+    assert "still calculating" in capsys.readouterr().out

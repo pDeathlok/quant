@@ -408,6 +408,12 @@ def ensure_local_service(
             print_fn(f"[service] 前后端已就绪: api={json.dumps(health, ensure_ascii=False)} frontend={frontend_url}")
             return None
         except Exception as exc:
+            if is_service_port_listening(config.base_url):
+                print_fn(
+                    "[service] 健康检查暂未通过，但端口仍有服务监听；"
+                    f"保留现有进程和 PID，继续检查刷新状态: {exc}"
+                )
+                return None
             print_fn(f"[service] 前后端未就绪，准备启动本地 web 服务: {exc}")
 
     merged_env = os.environ.copy()
@@ -558,6 +564,8 @@ def _status_signature(status: Mapping[str, Any]) -> tuple[Any, ...]:
         status.get("current_step"),
         status.get("updated_at"),
         status.get("message"),
+        status.get("heartbeat_at"),
+        status.get("job_active"),
     )
 
 
@@ -582,9 +590,12 @@ def wait_for_terminal_status(
                 f"percent={status.get('percent')} "
                 f"step={status.get('current_step')} "
                 f"updated_at={status.get('updated_at')} "
+                f"heartbeat_at={status.get('heartbeat_at')} "
+                f"job_active={status.get('job_active')} "
+                f"warning={status.get('execution_warning') or ''} "
                 f"message={status.get('message')}"
             )
-        if status.get("status") in {"success", "failed", "error"}:
+        if status.get("status") in {"success", "failed", "error"} and not status.get("job_active"):
             return status
         if monotonic_fn() - last_change_at > config.no_progress_timeout_seconds:
             raise TimeoutError(
@@ -630,7 +641,7 @@ def _run_refresh_workflow_locked(
             active_status = client.get_status()
         except Exception:
             active_status = {}
-        if active_status.get("status") in {"running", "queued"}:
+        if active_status.get("status") in {"running", "queued"} or active_status.get("job_active"):
             force_restart = False
             print_fn("[service] 检测到活动刷新任务，跳过显式服务重启并接管监控")
     service_process = ensure_local_service(
@@ -664,7 +675,7 @@ def _run_refresh_workflow_locked(
             )
             sleep_fn(config.retry_delay_seconds)
             continue
-        if status.get("status") in {"running", "queued"}:
+        if status.get("status") in {"running", "queued"} or status.get("job_active"):
             print_fn("[refresh] 检测到已有运行中的刷新任务，转为接管监控")
         else:
             attempts += 1
@@ -846,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
         service_pid_path=Path(args.pid_file).expanduser().resolve(),
         restart_service=args.restart_service,
     )
-    result = run_refresh_workflow(config=config)
+    result = run_refresh_workflow(config=config, print_fn=lambda line: print(line, flush=True))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("status") in {"success", "skipped"} else 1
 

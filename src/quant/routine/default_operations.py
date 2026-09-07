@@ -127,7 +127,7 @@ def _core_model_contracts(operation_id: str) -> tuple[str, ...]:
     if operation_id == "refresh_chan_model_scores":
         return tuple(f"models/research/chan_daily/{target}.joblib" for target in (
             "target_win10", "target_big10", "target_good",
-        ))
+        )) + ("reports/chan_daily/model_filter/chan_model_dataset.parquet",)
     return ()
 
 

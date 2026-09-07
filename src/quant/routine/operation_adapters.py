@@ -200,7 +200,8 @@ def refresh_active_project_features(
             and DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled
         ) else LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
         return _strict_python(context, [
-            "scripts/research/refresh_b1_feature_cache.py", "--incremental-start-date", _refresh_start(context),
+            "scripts/research/refresh_b1_feature_cache.py", "--incremental-start-date", context.target_trade_date,
+            "--target-trade-date", context.target_trade_date,
             "--workers", str(context.granted_workers), "--executor", "processes", "--no-adaptive-workers", "--live-only",
             "--daily-dir", _path(context, "data/raw/daily"),
             "--daily-basic-dir", _path(context, "data/raw/daily_basic"),

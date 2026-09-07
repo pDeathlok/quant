@@ -33,6 +33,7 @@ def is_tushare_data_missing(error: str) -> bool:
         return False
     markers = (
         "daily_basic model feature coverage below threshold",
+        "daily_basic live source coverage below threshold",
         "daily_basic missing model feature columns",
         "daily_basic missing required columns",
         "daily_basic missing expected market symbols",

@@ -141,6 +141,7 @@ def test_add_future_prices_reads_canonical_market_partitions(monkeypatch, tmp_pa
 def test_chan_live_features_read_canonical_market_partitions(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
     raw_root = tmp_path / "raw"
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(raw_root))
     daily_dir = raw_root / "daily"
     dates = pd.bdate_range("2026-01-01", periods=150)
     close = pd.Series(range(len(dates)), dtype=float) / 100 + 10.0
@@ -228,6 +229,7 @@ def test_chan_live_prediction_rejects_an_entirely_missing_required_feature() -> 
 def test_chan_live_turnover_history_comes_from_same_day_daily_basic(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
     raw_root = tmp_path / "raw"
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(raw_root))
     daily_dir = raw_root / "daily"
     daily_basic_dir = raw_root / "daily_basic"
     daily_basic_dir.mkdir(parents=True)

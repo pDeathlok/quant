@@ -44,8 +44,10 @@ from quant.features.project_factor_layer import (
     resolve_project_factor_schema,
 )
 from quant.features.variable_library import (
+    DailyBasicSourceCoverageError,
     PROJECT_FACTOR_COLUMNS,
     merge_daily_basic_features,
+    validate_daily_basic_source_keys,
 )
 from quant.ml.feature_coverage import (
     MODEL_FEATURE_HISTORY_YEARS,
@@ -562,6 +564,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--incremental-start-date", required=True)
+    parser.add_argument("--target-trade-date", help="Required source date for a production refresh")
     parser.add_argument("--oot-start", default="2025-01-01")
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
@@ -580,7 +583,8 @@ def main() -> None:
     started = perf_counter()
     args = parse_args()
     factor_schema_version = resolve_project_factor_schema()
-    start_ts = _parse_date(args.incremental_start_date)
+    requested_start_ts = _parse_date(args.incremental_start_date)
+    start_ts = requested_start_ts
     start_str = start_ts.strftime("%Y%m%d")
 
     gate_mode = "full_scan"
@@ -595,15 +599,22 @@ def main() -> None:
     source_store = MarketDataStore(
         MarketDataStoreConfig.from_env(root=args.daily_dir.parent)
     )
-    source_recent = source_store.read_market_range(
-        args.daily_dir.name,
-        start_date=start_str,
-    )
-    source_dates = pd.to_datetime(
-        source_recent.get("date", source_recent.get("trade_date")),
-        errors="coerce",
-    )
-    actual_source_latest = source_dates.max()
+    source_latest = source_store.latest_dataset_trade_date(args.daily_dir.name)
+    actual_source_latest = pd.Timestamp(source_latest) if source_latest is not None else pd.NaT
+    if pd.isna(actual_source_latest):
+        raise RuntimeError("Cannot build features without a canonical source trade date")
+    actual_source_latest = actual_source_latest.normalize()
+    target_trade_date = getattr(args, "target_trade_date", None)
+    if target_trade_date and _parse_date(target_trade_date).normalize() != actual_source_latest:
+        raise RuntimeError(
+            f"Feature source freshness mismatch: expected={target_trade_date} "
+            f"actual={actual_source_latest:%Y%m%d}"
+        )
+    if args.live_only:
+        # Rebuilding live outputs never expands their date domain. History is
+        # read separately by the canonical factor builder for its lookbacks.
+        start_ts = actual_source_latest
+        start_str = start_ts.strftime("%Y%m%d")
     if args.gate_cache is not None and args.gate_manifest is not None:
         try:
             gate_manifest = json.loads(
@@ -667,7 +678,44 @@ def main() -> None:
             end_date=actual_source_latest,
         )
 
-    if candidate_symbols == []:
+    daily_basic_preflight = None
+    live_features = None
+    if args.live_only:
+        live_symbols = sorted(set().union(*(
+            _gate_symbols_on_date(gate, actual_source_latest)
+            for gate in (b1_gate_rows, additional_gate_rows, family_gate_rows)
+        )))
+        target_keys = pd.DataFrame({
+            "ts_code": live_symbols,
+            "trade_date": [start_str] * len(live_symbols),
+        })
+        try:
+            daily_basic_preflight = validate_daily_basic_source_keys(
+                target_keys, args.daily_basic_dir,
+                min_match_rate=float(os.getenv("ROUTINE_DAILY_BASIC_MIN_MATCH_RATE", "0.98")),
+            )
+        except DailyBasicSourceCoverageError as exc:
+            raise RuntimeError(
+                f"Tushare daily_basic live source coverage below threshold for {start_str}: {exc}"
+            ) from exc
+        print(
+            f"live feature scope: target={start_str} symbols={len(live_symbols)} "
+            f"history_start={model_feature_history_start(start_ts):%Y%m%d}",
+            flush=True,
+        )
+        # Every live consumer uses the same exact-date canonical calculation;
+        # do not invoke the training builder or generate forward labels here.
+        live_features = _build_additional_candidate_features(
+            args.daily_dir, actual_source_latest, live_symbols,
+            workers=args.workers, executor_type=args.executor,
+        )
+        incremental = (
+            live_features[live_features["symbol"].isin(candidate_symbols)].copy()
+            if not live_features.empty else pd.DataFrame()
+        )
+        incremental.attrs.update(live_features.attrs)
+        incremental.attrs["source_latest_trade_date"] = start_ts.strftime("%Y-%m-%d")
+    elif candidate_symbols == []:
         incremental = pd.DataFrame()
         incremental.attrs["source_symbol_count"] = 0
         incremental.attrs["source_latest_trade_date"] = (
@@ -706,7 +754,13 @@ def main() -> None:
             family_gate_rows,
             target_date=actual_source_latest,
         )
-    if pd.notna(actual_source_latest):
+    if live_features is not None:
+        additional = (
+            live_features[live_features["symbol"].isin(additional_symbols)].copy()
+            if not live_features.empty else pd.DataFrame()
+        )
+        additional.attrs.update(live_features.attrs)
+    elif pd.notna(actual_source_latest):
         additional = _build_additional_candidate_features(
             args.daily_dir,
             actual_source_latest,
@@ -882,6 +936,9 @@ def main() -> None:
     active_manifest = {
         "status": "success",
         "updated_at": updated_at,
+        "refresh_mode": "live_exact_date" if args.live_only else "historical_incremental",
+        "daily_basic_preflight": daily_basic_preflight,
+        "elapsed_seconds": round(perf_counter() - started, 3),
         **active_stats,
         **candidate_coverage,
         "factor_schema_version": factor_schema_version,
@@ -905,6 +962,8 @@ def main() -> None:
         "status": "success",
         "updated_at": updated_at,
         "incremental_start_date": start_ts.strftime("%Y-%m-%d"),
+        "requested_incremental_start_date": requested_start_ts.strftime("%Y-%m-%d"),
+        "daily_basic_preflight": daily_basic_preflight,
         "incremental_rows": int(len(incremental)),
         "factor_schema_version": factor_schema_version,
         "release_id": release_id,

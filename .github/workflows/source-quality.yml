@@ -68,6 +68,20 @@ jobs:
           tests/test_f5_source_journal.py
           tests/test_dataset_revision_store.py tests/test_quant.py::TestMarketDataStore
           tests/test_ci_runtime.py tests/test_architecture_boundaries.py
+      - name: Check refresh source coverage and checkpoint contracts
+        run: >-
+          python -m pytest -q
+          tests/test_variable_library_incremental.py tests/test_tushare_availability.py
+          tests/test_routine_operation_identity.py tests/test_default_daily_operations.py
+          tests/test_web_refresh_runner.py
+      - name: Check live model boundaries and refresh ownership
+        if: matrix.python == '3.13'
+        run: >-
+          python -m pytest -q
+          tests/test_b1_training_pipeline.py tests/test_chan_live_refresh_reference.py
+          tests/test_refresh_job_lifecycle.py tests/test_routine_checkpoint_publication.py
+          tests/test_chan_model.py tests/test_chan_daily.py
+          tests/test_research_market_backtest.py tests/test_f5_composition.py
       - name: Check BYD source fallback with its supported strategy runtime
         if: matrix.python == '3.13'
         run: python -m pytest -q tests/test_byd_workspace.py
