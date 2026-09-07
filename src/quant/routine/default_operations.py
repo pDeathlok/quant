@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 import hashlib
 import json
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from quant.application.daily_dependencies import (
     DEFAULT_DAILY_DEPENDENCY_REGISTRY,
@@ -17,11 +18,117 @@ from quant.routine.operation_contracts import (
     CacheMode,
     CachePolicy,
     ExecutionMode,
+    OperationBinding,
     OperationDefinition,
     ResourceClaim,
     RetryPolicy,
 )
 from quant.routine.operation_registry import OperationRegistry
+
+
+CORE_OPERATION_INPUTS = {
+    "refresh_strategy_signal_cache": ("data.market_daily", "source.market_daily_parquet"),
+    "refresh_active_project_features": (
+        "data.market_daily", "source.market_daily_parquet", "data.daily_basic", "feature.strategy_signals",
+    ),
+    "run_right_side_unified": (
+        "data.market_daily", "source.market_daily_parquet",
+        "feature.strategy_signals", "feature.project_daily",
+    ),
+    "run_left_side_unified": (
+        "data.market_daily", "source.market_daily_parquet", "data.daily_basic",
+        "feature.strategy_signals", "feature.project_daily",
+    ),
+    "refresh_chan_model_scores": (
+        "data.market_daily", "source.market_daily_parquet", "data.daily_basic", "data.top_list",
+    ),
+}
+
+# These are atomic ownership groups of existing executable routines, not
+# independently cacheable nodes. The web composition supplies the real callback.
+COMPOSED_OPERATION_GROUPS = {
+    "refresh_reference_inputs": (
+        "refresh_index_000300", "refresh_stock_basic", "refresh_financial_pit",
+        "refresh_analyst_forecasts", "refresh_top_list", "refresh_market_regime_snapshot",
+        "refresh_tradability_for_research", "refresh_long_research_external",
+    ),
+    "build_byd_daily_workspace": (
+        "refresh_byd_intraday_when_due", "build_byd_daily_features",
+        "fit_or_reuse_byd_runtime_model", "build_byd_daily_workspace",
+    ),
+    "build_convertible_bond_grid_workspace": (
+        "refresh_convertible_bond_daily", "refresh_convertible_bond_reference",
+        "build_convertible_bond_grid_features", "build_convertible_bond_grid_workspace",
+    ),
+    "build_convertible_bond_allotment_workspace": (
+        "refresh_convertible_bond_allotment_events", "build_convertible_bond_allotment_workspace",
+    ),
+    "refresh_similar_pattern_analysis": (
+        "read_similar_watchlist", "refresh_similar_reference_vectors_when_due",
+        "build_similar_target_context", "score_similar_patterns", "refresh_similar_pattern_analysis",
+    ),
+    "build_selector_payload": ("build_selector_live_features", "build_selector_payload"),
+}
+
+_IMPLEMENTATION_PATHS = {
+    "refresh_strategy_signal_cache": (
+        "src/quant/research/strategy_signal_cache.py", "src/quant/research/b1_family_rules.py",
+        "src/quant/research/z_skill_rules.py", "src/quant/research/rule_windows.py",
+        "src/quant/research/rule_backtest_support.py",
+    ),
+    "refresh_active_project_features": (
+        "scripts/research/refresh_b1_feature_cache.py", "scripts/research/train_b1_tushare_models.py",
+        "configs/strategies/b1_selected.yaml",
+    ),
+    "run_right_side_unified": (
+        "src/quant/routine/right_side_unified_shadow.py", "src/quant/routine/project_feature_cache.py",
+        "src/quant/research/right_side_unified.py",
+    ),
+    "run_left_side_unified": (
+        "src/quant/routine/project_feature_cache.py",
+        "src/quant/features/candlestick_context.py",
+    ),
+    "refresh_chan_model_scores": (
+        "scripts/research/refresh_chan_model_live_scores.py", "scripts/research/backtest_chan_daily.py",
+        "scripts/research/train_chan_daily_models.py", "src/quant/features/market_sentiment.py",
+    ),
+    "refresh_long_factor_snapshot": (
+        "src/quant/research/long_dividend_quality.py", "src/quant/research/tea_master_long.py",
+        "src/quant/research/rule_backtest_support.py",
+    ),
+    "refresh_long_stock_pool_variants": (
+        "src/quant/research/long_dividend_quality.py", "src/quant/research/tea_master_long.py",
+        "src/quant/research/rule_backtest_support.py",
+    ),
+}
+
+_CHAN_OUTPUTS = (
+    "reports/chan_daily/chan_daily_candidates.parquet",
+    "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet",
+    "reports/chan_daily/model_filter/live_refresh_manifest.json",
+)
+
+
+def _core_model_contracts(operation_id: str) -> tuple[str, ...]:
+    from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+    from quant.application.selector_ranking import DEFAULT_SELECTOR_RANKING_CONFIG
+    from quant.routine.paths import PROJECT_ROOT
+
+    if operation_id == "run_right_side_unified":
+        paths = DEFAULT_SELECTOR_RANKING_CONFIG.paths
+        return tuple(path.relative_to(PROJECT_ROOT).as_posix() for path in (
+            paths.artifact, paths.artifact_manifest, paths.promotion_approval,
+        ))
+    if operation_id == "run_left_side_unified":
+        paths = DEFAULT_LEFT_SIDE_RANKING_CONFIG.paths
+        return tuple(path.relative_to(PROJECT_ROOT).as_posix() for path in (
+            paths.artifact, paths.artifact_manifest, paths.ranking_decision,
+        ))
+    if operation_id == "refresh_chan_model_scores":
+        return tuple(f"models/research/chan_daily/{target}.joblib" for target in (
+            "target_win10", "target_big10", "target_good",
+        ))
+    return ()
 
 
 _RESOURCE_PROFILES: dict[str, ResourceClaim] = {
@@ -73,10 +180,11 @@ _ENTRYPOINTS = {
 
 
 def _default_claim(operation_id: str) -> ResourceClaim:
-    return _RESOURCE_PROFILES.get(
+    claim = _RESOURCE_PROFILES.get(
         operation_id,
         ResourceClaim(cpu_slots=1, io_slots=1, memory_mb=512),
     )
+    return replace(claim, db_connections=1) if operation_id in CORE_OPERATION_INPUTS else claim
 
 
 def _cache_mode(operation_id: str, nodes: Iterable[DependencyNode]) -> CacheMode:
@@ -110,6 +218,8 @@ def _contract_version(operation_id: str, nodes: Iterable[DependencyNode]) -> str
 
 def build_default_operation_registry(
     dependencies: DependencyRegistry = DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+    *,
+    bindings: Mapping[str, OperationBinding] | None = None,
 ) -> OperationRegistry:
     grouped: dict[str, list[DependencyNode]] = defaultdict(list)
     for node in dependencies.nodes.values():
@@ -131,6 +241,14 @@ def build_default_operation_registry(
                 for path in node.contract_sources
             )
         )
+        contract_paths = tuple(dict.fromkeys((
+            *contract_paths, *_IMPLEMENTATION_PATHS.get(operation_id, ()),
+            *_core_model_contracts(operation_id),
+            *(("src/quant/routine/operation_adapters.py", "src/quant/routine/default_operations.py")
+              if operation_id in CORE_OPERATION_INPUTS else ()),
+        )))
+        if operation_id == "refresh_chan_model_scores":
+            outputs = _CHAN_OUTPUTS
         mode = _cache_mode(operation_id, nodes)
         definitions.append(
             OperationDefinition(
@@ -150,8 +268,21 @@ def build_default_operation_registry(
                     contract_version=_contract_version(operation_id, nodes),
                     output_paths=outputs,
                     contract_paths=contract_paths,
+                    optional_contract_paths=(
+                        (".env",)
+                        if operation_id in CORE_OPERATION_INPUTS else ()
+                    ),
+                    environment_keys=(
+                        ("ROUTINE_PRODUCTION_FACTOR_SCHEMA", "PROJECT_FACTOR_COMPATIBILITY_MODE",
+                         "ROUTINE_SIGNAL_FACTOR_MODE", "DAILY_FACTOR_ROOT",
+                         "ROUTINE_DAILY_BASIC_MIN_MATCH_RATE")
+                        if operation_id in CORE_OPERATION_INPUTS else ()
+                    ),
+                    track_python_imports=operation_id in CORE_OPERATION_INPUTS,
                 ),
                 retry=RetryPolicy(),
+                production_ready=operation_id in _ENTRYPOINTS,
+                input_ids=CORE_OPERATION_INPUTS.get(operation_id),
                 parameters={
                     "migration_mode": (
                         "enabled"
@@ -161,7 +292,7 @@ def build_default_operation_registry(
                 },
             )
         )
-    registry = OperationRegistry(definitions)
+    registry = OperationRegistry(definitions, bindings=bindings)
     registry.validate_against_dependencies(dependencies)
     return registry
 
@@ -171,5 +302,7 @@ DEFAULT_DAILY_OPERATION_REGISTRY = build_default_operation_registry()
 
 __all__ = [
     "DEFAULT_DAILY_OPERATION_REGISTRY",
+    "CORE_OPERATION_INPUTS",
+    "COMPOSED_OPERATION_GROUPS",
     "build_default_operation_registry",
 ]

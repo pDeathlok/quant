@@ -26,6 +26,7 @@ from quant.application.selector_ranking import (
     SelectorRankingSource,
 )
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.market_snapshot import pinned_market_environment
 from quant.data.atomic_io import atomic_write_json as publish_json
 from quant.features.market_regime import classify_market_regime
 from quant.features.factor_registry import (
@@ -45,16 +46,26 @@ from quant.routine.paths import CONFIG_PATH, PROJECT_ROOT, ROUTINE_DIR
 from quant.routine.strategies import StrategyConfig, load_strategy_configs
 
 
-def _incremental_daily_start(lookback_days: int | None = None) -> str:
-    if lookback_days is None:
-        # Re-fetch a short rolling window so vendor corrections to already
-        # published bars become explicit ChangeSets for downstream caches.
-        lookback_days = int(os.getenv("ROUTINE_DAILY_LOOKBACK_DAYS", "10"))
+def _latest_daily_trade_date() -> str:
+    """Return the canonical daily dataset watermark, without a lookback."""
+
     daily_dir = PROJECT_ROOT / "data/raw/daily"
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     latest = store.latest_dataset_trade_date(daily_dir.name)
     if latest is None:
         return "20100101"
+    return latest.strftime("%Y%m%d")
+
+
+def _incremental_daily_start(lookback_days: int | None = None) -> str:
+    if lookback_days is None:
+        # Re-fetch a short rolling window so vendor corrections to already
+        # published bars become explicit ChangeSets for downstream caches.
+        lookback_days = int(os.getenv("ROUTINE_DAILY_LOOKBACK_DAYS", "10"))
+    latest_text = _latest_daily_trade_date()
+    if latest_text == "20100101":
+        return latest_text
+    latest = pd.to_datetime(latest_text, format="%Y%m%d")
     start = latest - pd.Timedelta(days=lookback_days)
     return start.strftime("%Y%m%d")
 
@@ -63,7 +74,7 @@ def _incremental_feature_start() -> str:
     # Daily inference publishes an exact-date active-candidate sidecar.  The
     # historical training table is maintained outside the latency-sensitive
     # routine path, so its watermark must not force an old multi-day rebuild.
-    return _incremental_daily_start(lookback_days=0)
+    return _latest_daily_trade_date()
 
 
 def _incremental_daily_basic_start() -> str:
@@ -132,7 +143,7 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
             "start_date": start_date,
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
-    env = {**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")}
+    env = {**os.environ, **pinned_market_environment(), "PYTHONPATH": str(PROJECT_ROOT / "src")}
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
@@ -250,7 +261,7 @@ def refresh_reference_inputs(
     """
 
     started = time.monotonic()
-    end_date = _incremental_daily_start()
+    end_date = _latest_daily_trade_date()
     effective_include_analyst = (
         include_financials if include_analyst is None else include_analyst
     )
@@ -304,20 +315,46 @@ def refresh_reference_inputs(
             "status": "skipped",
             "reason": "not required for this refresh scope",
         }
-    if (
+    steps = result.setdefault("steps", {})
+    index_result = steps.get("index_000300")
+    index_missing_error = (
+        str(index_result.get("error") or "")
+        if isinstance(index_result, dict) and index_result.get("data_missing") is True
+        else ""
+    )
+    if include_market_regime and index_missing_error:
+        # The regime snapshot requires matching terminal dates.  Preserve the
+        # source-level missing-data classification so the routine runner waits
+        # for Tushare publication instead of consuming ordinary retries.
+        regime_result = {
+            "status": "failed",
+            "data_missing": True,
+            "source": "tushare.index_daily",
+            "expected_trade_date": str(result.get("end_date") or end_date),
+            "latest_trade_date": index_result.get("latest_trade_date"),
+            "error": index_missing_error,
+        }
+        steps["market_regime"] = regime_result
+        result["status"] = "failed"
+        result["data_missing"] = True
+        result["error_summary"] = index_missing_error
+        result.setdefault("critical_errors", []).append(
+            "market_regime: " + index_missing_error
+        )
+    elif (
         include_market_regime
         and result.get("end_date")
         and result.get("status") in {"success", "partial"}
     ):
         regime_result = refresh_market_regime_snapshot(str(result["end_date"]))
-        result.setdefault("steps", {})["market_regime"] = regime_result
+        steps["market_regime"] = regime_result
         if regime_result.get("status") == "failed":
             result["status"] = "failed"
             result.setdefault("critical_errors", []).append(
                 "market_regime: " + str(regime_result.get("error") or "refresh failed")
             )
     elif not include_market_regime:
-        result.setdefault("steps", {})["market_regime"] = {
+        steps["market_regime"] = {
             "status": "skipped",
             "reason": "not required for this refresh scope",
         }
@@ -464,7 +501,7 @@ def _refresh_analyst_forecast_snapshot() -> dict:
     output_path = PROJECT_ROOT / "data/raw/analyst_forecasts.parquet"
     research_marker = PROJECT_ROOT / "data/raw/analyst_research_refresh_status.json"
     today = pd.Timestamp.now().normalize()
-    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    env = {**os.environ, **pinned_market_environment(), "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
     steps: dict[str, dict] = {}
 
     latest: pd.Timestamp | None = None
@@ -698,6 +735,7 @@ def build_features(
     ]
     env = {
         **os.environ,
+        **pinned_market_environment(),
         "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}",
         "PROJECT_FACTOR_COMPATIBILITY_MODE": production_factor_schema,
     }
@@ -728,7 +766,7 @@ def build_features(
     manifest = _extract_last_json_object(stdout)
     source_latest_trade_date = str(manifest.get("source_latest_trade_date") or "")
     expected_trade_date = pd.to_datetime(
-        _incremental_daily_start(),
+        _latest_daily_trade_date(),
         format="%Y%m%d",
     ).strftime("%Y-%m-%d")
     complete = (
@@ -980,6 +1018,7 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
     )
     env = {
         **os.environ,
+        **pinned_market_environment(),
         "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}",
         "PROJECT_FACTOR_COMPATIBILITY_MODE": production_factor_schema,
     }
@@ -1020,7 +1059,7 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
     stdout = "".join(stdout_lines)
     manifest = _extract_last_json_object(stdout)
     expected_trade_date = pd.to_datetime(
-        _incremental_daily_start(),
+        _latest_daily_trade_date(),
         format="%Y%m%d",
     ).strftime("%Y-%m-%d")
     processed_through_date = str(manifest.get("processed_through_date") or "")
@@ -1047,7 +1086,7 @@ def refresh_strategy_signal_cache(workers: int = 8, progress_callback=None) -> d
 def score_latest_models(workers: int = 8) -> dict:
     started = time.monotonic()
     expected_trade_date = pd.to_datetime(
-        _incremental_daily_start(),
+        _latest_daily_trade_date(),
         format="%Y%m%d",
     ).strftime("%Y-%m-%d")
     executor_type = os.getenv(
@@ -1085,6 +1124,7 @@ def score_latest_models(workers: int = 8) -> dict:
     )
     env = {
         **os.environ,
+        **pinned_market_environment(),
         "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}",
         "PROJECT_FACTOR_COMPATIBILITY_MODE": production_factor_schema,
     }
@@ -1116,7 +1156,7 @@ def refresh_chan_model_scores(progress_callback=None, workers: int | None = None
     scored_path = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
     manifest_path = scored_path.parent / "live_refresh_manifest.json"
     candidate_path = PROJECT_ROOT / "reports/chan_daily/chan_daily_candidates.parquet"
-    end_date = _incremental_daily_start()
+    end_date = _latest_daily_trade_date()
     start_date = end_date
     if scored_path.exists():
         try:
@@ -1156,7 +1196,7 @@ def refresh_chan_model_scores(progress_callback=None, workers: int | None = None
             candidate_latest = pd.NaT
     if pd.isna(candidate_latest) or candidate_latest.normalize() < pd.to_datetime(end_date).normalize():
         command.append("--rebuild-candidates")
-    env = {**os.environ, "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
+    env = {**os.environ, **pinned_market_environment(), "PYTHONPATH": f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts' / 'research'}"}
     previous_manifest_mtime = manifest_path.stat().st_mtime_ns if manifest_path.exists() else None
     result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False, capture_output=True, text=True)
     manifest: dict = {}
@@ -1194,7 +1234,8 @@ def run_selected_strategies() -> dict:
         "-m",
         "quant.research.b1_formal_combos",
     ]
-    result = subprocess.run(command, cwd=PROJECT_ROOT, check=False, capture_output=True, text=True)
+    result = subprocess.run(command, cwd=PROJECT_ROOT, env={**os.environ, **pinned_market_environment()},
+                            check=False, capture_output=True, text=True)
     return {
         "status": "success" if result.returncode == 0 else "failed",
         "returncode": result.returncode,

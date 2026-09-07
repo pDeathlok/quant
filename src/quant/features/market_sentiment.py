@@ -67,10 +67,17 @@ def build_limit_proxy_features(daily_dir: Path, start: str | pd.Timestamp | None
 
 def read_top_list_features(top_list_dir: Path, start: str | pd.Timestamp | None = None) -> pd.DataFrame:
     """Read local Tushare top-list files and derive stock/date features."""
+    from quant.data.market_snapshot import current_market_snapshot
+
+    snapshot = current_market_snapshot()
     start_ts = pd.to_datetime(start) if start is not None else None
     frames: list[pd.DataFrame] = []
-    for path in sorted(top_list_dir.glob("*top_list_*.parquet")):
-        df = pd.read_parquet(path)
+    sources = (
+        [(None, snapshot.read("top_list", start_date=start_ts.strftime("%Y%m%d") if start_ts is not None else None))]
+        if snapshot is not None else
+        ((path, pd.read_parquet(path)) for path in sorted(top_list_dir.glob("*top_list_*.parquet")))
+    )
+    for path, df in sources:
         if df.empty:
             continue
         if "trade_date" not in df.columns:

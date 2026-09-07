@@ -16,7 +16,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import joblib
 import numpy as np
@@ -53,9 +53,11 @@ from quant.features.right_side_factor_contract import (
 from quant.features.variable_library import PROJECT_FACTOR_COLUMNS
 from quant.research.right_side_unified import load_signal_universe
 from quant.research.right_side_unified_features import (
+    RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS,
     RULE_FEATURE_COLUMNS,
     RULE_FEATURE_COLUMNS_SHA256,
     RULE_FEATURE_SCHEMA_VERSION,
+    compute_right_side_project_requirements,
     compute_right_side_rule_features,
     rule_feature_columns_sha256,
 )
@@ -518,12 +520,21 @@ def _empty_feature_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
+ShadowSymbolFeatureTask = tuple[
+    str,
+    pd.DataFrame,
+    dict[str, Any],
+    pd.Timestamp,
+    Optional[dict[str, Any]],
+]
+
+
 def _build_shadow_symbol_feature(
-    task: tuple[str, pd.DataFrame, dict[str, Any], pd.Timestamp],
+    task: ShadowSymbolFeatureTask,
 ) -> tuple[str, pd.DataFrame, str | None]:
     """Build one symbol in an isolated worker using the training-time contract."""
 
-    symbol, daily, signal_values, target = task
+    symbol, daily, signal_values, target, cached_project_values = task
     try:
         if daily.empty:
             raise ValueError("target market row is missing")
@@ -532,18 +543,29 @@ def _build_shadow_symbol_feature(
         ).reset_index(drop=True)
         if normalized.empty or not normalized["date"].dt.normalize().eq(target).any():
             raise ValueError("target market row is missing")
-        project = calculate_project_market_factors(
-            normalized,
-            symbol=symbol,
-            factor_schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
-        ).reset_index(drop=True)
+        if cached_project_values is None:
+            project = calculate_project_market_factors(
+                normalized,
+                symbol=symbol,
+                factor_schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
+            ).reset_index(drop=True)
+            canonical_for_rules = project
+        else:
+            project = pd.DataFrame([cached_project_values]).reset_index(drop=True)
+            project["date"] = pd.to_datetime(
+                project["date"], errors="coerce"
+            ).dt.normalize()
+            canonical_for_rules = compute_right_side_project_requirements(
+                normalized
+            ).reset_index(drop=True)
+            canonical_for_rules["date"] = normalized["date"].to_numpy()
         if not project["factor_schema_version"].eq(
             PROJECT_FACTOR_SCHEMA_VERSION
         ).all():
             raise ValueError("project factor calculator returned the wrong schema")
         rules = compute_right_side_rule_features(
             normalized,
-            canonical_factors=project,
+            canonical_factors=canonical_for_rules,
         ).reset_index(drop=True)
         candle_context = compute_candlestick_context_features(
             normalized
@@ -561,9 +583,20 @@ def _build_shadow_symbol_feature(
         for column in PROJECT_FACTOR_COLUMNS:
             if column not in project.columns:
                 project[column] = np.nan
+        target_positions = normalized.index[
+            normalized["date"].dt.normalize().eq(target)
+        ].tolist()
+        if not target_positions:
+            raise ValueError("target feature row is not unique")
+        target_position = target_positions[-1]
+        project_current = project[
+            pd.to_datetime(project["date"], errors="coerce").dt.normalize().eq(target)
+        ].tail(1).reset_index(drop=True)
+        if len(project_current) != 1:
+            raise ValueError("target project factor row is not unique")
         base = pd.concat(
             [
-                project[
+                project_current[
                     [
                         "ts_code",
                         "symbol",
@@ -572,16 +605,18 @@ def _build_shadow_symbol_feature(
                         *PROJECT_FACTOR_COLUMNS,
                         "factor_schema_version",
                     ]
-                ],
-                rules[list(RULE_FEATURE_COLUMNS)],
-                candle_context[list(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS)],
+                ].reset_index(drop=True),
+                rules.iloc[[target_position]][list(RULE_FEATURE_COLUMNS)].reset_index(
+                    drop=True
+                ),
+                candle_context.iloc[[target_position]][
+                    list(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS)
+                ].reset_index(drop=True),
             ],
             axis=1,
         )
         base["date"] = pd.to_datetime(base["date"], errors="coerce").dt.normalize()
-        current = base[base["date"].eq(target)].tail(1).copy()
-        if len(current) != 1:
-            raise ValueError("target feature row is not unique")
+        current = base.copy()
         current["right_side_feature_schema_version"] = (
             RIGHT_SIDE_SHADOW_FEATURE_SCHEMA_VERSION
         )
@@ -592,12 +627,21 @@ def _build_shadow_symbol_feature(
         return symbol, pd.DataFrame(), str(exc)
 
 
+def _build_shadow_symbol_feature_batch(
+    tasks: Sequence[ShadowSymbolFeatureTask],
+) -> list[tuple[str, pd.DataFrame, str | None]]:
+    """Amortize process IPC and scheduler overhead across multiple symbols."""
+
+    return [_build_shadow_symbol_feature(task) for task in tasks]
+
+
 def build_right_side_shadow_feature_frame(
     market: pd.DataFrame,
     signals: pd.DataFrame,
     *,
     target_date: str | pd.Timestamp,
     workers: int = 1,
+    project_features: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build one exact-date project-v5/rule-v4-113 frame from loaded inputs."""
 
@@ -637,6 +681,52 @@ def build_right_side_shadow_feature_frame(
             _shadow_symbol=market["ts_code"].astype(str)
         ).groupby("_shadow_symbol", sort=False)
     }
+    project_by_symbol: dict[str, dict[str, Any]] = {}
+    if project_features is not None:
+        required_project_columns = {
+            "ts_code",
+            "symbol",
+            "trade_date",
+            "date",
+            "factor_schema_version",
+            *PROJECT_FACTOR_COLUMNS,
+        }
+        missing_project_columns = required_project_columns - set(
+            project_features.columns
+        )
+        if missing_project_columns:
+            raise ValueError(
+                "right-side shared project features missing columns: "
+                f"{sorted(missing_project_columns)}"
+            )
+        project_rows = project_features.copy()
+        project_rows["symbol"] = project_rows["symbol"].astype(str)
+        project_rows["date"] = pd.to_datetime(
+            project_rows["date"], errors="coerce"
+        ).dt.normalize()
+        if project_rows["date"].isna().any() or not project_rows["date"].eq(
+            target
+        ).all():
+            raise ValueError("right-side shared project features are not exact-date")
+        if project_rows.duplicated(["symbol", "date"]).any():
+            raise ValueError("right-side shared project feature keys are not unique")
+        if not project_rows["factor_schema_version"].eq(
+            PROJECT_FACTOR_SCHEMA_VERSION
+        ).all():
+            raise ValueError("right-side shared project feature schema mismatch")
+        signal_symbols = set(signal_rows["symbol"].astype(str))
+        missing_project_symbols = signal_symbols - set(project_rows["symbol"])
+        if missing_project_symbols:
+            raise ValueError(
+                "right-side shared project feature coverage is incomplete: "
+                f"{sorted(missing_project_symbols)[:20]}"
+            )
+        project_by_symbol = {
+            str(row["symbol"]): row.to_dict()
+            for _, row in project_rows[
+                project_rows["symbol"].isin(signal_symbols)
+            ].iterrows()
+        }
     tasks = [
         (
             str(symbol),
@@ -645,6 +735,7 @@ def build_right_side_shadow_feature_frame(
             ),
             signal.iloc[-1].to_dict(),
             target,
+            project_by_symbol.get(str(symbol)) if project_features is not None else None,
         )
         for symbol, signal in signal_rows.groupby("symbol", sort=True)
     ]
@@ -660,26 +751,22 @@ def build_right_side_shadow_feature_frame(
         for task in tasks:
             collect(_build_shadow_symbol_feature(task))
     else:
-        task_iterator = iter(tasks)
         max_workers = min(workers, len(tasks))
-        max_pending = max_workers * 2
+        chunk_count = min(len(tasks), max_workers * 2)
+        task_batches = [
+            tasks[offset::chunk_count]
+            for offset in range(chunk_count)
+        ]
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            pending = set()
-            for _ in range(min(max_pending, len(tasks))):
-                pending.add(executor.submit(_build_shadow_symbol_feature, next(task_iterator)))
+            pending = {
+                executor.submit(_build_shadow_symbol_feature_batch, batch)
+                for batch in task_batches
+            }
             while pending:
                 completed, pending = wait(pending, return_when=FIRST_COMPLETED)
                 for future in completed:
-                    collect(future.result())
-                    try:
-                        pending.add(
-                            executor.submit(
-                                _build_shadow_symbol_feature,
-                                next(task_iterator),
-                            )
-                        )
-                    except StopIteration:
-                        pass
+                    for result in future.result():
+                        collect(result)
     if failures:
         raise RuntimeError("right-side shadow feature build failed: " + " | ".join(failures))
     result = pd.concat(frames, ignore_index=True, sort=False) if frames else _empty_feature_frame()
@@ -704,18 +791,40 @@ def build_right_side_shadow_features(
     target_date: str | pd.Timestamp,
     *,
     config: ShadowReleaseConfig,
+    signals: pd.DataFrame | None = None,
+    project_features: pd.DataFrame | None = None,
+    source_signal_candidate_count: int | None = None,
+    policy_excluded_symbols: Sequence[str] = (),
+    project_feature_cache_sha256: str | None = None,
 ) -> dict[str, Any]:
     target = _target_timestamp(target_date)
-    if not config.paths.z_signal_cache.is_file():
-        raise FileNotFoundError(config.paths.z_signal_cache)
-    if not config.paths.family_signal_cache.is_file():
-        raise FileNotFoundError(config.paths.family_signal_cache)
-    signals = load_signal_universe(
-        config.paths.z_signal_cache,
-        config.paths.family_signal_cache,
-        start_date=target,
-        end_date=target,
+    if signals is None:
+        if not config.paths.z_signal_cache.is_file():
+            raise FileNotFoundError(config.paths.z_signal_cache)
+        if not config.paths.family_signal_cache.is_file():
+            raise FileNotFoundError(config.paths.family_signal_cache)
+        signals = load_signal_universe(
+            config.paths.z_signal_cache,
+            config.paths.family_signal_cache,
+            start_date=target,
+            end_date=target,
+        )
+    else:
+        signals = signals.copy()
+    source_signal_candidate_count = (
+        len(signals)
+        if source_signal_candidate_count is None
+        else int(source_signal_candidate_count)
     )
+    policy_excluded = tuple(
+        sorted({str(symbol) for symbol in policy_excluded_symbols if str(symbol)})
+    )
+    if source_signal_candidate_count != len(signals) + len(policy_excluded):
+        raise ValueError(
+            "right-side source candidate accounting is inconsistent: "
+            f"source={source_signal_candidate_count} eligible={len(signals)} "
+            f"excluded={len(policy_excluded)}"
+        )
     symbols = sorted(signals["symbol"].astype(str).unique()) if not signals.empty else []
     start = target - pd.DateOffset(years=config.history_years)
     store = MarketDataStore(
@@ -751,6 +860,7 @@ def build_right_side_shadow_features(
         signals,
         target_date=target,
         workers=config.factor_workers,
+        project_features=project_features,
     )
     atomic_write_parquet(frame, config.paths.feature_output, index=False)
     manifest = {
@@ -758,8 +868,22 @@ def build_right_side_shadow_features(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "target_date": target.date().isoformat(),
         "candidate_coverage_status": "complete",
-        "signal_candidate_count": int(len(signals)),
+        "signal_candidate_count": source_signal_candidate_count,
+        "eligible_candidate_count": int(len(signals)),
         "computed_candidate_count": int(len(frame)),
+        "policy_excluded_candidate_count": len(policy_excluded),
+        "policy_excluded_candidate_symbols": list(policy_excluded),
+        "project_factor_execution": (
+            "full_history_recompute"
+            if project_features is None
+            else "shared_exact_date_cache_plus_rule_requirements"
+        ),
+        "historical_project_factor_count": (
+            len(PROJECT_FACTOR_COLUMNS)
+            if project_features is None
+            else len(RIGHT_SIDE_PROJECT_FACTOR_REQUIREMENTS)
+        ),
+        "project_feature_cache_sha256": project_feature_cache_sha256,
         "empty_candidate_set": bool(frame.empty),
         "candle_context_feature_schema_version": (
             CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION

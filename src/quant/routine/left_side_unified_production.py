@@ -57,6 +57,9 @@ from quant.research.left_side_unified_features import (
     compute_left_side_rule_features,
 )
 from quant.routine.paths import PROJECT_ROOT
+from quant.routine.project_feature_cache import (
+    load_exact_date_project_feature_cache,
+)
 
 
 LEFT_SIDE_NORMALIZATION_SCHEMA_VERSION = "daily-cross-section-percentile-v1"
@@ -432,92 +435,19 @@ def _load_project_feature_cache(
     config: LeftSideRankingConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Validate and load the shared exact-date project-factor sidecar."""
-
-    manifest = _load_json(config.paths.project_feature_manifest)
-    if manifest.get("status") != "success":
-        raise RuntimeError("left-side project feature cache did not succeed")
-    if manifest.get("target_date") != target.date().isoformat():
-        raise RuntimeError("left-side project feature cache is stale")
-    if manifest.get("candidate_coverage_status") != "complete":
-        raise RuntimeError("left-side project feature candidate coverage is incomplete")
-    if manifest.get("factor_schema_version") != PROJECT_FACTOR_SCHEMA_VERSION:
-        raise RuntimeError("left-side project feature schema mismatch")
-    expected_sha256 = str(manifest.get("output_sha256") or "")
-    if not expected_sha256 or expected_sha256 != _sha256(
-        config.paths.project_feature_cache
-    ):
-        raise RuntimeError("left-side project feature checksum mismatch")
-
-    features = pd.read_parquet(config.paths.project_feature_cache)
-    required = {
-        "ts_code",
-        "symbol",
-        "trade_date",
-        "date",
-        "factor_schema_version",
-        *PROJECT_FACTOR_COLUMNS,
-    }
-    missing_columns = required - set(features.columns)
-    if missing_columns:
-        raise RuntimeError(
-            "left-side project feature cache missing columns: "
-            f"{sorted(missing_columns)}"
-        )
-    features["symbol"] = features["symbol"].astype(str)
-    features["date"] = pd.to_datetime(
-        features["date"], errors="coerce"
-    ).dt.normalize()
-    features = features[features["date"].eq(target)].copy()
-    if features.duplicated(["symbol", "date"]).any():
-        raise RuntimeError("left-side project feature cache contains duplicate keys")
-    schemas = set(features["factor_schema_version"].dropna().astype(str))
-    if features.empty or schemas != {PROJECT_FACTOR_SCHEMA_VERSION}:
-        raise RuntimeError("left-side project feature cache row schema mismatch")
-    all_null = [
-        column
-        for column in PROJECT_FACTOR_COLUMNS
-        if features[column].notna().sum() == 0
-    ]
-    if all_null:
-        raise RuntimeError(
-            "left-side project feature cache has all-null factors: "
-            f"{all_null[:20]}"
-        )
-    incomplete_values = features[
-        list(LEFT_SIDE_REQUIRED_PROJECT_VALUE_COLUMNS)
-    ].isna().any(axis=1)
-    if incomplete_values.any():
-        samples = features.loc[
-            incomplete_values,
-            "symbol",
-        ].astype(str).head(20).tolist()
-        raise RuntimeError(
-            "left-side project feature cache has incomplete daily_basic values: "
-            f"count={int(incomplete_values.sum())} samples={samples}"
-        )
-
-    expected_symbols = set(signals["symbol"].astype(str))
-    available_symbols = set(features["symbol"])
-    missing_symbols = expected_symbols - available_symbols
-    policy_excluded = {
-        str(symbol)
-        for symbol in manifest.get("policy_excluded_candidate_symbols") or []
-    }
-    unexplained = missing_symbols - policy_excluded
-    if unexplained:
-        raise RuntimeError(
-            "left-side project feature cache has unexplained missing candidates: "
-            f"{sorted(unexplained)[:20]}"
-        )
-    excluded = sorted(missing_symbols & policy_excluded)
-    eligible_signals = signals[
-        ~signals["symbol"].astype(str).isin(excluded)
-    ].reset_index(drop=True)
-    eligible_symbols = set(eligible_signals["symbol"].astype(str))
-    features = features[
-        features["symbol"].isin(eligible_symbols)
-    ].reset_index(drop=True)
-    return features, eligible_signals, excluded
+    snapshot = load_exact_date_project_feature_cache(
+        target,
+        signals,
+        feature_path=config.paths.project_feature_cache,
+        manifest_path=config.paths.project_feature_manifest,
+        required_value_columns=LEFT_SIDE_REQUIRED_PROJECT_VALUE_COLUMNS,
+        context="left-side",
+    )
+    return (
+        snapshot.features,
+        snapshot.eligible_signals,
+        list(snapshot.policy_excluded_symbols),
+    )
 
 
 def _score_input_fingerprint(
@@ -766,6 +696,13 @@ def score_left_side_production(
         raise RuntimeError("left-side production features are stale")
     if feature_manifest.get("output_sha256") != _sha256(config.paths.feature_output):
         raise RuntimeError("left-side feature checksum mismatch")
+    policy_excluded = sorted(
+        {
+            str(symbol)
+            for symbol in feature_manifest.get("policy_excluded_candidate_symbols") or []
+            if str(symbol)
+        }
+    )
     frame = pd.read_parquet(config.paths.feature_output)
     missing = set(LEFT_SIDE_SCORING_INPUT_COLUMNS) - set(frame.columns)
     if missing:
@@ -792,6 +729,8 @@ def score_left_side_production(
         "factor_contract_sha256": LEFT_SIDE_FACTOR_CONTRACT_SHA256,
         "source_input_fingerprint": _score_input_fingerprint(target, config),
         "candidate_count": len(scored),
+        "policy_excluded_candidate_count": len(policy_excluded),
+        "policy_excluded_candidate_symbols": policy_excluded,
         "score_field": "ranking_score",
         "normalized_score_field": "ranking_score_normalized",
         "score_normalization": bundle["score_normalization"],

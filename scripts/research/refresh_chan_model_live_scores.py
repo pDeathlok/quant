@@ -132,8 +132,16 @@ def _read_daily_basic_turnover_history(
 
     start_key = pd.Timestamp(start).strftime("%Y%m%d")
     end_key = pd.Timestamp(end).strftime("%Y%m%d")
+    from quant.data.market_snapshot import current_market_snapshot
+
+    snapshot = current_market_snapshot()
     frames: list[pd.DataFrame] = []
-    for path in sorted(daily_basic_dir.glob("*.parquet")):
+    if snapshot is not None:
+        frames.append(snapshot.read(
+            "daily_basic", start_date=start_key, end_date=end_key,
+            columns=["ts_code", "trade_date", "turnover_rate"],
+        ))
+    for path in sorted(daily_basic_dir.glob("*.parquet")) if snapshot is None else ():
         if not (path.stem.isdigit() and start_key <= path.stem <= end_key):
             continue
         try:

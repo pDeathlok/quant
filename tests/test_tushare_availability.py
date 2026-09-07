@@ -51,6 +51,7 @@ def test_deadline_uses_shanghai_time_and_shortens_last_wait():
     ("Tushare daily returned no market rows for 20260828", True),
     ("Tushare daily market coverage below 99.50%", True),
     ("Tushare daily did not reach expected trade date for 000001.SZ", True),
+    ("Tushare index_daily missing requested trade date 20260901; latest available is 20260831", True),
     ("Tushare daily_basic missing model feature columns for 20260828", True),
     ("Tushare stock_basic returned no rows", True),
     ("Tushare daily_basic duplicate ts_code", False),
@@ -277,6 +278,22 @@ def test_workflow_recognizes_reference_source_missing_rows():
         "result": {"refresh_reference_inputs": {
             "status": "failed",
             "critical_errors": ["stock_basic: Tushare stock_basic returned no rows"],
+        }},
+    }
+
+    assert runner._tushare_missing_error(status) is not None
+
+
+def test_workflow_recognizes_reference_index_publication_delay():
+    status = {
+        "status": "failed",
+        "result": {"refresh_reference_inputs": {
+            "status": "failed",
+            "data_missing": True,
+            "error_summary": (
+                "Tushare index_daily missing requested trade date 20260901; "
+                "latest available is 20260831"
+            ),
         }},
     }
 

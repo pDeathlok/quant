@@ -1,0 +1,17 @@
+# Source-level correctness profile, not the full production/research environment.
+# Bounds come from pyproject.toml; exact observed versions live in constraints-ci-*.
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+pyarrow>=14.0.0
+scikit-learn>=1.3.0
+plotly>=5.18.0
+pyyaml>=6.0
+tushare>=1.4.0
+sqlalchemy>=2.0.0
+pymysql>=1.1.0
+pytest>=8.0.0
+ruff>=0.6.0
+packaging>=22
+# The existing strategies package imports akquant eagerly. It requires Python 3.10+.
+akquant>=0.2.36; python_version >= "3.10"

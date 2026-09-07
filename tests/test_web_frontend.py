@@ -314,8 +314,11 @@ def test_watchlist_new_stock_selection_does_not_fall_back_to_another_stock_resul
 def test_selector_filters_coalesce_rapid_clicks_and_ignore_stale_responses() -> None:
     assert "selectorFilterReloadTimer = window.setTimeout" in APP_JS
     assert "}, 150);" in APP_JS
-    assert "const requestId = ++state.selectorRequestId;" in APP_JS
-    assert "if (requestId !== state.selectorRequestId) return;" in APP_JS
+    selector_loader = APP_JS.split("async function loadSelector(options = {}) {", 1)[1].split(
+        "async function ", 1
+    )[0]
+    assert 'beginWorkspaceRequest("short", path)' in selector_loader
+    assert "if (!isCurrentWorkspaceRequest(request)) return;" in selector_loader
 
 
 def test_direct_refreshes_and_watchlist_order_are_single_flight() -> None:

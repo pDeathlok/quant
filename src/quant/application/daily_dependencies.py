@@ -192,6 +192,7 @@ class DependencyNode:
     artifact: ArtifactSpec | None = None
     final_gate: bool = False
     notes: str = ""
+    publication_outputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1812,6 +1813,7 @@ def build_default_daily_dependency_registry(
             ,),
             _exact(_json("web/data/b1_daily_plan.json", "signal_date")),
             _daily_incremental(), "generate_daily_plan", outputs=("web/data/b1_daily_plan.json",),
+            publication_outputs=("web/data/b1_daily_plan.json",),
             contract_sources=("configs/strategies/b1_selected.yaml",),
             result_aliases=("generate_daily_plan",), ui_step="daily_plan", ui_order=51,
             final_gate=True,
@@ -1829,6 +1831,7 @@ def build_default_daily_dependency_registry(
             ),
             _exact(_result("selector_core", "signal_date")), _daily_incremental(),
             "build_selector_payload", result_aliases=("selector_core",),
+            publication_outputs=("data/selector_snapshots",),
             contract_sources=("src/quant/webapp/services.py",),
             ui_step="selector_core", ui_order=71, final_gate=True,
         ),
@@ -1845,6 +1848,7 @@ def build_default_daily_dependency_registry(
             ),
             _exact(_result("selector_extended", "signal_date")), _daily_incremental(),
             "build_selector_payload", result_aliases=("selector_extended",),
+            publication_outputs=("data/selector_snapshots",),
             contract_sources=(
                 "src/quant/webapp/services.py",
                 "configs/strategies/triple_volume_breakout.yaml",
@@ -1858,6 +1862,7 @@ def build_default_daily_dependency_registry(
              _edge("product.selector_extended")),
             _exact(_result("selector_extended", "signal_date")), _daily_incremental(),
             "write_strategy_pool_snapshots", result_aliases=("snapshot",),
+            publication_outputs=("data/selector_snapshots",),
             contract_sources=("src/quant/webapp/services.py",),
             ui_step="snapshot", ui_order=99,
             final_gate=True,
@@ -1867,6 +1872,7 @@ def build_default_daily_dependency_registry(
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("score.chan"),),
             _exact(_result("chan_model_strategy", "signal_date")), _daily_incremental(),
             "generate_chan_model_strategy", result_aliases=("chan_model_strategy",),
+            publication_outputs=("data/workspace_snapshots",),
             contract_sources=("src/quant/strategies/custom/chan_model.py",),
             ui_step="chan_model_strategy", ui_order=76, final_gate=True,
         ),
@@ -1876,6 +1882,7 @@ def build_default_daily_dependency_registry(
             (_edge("feature.long_snapshot"),),
             _exact(_result("long_stock_pool.variants.0", "signal_date")), _daily_incremental(),
             "refresh_long_stock_pool_variants", result_aliases=("long_stock_pool",),
+            publication_outputs=("data/long_stock_pool_snapshots", "data/blood_chip_long_snapshots"),
             contract_sources=(
                 "configs/strategies/tea_master_long.yaml",
                 "configs/strategies/long_dividend_quality.yaml",
@@ -1887,6 +1894,7 @@ def build_default_daily_dependency_registry(
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("feature.cb_grid"),),
             _exact(_result("convertible_bond_plan", "trade_date")), _daily_incremental(),
             "build_convertible_bond_grid_workspace", result_aliases=("convertible_bond_plan",),
+            publication_outputs=("data/workspace_snapshots", "data/web/convertible_bond_grid_plan.json"),
             contract_sources=("configs/strategies/convertible_bond_rotation.yaml",),
             ui_step="convertible_bond_plan", ui_order=91, final_gate=True,
         ),
@@ -1897,6 +1905,7 @@ def build_default_daily_dependency_registry(
             _polled(_result("convertible_bond_allotment", "asof")),
             IncrementalPolicy("date", ("date", "ts_code"), write_mode="reuse_if_event_unchanged"),
             "build_convertible_bond_allotment_workspace",
+            publication_outputs=("data/workspace_snapshots", "data/routine/convertible_bond_allotments_latest.json"),
             contract_sources=(
                 "src/quant/routine/convertible_bond_allotment.py",
                 "src/quant/application/workspaces/convertible_bonds.py",
@@ -1909,6 +1918,7 @@ def build_default_daily_dependency_registry(
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("score.byd_runtime"),),
             _exact(_result("byd_daily_plan", "signal_date")), _daily_incremental(),
             "build_byd_daily_workspace", result_aliases=("byd_daily_plan",),
+            publication_outputs=("data/workspace_snapshots",),
             contract_sources=("src/quant/application/workspaces/byd.py",),
             ui_step="byd_daily_plan", ui_order=94, final_gate=True,
         ),
@@ -1917,6 +1927,7 @@ def build_default_daily_dependency_registry(
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("score.similar"),),
             _exact(_result("similar_patterns", "target_date")), _daily_incremental(),
             "refresh_similar_pattern_analysis",
+            publication_outputs=("data/research/similar_patterns/web_watchlist_analysis.json",),
             contract_sources=("src/quant/webapp/services.py",),
             outputs=("data/research/similar_patterns/web_watchlist_analysis.json",),
             result_aliases=("similar_patterns",), ui_step="similar_patterns", ui_order=98,

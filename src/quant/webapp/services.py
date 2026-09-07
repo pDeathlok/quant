@@ -5,7 +5,6 @@ import re
 import ast
 import hashlib
 import importlib
-import importlib.util
 import multiprocessing as mp
 import os
 import queue
@@ -15,10 +14,11 @@ import sys
 import threading
 import traceback
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, as_completed
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import date, datetime, timedelta
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from time import monotonic
 from typing import Any, Mapping
@@ -102,6 +102,15 @@ from quant.infrastructure.workspace_snapshots import (
     WorkspaceSnapshotRepository,
     canonical_snapshot_date,
     workspace_params_key,
+)
+from quant.infrastructure.publication import (
+    ContextThreadPoolExecutor as ThreadPoolExecutor,
+    PublicationStore,
+    assert_publication_writable,
+    current_publication,
+    publication_context,
+    publication_path,
+    publication_sql_key,
 )
 from quant.routine.b1_daily_plan import DAILY_PLAN_PATH, FEATURE_PATH, build_daily_plan, write_daily_plan
 from quant.routine.cache_retention import run_cache_cleanup
@@ -209,8 +218,6 @@ MODEL_SIGNAL_LABELS = {
     "YUEYUE": "跃跃欲试",
     "VIOLENCE_K": "暴力K",
 }
-_LONG_RESEARCH_MODULE_LOCK = threading.Lock()
-_TEA_MASTER_MODULE_LOCK = threading.Lock()
 _LONG_LIVE_DATA_LOCK = threading.Lock()
 _TEA_MASTER_LIVE_SCORE_LOCK = threading.Lock()
 _SELECTOR_SNAPSHOT_SCHEMA_LOCK = threading.Lock()
@@ -523,10 +530,7 @@ def _latest_similar_pattern_target_date(symbols: list[str]) -> str | None:
     latest: pd.Timestamp | None = None
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
     for symbol in symbols:
-        try:
-            candidate = store.latest_trade_date(DAILY_DIR.name, symbol)
-        except Exception:
-            candidate = None
+        candidate = store.latest_trade_date(DAILY_DIR.name, symbol)
         if pd.notna(candidate) and (latest is None or candidate > latest):
             latest = pd.Timestamp(candidate)
     return latest.strftime("%Y-%m-%d") if latest is not None else None
@@ -538,10 +542,8 @@ def _similar_pattern_vector_cache_refresh_decision(
     now: datetime | None = None,
     source_trade_date: str | None = None,
 ) -> dict[str, Any]:
-    state_dir = _similar_pattern_vector_cache_state_dir()
-    cache_files = list(state_dir.glob("*.npz")) if state_dir.exists() else []
-    metadata = _read_similar_pattern_vector_cache_metadata()
-    current = now or datetime.now()
+    from quant.routine.vector_refresh_policy import vector_cache_refresh_decision
+
     force_from_env = os.getenv("SIMILAR_PATTERN_FORCE_VECTOR_CACHE", "").strip().lower() in {
         "1",
         "true",
@@ -549,59 +551,16 @@ def _similar_pattern_vector_cache_refresh_decision(
         "on",
     }
 
-    refreshed_at = pd.to_datetime(metadata.get("refreshed_at"), errors="coerce")
-
-    refresh_age_days = (
-        max(0.0, (current - refreshed_at.to_pydatetime()).total_seconds() / 86_400)
-        if pd.notna(refreshed_at)
-        else None
+    return vector_cache_refresh_decision(
+        _similar_pattern_vector_cache_state_dir(),
+        force=force or force_from_env,
+        now=now,
+        source_trade_date=source_trade_date,
+        metadata=_read_similar_pattern_vector_cache_metadata(),
+        minimum_refresh_age_days=SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS,
+        refresh_weekday=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY,
+        refresh_hour=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR,
     )
-    minimum_age_reached = (
-        refresh_age_days is None
-        or refresh_age_days >= SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS
-    )
-    repair_reason: str | None = None
-    if not cache_files:
-        repair_reason = "cache_missing"
-    elif int(metadata.get("errors") or 0) > 0:
-        repair_reason = "previous_refresh_errors"
-    elif metadata.get("cached_files") is not None and int(metadata["cached_files"]) != len(cache_files):
-        repair_reason = "cache_file_count_changed"
-    elif any(path.stat().st_size == 0 for path in cache_files):
-        repair_reason = "empty_cache_file"
-    elif pd.isna(refreshed_at):
-        repair_reason = "refresh_time_missing"
-
-    if force or force_from_env:
-        due, reason = True, "forced"
-    elif not _similar_pattern_vector_cache_in_refresh_window(current):
-        due, reason = False, "waiting_for_friday_close"
-    elif not _similar_pattern_source_date_is_current(source_trade_date, current):
-        due, reason = False, "waiting_for_friday_trade_close"
-    elif not minimum_age_reached:
-        if _similar_pattern_vector_cache_refreshed_this_window(refreshed_at, current):
-            due, reason = False, "friday_close_window_already_refreshed"
-        else:
-            due, reason = False, "minimum_refresh_age_not_reached"
-    else:
-        due, reason = True, repair_reason or "friday_close_window"
-
-    next_refresh_at = _next_similar_pattern_vector_cache_refresh_at(current).isoformat(
-        timespec="seconds"
-    )
-    return {
-        "due": due,
-        "reason": reason,
-        "cached_files": len(cache_files),
-        "refreshed_at": refreshed_at.to_pydatetime().isoformat(timespec="seconds")
-        if pd.notna(refreshed_at)
-        else None,
-        "next_refresh_at": next_refresh_at,
-        "refresh_age_days": refresh_age_days,
-        "minimum_refresh_age_days": SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS,
-        "metadata": metadata,
-        "inferred_legacy": False,
-    }
 
 
 def _write_similar_pattern_vector_cache_metadata(
@@ -625,10 +584,15 @@ def _write_similar_pattern_vector_cache_metadata(
         "errors": int(cache_audit["status"].eq("error").sum()) if not cache_audit.empty else 0,
     }
     path = state_dir / SIMILAR_PATTERN_VECTOR_CACHE_METADATA
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(payload, path)
     return payload
+
+
+def _activate_similar_pattern_vector_cache_config() -> dict[str, Any]:
+    """Pin the production config only after its validated build metadata is durable."""
+    from quant.routine.cache_retention import activate_vector_config
+
+    return activate_vector_config(PROJECT_ROOT, _similar_pattern_vector_cache_state_dir())
 
 
 CHAN_MODEL_SCORED_PATH = PROJECT_ROOT / "reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"
@@ -1073,6 +1037,7 @@ def _expire_interrupted_refresh_status_unlocked(status: dict[str, Any]) -> dict[
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
+    path = publication_path(path)
     if not path.exists():
         raise FileNotFoundError(str(path))
     return json.loads(path.read_text(encoding="utf-8"))
@@ -1086,8 +1051,12 @@ def _read_daily_payload_cache(path: Path) -> dict[str, Any] | None:
 
 
 def _write_daily_payload_cache(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    atomic_write_json(payload, path)
+
+
+def _materialize(operation, *args, **kwargs):
+    assert_publication_writable()
+    return operation(*args, **kwargs)
 
 
 def _is_daily_payload_current(payload: dict[str, Any], today: date | None = None) -> bool:
@@ -1120,6 +1089,9 @@ def get_byd_daily_strategy(
     """Compatibility facade for the application-layer BYD workspace."""
 
     def is_snapshot_current(payload: dict[str, Any]) -> bool:
+        view = current_publication()
+        if view and view.generation and not view.writable:
+            return True
         expected = str(_local_market_trade_date() or "").replace("-", "")
         planned = payload.get("planned_t") or payload.get("daily_t_plan") or {}
         actual = str(planned.get("signal_date") or "").replace("-", "")
@@ -1139,60 +1111,22 @@ def get_byd_daily_strategy(
 
 @lru_cache(maxsize=1)
 def _long_research_module():
-    path = PROJECT_ROOT / "scripts/research/backtest_long_dividend_quality.py"
-    module_name = "quant_long_dividend_quality_research"
-    with _LONG_RESEARCH_MODULE_LOCK:
-        module = sys.modules.get(module_name)
-        if module is not None and getattr(module, "_quant_services_import_complete", False):
-            return module
-        if module is not None:
-            sys.modules.pop(module_name, None)
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"无法加载长线策略研究脚本: {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except BaseException:
-            if sys.modules.get(module_name) is module:
-                sys.modules.pop(module_name, None)
-            raise
-        module._quant_services_import_complete = True
-        return module
+    from quant.research import long_dividend_quality
+
+    return long_dividend_quality
 
 
 @lru_cache(maxsize=1)
 def _tea_master_research_module():
-    path = PROJECT_ROOT / "scripts/research/backtest_tea_master_long.py"
-    module_name = "quant_tea_master_long_research"
-    with _TEA_MASTER_MODULE_LOCK:
-        module = sys.modules.get(module_name)
-        if module is not None and getattr(module, "_quant_services_import_complete", False):
-            return module
-        if module is not None:
-            sys.modules.pop(module_name, None)
-        script_dir = str(path.parent)
-        if script_dir not in sys.path:
-            sys.path.insert(0, script_dir)
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"无法加载茶大长线策略脚本: {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except BaseException:
-            if sys.modules.get(module_name) is module:
-                sys.modules.pop(module_name, None)
-            raise
-        module._quant_services_import_complete = True
-        return module
+    from quant.research import tea_master_long
+
+    return tea_master_long
 
 
 @lru_cache(maxsize=2)
 def _load_live_long_base_full_cached(
     signal_date: str | None,
+    source_fingerprint: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Build the historical reference path used when no live checkpoint exists."""
 
@@ -1217,6 +1151,7 @@ def _load_live_long_base_full_cached(
 @lru_cache(maxsize=2)
 def _load_live_long_base_cached(
     signal_date: str | None,
+    source_fingerprint: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Build live inputs with enough monthly history for valuation percentiles."""
 
@@ -1252,7 +1187,7 @@ def _load_live_long_base_cached(
         candidate_symbols = set(latest_basic["ts_code"].dropna().astype(str))
     history_features = pd.DataFrame()
     module_root = getattr(module, "PROJECT_ROOT", None)
-    if module_root is not None:
+    if module_root is not None and source_fingerprint is None:
         full_cache_key = hashlib.sha1(
             "20130101|none|qfq_ohlc_price_v1|".encode("utf-8")
         ).hexdigest()[:16]
@@ -1337,8 +1272,12 @@ def _load_live_long_base(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     normalized_date = pd.to_datetime(signal_date).date().isoformat() if signal_date else None
     with _LONG_LIVE_DATA_LOCK:
+        from quant.data.market_snapshot import current_market_snapshot
+
         loader = _load_live_long_base_full_cached if full_history else _load_live_long_base_cached
-        features, daily_basic, stock_basic, coverage = loader(normalized_date)
+        snapshot = current_market_snapshot()
+        args = (normalized_date, snapshot.manifest["fingerprint"]) if snapshot else (normalized_date,)
+        features, daily_basic, stock_basic, coverage = loader(*args)
     return features, daily_basic, stock_basic, dict(coverage)
 
 
@@ -1521,7 +1460,7 @@ def _long_snapshot_key(variant: str, signal_date: str | None) -> tuple[str, str]
 
 
 def _long_snapshot_path(snapshot_key: str) -> Path:
-    return LONG_STOCK_POOL_SNAPSHOT_DIR / f"{snapshot_key}.json"
+    return publication_path(LONG_STOCK_POOL_SNAPSHOT_DIR) / f"{snapshot_key}.json"
 
 
 def _read_long_stock_pool_snapshot(
@@ -1535,8 +1474,8 @@ def _read_long_stock_pool_snapshot(
     exact_path = _long_snapshot_path(snapshot_key)
     if exact_path.exists():
         local_candidates.append((requested or "", exact_path))
-    if LONG_STOCK_POOL_SNAPSHOT_DIR.exists():
-        for path in LONG_STOCK_POOL_SNAPSHOT_DIR.glob("*.json"):
+    if publication_path(LONG_STOCK_POOL_SNAPSHOT_DIR).exists():
+        for path in publication_path(LONG_STOCK_POOL_SNAPSHOT_DIR).glob("*.json"):
             if path == exact_path:
                 continue
             try:
@@ -1558,6 +1497,8 @@ def _read_long_stock_pool_snapshot(
         if payload.get("schema_version") != LONG_STOCK_POOL_SCHEMA_VERSION:
             continue
         cached_date = _canonical_workspace_snapshot_date(payload.get("signal_date") or candidate_date)
+        if requested and current_publication() and cached_date != requested:
+            continue
         payload["cache"] = {
             "hit": True,
             "backend": "filesystem",
@@ -1567,7 +1508,7 @@ def _read_long_stock_pool_snapshot(
             "stale": bool(requested and cached_date != requested),
         }
         return payload
-    if not allow_sql:
+    if not allow_sql or (current_publication() and current_publication().generation):
         return None
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
@@ -1591,8 +1532,8 @@ def _read_long_stock_pool_snapshot(
 
 def _long_stock_pool_snapshot_dates(variant: str) -> set[str]:
     dates: set[str] = set()
-    if LONG_STOCK_POOL_SNAPSHOT_DIR.exists():
-        for path in LONG_STOCK_POOL_SNAPSHOT_DIR.glob("*.json"):
+    if publication_path(LONG_STOCK_POOL_SNAPSHOT_DIR).exists():
+        for path in publication_path(LONG_STOCK_POOL_SNAPSHOT_DIR).glob("*.json"):
             try:
                 payload = read_json_file(path)
             except Exception:
@@ -1601,7 +1542,7 @@ def _long_stock_pool_snapshot_dates(variant: str) -> set[str]:
                 dates.add(str(payload["signal_date"]))
 
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    if store.config.sql_url:
+    if store.config.sql_url and not (current_publication() and current_publication().generation):
         try:
             from sqlalchemy import text
 
@@ -1630,17 +1571,16 @@ def _write_long_stock_pool_snapshot(
     signal_date: str | None,
     write_sql: bool = True,
 ) -> None:
+    assert_publication_writable()
     snapshot_key, date_key = _long_snapshot_key(variant, signal_date)
     payload_to_store = dict(payload)
     payload_to_store["schema_version"] = LONG_STOCK_POOL_SCHEMA_VERSION
     payload_to_store["cache"] = {"hit": False, "backend": "generated", "snapshot_key": snapshot_key}
     payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
-    LONG_STOCK_POOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    publication_path(LONG_STOCK_POOL_SNAPSHOT_DIR).mkdir(parents=True, exist_ok=True)
     snapshot_path = _long_snapshot_path(snapshot_key)
-    temporary_path = snapshot_path.with_suffix(".json.tmp")
-    temporary_path.write_text(payload_json, encoding="utf-8")
-    temporary_path.replace(snapshot_path)
     if not write_sql:
+        atomic_write_text(payload_json, snapshot_path)
         return
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
@@ -1677,7 +1617,7 @@ def _write_long_stock_pool_snapshot(
                         """
                     ),
                     {
-                        "snapshot_key": snapshot_key,
+                        "snapshot_key": publication_sql_key(snapshot_key),
                         "variant": variant,
                         "signal_date": date_key,
                         "generated_at": str(payload.get("generated_at") or datetime.now().isoformat(timespec="seconds")),
@@ -1685,8 +1625,9 @@ def _write_long_stock_pool_snapshot(
                         "payload_json": payload_json,
                     },
                 )
-        except Exception:
-            return
+        except Exception as exc:
+            raise RuntimeError("Long stock pool SQL persistence failed") from exc
+    atomic_write_text(payload_json, snapshot_path)
 
 
 def _workspace_params_key(params: dict[str, Any] | None = None) -> str:
@@ -1734,12 +1675,15 @@ def _read_workspace_snapshot(
     params: dict[str, Any] | None = None,
     allow_sql: bool = True,
 ) -> dict[str, Any] | None:
-    return _workspace_snapshot_repository().read(
+    payload = _workspace_snapshot_repository().read(
         workspace,
         snapshot_date=snapshot_date,
         params=params,
         allow_sql=allow_sql,
     )
+    if payload is None:
+        assert_publication_writable()
+    return payload
 
 
 def _write_workspace_snapshot(
@@ -3221,7 +3165,7 @@ def get_long_stock_pool(
         if cached is not None:
             if variant_key in TEA_LONG_VARIANTS:
                 cached, upgraded = _upgrade_cached_tea_analyst_display(cached)
-                if upgraded:
+                if upgraded and not (current_publication() and not current_publication().writable):
                     _write_long_stock_pool_snapshot(cached, variant_key, signal_date, write_sql=False)
                     cached["cache"] = {
                         "hit": True,
@@ -3230,6 +3174,7 @@ def get_long_stock_pool(
                         "schema_version": LONG_STOCK_POOL_SCHEMA_VERSION,
                     }
             return cached
+    assert_publication_writable()
     if variant_key in TEA_LONG_VARIANTS:
         if refresh:
             _build_tea_master_stock_pool_cached.cache_clear()
@@ -3257,8 +3202,8 @@ def _read_blood_chip_long_snapshot(
         else None
     )
     candidates: list[tuple[str, Path]] = []
-    if BLOOD_CHIP_LONG_SNAPSHOT_DIR.exists():
-        for path in BLOOD_CHIP_LONG_SNAPSHOT_DIR.glob("*.json"):
+    if publication_path(BLOOD_CHIP_LONG_SNAPSHOT_DIR).exists():
+        for path in publication_path(BLOOD_CHIP_LONG_SNAPSHOT_DIR).glob("*.json"):
             try:
                 payload = read_json_file(path)
             except Exception:
@@ -3272,6 +3217,8 @@ def _read_blood_chip_long_snapshot(
                 candidate_date > requested
                 or (strictly_before and candidate_date >= requested)
             ):
+                continue
+            if requested and not strictly_before and current_publication() and candidate_date != requested:
                 continue
             candidates.append((candidate_date, path))
     if not candidates:
@@ -3370,6 +3317,7 @@ def get_blood_chip_long_plan(
         cached = _read_blood_chip_long_snapshot(signal_date)
         if cached is not None:
             return cached
+    assert_publication_writable()
     payload = _build_blood_chip_long_plan_live(signal_date)
     _write_blood_chip_long_snapshot(payload)
     payload["cache"] = {
@@ -3834,7 +3782,12 @@ def _similar_pattern_watchlist_profiles(
     include_scores: bool = True,
 ) -> list[dict[str, Any]]:
     state = _read_similar_pattern_watchlist_state()
-    scores = _watchlist_buy_hold_scores(tuple(state["symbols"])) if include_scores else {}
+    view = current_publication()
+    if include_scores and view and view.generation and not view.writable:
+        cached = _read_similar_pattern_analysis_cache() or {}
+        scores = {item["symbol"]: item for item in cached.get("watchlist", []) if item.get("symbol")}
+    else:
+        scores = _watchlist_buy_hold_scores(tuple(state["symbols"])) if include_scores else {}
     profiles = []
     for symbol in state["symbols"]:
         profile = _stock_profile_from_basic(symbol, basic)
@@ -3849,7 +3802,8 @@ def _similar_pattern_watchlist_profiles(
             len(reminder["conditions"])
             for reminder in alert_config["reminders"]
         )
-        profile.update(scores.get(symbol, {}))
+        score_fields = scores.get(symbol, {})
+        profile = {**score_fields, **profile}
         profiles.append(profile)
     return profiles
 
@@ -4286,10 +4240,11 @@ def _similar_pattern_result_payload(
 
 
 def _read_similar_pattern_analysis_cache() -> dict[str, Any] | None:
-    if not SIMILAR_PATTERN_ANALYSIS_PATH.exists():
+    path = publication_path(SIMILAR_PATTERN_ANALYSIS_PATH)
+    if not path.exists():
         return None
     try:
-        return json.loads(SIMILAR_PATTERN_ANALYSIS_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -4374,7 +4329,12 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
             hits[normalized].append(candidate)
 
     try:
-        latest_signal_date = _latest_candidate_signal_date()
+        view = current_publication()
+        latest_signal_date = (
+            _latest_selector_snapshot_date(None, True)
+            if view and view.generation and not view.writable
+            else _latest_candidate_signal_date()
+        )
         short_payload = _read_selector_snapshot(
             latest_signal_date,
             None,
@@ -4482,6 +4442,7 @@ def _refresh_similar_pattern_analysis_once(
             source_trade_date=source_trade_date,
             cache_audit=cache_audit,
         )
+        _activate_similar_pattern_vector_cache_config()
         cache_refreshed = True
     else:
         cache_audit = pd.DataFrame(columns=["status"])
@@ -4595,8 +4556,7 @@ def _refresh_similar_pattern_analysis_once(
         },
     }
     payload = _attach_watchlist_strategy_hits(payload)
-    SIMILAR_PATTERN_ANALYSIS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SIMILAR_PATTERN_ANALYSIS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(payload, SIMILAR_PATTERN_ANALYSIS_PATH)
     return payload
 
 
@@ -4606,6 +4566,7 @@ def refresh_similar_pattern_analysis(
     force_vector_cache: bool = False,
 ) -> dict[str, Any]:
     """Run one analysis per watchlist revision and share it with concurrent callers."""
+    assert_publication_writable()
     global _SIMILAR_PATTERN_REFRESH_INFLIGHT
 
     requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
@@ -4664,12 +4625,23 @@ def refresh_similar_pattern_analysis(
         requested_key = (requested_symbols, bool(force_vector_cache))
 
 
-def _similar_patterns_worker(result_queue: mp.Queue) -> None:
+def _similar_patterns_worker(result_queue: mp.Queue, publication=None, worker_limit=None, market_environment=None) -> None:
     def emit_progress(message: str) -> None:
         result_queue.put({"type": "progress", "message": message})
 
+    overrides = dict(market_environment or {})
+    if worker_limit is not None:
+        limit = max(1, int(worker_limit))
+        overrides.update({
+            "SIMILAR_PATTERN_CACHE_WORKERS": str(min(limit, max(1, int(os.getenv("SIMILAR_PATTERN_CACHE_WORKERS", "4"))))),
+            "ROUTINE_TOTAL_WORKERS": str(limit),
+            "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+        })
+    previous_environment = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
     try:
-        payload = refresh_similar_pattern_analysis(progress_callback=emit_progress)
+        with publication_context(publication) if publication else nullcontext():
+            payload = refresh_similar_pattern_analysis(progress_callback=emit_progress)
     except Exception as exc:
         result_queue.put(
             {
@@ -4679,6 +4651,12 @@ def _similar_patterns_worker(result_queue: mp.Queue) -> None:
             }
         )
         return
+    finally:
+        for key, value in previous_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     result_queue.put({"type": "result", "ok": True, "payload": payload})
 
 
@@ -4701,12 +4679,21 @@ def _drain_similar_pattern_worker_queue(result_queue: mp.Queue) -> dict[str, Any
 
 
 def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTERNS_TIMEOUT_SECONDS) -> dict[str, Any]:
+    from quant.data.market_snapshot import pinned_market_environment
+    from quant.routine.resource_scheduler import current_resource_grant
+
+    grant = current_resource_grant()
     ctx = mp.get_context("spawn")
     result_queue: mp.Queue = ctx.Queue()
-    proc = ctx.Process(target=_similar_patterns_worker, args=(result_queue,), daemon=False)
+    proc = ctx.Process(
+        target=_similar_patterns_worker,
+        args=(result_queue, current_publication(), grant.granted_workers if grant else None,
+              pinned_market_environment()),
+        daemon=False,
+    )
     proc.start()
-    _register_active_worker("similar_patterns", proc)
     try:
+        _register_active_worker("similar_patterns", proc)
         deadline = monotonic() + timeout_seconds
         result: dict[str, Any] | None = None
         while proc.is_alive():
@@ -4732,6 +4719,13 @@ def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTER
             raise RuntimeError(str(result.get("error") or "相似走势决策台刷新失败"))
         return dict(result.get("payload") or {})
     finally:
+        # A queue/progress exception must not outlive the parent's sealed files.
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+        proc.join()
         _clear_active_worker("similar_patterns")
 
 
@@ -4877,7 +4871,7 @@ def _selector_snapshot_key(
 
 
 def _selector_snapshot_path(snapshot_key: str) -> Path:
-    return SELECTOR_SNAPSHOT_DIR / f"{snapshot_key}.json"
+    return publication_path(SELECTOR_SNAPSHOT_DIR) / f"{snapshot_key}.json"
 
 
 def _selector_snapshot_matches_current_ranking_source(
@@ -4894,11 +4888,12 @@ def _selector_snapshot_matches_current_ranking_source(
 def _selector_snapshot_dates_cached(
     strategies: tuple[str, ...],
     include_extended: bool,
+    generation: str | None = None,
 ) -> tuple[str, ...]:
     _, _, strategy_key = _selector_snapshot_key(None, strategies, include_extended)
     dates: set[str] = set()
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
-    if store.config.sql_url:
+    if store.config.sql_url and not (current_publication() and current_publication().generation):
         try:
             from sqlalchemy import text
 
@@ -4923,8 +4918,8 @@ def _selector_snapshot_dates_cached(
         except Exception:
             pass
 
-    if SELECTOR_SNAPSHOT_DIR.exists():
-        for path in SELECTOR_SNAPSHOT_DIR.glob("*.json"):
+    if publication_path(SELECTOR_SNAPSHOT_DIR).exists():
+        for path in publication_path(SELECTOR_SNAPSHOT_DIR).glob("*.json"):
             try:
                 payload = read_json_file(path)
             except Exception:
@@ -4945,7 +4940,8 @@ def _selector_snapshot_dates_cached(
 
 def _selector_snapshot_dates(strategies: list[str] | None, include_extended: bool) -> list[str]:
     normalized = tuple(sorted({str(item).upper() for item in strategies or [] if item}))
-    return list(_selector_snapshot_dates_cached(normalized, include_extended))
+    view = current_publication()
+    return list(_selector_snapshot_dates_cached(normalized, include_extended, view.generation if view else None))
 
 
 def _latest_selector_snapshot_date(strategies: list[str] | None, include_extended: bool) -> str | None:
@@ -5013,6 +5009,8 @@ def _read_selector_snapshot(
             return payload
         except Exception:
             pass
+    if current_publication() and current_publication().generation:
+        return None
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     if store.config.sql_url:
         try:
@@ -5160,6 +5158,7 @@ def _write_selector_snapshot_batch(
 ) -> None:
     if not snapshots:
         return
+    assert_publication_writable()
     for payload, _, _ in snapshots:
         failed = [
             str(row.get("symbol")) for row in payload.get("stocks") or []
@@ -5213,19 +5212,12 @@ def _write_selector_snapshot_batch(
         for payload, strategies, include_extended in snapshots
     ]
 
-    SELECTOR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    published_files = 0
-    try:
-        for item in prepared:
-            atomic_write_text(item["payload_json"], item["snapshot_path"])
-            published_files += 1
-    finally:
-        if published_files:
-            _selector_snapshot_dates_cached.cache_clear()
-
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=PROJECT_ROOT / "data"))
     sql_url = store.config.sql_url
     if not sql_url:
+        for item in prepared:
+            atomic_write_text(item["payload_json"], item["snapshot_path"])
+        _selector_snapshot_dates_cached.cache_clear()
         return
     engine = None
     schema_cache_key = _selector_snapshot_schema_cache_key(str(sql_url))
@@ -5250,20 +5242,17 @@ def _write_selector_snapshot_batch(
                         payload_json = VALUES(payload_json)
                     """
                 ),
-                [item["sql_values"] for item in prepared],
+                [{**item["sql_values"], "snapshot_key": publication_sql_key(item["sql_values"]["snapshot_key"])} for item in prepared],
             )
     except Exception as exc:
         with _SELECTOR_SNAPSHOT_SCHEMA_LOCK:
             _SELECTOR_SNAPSHOT_SCHEMA_READY_URLS.discard(schema_cache_key)
         raise RuntimeError(
-            "selector MySQL snapshot publication failed; filesystem recovery copies retained"
+            "selector MySQL snapshot publication failed; visible filesystem snapshots unchanged"
         ) from exc
-    finally:
-        if engine is not None:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
+    for item in prepared:
+        atomic_write_text(item["payload_json"], item["snapshot_path"])
+    _selector_snapshot_dates_cached.cache_clear()
 
 
 def _write_selector_snapshot(
@@ -5344,6 +5333,9 @@ def _write_strategy_pool_snapshots(payload: dict[str, Any], include_extended: bo
 
 def _run_post_snapshot_cache_cleanup(results: dict[str, Any]) -> dict[str, Any]:
     """Enforce retention after the refresh writes its newest snapshot version."""
+
+    if current_publication() and current_publication().writable:
+        return {"status": "deferred", "reason": "publication_not_committed"}
 
     summary = run_cache_cleanup(PROJECT_ROOT)
     results["cache_cleanup_after_snapshot"] = summary
@@ -5616,6 +5608,8 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
     long_snapshot_dates = _long_stock_pool_snapshot_dates("tea")
     chan_strategy_dates = _chan_model_strategy_dates()
     chan_snapshot_dates = _workspace_snapshot_dates("chan_model_strategy", params={"top_n": 20})
+    if current_publication() and current_publication().generation:
+        chan_strategy_dates = chan_snapshot_dates
     latest_snapshot = max(snapshot_dates) if snapshot_dates else None
     latest_long_snapshot = max(long_snapshot_dates) if long_snapshot_dates else None
     latest_chan_signal = max(chan_strategy_dates) if chan_strategy_dates else None
@@ -5672,6 +5666,12 @@ def get_selector_calendar(start: str = "2026-06-01", end: str | None = None) -> 
 
 
 def get_b1_plan(refresh: bool = False, signal_date: str | None = None) -> dict[str, Any]:
+    view = current_publication()
+    if view and view.generation and not view.writable:
+        payload = read_json_file(DAILY_PLAN_PATH)
+        if refresh or (signal_date and payload.get("signal_date") != signal_date):
+            assert_publication_writable()
+        return payload
     if refresh or signal_date or not DAILY_PLAN_PATH.exists():
         payload = build_daily_plan(signal_date=signal_date)
         return payload
@@ -5684,7 +5684,7 @@ def refresh_b1_plan(signal_date: str | None = None) -> dict[str, Any]:
 
 
 def get_dashboard() -> dict[str, Any]:
-    if DASHBOARD_PATH.exists():
+    if publication_path(DASHBOARD_PATH).exists():
         return read_json_file(DASHBOARD_PATH)
     try:
         return build_dashboard_payload()
@@ -5734,7 +5734,7 @@ def get_convertible_bond_grid_plan(
     def read_legacy_snapshot() -> dict[str, Any] | None:
         try:
             payload = json.loads(
-                CONVERTIBLE_BOND_GRID_PLAN_PATH.read_text(encoding="utf-8")
+                publication_path(CONVERTIBLE_BOND_GRID_PLAN_PATH).read_text(encoding="utf-8")
             )
         except Exception:
             return None
@@ -5753,8 +5753,8 @@ def get_convertible_bond_grid_plan(
             )
         ),
         write_snapshot=_write_workspace_snapshot,
-        refresh_daily=refresh_convertible_bond_daily,
-        build_plan=build_convertible_bond_grid_plan,
+        refresh_daily=lambda **kwargs: _materialize(refresh_convertible_bond_daily, **kwargs),
+        build_plan=lambda **kwargs: _materialize(build_convertible_bond_grid_plan, **kwargs),
     )
     return build_convertible_bond_grid_workspace(
         trade_date=trade_date,
@@ -5802,7 +5802,7 @@ def get_convertible_bond_allotments(
             payload,
         ),
         write_snapshot=_write_workspace_snapshot,
-        build_payload=build_convertible_bond_allotment_payload,
+        build_payload=lambda **kwargs: _materialize(build_convertible_bond_allotment_payload, **kwargs),
         is_daily_current=_is_daily_payload_current,
     )
     return build_convertible_bond_allotment_workspace(
@@ -5986,6 +5986,7 @@ def get_chan_model_strategy_plan(
         )
         if cached is not None:
             return cached
+    assert_publication_writable()
     payload = _build_chan_model_strategy_payload(top_n=top_n, signal_date=signal_date)
     if signal_date and str(payload.get("signal_date") or "") != str(signal_date):
         raise RuntimeError(
@@ -6470,22 +6471,10 @@ def _fill_stock_profile(stock: dict[str, Any], signal_date: str | None = None) -
 def _daily_profile_at_or_before(symbol: str, signal_date: str | None = None) -> dict[str, Any]:
     if not symbol:
         return {}
-    try:
-        store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
-        cols = store.read_frame(DAILY_DIR.name, symbol)
-        wanted = [col for col in ["date", "trade_date", "close"] if col in cols.columns]
-        cols = cols[wanted].copy() if wanted else cols
-    except Exception:
-        path = DAILY_DIR / f"{symbol}.parquet"
-        if not path.exists():
-            return {}
-        try:
-            cols = pd.read_parquet(path, columns=["date", "trade_date", "close"])
-        except Exception:
-            try:
-                cols = pd.read_parquet(path)
-            except Exception:
-                return {}
+    store = MarketDataStore(MarketDataStoreConfig.from_env(root=DAILY_DIR.parent))
+    cols = store.read_frame(DAILY_DIR.name, symbol)
+    wanted = [col for col in ["date", "trade_date", "close"] if col in cols.columns]
+    cols = cols[wanted].copy() if wanted else cols
     if cols.empty or "close" not in cols.columns:
         return {}
     parsed_date = pd.to_datetime(cols["date"], errors="coerce") if "date" in cols.columns else pd.Series(pd.NaT, index=cols.index)
@@ -6972,7 +6961,9 @@ def _selector_turnover_feature_rows(
     """Build exact-date turnover ratios from current and trailing daily_basic."""
     if not symbols:
         return {}
-    root = daily_basic_dir or SELECTOR_DAILY_BASIC_DIR
+    from quant.data.market_snapshot import MarketSnapshotError, pinned_dataset_path, read_pinned_parquet
+
+    root = pinned_dataset_path("daily_basic") or daily_basic_dir or SELECTOR_DAILY_BASIC_DIR
     target = pd.Timestamp(signal_date).normalize()
     dated_paths: list[tuple[pd.Timestamp, Path]] = []
     for path in root.glob("*.parquet"):
@@ -6984,10 +6975,12 @@ def _selector_turnover_feature_rows(
     frames: list[pd.DataFrame] = []
     for _, path in sorted(dated_paths)[-30:]:
         try:
-            frame = pd.read_parquet(
+            frame = read_pinned_parquet(
                 path,
                 columns=["ts_code", "trade_date", "turnover_rate"],
             )
+        except MarketSnapshotError:
+            raise
         except Exception:
             continue
         frames.append(frame)
@@ -7086,25 +7079,49 @@ def _selector_production_snapshot_rows(
     if not features:
         return {}
     definitions = {definition.name: definition for definition in FACTOR_REGISTRY}
+    # Project factors have one production owner.  The side-specific products
+    # may materialize the same columns for their own rankers, but recomputing a
+    # cumulative factor (for example OBV) against a slightly different source
+    # history must not create a second selector source of truth.
     source_specs = (
-        (
-            PROJECT_ROOT / "data/features/right_side_unified/latest_features.parquet",
-            frozenset({"project_daily", "right_side_rule"}),
-        ),
-        (
-            PROJECT_ROOT / "data/features/left_side_unified/latest_features.parquet",
-            frozenset({"project_daily", "left_side_rule"}),
-        ),
-        (
-            LONG_FACTOR_SNAPSHOT_DIR / "latest.parquet",
-            frozenset({"long_snapshot"}),
-        ),
+        {
+            "path": PROJECT_ROOT
+            / "data/features/b1/active_candidate_project_features.parquet",
+            "manifest": PROJECT_ROOT
+            / "data/features/b1/active_candidate_project_features_manifest.json",
+            "calculators": frozenset({"project_daily"}),
+            "dated": False,
+        },
+        {
+            "path": PROJECT_ROOT
+            / "data/features/right_side_unified/latest_features.parquet",
+            "manifest": PROJECT_ROOT
+            / "data/features/right_side_unified/feature_manifest.json",
+            "calculators": frozenset({"right_side_rule"}),
+            "dated": True,
+        },
+        {
+            "path": PROJECT_ROOT
+            / "data/features/left_side_unified/latest_features.parquet",
+            "manifest": PROJECT_ROOT
+            / "data/features/left_side_unified/feature_manifest.json",
+            "calculators": frozenset({"left_side_rule"}),
+            "dated": True,
+        },
+        {
+            "path": LONG_FACTOR_SNAPSHOT_DIR / "latest.parquet",
+            "manifest": None,
+            "calculators": frozenset({"long_snapshot"}),
+            "dated": True,
+        },
     )
     target = pd.Timestamp(signal_date).normalize()
     rows: dict[str, dict[str, Any]] = {}
     source_names: dict[str, set[str]] = {}
     layer_coverage: dict[str, dict[str, Any]] = {}
-    for path, calculators in source_specs:
+    for spec in source_specs:
+        path = Path(spec["path"])
+        calculators = spec["calculators"]
         required = [
             feature for feature in features
             if definitions[feature].calculator_id in calculators
@@ -7122,9 +7139,19 @@ def _selector_production_snapshot_rows(
                 path = Path(manifest["snapshot_path"])
                 available = set(frame.columns)
             else:
-                dated_path = path.with_name(f"{target:%Y%m%d}_features.parquet")
-                if dated_path.is_file():
-                    path = dated_path
+                if spec["dated"]:
+                    dated_path = path.with_name(f"{target:%Y%m%d}_features.parquet")
+                    if dated_path.is_file():
+                        path = dated_path
+                metadata = json.loads(
+                    Path(spec["manifest"]).read_text(encoding="utf-8")
+                )
+                if (
+                    metadata.get("status") != "success"
+                    or metadata.get("target_date") != signal_date
+                    or metadata.get("output_sha256") != _file_sha256(path)
+                ):
+                    raise RuntimeError("manifest date or checksum mismatch")
                 available = set(pq.ParquetFile(path).schema.names)
                 symbol_column = "symbol" if "symbol" in available else "ts_code"
                 missing = set(required) - available
@@ -7137,19 +7164,6 @@ def _selector_production_snapshot_rows(
             symbol_column = "symbol" if "symbol" in available else "ts_code"
             if frame[symbol_column].duplicated().any():
                 raise RuntimeError("duplicate symbols in exact-date cross-section")
-            if frame.empty:
-                metadata_path = (
-                    path.with_suffix(".json") if path.name != "latest_features.parquet"
-                    else path.with_name("feature_manifest.json")
-                )
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                if not (
-                    metadata.get("status") == "success"
-                    and metadata.get("target_date") == signal_date
-                    and metadata.get("signal_candidate_count") == 0
-                    and metadata.get("output_sha256") == _file_sha256(path)
-                ):
-                    raise RuntimeError("empty exact-date cross-section without zero-candidate proof")
             for calculator in calculators:
                 columns = [feature for feature in required if definitions[feature].calculator_id == calculator]
                 if columns and not frame.empty and not frame[columns].notna().any(axis=None):
@@ -8739,8 +8753,18 @@ def _refresh_long_stock_pool_variant(variant: str, signal_date: str | None) -> d
 def _refresh_long_stock_pool_variants(variants: list[str], signal_date: str | None) -> list[dict[str, Any]]:
     if not variants:
         return []
-    with ThreadPoolExecutor(max_workers=min(3, len(variants))) as executor:
-        results = list(executor.map(lambda variant: _refresh_long_stock_pool_variant(variant, signal_date), variants))
+    from quant.routine.operation_contracts import ResourceClaim
+    from quant.routine.resource_scheduler import current_resource_grant
+
+    grant = current_resource_grant()
+    if grant is not None:
+        results = grant.map(
+            lambda variant, child: _refresh_long_stock_pool_variant(variant, signal_date),
+            variants, claim=ResourceClaim(memory_mb=512, db_connections=1),
+        )
+    else:
+        with ThreadPoolExecutor(max_workers=min(3, len(variants))) as executor:
+            results = list(executor.map(lambda variant: _refresh_long_stock_pool_variant(variant, signal_date), variants))
     ordered = sorted(results, key=lambda item: variants.index(item["variant"]))
     if signal_date:
         stale = [item for item in ordered if str(item.get("signal_date") or "") != str(signal_date)]
@@ -9004,6 +9028,91 @@ def _run_latest_refresh_job(
     resume_status: dict[str, Any] | None = None,
     run_id: str | None = None,
 ) -> None:
+    refresh_run_id = run_id or _new_refresh_run_id(_normalize_refresh_scope(scope))
+    with _REFRESH_LOCK:
+        if _REFRESH_STATUS.get("run_id") == refresh_run_id and _REFRESH_STATUS.get("status") in {"success", "failed"}:
+            return
+    try:
+        with _publication_store().begin(f"{refresh_run_id}-{uuid.uuid4().hex[:8]}") as staged:
+            _run_latest_refresh_job_in_generation(scope, resume_status, refresh_run_id)
+            if _REFRESH_STATUS.get("status") == "success" and _publication_store().view().generation != staged.generation:
+                raise RuntimeError("Refresh finished without a committed publication")
+    except Exception as exc:
+        _set_refresh_progress(status="failed", error=str(exc), message="Publication failed")
+        return
+    if _REFRESH_STATUS.get("status") == "success":
+        results = _REFRESH_STATUS.get("result") or {}
+        try:
+            _run_post_snapshot_cache_cleanup(results)
+            from quant.routine.cache_retention import cleanup_publication_generations
+
+            results["publication_retention"] = cleanup_publication_generations(
+                _publication_store().root, dry_run=False,
+            )
+        except Exception as exc:
+            results["retention_warning"] = str(exc)
+        with _REFRESH_LOCK:
+            _REFRESH_STATUS["result"] = results
+            _persist_refresh_status_unlocked()
+
+
+def _publication_store() -> PublicationStore:
+    from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+
+    missing = [node_id for node_id in DEFAULT_DAILY_DEPENDENCY_REGISTRY.scope_roots["all"]
+               if not DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[node_id].publication_outputs]
+    if missing:
+        raise RuntimeError(f"Production workspaces require publication outputs: {missing}")
+    outputs = {
+        path for node in DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes.values()
+        for path in node.publication_outputs
+    }
+    outputs.update(("web/data/dashboard.json", "data/contracts/daily_dependencies", "data/cache/routine_source_manifests"))
+    return PublicationStore(PROJECT_ROOT, tuple(sorted(outputs)))
+
+
+def _with_refresh_scheduler(function):
+    @wraps(function)
+    def run(*args, **kwargs):
+        from quant.routine.resource_scheduler import (
+            ResourceBudget, ResourceScheduler, current_resource_scheduler,
+        )
+        scheduler = current_resource_scheduler() or ResourceScheduler(replace(
+            ResourceBudget.from_environment(), cpu_slots=configured_worker_budget(),
+        ))
+        with scheduler.activate():
+            return function(*args, **kwargs)
+    return run
+
+
+@_with_refresh_scheduler
+def _run_latest_refresh_job_in_generation(
+    scope: str = "all",
+    resume_status: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> None:
+    from quant.routine.checkpoint_store import CheckpointStore
+    from quant.routine.operation_contracts import NodeChanges, ResourceClaim
+    from contextlib import ExitStack
+    from quant.routine.production_dag import (
+        production_dag_mode, production_stage_inputs, sealed_core_market_inputs,
+        snapshots_from_results, save_core_source_manifest,
+    )
+    from quant.routine.resource_scheduler import current_resource_scheduler, run_with_resources
+
+    scheduler = current_resource_scheduler()
+    dag_mode = production_dag_mode(_normalize_refresh_scope(scope))
+    from quant.routine.composed_operations import validate_composed_closure
+
+    if _normalize_refresh_scope(scope) in {"all", "short"}:
+        validate_composed_closure(_normalize_refresh_scope(scope))
+    strict_core = dag_mode == "core" and _normalize_refresh_scope(scope) in {"all", "short"}
+    core_inputs = ExitStack()
+    checkpoint_store = CheckpointStore(
+        PROJECT_ROOT, PROJECT_ROOT / "data/cache/routine_operations",
+    ) if strict_core else None
+    stage_snapshots = {}
+
     from quant.routine.pipeline import (
         generate_dashboard,
         generate_daily_plan,
@@ -9024,10 +9133,26 @@ def _run_latest_refresh_job(
     resume_tail = _tail_resume_ready(resume_status, refresh_scope)
     resume_inputs = not resume_tail and _input_resume_ready(resume_status, refresh_scope)
     reuse_completed = _completed_checkpoint_ready(resume_status, refresh_scope)
+    if strict_core:
+        resume_tail = resume_inputs = reuse_completed = False
     early_workspace_executor: ThreadPoolExecutor | None = None
     early_workspace_futures: dict[Any, tuple[str, str]] = {}
     early_workspace_results_lock = threading.Lock()
     workspace_failure_step: str | None = None
+    executed_callbacks: set[str] = set()
+    expected_signal_date = ""
+
+    def composed(operation_id, callback, *args, **kwargs):
+        from quant.routine.composed_operations import execute_composed_operation
+
+        payload = execute_composed_operation(
+            operation_id, callback, *args,
+            target_trade_date=expected_signal_date or datetime.now().date().isoformat(),
+            scope=refresh_scope, project_root=PROJECT_ROOT, **kwargs,
+        )
+        with early_workspace_results_lock:
+            executed_callbacks.add(operation_id)
+        return payload
 
     def shutdown_early_workspaces(*, cancel_pending: bool) -> None:
         nonlocal early_workspace_executor
@@ -9050,6 +9175,49 @@ def _run_latest_refresh_job(
         phase: str,
         strict_freshness: bool,
     ) -> dict[str, Any]:
+        if phase == "postflight":
+            from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+            from quant.routine.default_operations import COMPOSED_OPERATION_GROUPS
+
+            active_operations = {
+                DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[node].operation_id
+                for node in DEFAULT_DAILY_DEPENDENCY_REGISTRY.required_node_ids(refresh_scope)
+            }
+            core_operations = {
+                operation for key in ("feature_stage_dag", "output_dag")
+                for operation in (results.get(key) or {}).get("operations", ())
+            }
+            callback_members = {
+                member for operation in executed_callbacks
+                for member in COMPOSED_OPERATION_GROUPS.get(operation, (operation,))
+            } & active_operations
+            missing = active_operations - core_operations - callback_members
+            results["operation_execution_audit"] = {
+                "active_operation_count": len(active_operations),
+                "core_operations": sorted(core_operations),
+                "callback_operations": sorted(executed_callbacks),
+                "callback_member_operations": sorted(callback_members),
+                "unmigrated_operations": sorted(missing),
+                "executable_closure_complete": not missing,
+                "callback_identity_audited": False,
+                "full_production_closure": False,
+            }
+            if strict_core and missing:
+                raise RuntimeError(
+                    "Strict core execution closure incomplete: " + ", ".join(sorted(missing))
+                )
+        if strict_freshness and phase == "postflight":
+            from quant.routine.cache_retention import prune_staged_publication_snapshots
+
+            staged_view = current_publication()
+            if staged_view is not None and staged_view.writable:
+                retention = prune_staged_publication_snapshots(
+                    staged_view.directory / staged_view.generation / "tree",
+                    pd.Timestamp(target_date).date(),
+                )
+                results["staged_snapshot_retention"] = retention
+                if retention["status"] != "success":
+                    raise RuntimeError("Staged snapshot retention failed")
         result = publish_daily_dependency_contract(
             target_date,
             refresh_scope,
@@ -9079,6 +9247,13 @@ def _run_latest_refresh_job(
             raise RuntimeError(
                 "每日依赖合同新鲜度门禁失败: " + (details or "unknown failure")
             )
+        view = current_publication()
+        if strict_freshness and phase == "postflight" and view is not None:
+            _publication_store().commit(view, result)
+            results["publication"] = {
+                "status": "success", "generation": view.generation,
+                "target_trade_date": target_date,
+            }
         return result
 
     resume_contract_preview: dict[str, Any] = {}
@@ -9282,7 +9457,7 @@ def _run_latest_refresh_job(
 
         if not resume_inputs:
             _set_refresh_progress(step_key="refresh_data", message=f"{refresh_label}：正在共享拉取 Tushare 最新日线数据", percent=10)
-            results["refresh_data"] = refresh_data(
+            results["refresh_data"] = composed("refresh_data", refresh_data,
                 dry_run=False,
                 progress_callback=lambda percent, message: _set_refresh_progress(
                     step_key="refresh_data",
@@ -9294,7 +9469,7 @@ def _run_latest_refresh_job(
                 raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
             if source_options["include_daily_basic"]:
-                results["refresh_daily_basic"] = refresh_daily_basic_data(
+                results["refresh_daily_basic"] = composed("refresh_daily_basic", refresh_daily_basic_data,
                     dry_run=False,
                     progress_callback=lambda percent, message: _set_refresh_progress(
                         step_key="refresh_data",
@@ -9306,7 +9481,7 @@ def _run_latest_refresh_job(
                 if results["refresh_daily_basic"].get("status") == "failed":
                     raise RuntimeError("Tushare daily_basic 刷新失败")
 
-            results["refresh_reference_inputs"] = refresh_reference_inputs(
+            results["refresh_reference_inputs"] = composed("refresh_reference_inputs", refresh_reference_inputs,
                 dry_run=False,
                 include_financials=source_options["include_financials"],
                 include_analyst=source_options["include_analyst"],
@@ -9408,16 +9583,6 @@ def _run_latest_refresh_job(
             planned_refresh_nodes.update(inherited_refresh_nodes)
         dependency_preflight["retry_identity_stable"] = retry_identity_stable
         dependency_preflight["refresh_node_ids"] = sorted(planned_refresh_nodes)
-        dag_mode = os.getenv("ROUTINE_DAG_EXECUTOR", "shadow").strip().lower()
-        if dag_mode not in {"legacy", "shadow", "enabled"}:
-            raise RuntimeError(
-                "ROUTINE_DAG_EXECUTOR must be legacy, shadow, or enabled"
-            )
-        if dag_mode == "enabled":
-            raise RuntimeError(
-                "DAG cutover is not enabled until every production operation "
-                "has a non-shadow adapter"
-            )
         if dag_mode == "shadow":
             from quant.routine.production_dag import build_daily_dag_plan
 
@@ -9430,6 +9595,11 @@ def _run_latest_refresh_job(
                 planned_refresh_nodes
             )
             dependency_preflight["dag_executor"] = dag_plan
+        elif dag_mode == "core":
+            dependency_preflight["dag_executor"] = {
+                "status": "partial", "mode": "core", "audited_operation_count": 5,
+                "full_production_closure": False,
+            }
         else:
             dependency_preflight["dag_executor"] = {
                 "status": "skipped",
@@ -9498,6 +9668,16 @@ def _run_latest_refresh_job(
                 _persist_refresh_status_unlocked()
             return
 
+        if strict_core:
+            sealed_input = core_inputs.enter_context(sealed_core_market_inputs(PROJECT_ROOT))
+            results["market_snapshot"] = {
+                "status": "success", "fingerprint": sealed_input.fingerprint,
+                "datasets": list(sealed_input.payload.get("sealed_datasets", ())),
+                "acquired_after_source_refresh": True,
+                "export_seconds": sealed_input.payload.get("export_seconds"),
+                "export_bytes": sealed_input.payload.get("export_bytes"),
+            }
+
         # These workspaces only need the refreshed shared inputs. Start their
         # network-heavy work before the CPU-bound short-selector branch and
         # join the same futures at the normal downstream barrier.
@@ -9539,7 +9719,14 @@ def _run_latest_refresh_job(
                 operation,
                 success_message: str,
             ) -> Any:
-                payload = operation()
+                payload = run_with_resources(
+                    ResourceClaim(io_slots=1, memory_mb=512, db_connections=1),
+                    composed, {
+                        "convertible_bond_plan": "build_convertible_bond_grid_workspace",
+                        "convertible_bond_allotment": "build_convertible_bond_allotment_workspace",
+                        "byd_daily_plan": "build_byd_daily_workspace",
+                    }[step_key], operation,
+                )
                 if step_key == "convertible_bond_plan":
                     actual_date = str(payload.get("trade_date") or "").replace("-", "")
                     if actual_date != early_trade_date:
@@ -9908,13 +10095,15 @@ def _run_latest_refresh_job(
                 checkpoint_reused=True,
             )
 
+        # In core mode only verified central checkpoints may skip these stages.
+        if strict_core:
+            signal_ready = feature_ready = False
         feature_stage_nodes: list[str] = []
         if not signal_ready:
             feature_stage_nodes.append("feature.strategy_signals")
         if not feature_ready:
             feature_stage_nodes.append("feature.project_daily")
         if feature_stage_nodes:
-            from quant.routine.dag_executor import ResourceBudget
             from quant.routine.production_dag import execute_daily_operations
 
             feature_stage_steps = {
@@ -9953,14 +10142,15 @@ def _run_latest_refresh_job(
                 refresh_scope,
                 feature_stage_nodes,
                 project_root=PROJECT_ROOT,
-                budget=ResourceBudget(
-                    cpu_slots=configured_worker_budget(),
-                    io_slots=4,
-                    memory_mb=max(
-                        4096,
-                        int(os.getenv("ROUTINE_MEMORY_BUDGET_MB", "4096")),
-                    ),
-                ),
+                scheduler=scheduler,
+                checkpoint_store=checkpoint_store,
+                require_identity=strict_core,
+                input_snapshots=production_stage_inputs(
+                    PROJECT_ROOT, feature_stage_nodes,
+                    changes={"data.daily_basic": NodeChanges(
+                        partitions=tuple(daily_basic_repair_dates), full_rebuild=True,
+                    )},
+                ) if strict_core else None,
                 dirty_partitions=daily_basic_repair_dates,
                 progress_callback=feature_stage_progress,
             )
@@ -9973,6 +10163,8 @@ def _run_latest_refresh_job(
                 raise RuntimeError(
                     "信号/共享特征 DAG 失败: " + " | ".join(errors[:5])
                 )
+            if strict_core:
+                stage_snapshots.update(snapshots_from_results(feature_stage["operations"].values()))
             results["feature_stage_dag"] = {
                 "status": "success",
                 "resource_usage": feature_stage["resource_usage"],
@@ -10067,7 +10259,7 @@ def _run_latest_refresh_job(
         from quant.application.daily_dependencies import (
             DEFAULT_DAILY_DEPENDENCY_REGISTRY,
         )
-        from quant.routine.dag_executor import DailyDagExecutor, ResourceBudget
+        from quant.routine.dag_executor import DailyDagExecutor
         from quant.routine.default_operations import (
             DEFAULT_DAILY_OPERATION_REGISTRY,
         )
@@ -10120,19 +10312,17 @@ def _run_latest_refresh_job(
             DEFAULT_DAILY_DEPENDENCY_REGISTRY,
             DEFAULT_DAILY_OPERATION_REGISTRY,
             project_root=PROJECT_ROOT,
-            budget=ResourceBudget(
-                cpu_slots=worker_budget,
-                io_slots=4,
-                memory_mb=max(
-                    4096,
-                    int(os.getenv("ROUTINE_MEMORY_BUDGET_MB", "4096")),
-                ),
-            ),
+            scheduler=scheduler,
+            checkpoint_store=checkpoint_store,
+            require_identity=strict_core,
             progress_callback=output_dag_progress,
         ).execute(
             target_trade_date=expected_signal_date,
             scope=refresh_scope,
             node_ids=selected_output_nodes,
+            input_snapshots=production_stage_inputs(
+                PROJECT_ROOT, selected_output_nodes, completed_snapshots=stage_snapshots,
+            ) if strict_core else None,
         )
         if output_dag["status"] != "success":
             errors = [
@@ -10218,7 +10408,7 @@ def _run_latest_refresh_job(
                     complete_previous=False,
                 )
 
-        plan_payload = generate_daily_plan()
+        plan_payload = composed("generate_daily_plan", generate_daily_plan)
         results["generate_daily_plan"] = {
             **plan_payload,
             "status": "success",
@@ -10241,7 +10431,8 @@ def _run_latest_refresh_job(
             percent=79,
             complete_previous=False,
         )
-        selector_long_snapshot = _ensure_selector_long_factor_snapshot(
+        selector_long_snapshot = composed(
+            "refresh_long_factor_snapshot", _ensure_selector_long_factor_snapshot,
             expected_signal_date,
             force_refresh="feature.long_snapshot" in planned_refresh_nodes,
         )
@@ -10262,7 +10453,7 @@ def _run_latest_refresh_job(
             percent=85,
             complete_previous=False,
         )
-        full_payload = get_stock_selector_payload(
+        full_payload = composed("build_selector_payload", get_stock_selector_payload,
             signal_date=expected_signal_date,
             include_extended=True,
             use_cache=False,
@@ -10300,8 +10491,13 @@ def _run_latest_refresh_job(
         )
 
         if refresh_scope == "short":
+            if strict_core:
+                save_core_source_manifest(PROJECT_ROOT, sealed_input)
             _set_refresh_progress(step_key="snapshot", message="正在写入短线策略股票池快照", percent=98)
-            written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+            written_pools = composed(
+                "write_strategy_pool_snapshots", _write_strategy_pool_snapshots,
+                full_payload, include_extended=True,
+            )
             results["snapshot"] = {
                 "status": "success",
                 "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
@@ -10355,15 +10551,29 @@ def _run_latest_refresh_job(
             thread_name_prefix="quant-late-workspace",
         ) as executor:
             futures = {
-                executor.submit(get_chan_model_strategy_plan, 20, True, signal_date): (
+                executor.submit(
+                    run_with_resources, ResourceClaim(io_slots=1, memory_mb=512, db_connections=1),
+                    composed, "generate_chan_model_strategy", get_chan_model_strategy_plan, 20, True, signal_date,
+                ): (
                     "chan_model_strategy",
                     "缠论模型策略候选生成失败",
                 ),
-                executor.submit(_refresh_long_workspace, long_variants, signal_date): (
+                executor.submit(
+                    run_with_resources, ResourceClaim(
+                        cpu_slots=min(3, scheduler.budget.cpu_slots), io_slots=1, memory_mb=2048,
+                        db_connections=1, requested_workers=3, max_workers=3,
+                    ), composed, "refresh_long_stock_pool_variants", _refresh_long_workspace, long_variants, signal_date,
+                ): (
                     "long_stock_pool",
                     "长线策略与带血筹计划生成失败",
                 ),
-                executor.submit(_run_similar_pattern_analysis_isolated): (
+                executor.submit(
+                    run_with_resources, ResourceClaim(
+                        cpu_slots=min(4, scheduler.budget.cpu_slots), io_slots=1, memory_mb=1024,
+                        db_connections=min(4, scheduler.budget.db_connections), requested_workers=4, max_workers=4,
+                    ),
+                    composed, "refresh_similar_pattern_analysis", _run_similar_pattern_analysis_isolated,
+                ): (
                     "similar_patterns",
                     "相似走势决策台刷新失败",
                 ),
@@ -10446,8 +10656,13 @@ def _run_latest_refresh_job(
 
         shutdown_early_workspaces(cancel_pending=False)
 
+        if strict_core:
+            save_core_source_manifest(PROJECT_ROOT, sealed_input)
         _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
-        written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+        written_pools = composed(
+            "write_strategy_pool_snapshots", _write_strategy_pool_snapshots,
+            full_payload, include_extended=True,
+        )
         results["snapshot"] = {
             "status": "success",
             "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
@@ -10486,6 +10701,7 @@ def _run_latest_refresh_job(
         )
     finally:
         shutdown_early_workspaces(cancel_pending=True)
+        core_inputs.close()
         if getattr(_REFRESH_CONTEXT, "run_id", None) == refresh_run_id:
             delattr(_REFRESH_CONTEXT, "run_id")
 
@@ -10609,6 +10825,8 @@ def get_stock_selector_payload(
         cached = _read_selector_snapshot(signal_date, strategies, effective_include_extended)
         if cached is not None:
             return cached if full_snapshot else _display_selector_payload(cached, side=side)
+
+    assert_publication_writable()
 
     plan = get_b1_plan(signal_date=signal_date)
     effective_signal_date = signal_date or plan.get("signal_date")

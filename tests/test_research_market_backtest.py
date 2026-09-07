@@ -106,8 +106,11 @@ def test_calibrated_formal_combo_masks_use_unified_probability_names() -> None:
     assert combo_mask(candidates, COMBOS[1]).tolist() == [False, True]
 
 
-def test_add_future_prices_reads_canonical_market_partitions(tmp_path: Path) -> None:
+def test_add_future_prices_reads_canonical_market_partitions(monkeypatch, tmp_path: Path) -> None:
     raw_root = tmp_path / "raw"
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(raw_root))
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
     store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=raw_root))
     dates = ["20260715", "20260716", "20260717", "20260720"]
     store.write_market_batch(
@@ -135,7 +138,8 @@ def test_add_future_prices_reads_canonical_market_partitions(tmp_path: Path) -> 
     assert result.iloc[0]["close_t2"] == 10.2
 
 
-def test_chan_live_features_read_canonical_market_partitions(tmp_path: Path) -> None:
+def test_chan_live_features_read_canonical_market_partitions(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
     raw_root = tmp_path / "raw"
     daily_dir = raw_root / "daily"
     dates = pd.bdate_range("2026-01-01", periods=150)
@@ -221,7 +225,8 @@ def test_chan_live_prediction_rejects_an_entirely_missing_required_feature() -> 
         )
 
 
-def test_chan_live_turnover_history_comes_from_same_day_daily_basic(tmp_path: Path) -> None:
+def test_chan_live_turnover_history_comes_from_same_day_daily_basic(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
     raw_root = tmp_path / "raw"
     daily_dir = raw_root / "daily"
     daily_basic_dir = raw_root / "daily_basic"

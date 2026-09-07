@@ -40,6 +40,7 @@ def is_tushare_data_missing(error: str) -> bool:
         "daily market coverage below",
         "daily market response missing required columns",
         "daily did not reach expected trade date",
+        "index_daily missing requested trade date",
         "stock_basic returned no symbols",
         "stock_basic returned no rows",
     )

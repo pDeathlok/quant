@@ -164,3 +164,68 @@ def test_project_feature_cache_requires_explained_candidate_coverage(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(RuntimeError, match="incomplete daily_basic values"):
         production._load_project_feature_cache(target, signals, config)
+
+
+def test_score_manifest_propagates_policy_exclusions(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    target = pd.Timestamp("2026-09-01")
+    feature_output = tmp_path / "features.parquet"
+    feature_manifest = tmp_path / "feature_manifest.json"
+    score_output = tmp_path / "scores.parquet"
+    score_manifest = tmp_path / "score_manifest.json"
+    artifact = tmp_path / "ranking.joblib"
+    artifact.write_bytes(b"ranking")
+    paths = replace(
+        DEFAULT_LEFT_SIDE_RANKING_CONFIG.paths,
+        artifact=artifact,
+        feature_output=feature_output,
+        feature_manifest=feature_manifest,
+        score_output=score_output,
+        score_manifest=score_manifest,
+    )
+    config = replace(DEFAULT_LEFT_SIDE_RANKING_CONFIG, paths=paths)
+    row = {column: 1.0 for column in production.LEFT_SIDE_SCORING_INPUT_COLUMNS}
+    row.update(
+        ts_code="000001.SZ",
+        symbol="000001.SZ",
+        trade_date="20260901",
+        date=target,
+        **{signal: signal == "B1" for signal in LEFT_SIDE_SIGNALS},
+    )
+    pd.DataFrame([row]).to_parquet(feature_output, index=False)
+    feature_manifest.write_text(
+        json.dumps(
+            {
+                "target_date": "2026-09-01",
+                "output_sha256": production._sha256(feature_output),
+                "policy_excluded_candidate_symbols": ["300093.SZ"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Model:
+        def predict_proba(self, frame):
+            return np.asarray([[0.2, 0.8]] * len(frame))
+
+    monkeypatch.setattr(
+        production,
+        "validate_left_side_production_artifact",
+        lambda _config: {
+            "model": Model(),
+            "score_normalization": {"schema_version": "test"},
+            "strategy_thresholds": {},
+        },
+    )
+    monkeypatch.setattr(
+        production,
+        "_score_input_fingerprint",
+        lambda *_args, **_kwargs: "fingerprint",
+    )
+
+    result = production.score_left_side_production("2026-09-01", config=config)
+
+    assert result["policy_excluded_candidate_count"] == 1
+    assert result["policy_excluded_candidate_symbols"] == ["300093.SZ"]

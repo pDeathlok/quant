@@ -255,6 +255,8 @@ def test_reference_refresh_reports_partial_when_index_is_stale(tmp_path: Path) -
     assert result["status"] == "partial"
     assert result["steps"]["index_000300"]["status"] == "partial"
     assert result["steps"]["index_000300"]["latest_trade_date"] == "20260720"
+    assert result["steps"]["index_000300"]["data_missing"] is True
+    assert "missing requested trade date 20260721" in result["steps"]["index_000300"]["error"]
 
 
 def test_stock_basic_cache_obeys_ttl_and_force_refresh(tmp_path: Path) -> None:

@@ -1,0 +1,71 @@
+name: Source Quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: src
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+  MARKET_DATA_BACKEND: file
+  MARKET_DATA_SQL_URL: ""
+  MARKET_DATA_ROOT: ${{ runner.temp }}/quant-ci/raw
+  DAILY_FACTOR_ROOT: ${{ runner.temp }}/quant-ci/factors
+  TUSHARE_TOKEN: ""
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.9"
+            constraints: requirements/constraints-ci-py39.txt
+          - python: "3.13"
+            constraints: requirements/constraints-ci-py313.txt
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements/ci.txt
+            ${{ matrix.constraints }}
+      - name: Install observed regression profile
+        run: >-
+          python -m pip --isolated install --disable-pip-version-check
+          --index-url https://pypi.org/simple
+          -r requirements/ci.txt -c ${{ matrix.constraints }}
+      - name: Check resolved dependencies
+        run: python -m pip check
+      - name: Record actual runtime in the job log
+        run: python scripts/ci/runtime_snapshot.py
+      - name: Check syntax and undefined names
+        run: python -m ruff check --select E9,F63,F7,F82 src/quant scripts/ci
+      - name: Compile source on the selected Python
+        run: python -m compileall -q src/quant scripts/ci
+      - name: Run local-only source regressions
+        run: >-
+          python -m pytest -q
+          tests/test_market_data_store.py tests/test_market_data_sql_pool.py
+          tests/test_daily_factor_source.py tests/test_daily_factor_layer.py
+          tests/test_market_snapshot.py tests/test_signal_factor_persistence.py
+          tests/test_f5_source_journal.py
+          tests/test_dataset_revision_store.py tests/test_quant.py::TestMarketDataStore
+          tests/test_ci_runtime.py tests/test_architecture_boundaries.py
+      - name: Check BYD source fallback with its supported strategy runtime
+        if: matrix.python == '3.13'
+        run: python -m pytest -q tests/test_byd_workspace.py

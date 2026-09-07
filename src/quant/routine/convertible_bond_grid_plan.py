@@ -458,6 +458,10 @@ def _underlying_stock_daily(
             columns=["ts_code", "trade_date", "close"],
         )
     except Exception:
+        from quant.data.market_snapshot import current_market_snapshot
+
+        if current_market_snapshot() is not None:
+            raise
         return pd.DataFrame()
 
 

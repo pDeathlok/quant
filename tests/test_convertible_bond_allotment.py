@@ -13,9 +13,17 @@ import pytest
 def isolate_convertible_bond_watchlist(monkeypatch, tmp_path):
     import quant.routine.convertible_bond_allotment as module
 
+    # These fixtures contain local parquet data, independent of production SQL.
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(tmp_path))
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
     monkeypatch.setattr(module, "CB_WATCHLIST_PATH", tmp_path / "missing_watchlist.csv")
     monkeypatch.setattr(module, "CB_PIPELINE_ISSUE_SIZE_PATH", tmp_path / "missing_issue_size.parquet")
     monkeypatch.setattr(module, "DAILY_BASIC_DIR", tmp_path / "missing_daily_basic")
+    monkeypatch.setattr(module, "TushareDataFetcher", lambda **kwargs: SimpleNamespace(
+        get_cb_basic=lambda **params: pd.DataFrame(),
+        get_cb_issue=lambda **params: pd.DataFrame(),
+    ))
 
 
 def test_cninfo_pipeline_poll_retries_transient_non_json_page(monkeypatch) -> None:
@@ -667,6 +675,48 @@ def test_convertible_bond_allotment_refreshes_issue_size_for_legacy_inquiry_stag
     assert refreshed[0]["issue_size_yuan"] == 600_000_000
     assert refreshed[0]["issue_size_source"] == "cninfo_pdf"
     assert meta["refreshed"] == 1
+
+
+def test_convertible_bond_allotment_bounds_issue_size_refresh_batch(monkeypatch, tmp_path):
+    import quant.routine.convertible_bond_allotment as module
+
+    issue_size_path = tmp_path / "issue_size.parquet"
+    calls = []
+    clock_values = iter([0.0, 0.0, 31.0])
+
+    def fake_refresh(record, today=None):
+        calls.append(record["stock_code"])
+        return None
+
+    monkeypatch.setattr(module, "CB_PIPELINE_ISSUE_SIZE_PATH", issue_size_path)
+    monkeypatch.setattr(module, "_refresh_issue_size_for_record", fake_refresh)
+    records = [
+        {
+            "stock_code": "300001",
+            "stock_name": "测试一",
+            "stage": "registered",
+            "issue_size": None,
+        },
+        {
+            "stock_code": "300002",
+            "stock_name": "测试二",
+            "stage": "registered",
+            "issue_size": None,
+        },
+    ]
+
+    _, meta = module._attach_pipeline_issue_sizes(
+        records,
+        refresh=True,
+        today=date(2026, 6, 18),
+        refresh_budget_seconds=30.0,
+        clock=lambda: next(clock_values),
+    )
+
+    assert calls == ["300001"]
+    assert meta["refresh_status"] == "budget_exhausted"
+    assert meta["attempted"] == 1
+    assert meta["pending"] == 1
 
 
 def test_convertible_bond_allotment_extracts_issue_dates_from_issuing_text():

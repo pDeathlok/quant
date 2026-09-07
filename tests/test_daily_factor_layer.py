@@ -103,7 +103,9 @@ def test_prepare_daily_reuses_already_normalized_frame(monkeypatch) -> None:
     pd.testing.assert_frame_equal(prepared, daily)
 
 
-def test_incremental_refresh_replaces_same_dates_without_duplicates(tmp_path) -> None:
+def test_incremental_refresh_replaces_same_dates_without_duplicates(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "file")
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
     daily_path = tmp_path / "000001.SZ.parquet"
     factor_root = tmp_path / "factor-cache"
     daily = _daily()
@@ -369,3 +371,36 @@ def test_signal_factor_state_rebuilds_after_structural_corruption(
 
     assert actual.attrs["signal_factor_cache_mode"] == "invalidated_rebuild"
     _assert_signal_factors_equal(actual, expected)
+
+
+def test_legacy_signal_state_rebuilds_cached_rows_and_incremental_overlay(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    daily = _daily()
+    factor_root = tmp_path / "factors"
+    monkeypatch.setenv("DAILY_FACTOR_ROOT", str(factor_root))
+    layer.attach_daily_signal_factors(daily.iloc[:-1], "000001.SZ")
+    layer.attach_daily_signal_factors(daily, "000001.SZ")
+    symbol_dir = layer.signal_factor_symbol_dir(factor_root, "000001.SZ")
+    delta_path = symbol_dir / f"{daily['date'].iloc[-1].year}.delta.parquet"
+    delta = pd.read_parquet(delta_path)
+    delta["kdj_d_j"] = -999.0
+    delta.to_parquet(delta_path, index=False)
+    state_path = symbol_dir / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["schema_version"] = 1
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    actual = layer.attach_daily_signal_factors(daily, "000001.SZ")
+    expected = layer.attach_daily_signal_factors(
+        daily, "000001.SZ", persist_missing=False,
+    )
+
+    assert actual.attrs["signal_factor_cache_mode"] == "invalidated_rebuild"
+    assert not delta_path.exists()
+    assert json.loads(state_path.read_text(encoding="utf-8"))["schema_version"] > 1
+    _assert_signal_factors_equal(actual, expected)
+    reused = layer.attach_daily_signal_factors(daily, "000001.SZ")
+    assert reused.attrs["signal_factor_cache_mode"] == "cache_hit"
+    _assert_signal_factors_equal(reused, expected)

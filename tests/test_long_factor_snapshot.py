@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from quant.data.atomic_io import atomic_write_parquet
+from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
 from quant.features.factor_registry import LONG_PRODUCTION_FACTOR_COLUMNS
 from quant.features.long_factor_snapshot import publish_long_factor_snapshot, read_long_factor_snapshot
@@ -91,6 +91,68 @@ def test_historical_read_does_not_use_future_latest(monkeypatch, tmp_path):
 
     assert rows["000001.SZ"]["roe"] == 2.0
     assert rows["000001.SZ"]["_selector_layer_coverage"]["long_snapshot"]["date"] == "2026-08-24"
+
+
+def test_selector_uses_shared_project_factor_owner(monkeypatch, tmp_path):
+    project_path = (
+        tmp_path / "data/features/b1/active_candidate_project_features.parquet"
+    )
+    right_path = (
+        tmp_path / "data/features/right_side_unified/20260826_features.parquet"
+    )
+    project_path.parent.mkdir(parents=True)
+    right_path.parent.mkdir(parents=True)
+    atomic_write_parquet(
+        pd.DataFrame(
+            [{"symbol": "000001.SZ", "date": pd.Timestamp("2026-08-26"), "obv": 10.0}]
+        ),
+        project_path,
+        index=False,
+    )
+    # Side products may contain their own project-factor materialization.  It
+    # is deliberately ignored; only the rule factor belongs to this source.
+    atomic_write_parquet(
+        pd.DataFrame(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "date": pd.Timestamp("2026-08-26"),
+                    "obv": 20.0,
+                    "rs_close_pos": 0.7,
+                }
+            ]
+        ),
+        right_path,
+        index=False,
+    )
+    atomic_write_json(
+        {
+            "status": "success",
+            "target_date": "2026-08-26",
+            "output_sha256": services._file_sha256(project_path),
+        },
+        project_path.with_name("active_candidate_project_features_manifest.json"),
+    )
+    atomic_write_json(
+        {
+            "status": "success",
+            "target_date": "2026-08-26",
+            "output_sha256": services._file_sha256(right_path),
+        },
+        right_path.with_name("feature_manifest.json"),
+    )
+    monkeypatch.setattr(services, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        services, "_selector_active_model_features", lambda: ("obv", "rs_close_pos")
+    )
+
+    rows = services._selector_production_snapshot_rows("2026-08-26")
+
+    assert rows["000001.SZ"]["obv"] == 10.0
+    assert rows["000001.SZ"]["rs_close_pos"] == 0.7
+    assert rows["000001.SZ"]["_selector_layer_coverage"]["project_daily"][
+        "path"
+    ] == "data/features/b1/active_candidate_project_features.parquet"
 
 
 def test_native_missing_values_cannot_mask_missing_layer(monkeypatch):

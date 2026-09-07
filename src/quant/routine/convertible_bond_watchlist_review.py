@@ -726,6 +726,13 @@ def apply_watchlist_review_plan(
     if data_synchronizer is not None:
         try:
             data_sync = data_synchronizer()
+            if (
+                not isinstance(data_sync, dict)
+                or data_sync.get("status") != "success"
+                or data_sync.get("watchlist_count") != len(symbols)
+                or data_sync.get("scored_count") != len(symbols)
+            ):
+                raise RuntimeError("评分同步未成功覆盖全部自选股")
         except Exception as exc:
             atomic_link_or_copy(backup_path, watchlist_path)
             raise RuntimeError(

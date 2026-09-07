@@ -315,7 +315,7 @@ def test_apply_updates_only_confirmed_actions_and_creates_backup(tmp_path: Path)
     def sync_watchlist_data():
         saved = json.loads(watchlist_path.read_text(encoding="utf-8"))
         sync_calls.append(saved["symbols"])
-        return {"status": "success", "scored_count": len(saved["symbols"])}
+        return {"status": "success", "watchlist_count": len(saved["symbols"]), "scored_count": len(saved["symbols"])}
 
     result = apply_watchlist_review_plan(
         plan_path=plan_path,
@@ -362,7 +362,7 @@ def test_apply_updates_only_confirmed_actions_and_creates_backup(tmp_path: Path)
         "300002.SZ",
         "600000.SH",
     ]
-    assert result["data_sync"] == {"status": "success", "scored_count": 4}
+    assert result["data_sync"] == {"status": "success", "watchlist_count": 4, "scored_count": 4}
     assert sync_calls == [saved["symbols"]]
 
     backup_path = Path(result["backup_path"])
@@ -392,4 +392,35 @@ def test_apply_rolls_back_watchlist_when_data_sync_fails(tmp_path: Path) -> None
         )
 
     assert json.loads(watchlist_path.read_text(encoding="utf-8")) == original
+    assert watchlist_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize(
+    "sync_result",
+    [
+        {"status": "failed", "watchlist_count": 4, "scored_count": 4},
+        {"status": "success", "watchlist_count": 4, "scored_count": 3},
+        {"status": "success", "watchlist_count": 3, "scored_count": 3},
+        {"status": "success", "scored_count": 4},
+        None,
+    ],
+    ids=["failed_status", "missing_score", "missing_stock", "missing_count", "no_result"],
+)
+def test_apply_rolls_back_incomplete_score_sync(tmp_path: Path, sync_result) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    plan_path = tmp_path / "plan.json"
+    _write_json(watchlist_path, _watchlist_payload())
+    original_bytes = watchlist_path.read_bytes()
+    plan = _build_plan(watchlist_path)
+    _write_json(plan_path, plan)
+
+    with pytest.raises(RuntimeError, match="已回滚自选池"):
+        apply_watchlist_review_plan(
+            plan_path=plan_path,
+            watchlist_path=watchlist_path,
+            confirm_plan_id=plan["plan_id"],
+            today=ASOF,
+            data_synchronizer=lambda: sync_result,
+        )
+
     assert watchlist_path.read_bytes() == original_bytes

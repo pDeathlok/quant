@@ -15,6 +15,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from quant.infrastructure.publication import (
+    assert_publication_writable,
+    current_publication,
+    publication_path,
+    publication_sql_key,
+)
+
 
 class _StoreConfig(Protocol):
     sql_url: str | None
@@ -72,7 +79,7 @@ class WorkspaceSnapshotRepository:
             char for char in workspace if char.isalnum() or char in {"_", "-"}
         )
         date_key = canonical_snapshot_date(snapshot_date)
-        return self.directory / safe_workspace / params_key / f"{date_key}.json"
+        return publication_path(self.directory) / safe_workspace / params_key / f"{date_key}.json"
 
     def read_filesystem(
         self,
@@ -120,6 +127,8 @@ class WorkspaceSnapshotRepository:
             )
             if requested and cached_date != "latest" and cached_date > requested:
                 continue
+            if requested and current_publication() and cached_date != requested:
+                continue
             payload["cache"] = {
                 "hit": True,
                 "backend": "filesystem",
@@ -143,7 +152,7 @@ class WorkspaceSnapshotRepository:
         filesystem_payload = self.read_filesystem(workspace, snapshot_date, params_key)
         if filesystem_payload is not None:
             return filesystem_payload
-        if not allow_sql:
+        if not allow_sql or (current_publication() and current_publication().generation):
             return None
         store = self._sql_store()
         if store is None:
@@ -203,6 +212,7 @@ class WorkspaceSnapshotRepository:
         *,
         write_sql: bool = True,
     ) -> None:
+        assert_publication_writable()
         canonical_date = canonical_snapshot_date(snapshot_date)
         params = params or {}
         params_key = workspace_params_key(params)
@@ -216,11 +226,12 @@ class WorkspaceSnapshotRepository:
             "snapshot_date": canonical_date,
         }
         payload_json = json.dumps(payload_to_store, ensure_ascii=False, default=str)
-        self.write_filesystem(workspace, params_key, canonical_date, payload_json)
         if not write_sql:
+            self.write_filesystem(workspace, params_key, canonical_date, payload_json)
             return
         store = self._sql_store()
         if store is None:
+            self.write_filesystem(workspace, params_key, canonical_date, payload_json)
             return
         try:
             from sqlalchemy import text
@@ -259,7 +270,7 @@ class WorkspaceSnapshotRepository:
                         """
                     ),
                     {
-                        "snapshot_key": snapshot_key,
+                        "snapshot_key": publication_sql_key(snapshot_key),
                         "workspace": workspace,
                         "snapshot_date": canonical_date,
                         "params_key": params_key,
@@ -276,8 +287,9 @@ class WorkspaceSnapshotRepository:
                         "payload_json": payload_json,
                     },
                 )
-        except Exception:
-            return
+        except Exception as exc:
+            raise RuntimeError("Workspace snapshot SQL persistence failed") from exc
+        self.write_filesystem(workspace, params_key, canonical_date, payload_json)
 
     def write_filesystem(
         self,
@@ -286,20 +298,21 @@ class WorkspaceSnapshotRepository:
         snapshot_date: str,
         payload_json: str,
     ) -> None:
+        assert_publication_writable()
         snapshot_path = self.file_path(workspace, params_key, snapshot_date)
         latest_path = self.file_path(workspace, params_key, "latest")
         try:
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = snapshot_path.with_suffix(".json.tmp")
-            temporary_path.write_text(payload_json, encoding="utf-8")
-            temporary_path.replace(snapshot_path)
-            latest_temporary_path = latest_path.with_suffix(".json.tmp")
-            latest_temporary_path.write_text(payload_json, encoding="utf-8")
-            latest_temporary_path.replace(latest_path)
-        except Exception:
-            return
+            from quant.data.atomic_io import atomic_write_text
+
+            atomic_write_text(payload_json, snapshot_path)
+            atomic_write_text(payload_json, latest_path)
+        except Exception as exc:
+            raise RuntimeError("Workspace snapshot file persistence failed") from exc
 
     def dates(self, workspace: str, params: dict[str, Any] | None = None) -> set[str]:
+        if current_publication() and current_publication().generation:
+            directory = self.file_path(workspace, workspace_params_key(params), "latest").parent
+            return {path.stem for path in directory.glob("*.json") if path.stem != "latest"}
         store = self._sql_store()
         if store is None:
             return set()

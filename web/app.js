@@ -67,7 +67,13 @@ const state = {
   similarAutoRefreshPending: false,
   similarPendingRemovals: new Set(),
   similarOrderSaving: false,
-  selectorRequestId: 0,
+  workspaceRequestToken: 0,
+  workspaceRequests: new Map(),
+  workspaceGeneration: "",
+  workspaceGenerationEpoch: 0,
+  workspaceGenerationPromise: null,
+  workspaceGenerationReloadPromise: null,
+  workspaceGenerationRecoveries: new Set(),
   directRefreshPromises: new Map(),
   loading: false,
   operationPlans: [],
@@ -79,7 +85,129 @@ const state = {
 };
 
 const API_BASE = "/api";
-const fetchJson = createApiClient(API_BASE);
+const fetchControlJson = createApiClient(API_BASE);
+const WORKSPACE_CALENDAR_PATH = "/selector/calendar?start=2020-01-01";
+const WORKSPACE_GENERATION_HEADER = "X-Quant-Generation";
+
+function isWorkspaceRead(path, options = {}) {
+  if ((options.method || "GET").toUpperCase() !== "GET") return false;
+  const pathname = path.split("?")[0];
+  return ["/selector/calendar", "/selector/stocks", "/similar-patterns/analysis", "/similar-patterns/watchlist", "/operation-plans"].includes(pathname)
+    || ["/long/", "/chan/", "/byd/", "/convertible-bonds/"].some((prefix) => pathname.startsWith(prefix));
+}
+
+async function fetchWorkspaceResponse(path, options = {}, generation = "") {
+  const { timeoutMs = 0, ...fetchOptions } = options;
+  const controller = timeoutMs > 0 && !fetchOptions.signal ? new AbortController() : null;
+  const timeoutId = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+  const headers = new Headers(fetchOptions.headers || {});
+  if (generation) headers.set(WORKSPACE_GENERATION_HEADER, generation);
+  else headers.delete(WORKSPACE_GENERATION_HEADER);
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      cache: "no-store", ...fetchOptions, headers,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    const payload = await response.json().catch((error) => {
+      if (response.ok) throw error;
+      return {};
+    });
+    if (!response.ok) {
+      const error = new Error(`${path} 加载失败: ${response.status}${payload?.detail ? ` · ${payload.detail}` : ""}`);
+      error.status = response.status;
+      throw error;
+    }
+    return { payload, generation: response.headers.get(WORKSPACE_GENERATION_HEADER) || "" };
+  } catch (error) {
+    if (controller?.signal.aborted) throw new Error(`${path} 加载超时，请稍后重试`);
+    throw error;
+  } finally {
+    if (timeoutId !== null) window.clearTimeout(timeoutId);
+  }
+}
+
+function initializeWorkspaceGeneration() {
+  if (state.workspaceGenerationPromise) return state.workspaceGenerationPromise;
+  const epoch = state.workspaceGenerationEpoch;
+  const request = fetchWorkspaceResponse(WORKSPACE_CALENDAR_PATH, { timeoutMs: 15000 })
+    .then((result) => {
+      if (epoch !== state.workspaceGenerationEpoch) throw new Error("Workspace generation changed");
+      if (!result.generation) throw new Error("工作区响应缺少 X-Quant-Generation，无法保证数据版本一致");
+      state.workspaceGeneration = result.generation;
+      return result.payload;
+    });
+  const sharedRequest = request.finally(() => {
+    if (state.workspaceGenerationPromise === sharedRequest) state.workspaceGenerationPromise = null;
+  });
+  state.workspaceGenerationPromise = sharedRequest;
+  return sharedRequest;
+}
+
+function resetWorkspaceGeneration() {
+  state.workspaceGenerationEpoch += 1;
+  state.workspaceGeneration = "";
+  state.workspaceGenerationPromise = null;
+  for (const scope of state.workspaceRequests.keys()) invalidateWorkspaceRequest(scope);
+  for (const [, payload] of Object.values(WORKSPACE_REQUEST_FIELDS)) {
+    if (payload) state[payload] = null;
+  }
+  state.calendar = null;
+  state.operationPlans = [];
+  state.operationPlansLoaded = false;
+}
+
+function reloadWorkspaceGeneration() {
+  if (state.workspaceGenerationReloadPromise) return state.workspaceGenerationReloadPromise;
+  resetWorkspaceGeneration();
+  const epoch = state.workspaceGenerationEpoch;
+  setRefreshMessage("数据版本已更新，正在重新加载工作区...");
+  const request = loadCalendar({ loadPage: false }).then(() => {
+    if (epoch === state.workspaceGenerationEpoch) loadActivePageData();
+  }).catch((error) => {
+    if (epoch === state.workspaceGenerationEpoch) showError(error);
+  });
+  const sharedRequest = request.finally(() => {
+    if (state.workspaceGenerationReloadPromise === sharedRequest) state.workspaceGenerationReloadPromise = null;
+  });
+  state.workspaceGenerationReloadPromise = sharedRequest;
+  return sharedRequest;
+}
+
+async function fetchJson(path, options = {}) {
+  if (!isWorkspaceRead(path, options)) return fetchControlJson(path, options);
+  const epoch = state.workspaceGenerationEpoch;
+  if (!state.workspaceGeneration) {
+    const calendar = await initializeWorkspaceGeneration();
+    if (epoch !== state.workspaceGenerationEpoch) throw new Error("Workspace generation changed");
+    if (path === WORKSPACE_CALENDAR_PATH) return calendar;
+  }
+  const generation = state.workspaceGeneration;
+  const page = state.activePage;
+  const selection = workspaceSelectionKey(page, generation);
+  const activeRequest = state.workspaceRequests.get(page);
+  try {
+    const result = await fetchWorkspaceResponse(path, options, generation);
+    if (epoch !== state.workspaceGenerationEpoch) throw new Error("Workspace generation changed");
+    if (result.generation !== generation) {
+      const error = new Error("工作区数据版本不一致，正在重新加载");
+      error.status = 409;
+      throw error;
+    }
+    return result.payload;
+  } catch (error) {
+    if (error.status === 409 && epoch === state.workspaceGenerationEpoch) {
+      if (selection !== workspaceSelectionKey(state.activePage, generation)
+          || (activeRequest && !isCurrentWorkspaceRequest(activeRequest))) throw error;
+      // Recovery resets the epoch, but must not replenish this selection's budget.
+      if (state.workspaceGenerationRecoveries.has(selection)) {
+        throw new Error("工作区数据版本持续冲突，已停止自动重载，请稍后重试");
+      }
+      state.workspaceGenerationRecoveries.add(selection);
+      await reloadWorkspaceGeneration();
+    }
+    throw error;
+  }
+}
 const WATCHLIST_ALERT_INDICATORS = {
   ret_20d: { label: "20日涨跌幅", unit: "%", source: "snapshot" },
   drawdown_60d: { label: "60日回撤", unit: "%", source: "snapshot" },
@@ -510,7 +638,7 @@ function loadActivePageData() {
   } else if (state.activePage === "plans" && !state.operationPlansLoading && !state.operationPlansLoaded) {
     loadOperationPlans().catch(showError);
   } else if (state.activePage === "short" && !state.payload && !state.loading) {
-    loadSelector({ latest: true }).catch(showError);
+    loadSelector().catch(showError);
   }
 }
 
@@ -836,6 +964,82 @@ function workspaceRequestOptions(options = {}) {
   return { timeoutMs: options.refresh ? 0 : 15000 };
 }
 
+const WORKSPACE_REQUEST_FIELDS = {
+  short: ["loading", "payload"],
+  long: ["longLoading", "longPayload", "longError"],
+  chan: ["chanLoading", "chanPayload"],
+  cb: ["cbLoading", "cbPayload"],
+  cbAllotment: ["cbAllotmentLoading", "cbAllotmentPayload", "cbAllotmentError"],
+  byd: ["bydLoading", "bydPayload"],
+  similar: ["similarLoading", "similarPayload", "similarError"],
+  plans: ["operationPlansLoading"],
+};
+
+function workspaceSelectionKey(scope, generationIdentity = state.workspaceGenerationEpoch) {
+  if (scope === "calendar") return JSON.stringify(["calendar", state.workspaceGenerationEpoch]);
+  const selection = [state.activePage, state.signalDate, generationIdentity];
+  if (scope === "long") selection.push(state.longVariant);
+  if (scope === "short") {
+    selection.push(state.shortSideFilter, [...state.selectedStrategies].sort());
+  }
+  if (scope === "byd") {
+    selection.push(...BYD_HOLDING_INPUT_IDS.map((id) => document.querySelector(`#${id}`)?.value || ""));
+  }
+  return JSON.stringify(selection);
+}
+
+function beginWorkspaceRequest(scope, queryKey) {
+  const request = Object.freeze({
+    scope,
+    queryKey,
+    selectionKey: workspaceSelectionKey(scope),
+    token: ++state.workspaceRequestToken,
+  });
+  state.workspaceRequests.set(scope, request);
+  return request;
+}
+
+function isCurrentWorkspaceRequest(request) {
+  return state.workspaceRequests.get(request.scope)?.token === request.token
+    && workspaceSelectionKey(request.scope) === request.selectionKey;
+}
+
+function invalidateWorkspaceRequest(scope, { preservePayload = false } = {}) {
+  state.workspaceRequests.delete(scope);
+  const [loading, payload, error] = WORKSPACE_REQUEST_FIELDS[scope] || [];
+  // A cancelled loader cannot clear its own spinner or partial payload later.
+  if (loading && state[loading]) {
+    state[loading] = false;
+    if (payload && !preservePayload) state[payload] = null;
+  }
+  if (error) state[error] = "";
+  if (scope === "similar") state.similarRefreshPromise = null;
+  if (scope === "similarScores") {
+    state.similarScoreRefreshPromise = null;
+    state.similarScoreRefreshPending = false;
+  }
+}
+
+function setWorkspaceSignalDate(date, sourceScope = "") {
+  if (state.signalDate === date) return;
+  state.signalDate = date;
+  for (const scope of state.workspaceRequests.keys()) {
+    if (scope !== sourceScope && scope !== "calendar") invalidateWorkspaceRequest(scope);
+  }
+  // Hidden date-sensitive pages must not reuse a previously selected day's cache.
+  for (const scope of ["short", "long", "chan", "cb"]) {
+    if (scope !== sourceScope) state[WORKSPACE_REQUEST_FIELDS[scope][1]] = null;
+  }
+}
+
+function setActiveWorkspacePage(page) {
+  if (state.activePage === page) return;
+  for (const scope of state.workspaceRequests.keys()) {
+    if (scope !== "calendar") invalidateWorkspaceRequest(scope);
+  }
+  state.activePage = page;
+}
+
 function runDirectWorkspaceRefresh(key, operation) {
   const active = state.directRefreshPromises.get(key);
   if (active) return active;
@@ -863,13 +1067,10 @@ function renderShortPage() {
 }
 
 async function loadSelector(options = {}) {
-  const requestId = ++state.selectorRequestId;
-  state.loading = true;
-  renderShortPage();
   if (options.latest && state.calendar?.latest_signal_date) {
-    state.signalDate = state.calendar.latest_signal_date;
+    setWorkspaceSignalDate(state.calendar.latest_signal_date);
   }
-  state.signalDate = applySelectableSignalDate(state.signalDate);
+  setWorkspaceSignalDate(applySelectableSignalDate(state.signalDate));
   const requestedSignalDate = state.signalDate;
   const query = new URLSearchParams();
   const params = selectedStrategyParam();
@@ -880,15 +1081,15 @@ async function loadSelector(options = {}) {
   if (options.refresh) query.set("refresh", "true");
   const suffix = query.toString();
   const path = suffix ? `/selector/stocks?${suffix}` : "/selector/stocks";
+  const request = beginWorkspaceRequest("short", path);
+  state.loading = true;
+  renderShortPage();
+  let resolvedSignalDate = requestedSignalDate;
   try {
     const payload = await fetchJson(path, workspaceRequestOptions(options));
-    if (requestId !== state.selectorRequestId) return;
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.payload = payload;
-    state.signalDate = requestedSignalDate || state.payload.signal_date || state.signalDate;
-    const dateInput = document.querySelector("#signalDateInput");
-    if (dateInput) {
-      dateInput.value = state.signalDate || state.payload.signal_date || "";
-    }
+    resolvedSignalDate = requestedSignalDate || payload.signal_date || "";
     if (!state.selectedSymbol && state.payload.stocks.length) {
       state.selectedSymbol = state.payload.stocks[0].symbol;
     }
@@ -896,12 +1097,13 @@ async function loadSelector(options = {}) {
       state.selectedSymbol = state.payload.stocks[0]?.symbol || null;
     }
   } catch (error) {
-    if (requestId !== state.selectorRequestId) return;
+    if (!isCurrentWorkspaceRequest(request)) return;
     showError(error);
     throw error;
   } finally {
-    if (requestId !== state.selectorRequestId) return;
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.loading = false;
+    setWorkspaceSignalDate(resolvedSignalDate, "short");
     renderShortPage();
   }
 }
@@ -962,11 +1164,14 @@ function syncSimilarLoadingControls() {
 }
 
 async function loadSimilarPatternsOnce() {
+  const request = beginWorkspaceRequest("similar", "/similar-patterns/analysis");
+  invalidateWorkspaceRequest("similarScores");
   state.similarLoading = true;
   state.similarError = "";
   renderSimilarPatternsPage();
   try {
     const watchlistPayload = await fetchJson("/similar-patterns/watchlist?include_scores=false");
+    if (!isCurrentWorkspaceRequest(request)) return;
     const currentWatchlist = state.similarPayload?.watchlist || [];
     const latestPersistedWatchlist = mergeWatchlistProfiles(
       currentWatchlist,
@@ -981,6 +1186,7 @@ async function loadSimilarPatternsOnce() {
       "/similar-patterns/analysis",
       workspaceRequestOptions(),
     );
+    if (!isCurrentWorkspaceRequest(request)) return;
     const latestWatchlist = enrichWatchlistProfiles(
       state.similarPayload?.watchlist || latestPersistedWatchlist,
       analysisPayload.watchlist || [],
@@ -1001,35 +1207,44 @@ async function loadSimilarPatternsOnce() {
         || null;
     }
   } catch (error) {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.similarError = error.message || "自选池分析加载失败";
     showError(error);
     throw error;
   } finally {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.similarLoading = false;
     renderSimilarPatternsPage();
   }
 }
 
 function loadSimilarPatterns() {
-  if (state.similarRefreshPromise) {
+  const active = state.workspaceRequests.get("similar");
+  if (state.similarRefreshPromise && active && isCurrentWorkspaceRequest(active)) {
     return state.similarRefreshPromise;
   }
   const request = loadSimilarPatternsOnce();
+  const identity = state.workspaceRequests.get("similar");
   const sharedRequest = request.finally(() => {
-    if (state.similarRefreshPromise === sharedRequest) state.similarRefreshPromise = null;
+    if (isCurrentWorkspaceRequest(identity) && state.similarRefreshPromise === sharedRequest) {
+      state.similarRefreshPromise = null;
+    }
   });
   state.similarRefreshPromise = sharedRequest;
   return sharedRequest;
 }
 
 async function refreshSimilarWatchlistScores() {
-  if (state.similarScoreRefreshPromise) {
+  const active = state.workspaceRequests.get("similarScores");
+  if (state.similarScoreRefreshPromise && active && isCurrentWorkspaceRequest(active)) {
     state.similarScoreRefreshPending = true;
     return state.similarScoreRefreshPromise;
   }
+  const identity = beginWorkspaceRequest("similarScores", "/similar-patterns/watchlist?include_scores=true");
   state.similarScoreRefreshPending = false;
   const request = fetchJson("/similar-patterns/watchlist?include_scores=true")
     .then((payload) => {
+      if (!isCurrentWorkspaceRequest(identity)) return;
       const scoredWatchlist = enrichWatchlistProfiles(
         state.similarPayload?.watchlist || [],
         payload.stocks || [],
@@ -1041,9 +1256,11 @@ async function refreshSimilarWatchlistScores() {
       renderSimilarPatternsPage();
     })
     .catch((error) => {
+      if (!isCurrentWorkspaceRequest(identity)) return;
       showWatchlistToast(`评分暂未更新：${error.message || "请稍后重试"}`, "error");
     });
   const sharedRequest = request.finally(() => {
+    if (!isCurrentWorkspaceRequest(identity)) return;
     if (state.similarScoreRefreshPromise === sharedRequest) {
       state.similarScoreRefreshPromise = null;
     }
@@ -1105,6 +1322,8 @@ async function saveSimilarWatchNote(symbol, content) {
     method: "PUT",
     body: JSON.stringify({ content }),
   });
+  invalidateWorkspaceRequest("similar", { preservePayload: true });
+  invalidateWorkspaceRequest("similarScores");
   const saved = (payload.stocks || []).find((item) => item.symbol === symbol);
   const current = (state.similarPayload?.watchlist || []).find((item) => item.symbol === symbol);
   if (saved && current) Object.assign(current, saved);
@@ -1113,6 +1332,9 @@ async function saveSimilarWatchNote(symbol, content) {
 }
 
 function applySimilarWatchlistPayload(payload, options = {}) {
+  // Persisted edits supersede reads even when no new analysis starts immediately.
+  invalidateWorkspaceRequest("similar", { preservePayload: true });
+  invalidateWorkspaceRequest("similarScores");
   const currentPayload = {
     ...(state.similarPayload || {}),
     generated_at: state.similarPayload?.generated_at || payload.updated_at,
@@ -1765,29 +1987,27 @@ async function loadLongStockPool(options = {}) {
   if (requestedVariant !== "blood_chip") query.set("variant", requestedVariant);
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
+  const endpoint = requestedVariant === "blood_chip"
+    ? `/long/blood-chip?${query.toString()}`
+    : `/long/stock-pool?${query.toString()}`;
+  const request = beginWorkspaceRequest("long", endpoint);
   try {
     const requestOptions = workspaceRequestOptions(options);
     if (!options.refresh) requestOptions.timeoutMs = 120000;
-    const endpoint = requestedVariant === "blood_chip"
-      ? `/long/blood-chip?${query.toString()}`
-      : `/long/stock-pool?${query.toString()}`;
     const payload = await fetchJson(endpoint, requestOptions);
-    if (state.longVariant === requestedVariant) {
-      state.longPayload = payload;
-      state.longError = "";
-    }
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.longPayload = payload;
+    state.longError = "";
   } catch (error) {
-    if (state.longVariant === requestedVariant) {
-      state.longError = error?.message || "长线股票池加载失败";
-    }
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.longError = error?.message || "长线股票池加载失败";
     showError(error);
     throw error;
   } finally {
-    if (state.longVariant === requestedVariant) {
-      state.longLoading = false;
-      renderLongOverview();
-      renderLongStockPool();
-    }
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.longLoading = false;
+    renderLongOverview();
+    renderLongStockPool();
   }
 }
 
@@ -1800,13 +2020,19 @@ async function loadBydMinuteStrategy(options = {}) {
   query.set("shares", String(shares));
   query.set("cost", String(cost));
   if (options.refresh) query.set("refresh", "true");
+  const endpoint = `/byd/daily-plan?${query.toString()}`;
+  const request = beginWorkspaceRequest("byd", endpoint);
   try {
-    state.bydPayload = await fetchJson(`/byd/daily-plan?${query.toString()}`, workspaceRequestOptions(options));
+    const payload = await fetchJson(endpoint, workspaceRequestOptions(options));
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.bydPayload = payload;
     maybeShowBydTradeToast(state.bydPayload, options);
   } catch (error) {
+    if (!isCurrentWorkspaceRequest(request)) return;
     showError(error);
     throw error;
   } finally {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.bydLoading = false;
     renderBydPage();
   }
@@ -1819,10 +2045,14 @@ async function loadConvertibleBondPlan(options = {}) {
   if (state.signalDate) query.set("trade_date", state.signalDate);
   query.set("limit", "18");
   if (options.refresh) query.set("refresh", "true");
+  const endpoint = `/convertible-bonds/plan?${query.toString()}`;
+  const request = beginWorkspaceRequest("cb", endpoint);
   try {
     const requestOptions = workspaceRequestOptions(options);
     if (!options.refresh) requestOptions.timeoutMs = 60000;
-    state.cbPayload = await fetchJson(`/convertible-bonds/plan?${query.toString()}`, requestOptions);
+    const payload = await fetchJson(endpoint, requestOptions);
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.cbPayload = payload;
     const plans = state.cbPayload.strategy_plans || [];
     if (!state.selectedCbStrategy && plans.length) {
       state.selectedCbStrategy = "all";
@@ -1835,9 +2065,11 @@ async function loadConvertibleBondPlan(options = {}) {
       state.selectedCbCode = groups[0]?.ts_code || null;
     }
   } catch (error) {
+    if (!isCurrentWorkspaceRequest(request)) return;
     showError(error);
     throw error;
   } finally {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.cbLoading = false;
     renderConvertibleBondPage();
   }
@@ -1849,16 +2081,22 @@ async function loadConvertibleBondAllotments(options = {}) {
   renderConvertibleBondAllotments();
   const query = new URLSearchParams();
   query.set("stage_scope", "pipeline");
+  const endpoint = `/convertible-bonds/allotments?${query.toString()}`;
+  const request = beginWorkspaceRequest("cbAllotment", endpoint);
   try {
-    state.cbAllotmentPayload = await fetchJson(
-      `/convertible-bonds/allotments?${query.toString()}`,
+    const payload = await fetchJson(
+      endpoint,
       workspaceRequestOptions(options)
     );
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.cbAllotmentPayload = payload;
   } catch (error) {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.cbAllotmentError = error.message;
     showError(error);
     throw error;
   } finally {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.cbAllotmentLoading = false;
     renderConvertibleBondAllotments();
   }
@@ -1979,15 +2217,25 @@ function maybeShowBydTradeToast(payload, options = {}) {
   `;
 }
 
-async function loadCalendar() {
-  state.calendar = await fetchJson("/selector/calendar?start=2020-01-01", { timeoutMs: 15000 });
+async function loadCalendar(options = {}) {
+  const request = beginWorkspaceRequest("calendar", "/selector/calendar?start=2020-01-01");
+  let payload;
+  try {
+    payload = await fetchJson(request.queryKey, { timeoutMs: 15000 });
+  } catch (error) {
+    if (!isCurrentWorkspaceRequest(request)) return;
+    throw error;
+  }
+  if (!isCurrentWorkspaceRequest(request)) return;
+  state.calendar = payload;
   const latestPageDate = state.activePage === "chan"
     ? (state.calendar.latest_chan_snapshot_date || state.calendar.latest_chan_signal_date)
     : state.calendar.latest_signal_date;
   if (!state.signalDate && latestPageDate) {
-    state.signalDate = latestPageDate;
+    setWorkspaceSignalDate(latestPageDate);
     const input = document.querySelector("#signalDateInput");
     if (input) input.value = state.signalDate;
+    if (options.loadPage !== false) loadActivePageData();
   }
   if (!state.calendarMonth) {
     state.calendarMonth = (state.signalDate || latestPageDate || state.calendar.latest_signal_date || "").slice(0, 7);
@@ -1997,29 +2245,39 @@ async function loadCalendar() {
 }
 
 async function loadChanModelStrategy(options = {}) {
-  state.chanLoading = true;
-  renderChanModelPage();
   const query = new URLSearchParams({ top_n: String(options.topN || 20) });
   if (!state.signalDate) {
-    state.signalDate = state.calendar?.latest_chan_snapshot_date
+    setWorkspaceSignalDate(state.calendar?.latest_chan_snapshot_date
       || state.calendar?.latest_chan_signal_date
       || state.calendar?.latest_signal_date
-      || "";
+      || "");
   }
-  state.signalDate = applySelectableSignalDate(state.signalDate);
+  setWorkspaceSignalDate(applySelectableSignalDate(state.signalDate));
   if (state.signalDate) query.set("signal_date", state.signalDate);
   if (options.refresh) query.set("refresh", "true");
+  const endpoint = `/chan/strategy-plan?${query.toString()}`;
+  const request = beginWorkspaceRequest("chan", endpoint);
+  let resolvedSignalDate = state.signalDate;
+  state.chanLoading = true;
+  renderChanModelPage();
   try {
-    state.chanPayload = await fetchJson(`/chan/strategy-plan?${query.toString()}`, workspaceRequestOptions(options));
-    state.signalDate = state.signalDate || state.chanPayload?.signal_date || "";
-    const dateInput = document.querySelector("#signalDateInput");
-    if (dateInput) dateInput.value = state.signalDate || state.chanPayload?.signal_date || "";
+    const payload = await fetchJson(endpoint, workspaceRequestOptions(options));
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.chanPayload = payload;
+    resolvedSignalDate = resolvedSignalDate || payload?.signal_date || "";
     const rows = state.chanPayload?.candidates || [];
     if (!rows.some((item) => item.symbol === state.chanSelectedSymbol)) {
       state.chanSelectedSymbol = rows[0]?.symbol || null;
     }
+  } catch (error) {
+    if (!isCurrentWorkspaceRequest(request)) return;
+    throw error;
   } finally {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.chanLoading = false;
+    setWorkspaceSignalDate(resolvedSignalDate, "chan");
+    const dateInput = document.querySelector("#signalDateInput");
+    if (dateInput) dateInput.value = state.signalDate;
     renderChanModelPage();
   }
 }
@@ -2324,7 +2582,7 @@ function renderCalendar() {
   }).join("");
   wrap.querySelectorAll("button[data-date]:not(:disabled)").forEach((button) => {
     button.addEventListener("click", async () => {
-      state.signalDate = applySelectableSignalDate(button.dataset.date);
+      setWorkspaceSignalDate(applySelectableSignalDate(button.dataset.date));
       state.calendarOpen = false;
       state.selectedSymbol = null;
       const input = document.querySelector("#signalDateInput");
@@ -2428,6 +2686,7 @@ function renderStrategyFilters() {
       } else {
         state.selectedStrategies.add(key);
       }
+      invalidateWorkspaceRequest("short");
       renderStrategyFilters();
       if (selectorFilterReloadTimer !== null) {
         window.clearTimeout(selectorFilterReloadTimer);
@@ -2811,13 +3070,19 @@ function renderOperationPlans() {
 }
 
 async function loadOperationPlans() {
+  const request = beginWorkspaceRequest("plans", "/operation-plans");
   state.operationPlansLoading = true;
   renderOperationPlans();
   try {
     const payload = await fetchJson("/operation-plans");
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.operationPlans = payload.plans || [];
     state.operationPlansLoaded = true;
+  } catch (error) {
+    if (!isCurrentWorkspaceRequest(request)) return;
+    throw error;
   } finally {
+    if (!isCurrentWorkspaceRequest(request)) return;
     state.operationPlansLoading = false;
     renderOperationPlans();
   }
@@ -3978,6 +4243,7 @@ document.querySelectorAll("[data-short-side]").forEach((button) => {
     const side = button.dataset.shortSide;
     if (!new Set(["all", "left", "right"]).has(side) || side === state.shortSideFilter) return;
     state.shortSideFilter = side;
+    invalidateWorkspaceRequest("short");
     state.selectedSymbol = null;
     await loadSelector().catch(showError);
   });
@@ -3990,6 +4256,7 @@ document.querySelector("#clearFilters").addEventListener("click", async () => {
   }
   state.selectedStrategies.clear();
   state.shortSideFilter = "all";
+  invalidateWorkspaceRequest("short");
   state.query = "";
   document.querySelector("#searchInput").value = "";
   await loadSelector().catch(showError);
@@ -4105,6 +4372,7 @@ function setRefreshButtonRunning(isRunning) {
 }
 
 async function reloadAfterRefresh(status) {
+  resetWorkspaceGeneration();
   const scope = status?.scope || "all";
   const shouldReloadShort = scope === "all" || scope === "short";
   const shouldReloadChan = scope === "all" || scope === "chan";
@@ -4115,15 +4383,12 @@ async function reloadAfterRefresh(status) {
   const shouldReloadSimilar = scope === "all" || scope === "similar";
 
   if (shouldReloadShort) {
-    state.signalDate = "";
+    setWorkspaceSignalDate("");
     state.selectedSymbol = null;
-    await loadCalendar().catch(showError);
   }
-  if (shouldReloadChan) state.chanPayload = null;
-  if (shouldReloadLong) state.longPayload = null;
-  if (shouldReloadCb) state.cbPayload = null;
-  if (shouldReloadAllotment) state.cbAllotmentPayload = null;
-  if (shouldReloadByd) state.bydPayload = null;
+  const epoch = state.workspaceGenerationEpoch;
+  await loadCalendar({ loadPage: false }).catch(showError);
+  if (epoch !== state.workspaceGenerationEpoch) return;
 
   if (state.activePage === "long" && shouldReloadLong) {
     await loadLongStockPool();
@@ -4139,6 +4404,8 @@ async function reloadAfterRefresh(status) {
     await loadSimilarPatterns();
   } else if (state.activePage === "short" && shouldReloadShort) {
     await loadSelector();
+  } else {
+    loadActivePageData();
   }
 }
 
@@ -4242,7 +4509,7 @@ document.querySelectorAll(".page-tab").forEach((button) => {
       window.location.hash = nextHash;
       return;
     }
-    state.activePage = nextPage;
+    setActiveWorkspacePage(nextPage);
     renderPageShell();
     loadActivePageData();
   });
@@ -4316,7 +4583,7 @@ document.querySelectorAll(".workspace-tabs").forEach((nav) => {
 
 window.addEventListener("hashchange", () => {
   hideWatchlistContextMenu();
-  state.activePage = hashPage();
+  setActiveWorkspacePage(hashPage());
   renderPageShell();
   loadActivePageData();
 });
@@ -4352,6 +4619,7 @@ document.querySelector("#cbRefreshButton")?.addEventListener("click", async () =
 document.querySelectorAll(".long-variant-button").forEach((button) => {
   button.addEventListener("click", () => {
     state.longVariant = button.dataset.longVariant || "tea";
+    invalidateWorkspaceRequest("long");
     state.longPayload = null;
     renderLongOverview();
     renderLongStrategies();
@@ -4400,7 +4668,9 @@ document.querySelector("#bydTradeToast")?.addEventListener("click", (event) => {
 });
 
 BYD_HOLDING_INPUT_IDS.map((id) => document.querySelector(`#${id}`)).filter(Boolean).forEach((input) => {
+  input.addEventListener("input", () => invalidateWorkspaceRequest("byd"));
   input.addEventListener("change", () => {
+    invalidateWorkspaceRequest("byd");
     if (!saveBydHoldingInputs()) return;
     if (state.activePage === "byd") {
       loadBydMinuteStrategy().catch(showError);

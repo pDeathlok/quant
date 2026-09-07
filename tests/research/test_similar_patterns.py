@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -31,6 +32,13 @@ from quant.research.similar_patterns import (
     summarize_forecast,
     summarize_status_probs,
 )
+
+
+@pytest.fixture(autouse=True)
+def _local_market_backend(monkeypatch):
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    monkeypatch.delenv("MARKET_DATA_ROOT", raising=False)
 
 
 def _write_synthetic_vector_cache(
@@ -456,7 +464,7 @@ def test_stock_vector_cache_supports_partitioned_daily_source(tmp_path: Path) ->
     assert second["status"] == "cache_hit"
     assert third["status"] == "built"
     assert load_stock_vector_cache(Path(third["cache_path"]))["source_fingerprint"].startswith(
-        "partitioned:"
+        "symbol-semantic:"
     )
 
 

@@ -271,6 +271,15 @@ def assign_stock_time_splits(
 
 
 def read_daily_basic_features(daily_basic_dir: Path, dates: pd.Series) -> pd.DataFrame:
+    from quant.data.market_snapshot import pinned_dataset_path
+
+    pinned_dir = pinned_dataset_path("daily_basic")
+    read_parquet = pd.read_parquet
+    if pinned_dir is not None:
+        from quant.data.market_snapshot import read_pinned_parquet
+
+        daily_basic_dir = pinned_dir
+        read_parquet = read_pinned_parquet
     needed_dates = {
         pd.Timestamp(date).strftime("%Y%m%d")
         for date in pd.to_datetime(dates, errors="coerce").dropna().unique()
@@ -295,7 +304,7 @@ def read_daily_basic_features(daily_basic_dir: Path, dates: pd.Series) -> pd.Dat
         path = daily_basic_dir / f"{trade_date}.parquet"
         if not path.exists():
             continue
-        df = pd.read_parquet(path)
+        df = read_parquet(path)
         present = [col for col in keep if col in df.columns]
         if {"ts_code", "trade_date"} <= set(present):
             frames.append(df[present].copy())

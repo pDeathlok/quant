@@ -519,18 +519,21 @@ def extract_failed_count(status: Mapping[str, Any]) -> int | None:
     results = status.get("result")
     if not isinstance(results, Mapping):
         return None
+    failed_step_count = 0
+    reported_counts: list[int] = []
     for payload in results.values():
         if isinstance(payload, Mapping) and payload.get("status") in {"failed", "error"}:
+            failed_step_count += 1
             failed = payload.get("failed")
             if isinstance(failed, int):
-                return failed
+                reported_counts.append(failed)
     refresh_data = results.get("refresh_data")
     if isinstance(refresh_data, Mapping):
         failed = refresh_data.get("failed")
         if isinstance(failed, int):
-            return failed
-        stdout_tail = refresh_data.get("stdout_tail")
-        if isinstance(stdout_tail, str):
+            reported_counts.append(failed)
+        elif isinstance(refresh_data.get("stdout_tail"), str):
+            stdout_tail = refresh_data["stdout_tail"]
             marker = '"failed":'
             if marker in stdout_tail:
                 try:
@@ -538,10 +541,14 @@ def extract_failed_count(status: Mapping[str, Any]) -> int | None:
                     parsed = json.loads(suffix)
                     failed_value = parsed.get("failed")
                     if isinstance(failed_value, int):
-                        return failed_value
+                        reported_counts.append(failed_value)
                 except Exception:
-                    return None
-    return None
+                    pass
+    if failed_step_count:
+        reported_counts.append(failed_step_count)
+    if status.get("status") in {"failed", "error"}:
+        reported_counts.append(1)
+    return max(reported_counts) if reported_counts else None
 
 
 def _status_signature(status: Mapping[str, Any]) -> tuple[Any, ...]:

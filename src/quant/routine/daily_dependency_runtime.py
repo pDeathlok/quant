@@ -86,7 +86,9 @@ def _safe_path(project_root: Path, relative_path: str) -> Path:
         candidate.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"dependency artifact escapes project root: {relative_path}") from exc
-    return candidate
+    from quant.infrastructure.publication import publication_path
+
+    return publication_path(candidate)
 
 
 def _sha256(path: Path) -> str:
@@ -110,6 +112,9 @@ def _file_signature(path: Path) -> dict[str, int]:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    from quant.infrastructure.publication import publication_path
+
+    path = publication_path(path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, ValueError):
@@ -498,7 +503,7 @@ def _evidence_value(
             return None
         return None, datetime.fromtimestamp(path.stat().st_mtime), _stat_fingerprint(path)
     if adapter in {"glob_parquet_max", "glob_json_latest"}:
-        paths = sorted(project_root.glob(locator))
+        paths = sorted(_safe_path(project_root, str(Path(locator).parent)).glob(Path(locator).name))
         values: list[datetime] = []
         fingerprints: list[str] = []
         for path in paths:
@@ -537,7 +542,8 @@ def _output_artifact_paths(
 
     if "YYYYMMDD" in locator:
         if watermark is None:
-            matches = project_root.glob(locator.replace("YYYYMMDD", "*"))
+            pattern = Path(locator.replace("YYYYMMDD", "*"))
+            matches = _safe_path(project_root, str(pattern.parent)).glob(pattern.name)
             return tuple(sorted(path for path in matches if path.is_file()))
         locator = locator.replace("YYYYMMDD", watermark.strftime("%Y%m%d"))
 

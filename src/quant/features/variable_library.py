@@ -164,6 +164,48 @@ PROJECT_FACTOR_COLUMNS = [
     "ps_ttm_inv",
 ]
 
+# Project factors sourced from Tushare daily_basic, including their derived
+# rolling and ratio features. Consumers trained without daily_basic must null
+# this whole family rather than accidentally changing inference semantics when
+# they reuse the complete shared project-factor cache.
+DAILY_BASIC_PROJECT_FACTOR_COLUMNS: tuple[str, ...] = (
+    "turnover_rate",
+    "turnover_rate_f",
+    "ts_volume_ratio",
+    "pe",
+    "pe_ttm",
+    "pb",
+    "ps",
+    "ps_ttm",
+    "dv_ratio",
+    "dv_ttm",
+    "total_share",
+    "float_share",
+    "free_share",
+    "total_mv",
+    "circ_mv",
+    "total_mv_log",
+    "circ_mv_log",
+    "free_share_ratio",
+    "float_share_ratio",
+    "float_mv_ratio",
+    "free_float_share_ratio",
+    "turnover_rate_ma5",
+    "turnover_rate_ma20",
+    "turnover_rate_rel20",
+    "turnover_rate_f_ma5",
+    "turnover_rate_f_ma20",
+    "turnover_rate_f_rel20",
+    "ts_volume_ratio_ma5",
+    "ts_volume_ratio_ma20",
+    "ts_volume_ratio_rel20",
+    "total_mv_change_20d",
+    "circ_mv_change_20d",
+    "pe_ttm_inv",
+    "pb_inv",
+    "ps_ttm_inv",
+)
+
 
 def build_continuous_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     """Return causal continuous OHLC using actions known by each row.
@@ -652,15 +694,27 @@ def load_daily_basic_features(
     and model-training jobs.
     """
 
-    files = sorted(daily_basic_dir.glob("*.parquet"))
-    if not files:
-        return pd.DataFrame()
+    from quant.data.market_snapshot import current_market_snapshot
 
+    snapshot = current_market_snapshot()
     started = perf_counter()
-    if target_keys is None:
-        source_frames = [_read_daily_basic_file(path) for path in files]
+    if snapshot is not None:
+        # Keep complete symbol history for rolling factors; target-only reads
+        # would silently change the first window after an incremental update.
+        symbols = None
+        if target_keys is not None and "ts_code" in target_keys:
+            symbols = sorted(target_keys["ts_code"].dropna().astype(str).unique())
+        source_frames = [snapshot.read("daily_basic", symbols=symbols)]
+        files = snapshot.manifest["datasets"]["daily_basic"]["files"]
         files_read = len(files)
     else:
+        files = sorted(daily_basic_dir.glob("*.parquet"))
+        if not files:
+            return pd.DataFrame()
+    if snapshot is None and target_keys is None:
+        source_frames = [_read_daily_basic_file(path) for path in files]
+        files_read = len(files)
+    elif snapshot is None:
         source_frames, files_read = _bounded_daily_basic_frames(
             files,
             target_keys=target_keys,

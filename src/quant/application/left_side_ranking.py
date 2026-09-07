@@ -205,6 +205,17 @@ def _load_left_side_ranking_frame(
         (normalized < 0.0) | (normalized > 100.0)
     ).any():
         raise RuntimeError("left-side scores are outside their contracts")
+    policy_excluded = {
+        str(symbol)
+        for symbol in manifest.get("policy_excluded_candidate_symbols") or []
+        if str(symbol)
+    }
+    overlap = sorted(policy_excluded & set(frame["symbol"].astype(str)))
+    if overlap:
+        raise RuntimeError(
+            "left-side score output contains policy-excluded candidates: "
+            f"{overlap[:20]}"
+        )
     return frame, manifest
 
 

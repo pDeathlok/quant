@@ -512,6 +512,24 @@ def load_right_side_ranking_scores(
             raise RuntimeError("right-side ranking normalization is not monotonic")
     if int(manifest.get("candidate_count") or -1) != len(frame):
         raise RuntimeError("right-side ranking candidate_count mismatches parquet")
+    policy_excluded = tuple(
+        sorted(
+            {
+                str(symbol)
+                for symbol in manifest.get("policy_excluded_candidate_symbols") or ()
+                if str(symbol)
+            }
+        )
+    )
+    exclusion_count = manifest.get("policy_excluded_candidate_count")
+    if exclusion_count is not None and int(exclusion_count) != len(policy_excluded):
+        raise RuntimeError("right-side ranking policy exclusion count mismatches manifest")
+    exclusion_overlap = set(symbols) & set(policy_excluded)
+    if exclusion_overlap:
+        raise RuntimeError(
+            "right-side ranking policy exclusions overlap scored candidates: "
+            f"{sorted(exclusion_overlap)[:20]}"
+        )
     return dict(zip(symbols, zip(scores, normalized_scores))), manifest
 
 
@@ -555,12 +573,19 @@ def apply_selector_ranking_source(
         if active.source == SelectorRankingSource.RIGHT_SIDE_UNIFIED
         and _row_uses_supported_strategy(row, set(active.supported_strategy_keys))
     }
+    right_policy_excluded_symbols: set[str] = set()
     if right_eligible_symbols:
         if not signal_date:
             raise RuntimeError("right-side unified selector ranking requires signal_date")
         right_scores, right_manifest = load_right_side_ranking_scores(
             signal_date, config=active
         )
+        right_policy_excluded_symbols = {
+            str(symbol)
+            for symbol in right_manifest.get("policy_excluded_candidate_symbols") or ()
+            if str(symbol)
+        }
+        right_eligible_symbols -= right_policy_excluded_symbols
         missing = sorted(right_eligible_symbols - set(right_scores))
         if missing:
             raise RuntimeError(
@@ -579,6 +604,13 @@ def apply_selector_ranking_source(
         right_scores = {}
         right_artifact_sha = ""
 
+    if right_policy_excluded_symbols:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("symbol") or "") not in right_policy_excluded_symbols
+        ]
+
     left_members = set(LEFT_GROUP_MEMBERS) | {
         member
         for members in LEFT_GROUP_MEMBERS.values()
@@ -592,12 +624,19 @@ def apply_selector_ranking_source(
         and str(row.get("symbol") or "") not in right_eligible_symbols
         and _row_uses_supported_strategy(row, left_members)
     }
+    left_policy_excluded_symbols: set[str] = set()
     if left_eligible_symbols:
         if not signal_date:
             raise RuntimeError("left-side unified selector ranking requires signal_date")
         left_scores, left_manifest = load_left_side_ranking_scores(
             signal_date, config=active_left
         )
+        left_policy_excluded_symbols = {
+            str(symbol)
+            for symbol in left_manifest.get("policy_excluded_candidate_symbols") or []
+            if str(symbol)
+        }
+        left_eligible_symbols -= left_policy_excluded_symbols
         missing = sorted(left_eligible_symbols - set(left_scores))
         if missing:
             raise RuntimeError(
@@ -620,6 +659,14 @@ def apply_selector_ranking_source(
     else:
         left_scores = {}
         left_artifact_sha = ""
+
+    if left_policy_excluded_symbols:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("symbol") or "") not in left_policy_excluded_symbols
+            or str(row.get("symbol") or "") in right_eligible_symbols
+        ]
 
     for row in rows:
         symbol = str(row.get("symbol") or "")

@@ -190,6 +190,34 @@ def test_run_refresh_workflow_retries_after_failed_status(tmp_path: Path) -> Non
     assert any("自动重试" in line for line in logs)
 
 
+def test_failed_count_includes_failed_step_when_data_refresh_has_zero_failures() -> None:
+    status = {
+        "status": "failed",
+        "result": {
+            "refresh_data": {"status": "success", "failed": 0},
+            "refresh_reference_inputs": {
+                "status": "failed",
+                "data_missing": True,
+            },
+        },
+    }
+
+    assert runner.extract_failed_count(status) == 1
+
+
+def test_failed_count_includes_top_level_failure_without_failed_result_step() -> None:
+    status = {
+        "status": "failed",
+        "error": "selector materialization failed",
+        "result": {
+            "refresh_data": {"status": "success", "failed": 0},
+            "left_side_unified_scores": {"status": "success"},
+        },
+    }
+
+    assert runner.extract_failed_count(status) == 1
+
+
 def test_ensure_local_service_checks_frontend_and_starts_stack(monkeypatch, tmp_path: Path) -> None:
     responses = [
         FakeResponse({"status": "ok", "service": "quant-webapp"}),

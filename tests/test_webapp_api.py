@@ -23,7 +23,17 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def isolate_long_factor_publication(monkeypatch, tmp_path):
+    # Legacy payload stubs do not materialize strict checkpoint outputs. Core
+    # composition tests below explicitly select the new production default.
+    monkeypatch.setenv("ROUTINE_DAG_EXECUTOR", "shadow")
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "file")
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
     monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path / "long_factors")
+    from quant.infrastructure.publication import PublicationStore
+
+    publication_root = tmp_path / "publication"
+    publication_root.mkdir()
+    monkeypatch.setattr(services, "_publication_store", lambda: PublicationStore(publication_root, ()))
 
 
 def test_selector_score_presentation_normalizes_and_ranks_all_three_scores() -> None:
@@ -631,6 +641,36 @@ def test_global_refresh_stub_never_calls_real_long_factor_builder(monkeypatch, t
     assert calls == []
 
 
+def test_failed_postflight_does_not_publish_staged_workspaces(monkeypatch, tmp_path):
+    from quant.infrastructure.publication import PublicationStore, publication_path
+    from quant.routine import pipeline
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    store = PublicationStore(tmp_path, ("snapshots",))
+    output = tmp_path / "snapshots/result.json"
+    with store.begin("prior") as stage:
+        target = publication_path(output)
+        target.parent.mkdir(parents=True)
+        target.write_text("old")
+        store.commit(stage, {"status": "success", "freshness_audit": {"status": "success"}})
+    monkeypatch.setattr(services, "_publication_store", lambda: store)
+    original_gate = pipeline.publish_daily_dependency_contract
+
+    def gate(*args, **kwargs):
+        if kwargs["phase"] == "postflight":
+            publication_path(output).write_text("unvalidated")
+            return {"status": "failed", "freshness_audit": {"status": "failed", "failures": []}}
+        return original_gate(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "publish_daily_dependency_contract", gate)
+    services._run_latest_refresh_job("all")
+    assert status["status"] == "failed"
+    assert store.view().generation == "prior"
+    assert store.view().resolve(output).read_text() == "old"
+    states = [json.loads(path.read_text()) for path in store.directory.glob("*/state.json")]
+    assert any(state["status"] == "aborted" for state in states)
+
+
 def test_historical_long_snapshot_cannot_replace_newer_latest(monkeypatch, tmp_path):
     monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path)
     row = {column: 1.0 for column in services.LONG_PRODUCTION_FACTOR_COLUMNS}
@@ -858,9 +898,151 @@ def test_api_refresh_runs_cleanup_before_data_refresh_even_when_refresh_fails(mo
     assert status["result"]["cache_cleanup"] == cleanup_result
 
 
+def test_core_refresh_acquires_pin_after_source_refresh_and_fails_closed(monkeypatch):
+    from contextlib import contextmanager
+    from quant.routine import pipeline, production_dag
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    monkeypatch.setenv("ROUTINE_DAG_EXECUTOR", "core")
+    calls = []
+    original_refresh = pipeline.refresh_data
+    monkeypatch.setattr(pipeline, "refresh_data", lambda **kwargs: calls.append("refresh") or original_refresh(**kwargs))
+
+    @contextmanager
+    def fail_pin(root):
+        calls.append("pin")
+        raise ValueError("sealed export unavailable")
+        yield
+
+    monkeypatch.setattr(production_dag, "sealed_core_market_inputs", fail_pin)
+    services._run_latest_refresh_job("short", run_id="core-unpinned")
+    assert status["status"] == "failed"
+    assert "sealed export unavailable" in status["error"]
+    assert calls == ["refresh", "pin"]
+
+
+def test_full_refresh_executes_every_active_composition_owner(monkeypatch):
+    status = _stub_successful_global_refresh(monkeypatch)
+    services._run_latest_refresh_job("all", run_id="composition-closure")
+    assert status["status"] == "success", status.get("error")
+    audit = status["result"]["operation_execution_audit"]
+    assert audit["unmigrated_operations"] == []
+    assert audit["executable_closure_complete"]
+    assert not audit["callback_identity_audited"]
+    assert not audit["full_production_closure"]
+
+
+@pytest.mark.parametrize("scope,late_failure,missing_operation", [
+    ("short", False, False), ("all", False, False), ("all", True, False),
+    ("short", False, True), ("all", False, True),
+])
+def test_core_refresh_passes_one_scheduler_store_and_explicit_stage_inputs(monkeypatch, scope, late_failure, missing_operation):
+    from contextlib import contextmanager
+    from quant.routine import dag_executor, production_dag
+    from quant.routine.operation_contracts import InputSnapshot
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    monkeypatch.delenv("ROUTINE_DAG_EXECUTOR")
+    stages = []
+    constructors = []
+    original_init = dag_executor.DailyDagExecutor.__init__
+
+    def record_init(self, *args, **kwargs):
+        if kwargs.get("require_identity"):
+            constructors.append(dict(kwargs))
+        # This fixture tests the web composition only. Isolated executor tests
+        # exercise real identities and persistence; legacy payload stubs do not.
+        kwargs.update(checkpoint_store=None, require_identity=False)
+        original_init(self, *args, **kwargs)
+
+    def stage_inputs(root, nodes, **kwargs):
+        stages.append(tuple(nodes))
+        return {"data.market_daily": InputSnapshot("fixture-canonical")}
+
+    monkeypatch.setattr(dag_executor.DailyDagExecutor, "__init__", record_init)
+    monkeypatch.setattr(production_dag, "production_stage_inputs", stage_inputs)
+    monkeypatch.setattr(production_dag, "snapshots_from_results", lambda results: {})
+    monkeypatch.setattr(production_dag, "save_core_source_manifest", lambda *args: None)
+    if missing_operation:
+        from quant.routine import pipeline
+        from quant.routine.default_operations import DEFAULT_DAILY_OPERATION_REGISTRY
+
+        omitted = "refresh_active_project_features"
+        assert DEFAULT_DAILY_OPERATION_REGISTRY.definitions[omitted].production_ready
+        execute = production_dag.execute_daily_operations
+        publish = pipeline.publish_daily_dependency_contract
+        published_phases = []
+
+        def incomplete_execution(*args, **kwargs):
+            result = execute(*args, **kwargs)
+            # Fresh node payloads alone cannot certify operation execution closure.
+            result["operations"].pop(omitted, None)
+            return result
+
+        def record_publish(*args, **kwargs):
+            published_phases.append(kwargs.get("phase"))
+            return publish(*args, **kwargs)
+
+        monkeypatch.setattr(production_dag, "execute_daily_operations", incomplete_execution)
+        monkeypatch.setattr(pipeline, "publish_daily_dependency_contract", record_publish)
+    lifetime = []
+    consumed = []
+    names = ["get_convertible_bond_grid_plan", "get_convertible_bond_allotments",
+             "get_byd_daily_strategy", "get_chan_model_strategy_plan",
+             "_refresh_long_stock_pool_variants", "_run_similar_pattern_analysis_isolated",
+             "_ensure_selector_long_factor_snapshot", "get_stock_selector_payload",
+             "_write_strategy_pool_snapshots"]
+    for name in names:
+        original = getattr(services, name)
+
+        def consume(*args, _name=name, _original=original, **kwargs):
+            assert production_dag.require_pinned_market().fingerprint == "fixture-canonical"
+            assert lifetime == ["pin"]
+            consumed.append(_name)
+            if late_failure and _name == "get_chan_model_strategy_plan":
+                raise RuntimeError("late fixture failure")
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(services, name, consume)
+
+    @contextmanager
+    def pin(root):
+        lifetime.append("pin")
+        snapshot = InputSnapshot("fixture-canonical")
+        try:
+            with production_dag.pinned_market_inputs(snapshot):
+                yield snapshot
+        finally:
+            lifetime.append("release")
+
+    monkeypatch.setattr(production_dag, "sealed_core_market_inputs", pin)
+    services._run_latest_refresh_job(scope, run_id="core-wiring")
+    assert status["status"] == ("failed" if late_failure or missing_operation else "success"), status.get("error")
+    if missing_operation:
+        assert "Strict core execution closure incomplete: " + omitted in status["error"]
+        assert status["result"]["operation_execution_audit"]["unmigrated_operations"] == [omitted]
+        assert "postflight" not in published_phases
+        assert "publication" not in status["result"]
+    expected = set(names if scope == "all" else names[-3:])
+    if late_failure:
+        expected.remove("_write_strategy_pool_snapshots")
+    assert expected.issubset(consumed)
+    assert len(stages) == len(constructors) == 2
+    assert set(stages[0]) == {"feature.strategy_signals", "feature.project_daily"}
+    assert all(item["require_identity"] for item in constructors)
+    assert constructors[0]["checkpoint_store"] is constructors[1]["checkpoint_store"]
+    assert constructors[0]["checkpoint_store"] is not None
+    assert constructors[0]["scheduler"] is constructors[1]["scheduler"]
+    assert lifetime == ["pin", "release"]
+    assert status["result"]["market_snapshot"]["acquired_after_source_refresh"] is True
+    assert status["result"]["dependency_preflight"]["dag_executor"]["full_production_closure"] is False
+
+
 def test_global_refresh_starts_independent_workspaces_before_feature_build(
     monkeypatch,
 ) -> None:
+    # Three external envelopes must fit alongside the eight-slot signal stage.
+    monkeypatch.setattr(services, "configured_worker_budget", lambda: 12)
     rendezvous = threading.Barrier(4, timeout=3)
     calls: list[str] = []
     calls_lock = threading.Lock()
@@ -1249,6 +1431,7 @@ def test_global_refresh_propagates_early_workspace_failure(monkeypatch) -> None:
 def test_global_refresh_checkpoints_early_results_before_terminal_failure(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(services, "configured_worker_budget", lambda: 12)
     rendezvous = threading.Barrier(4, timeout=3)
 
     def early_success(payload: dict):
@@ -2224,103 +2407,21 @@ def test_long_workspace_refresh_includes_blood_chip_daily_plan(monkeypatch) -> N
     }
 
 
-def test_long_research_module_waits_for_concurrent_import(monkeypatch) -> None:
-    module_name = "quant_long_dividend_quality_research"
-    import_started = threading.Event()
-    allow_import_to_finish = threading.Event()
-    second_returned = threading.Event()
-    import_calls = []
+def test_long_research_module_uses_normal_package_import_under_concurrency() -> None:
+    from quant.research import long_dividend_quality
 
-    class FakeLoader:
-        def exec_module(self, module) -> None:
-            import_calls.append(module)
-            import_started.set()
-            assert allow_import_to_finish.wait(timeout=2)
-            module.load_stock_basic = lambda: pd.DataFrame()
-
-    class FakeSpec:
-        loader = FakeLoader()
-
-    class FakeModule:
-        pass
-
-    monkeypatch.delitem(services.sys.modules, module_name, raising=False)
-    monkeypatch.setattr(
-        services.importlib.util,
-        "spec_from_file_location",
-        lambda *args, **kwargs: FakeSpec(),
-    )
-    monkeypatch.setattr(
-        services.importlib.util,
-        "module_from_spec",
-        lambda spec: FakeModule(),
-    )
     services._long_research_module.cache_clear()
-
-    def load_second():
-        module = services._long_research_module()
-        second_returned.set()
-        return module
-
-    try:
-        with services.ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(services._long_research_module)
-            assert import_started.wait(timeout=2)
-            second = executor.submit(load_second)
-            returned_before_import_finished = second_returned.wait(timeout=0.1)
-            allow_import_to_finish.set()
-            first_module = first.result(timeout=2)
-            second_module = second.result(timeout=2)
-    finally:
-        allow_import_to_finish.set()
-        services._long_research_module.cache_clear()
-
-    assert not returned_before_import_finished
-    assert first_module is second_module
-    assert len(import_calls) == 1
-    assert first_module._quant_services_import_complete is True
+    with services.ThreadPoolExecutor(max_workers=2) as executor:
+        modules = list(executor.map(lambda _: services._long_research_module(), range(8)))
+    assert all(module is long_dividend_quality for module in modules)
 
 
-def test_tea_master_research_module_discards_partial_import(monkeypatch) -> None:
-    module_name = "quant_tea_master_long_research"
-    imported_modules = []
+def test_tea_master_research_module_uses_installed_package() -> None:
+    from quant.research import tea_master_long
 
-    class FakeLoader:
-        def exec_module(self, module) -> None:
-            imported_modules.append(module)
-            module.CONFIGS = []
-            if len(imported_modules) == 1:
-                raise RuntimeError("incomplete import")
-
-    class FakeSpec:
-        loader = FakeLoader()
-
-    class FakeModule:
-        pass
-
-    monkeypatch.delitem(services.sys.modules, module_name, raising=False)
-    monkeypatch.setattr(
-        services.importlib.util,
-        "spec_from_file_location",
-        lambda *args, **kwargs: FakeSpec(),
-    )
-    monkeypatch.setattr(
-        services.importlib.util,
-        "module_from_spec",
-        lambda spec: FakeModule(),
-    )
     services._tea_master_research_module.cache_clear()
-
-    try:
-        with pytest.raises(RuntimeError, match="incomplete import"):
-            services._tea_master_research_module()
-        recovered = services._tea_master_research_module()
-    finally:
-        services._tea_master_research_module.cache_clear()
-
-    assert len(imported_modules) == 2
-    assert recovered is imported_modules[1]
-    assert recovered._quant_services_import_complete is True
+    assert services._tea_master_research_module() is tea_master_long
+    assert "scripts/research" not in str(tea_master_long.__file__)
 
 
 def test_long_stock_pool_worker_does_not_redirect_process_stdout(monkeypatch) -> None:
@@ -3129,6 +3230,7 @@ def test_similar_pattern_refresh_updates_vector_caches(monkeypatch, tmp_path) ->
         return pd.DataFrame({"status": ["built", "cache_hit"]})
 
     monkeypatch.setattr(services, "build_vector_caches_parallel", fake_build)
+    monkeypatch.setattr(services, "_activate_similar_pattern_vector_cache_config", lambda: {})
     monkeypatch.setattr(services, "analyze_targets_by_threshold", lambda *args, **kwargs: {})
 
     payload = services.refresh_similar_pattern_analysis(force_vector_cache=True)
@@ -3157,7 +3259,7 @@ def test_similar_pattern_refresh_reuses_current_weekly_library_but_analyzes_live
 
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps(
             {
@@ -3291,7 +3393,7 @@ def test_similar_pattern_weekly_library_waits_for_friday_close_after_seven_days(
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps({"refreshed_at": "2026-07-14T08:00:00"}),
         encoding="utf-8",
@@ -3313,7 +3415,7 @@ def test_similar_pattern_weekly_library_becomes_due_on_friday_after_close(
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps({"refreshed_at": "2026-07-19T15:01:00", "cached_files": 1}),
         encoding="utf-8",
@@ -3337,7 +3439,7 @@ def test_similar_pattern_weekly_library_waits_until_minimum_age_on_friday(
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps({"refreshed_at": "2026-07-20T20:25:57", "cached_files": 1}),
         encoding="utf-8",
@@ -3360,7 +3462,7 @@ def test_similar_pattern_weekly_library_waits_when_friday_is_not_trade_date(
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps({"refreshed_at": "2026-07-18T15:01:00", "cached_files": 1}),
         encoding="utf-8",
@@ -3382,7 +3484,7 @@ def test_similar_pattern_weekly_library_does_not_rebuild_twice_in_friday_window(
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps({"refreshed_at": "2026-07-24T15:05:00", "cached_files": 1}),
         encoding="utf-8",
@@ -3402,7 +3504,7 @@ def test_similar_pattern_weekly_library_rebuilds_when_cache_count_changes(monkey
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps(
             {
@@ -3423,14 +3525,44 @@ def test_similar_pattern_weekly_library_rebuilds_when_cache_count_changes(monkey
     assert decision["reason"] == "cache_file_count_changed"
 
 
-def test_similar_pattern_cache_repair_waits_for_minimum_refresh_age(
+def test_similar_pattern_missing_cache_repairs_on_non_friday_before_minimum_age(
     monkeypatch,
     tmp_path,
 ) -> None:
     monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
     state_dir = services._similar_pattern_vector_cache_state_dir()
     state_dir.mkdir(parents=True)
-    (state_dir / "000001_SZ.npz").write_bytes(b"cache")
+    (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
+        json.dumps(
+            {
+                "refreshed_at": "2026-07-20T15:01:00",
+                "cached_files": 1,
+                "errors": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decision = services._similar_pattern_vector_cache_refresh_decision(
+        now=datetime(2026, 7, 21, 8, 0, 0),
+        source_trade_date="2026-07-20",
+    )
+
+    assert decision["due"] is True
+    assert decision["reason"] == "cache_missing"
+    assert decision["repair_required"] is True
+    assert decision["cached_files"] == 0
+    assert decision["refresh_age_days"] < decision["minimum_refresh_age_days"]
+
+
+def test_similar_pattern_cache_repair_does_not_wait_for_minimum_refresh_age(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path / "vector_cache")
+    state_dir = services._similar_pattern_vector_cache_state_dir()
+    state_dir.mkdir(parents=True)
+    np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
         json.dumps(
             {
@@ -3447,8 +3579,10 @@ def test_similar_pattern_cache_repair_waits_for_minimum_refresh_age(
         source_trade_date="2026-07-24",
     )
 
-    assert decision["due"] is False
-    assert decision["reason"] == "minimum_refresh_age_not_reached"
+    assert decision["due"] is True
+    assert decision["reason"] == "cache_file_count_changed"
+    assert decision["repair_required"] is True
+    assert decision["refresh_age_days"] < decision["minimum_refresh_age_days"]
 
 
 def test_similar_pattern_weekly_library_does_not_advance_watermark_on_build_errors(
@@ -4376,13 +4510,18 @@ def test_vector_cache_builder_uses_thread_pool_in_daemon_process(monkeypatch, tm
     daily_dir.mkdir()
     cache_dir.mkdir()
     for symbol in ["000001.SZ", "000002.SZ"]:
-        (daily_dir / f"{symbol}.parquet").write_text("", encoding="utf-8")
+        pd.DataFrame({
+            "ts_code": [symbol], "trade_date": ["20260904"],
+            "open": [1.0], "high": [1.0], "low": [1.0],
+            "close": [1.0], "vol": [100.0],
+        }).to_parquet(daily_dir / f"{symbol}.parquet", index=False)
 
     worker_calls = []
+    real_worker = similar_patterns_module._build_stock_vector_cache_worker
 
     def fake_worker(task):
         worker_calls.append(task[0])
-        return {"status": "cache_hit", "symbol": task[0], "vectors": 1}
+        return real_worker(task)
 
     class InlineFuture:
         def __init__(self, value):
@@ -4422,7 +4561,7 @@ def test_vector_cache_builder_uses_thread_pool_in_daemon_process(monkeypatch, tm
     )
 
     assert len(worker_calls) == 2
-    assert set(result["status"]) == {"cache_hit"}
+    assert set(result["status"]) == {"too_short"}
 
 
 def test_isolated_similar_pattern_process_is_not_daemon(monkeypatch) -> None:

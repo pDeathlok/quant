@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -46,6 +46,8 @@ PIPELINE_STAGE_STATUS = {
     "registered": "同意注册",
     "issuing": "发行公告",
 }
+
+PIPELINE_ISSUE_SIZE_REFRESH_BUDGET_SECONDS = 45.0
 
 
 class _PdfExtractTimeout(Exception):
@@ -309,6 +311,10 @@ def _attach_stock_market_snapshots(records: list[dict[str, Any]], daily_dir: Pat
         try:
             canonical_daily = store.read_market_range(daily_dir.name, symbols=candidates)
         except Exception as exc:
+            from quant.data.market_snapshot import current_market_snapshot
+
+            if current_market_snapshot() is not None:
+                raise
             storage_error = str(exc)
     cache: dict[str, dict[str, Any]] = {}
     hits = 0
@@ -341,7 +347,9 @@ def _attach_stock_market_snapshots(records: list[dict[str, Any]], daily_dir: Pat
 
 
 def _latest_daily_basic_frame(daily_basic_dir: Path | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
-    daily_basic_dir = daily_basic_dir or DAILY_BASIC_DIR
+    from quant.data.market_snapshot import MarketSnapshotError, pinned_dataset_path, read_pinned_parquet
+
+    daily_basic_dir = pinned_dataset_path("daily_basic") or daily_basic_dir or DAILY_BASIC_DIR
     meta: dict[str, Any] = {"source": str(daily_basic_dir), "available": daily_basic_dir.exists(), "file": None, "error": None}
     if not daily_basic_dir.exists():
         return pd.DataFrame(), meta
@@ -352,9 +360,11 @@ def _latest_daily_basic_frame(daily_basic_dir: Path | None = None) -> tuple[pd.D
     latest = files[-1]
     meta["file"] = str(latest)
     try:
-        frame = pd.read_parquet(latest)
+        frame = read_pinned_parquet(latest)
         meta.update({"available": not frame.empty, "rows": int(len(frame))})
         return frame, meta
+    except MarketSnapshotError:
+        raise
     except Exception as exc:
         meta.update({"available": False, "error": str(exc)})
         return pd.DataFrame(), meta
@@ -686,6 +696,9 @@ def _attach_pipeline_issue_sizes(
     records: list[dict[str, Any]],
     refresh: bool = False,
     today: date | None = None,
+    *,
+    refresh_budget_seconds: float = PIPELINE_ISSUE_SIZE_REFRESH_BUDGET_SECONDS,
+    clock: Callable[[], float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     cache = _load_issue_size_cache()
     lookup: dict[str, dict[str, Any]] = {}
@@ -695,18 +708,36 @@ def _attach_pipeline_issue_sizes(
             for _, row in cache.dropna(subset=["stock_code"]).iterrows()
         }
     refreshed: list[dict[str, Any]] = []
+    attempted = 0
+    pending = 0
+    refresh_status = "not_requested"
     if refresh:
+        candidates = []
         for item in records:
             code = _clean_text(item.get("stock_code"))
             if _normalize_pipeline_stage(item.get("stage")) not in PIPELINE_STAGES:
                 continue
             if not code or _number(item.get("issue_size")) is not None or code in lookup:
                 continue
+            candidates.append(item)
+
+        monotonic = clock or time.monotonic
+        deadline = monotonic() + max(0.0, refresh_budget_seconds)
+        refresh_status = "success"
+        for item in candidates:
+            if monotonic() >= deadline:
+                refresh_status = "budget_exhausted"
+                break
+            code = _clean_text(item.get("stock_code"))
+            if not code:
+                continue
+            attempted += 1
             result = _refresh_issue_size_for_record(item, today=today)
             if result:
                 lookup[code] = result
                 refreshed.append(result)
                 _save_issue_size_cache(pd.DataFrame([*lookup.values()]))
+        pending = len(candidates) - attempted
     hits = 0
     for item in records:
         code = _clean_text(item.get("stock_code"))
@@ -728,6 +759,10 @@ def _attach_pipeline_issue_sizes(
         "rows": int(len(lookup)),
         "matched": hits,
         "refreshed": len(refreshed),
+        "refresh_status": refresh_status,
+        "attempted": attempted,
+        "pending": pending,
+        "refresh_budget_seconds": refresh_budget_seconds,
     }
 
 

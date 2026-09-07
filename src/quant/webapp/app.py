@@ -8,6 +8,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from quant.core.paths import PROJECT_ROOT
 from quant.webapp.api import router
 from quant.webapp.static_delivery import StaticAssetCacheMiddleware
+from quant.webapp.publication_middleware import PublicationMiddleware
 
 
 WEB_DIR = PROJECT_ROOT / "web"
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
     app.add_middleware(StaticAssetCacheMiddleware)
+    app.add_middleware(PublicationMiddleware)
     app.include_router(router, prefix="/api")
     app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
     return app

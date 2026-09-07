@@ -284,6 +284,122 @@ def test_shadow_feature_frame_requires_complete_exact_date_candidate_coverage(
         )
 
 
+def test_feature_frame_reuses_shared_project_row_without_full_recalculation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = pd.bdate_range("2026-06-01", periods=30)
+    close = np.linspace(10.0, 12.0, len(dates))
+    market = pd.DataFrame(
+        {
+            "ts_code": "000001.SZ",
+            "symbol": "000001.SZ",
+            "trade_date": dates.strftime("%Y%m%d"),
+            "date": dates,
+            "open": close * 0.99,
+            "high": close * 1.02,
+            "low": close * 0.98,
+            "close": close,
+            "pre_close": pd.Series(close).shift(1).fillna(close[0]),
+            "vol": np.linspace(1_000.0, 2_000.0, len(dates)),
+        }
+    )
+    signals = pd.DataFrame(
+        {
+            "symbol": ["000001.SZ"],
+            "date": [dates[-1]],
+            **{
+                name: [name == "B2"]
+                for name in RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS
+            },
+        }
+    )
+    shared_row = {name: 7.0 for name in PROJECT_FACTOR_COLUMNS}
+    shared_row.update(
+        ts_code="000001.SZ",
+        symbol="000001.SZ",
+        trade_date=dates[-1].strftime("%Y%m%d"),
+        date=dates[-1],
+        factor_schema_version=PROJECT_FACTOR_SCHEMA_VERSION,
+    )
+
+    def reject_full_recalculation(*args, **kwargs):
+        raise AssertionError("full project factor calculation must not run")
+
+    monkeypatch.setattr(
+        shadow,
+        "calculate_project_market_factors",
+        reject_full_recalculation,
+    )
+
+    result = shadow.build_right_side_shadow_feature_frame(
+        market,
+        signals,
+        target_date=dates[-1],
+        project_features=pd.DataFrame([shared_row]),
+    )
+
+    assert len(result) == 1
+    assert result.loc[0, "alpha003"] == 7.0
+    assert result.loc[0, "B2"]
+
+
+def test_shared_project_feature_batches_run_in_parallel() -> None:
+    dates = pd.bdate_range("2026-06-01", periods=30)
+    symbols = [f"00000{number}.SZ" for number in range(1, 5)]
+    market_frames = []
+    signal_rows = []
+    project_rows = []
+    for offset, symbol in enumerate(symbols):
+        close = np.linspace(10.0 + offset, 12.0 + offset, len(dates))
+        market_frames.append(
+            pd.DataFrame(
+                {
+                    "ts_code": symbol,
+                    "symbol": symbol,
+                    "trade_date": dates.strftime("%Y%m%d"),
+                    "date": dates,
+                    "open": close * 0.99,
+                    "high": close * 1.02,
+                    "low": close * 0.98,
+                    "close": close,
+                    "pre_close": pd.Series(close).shift(1).fillna(close[0]),
+                    "vol": np.linspace(1_000.0, 2_000.0, len(dates)),
+                }
+            )
+        )
+        signal_rows.append(
+            {
+                "symbol": symbol,
+                "date": dates[-1],
+                **{
+                    name: name == "B2"
+                    for name in RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS
+                },
+            }
+        )
+        project_rows.append(
+            {
+                **{name: float(offset) for name in PROJECT_FACTOR_COLUMNS},
+                "ts_code": symbol,
+                "symbol": symbol,
+                "trade_date": dates[-1].strftime("%Y%m%d"),
+                "date": dates[-1],
+                "factor_schema_version": PROJECT_FACTOR_SCHEMA_VERSION,
+            }
+        )
+
+    result = shadow.build_right_side_shadow_feature_frame(
+        pd.concat(market_frames, ignore_index=True),
+        pd.DataFrame(signal_rows),
+        target_date=dates[-1],
+        workers=2,
+        project_features=pd.DataFrame(project_rows),
+    )
+
+    assert result["symbol"].tolist() == symbols
+    assert result["alpha003"].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
 def test_shadow_score_and_product_are_checksum_pinned_and_selector_is_not_published(
     tmp_path: Path,
 ) -> None:

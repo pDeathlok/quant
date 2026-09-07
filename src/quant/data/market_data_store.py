@@ -2,17 +2,20 @@
 
 The production storage target is MySQL. A parquet mirror can be enabled for
 research scripts that still scan local files directly while the project is being
-incrementally migrated to SQL-backed reads.
+incrementally migrated to SQL-backed reads. SQL reads never fall back to that
+mirror: a successful empty result stays empty, and an unavailable source raises
+MarketDataUnavailableError. Select a file backend explicitly for local reads.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-import hashlib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 import pandas as pd
 
@@ -20,6 +23,18 @@ from quant.data.dataset_revision_store import (
     DatasetRevisionStore,
     PartitionRevisionInput,
 )
+from quant.data.sql_pool import get_sql_engine
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Connection, Engine
+
+
+class MarketDataUnavailableError(RuntimeError):
+    """A canonical SQL read failed; this is not a successful empty result.
+
+    Messages deliberately omit driver exceptions and connection URLs so callers
+    can report source unavailability without exposing credentials.
+    """
 
 
 @dataclass(frozen=True)
@@ -48,6 +63,7 @@ class MarketDataStore:
         self.config = config or MarketDataStoreConfig.from_env()
 
     def write_frame(self, frame: pd.DataFrame, dataset: str, key: str) -> None:
+        self._assert_unpinned_write()
         if self.config.backend in {"mysql", "sql"}:
             if self.config.sql_url:
                 self._write_sql(frame, dataset, key)
@@ -66,6 +82,8 @@ class MarketDataStore:
         partition_column: str = "trade_date",
     ) -> dict[str, Any]:
         """Idempotently persist a cross-sectional market batch in one SQL transaction and date partitions."""
+
+        self._assert_unpinned_write()
 
         if frame.empty:
             return {"rows": 0, "sql_rows": 0, "parquet_partitions": 0, "table": self._dataset_table_name(dataset)}
@@ -89,11 +107,21 @@ class MarketDataStore:
             )
         except Exception:
             # Older canonical partitions can predate newly added columns. Read
-            # their available schema and let the comparison align columns.
-            existing = self.read_market_range(
-                dataset,
-                start_date=trade_dates[0],
-                end_date=trade_dates[-1],
+            # their available schema; bootstrap only after SQL confirms absence.
+            table_exists = True
+            if self.config.backend in {"mysql", "sql"}:
+                with self._sql_connection(dataset, "write_market_batch_schema") as connection:
+                    from sqlalchemy import inspect
+
+                    table_exists = inspect(connection).has_table(self._dataset_table_name(dataset))
+            existing = (
+                self.read_market_range(
+                    dataset,
+                    start_date=trade_dates[0],
+                    end_date=trade_dates[-1],
+                )
+                if table_exists
+                else pd.DataFrame()
             )
         changed_keys = self._changed_market_keys(
             existing,
@@ -140,6 +168,20 @@ class MarketDataStore:
         }
 
     def dataset_revision(self, dataset: str = "daily") -> int | None:
+        if self._pinned_reader() is not None:
+            return None
+        if self.config.backend in {"mysql", "sql"}:
+            with self._sql_connection(dataset, "dataset_revision") as connection:
+                from sqlalchemy import text
+
+                value = connection.execute(
+                    text(
+                        "SELECT revision FROM routine_dataset_revisions "
+                        "WHERE dataset_id = :dataset_id"
+                    ),
+                    {"dataset_id": self._dataset_table_name(dataset)},
+                ).scalar_one_or_none()
+                return int(value) if value is not None else None
         revision = self._revision_store().get(self._dataset_table_name(dataset))
         return revision.revision if revision is not None else None
 
@@ -150,16 +192,11 @@ class MarketDataStore:
         )
 
     def read_frame(self, dataset: str, key: str) -> pd.DataFrame:
+        reader = self._pinned_reader()
+        if reader is not None:
+            return reader.available(dataset, symbols=[key])
         if self.config.backend in {"mysql", "sql"}:
-            if self.config.sql_url:
-                sql_frame = self._read_sql(dataset, key)
-                if not sql_frame.empty:
-                    return sql_frame
-            if self.config.mirror_parquet:
-                return self._read_parquet(dataset, key)
-            if not self.config.sql_url and not self.config.mirror_parquet:
-                raise ValueError("MARKET_DATA_SQL_URL is required when MARKET_DATA_BACKEND=mysql")
-            return pd.DataFrame()
+            return self._read_sql(dataset, key)
         return self._read_parquet(dataset, key)
 
     def read_market_range(
@@ -172,29 +209,27 @@ class MarketDataStore:
     ) -> pd.DataFrame:
         """Read a canonical date range in one query or one pass over month partitions."""
 
-        if self.config.backend in {"mysql", "sql"} and self.config.sql_url:
-            frame = self._read_sql_range(dataset, start_date, end_date, symbols, columns)
-            if not frame.empty or not self.config.mirror_parquet:
-                return frame
+        reader = self._pinned_reader()
+        if reader is not None:
+            return reader.read(dataset, start_date, end_date, symbols, columns)
+
+        if self.config.backend in {"mysql", "sql"}:
+            return self._read_sql_range(dataset, start_date, end_date, symbols, columns)
         return self._read_parquet_range(dataset, start_date, end_date, symbols, columns)
 
     def list_symbols(self, dataset: str = "daily") -> list[str]:
-        if self.config.backend in {"mysql", "sql"} and self.config.sql_url:
-            engine = self._engine()
-            try:
+        reader = self._pinned_reader()
+        if reader is not None:
+            return reader.list_symbols(dataset)
+        if self.config.backend in {"mysql", "sql"}:
+            with self._sql_connection(dataset, "list_symbols") as connection:
                 from sqlalchemy import text
 
                 frame = pd.read_sql_query(
                     text(f"SELECT DISTINCT ts_code FROM `{self._dataset_table_name(dataset)}`"),
-                    engine,
+                    connection,
                 )
-                if not frame.empty:
-                    return sorted(frame["ts_code"].dropna().astype(str).tolist())
-            except Exception:
-                if not self.config.mirror_parquet:
-                    return []
-            finally:
-                engine.dispose()
+                return sorted(frame["ts_code"].dropna().astype(str).tolist())
         symbols: set[str] = set()
         for path in self._partition_root(dataset).glob("year_month=*/data.parquet"):
             frame = pd.read_parquet(path, columns=["ts_code"])
@@ -202,31 +237,36 @@ class MarketDataStore:
         return sorted(symbols)
 
     def latest_trade_date(self, dataset: str, key: str) -> pd.Timestamp | None:
-        if self.config.backend in {"mysql", "sql"} and self.config.sql_url:
-            try:
-                latest = self._latest_trade_date_sql(dataset, key)
-            except Exception:
-                latest = None
-            if latest is not None:
-                return latest
-            if not self.config.mirror_parquet:
-                return None
+        reader = self._pinned_reader()
+        if reader is not None:
+            return reader.latest_date(dataset, key)
+        if self.config.backend in {"mysql", "sql"}:
+            return self._latest_trade_date_sql(dataset, key)
         return self._latest_trade_date_parquet(dataset, key)
 
     def latest_dataset_trade_date(self, dataset: str) -> pd.Timestamp | None:
-        if self.config.backend in {"mysql", "sql"} and self.config.sql_url:
-            try:
-                latest = self._latest_dataset_trade_date_sql(dataset)
-            except Exception:
-                latest = None
-            if latest is not None:
-                return latest
-            if not self.config.mirror_parquet:
-                return None
+        reader = self._pinned_reader()
+        if reader is not None:
+            return reader.latest_date(dataset)
+        if self.config.backend in {"mysql", "sql"}:
+            return self._latest_dataset_trade_date_sql(dataset)
         latest = self._latest_partition_trade_date(dataset)
         if latest is not None:
             return latest
         return None
+
+    @staticmethod
+    def _pinned_reader():
+        from quant.data.market_snapshot import current_market_snapshot
+
+        return current_market_snapshot()
+
+    @classmethod
+    def _assert_unpinned_write(cls) -> None:
+        if cls._pinned_reader() is not None:
+            from quant.data.market_snapshot import MarketSnapshotError
+
+            raise MarketSnapshotError("Canonical writes are forbidden inside a pinned read")
 
     def _path(self, dataset: str, key: str) -> Path:
         safe_key = key.replace("/", "_").replace(":", "").replace(" ", "_")
@@ -368,33 +408,44 @@ class MarketDataStore:
         latest = pd.to_datetime(frame["trade_date"].astype(str), format="%Y%m%d", errors="coerce").max()
         return latest if pd.notna(latest) else None
 
-    def _engine(self):
+    @contextmanager
+    def _sql_connection(self, dataset: str, operation: str) -> Iterator[Connection]:
+        context = f"operation={operation}, dataset={self._dataset_table_name(dataset)}"
+        if not self.config.sql_url:
+            raise MarketDataUnavailableError(
+                f"Canonical SQL read unavailable ({context}): MARKET_DATA_SQL_URL is required"
+            )
+        try:
+            with self._engine().connect() as connection:
+                yield connection
+        except Exception:
+            # Driver errors (including engine construction) can contain secrets.
+            raise MarketDataUnavailableError(
+                f"Canonical SQL read unavailable ({context})"
+            ) from None
+
+    def _engine(self) -> Engine:
+        """Borrow a process-owned engine; callers must not dispose it per query."""
         if not self.config.sql_url:
             raise ValueError("MARKET_DATA_SQL_URL is required when MARKET_DATA_BACKEND=mysql")
         try:
-            from sqlalchemy import create_engine
+            from sqlalchemy.engine import make_url
         except ImportError as exc:
             raise ImportError("SQL backend requires sqlalchemy and a database driver such as pymysql") from exc
-        connect_args = {
-            "connect_timeout": int(os.getenv("MARKET_DATA_SQL_CONNECT_TIMEOUT", "10")),
-            "read_timeout": int(os.getenv("MARKET_DATA_SQL_READ_TIMEOUT", "60")),
-            "write_timeout": int(os.getenv("MARKET_DATA_SQL_WRITE_TIMEOUT", "60")),
-        }
-        return create_engine(
-            self.config.sql_url,
-            connect_args=connect_args,
-            pool_pre_ping=True,
-            pool_recycle=300,
-        )
+        connect_args = {}
+        if make_url(self.config.sql_url).get_backend_name() in {"mysql", "mariadb"}:
+            connect_args = {
+                "connect_timeout": int(os.getenv("MARKET_DATA_SQL_CONNECT_TIMEOUT", "10")),
+                "read_timeout": int(os.getenv("MARKET_DATA_SQL_READ_TIMEOUT", "60")),
+                "write_timeout": int(os.getenv("MARKET_DATA_SQL_WRITE_TIMEOUT", "60")),
+            }
+        return get_sql_engine(self.config.sql_url, connect_args=connect_args)
 
     def _write_sql(self, frame: pd.DataFrame, dataset: str, key: str) -> None:
         table = self._table_name(dataset, key)
         engine = self._engine()
-        try:
-            with self._sql_write_lock:
-                frame.to_sql(table, engine, if_exists="replace", index=False, chunksize=5000, method="multi")
-        finally:
-            engine.dispose()
+        with self._sql_write_lock, engine.begin() as connection:
+            frame.to_sql(table, connection, if_exists="replace", index=False, chunksize=5000, method="multi")
 
     def _write_sql_batch(
         self,
@@ -409,85 +460,82 @@ class MarketDataStore:
 
         table_name = self._dataset_table_name(dataset)
         engine = self._engine()
-        try:
-            dtype = {
-                "ts_code": VARCHAR(9, charset="ascii", collation="ascii_bin"),
-                "symbol": VARCHAR(9, charset="ascii", collation="ascii_bin"),
-                partition_column: Date(),
-                "date": DateTime(),
-                "name": String(128),
-                "industry": String(128),
-            }
-            for column in (
-                "open",
-                "high",
-                "low",
-                "close",
-                "pre_close",
-                "change",
-                "pct_chg",
-                "vol",
-                "volume",
-                "amount",
-                "turnover",
-            ):
-                dtype[column] = Float()
-            frame.head(0).to_sql(table_name, engine, if_exists="append", index=False, dtype=dtype)
-            inspector = inspect(engine)
-            indexes = inspector.get_indexes(table_name)
-            unique_columns = {tuple(item.get("column_names") or []) for item in indexes if item.get("unique")}
-            indexed_columns = {tuple(item.get("column_names") or []) for item in indexes}
-            if ("ts_code", partition_column) not in unique_columns:
-                with engine.begin() as conn:
-                    conn.exec_driver_sql(
-                        f"ALTER TABLE `{table_name}` ADD UNIQUE KEY "
-                        f"`uq_ts_code_{partition_column}` (`ts_code`, `{partition_column}`)"
-                    )
-            if (partition_column,) not in indexed_columns:
-                with engine.begin() as conn:
-                    conn.exec_driver_sql(
-                        f"ALTER TABLE `{table_name}` ADD INDEX "
-                        f"`idx_{partition_column}` (`{partition_column}`)"
-                    )
-            table = Table(table_name, MetaData(), autoload_with=engine)
-            sql_frame = frame.copy()
-            sql_frame[partition_column] = pd.to_datetime(
-                sql_frame[partition_column].astype(str).str.replace("-", "", regex=False),
-                format="%Y%m%d",
-                errors="raise",
-            ).dt.date
-            records = sql_frame.astype(object).where(pd.notna(sql_frame), None).to_dict("records")
-            chunk_size = max(100, int(os.getenv("MARKET_DATA_SQL_BATCH_SIZE", "5000")))
-            with self._sql_write_lock, engine.begin() as conn:
-                if replace_partitions:
-                    dates = sorted(sql_frame[partition_column].unique().tolist())
-                    conn.execute(
-                        table.delete().where(table.c[partition_column].in_(dates))
-                    )
-                    for offset in range(0, len(records), chunk_size):
-                        conn.execute(table.insert(), records[offset : offset + chunk_size])
-                elif engine.dialect.name == "mysql":
-                    from sqlalchemy.dialects.mysql import insert as mysql_insert
+        dtype = {
+            "ts_code": VARCHAR(9, charset="ascii", collation="ascii_bin"),
+            "symbol": VARCHAR(9, charset="ascii", collation="ascii_bin"),
+            partition_column: Date(),
+            "date": DateTime(),
+            "name": String(128),
+            "industry": String(128),
+        }
+        for column in (
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "volume",
+            "amount",
+            "turnover",
+        ):
+            dtype[column] = Float()
+        frame.head(0).to_sql(table_name, engine, if_exists="append", index=False, dtype=dtype)
+        inspector = inspect(engine)
+        indexes = inspector.get_indexes(table_name)
+        unique_columns = {tuple(item.get("column_names") or []) for item in indexes if item.get("unique")}
+        indexed_columns = {tuple(item.get("column_names") or []) for item in indexes}
+        if ("ts_code", partition_column) not in unique_columns:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE `{table_name}` ADD UNIQUE KEY "
+                    f"`uq_ts_code_{partition_column}` (`ts_code`, `{partition_column}`)"
+                )
+        if (partition_column,) not in indexed_columns:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE `{table_name}` ADD INDEX "
+                    f"`idx_{partition_column}` (`{partition_column}`)"
+                )
+        table = Table(table_name, MetaData(), autoload_with=engine)
+        sql_frame = frame.copy()
+        sql_frame[partition_column] = pd.to_datetime(
+            sql_frame[partition_column].astype(str).str.replace("-", "", regex=False),
+            format="%Y%m%d",
+            errors="raise",
+        ).dt.date
+        records = sql_frame.astype(object).where(pd.notna(sql_frame), None).to_dict("records")
+        chunk_size = max(100, int(os.getenv("MARKET_DATA_SQL_BATCH_SIZE", "5000")))
+        with self._sql_write_lock, engine.begin() as conn:
+            if replace_partitions:
+                dates = sorted(sql_frame[partition_column].unique().tolist())
+                conn.execute(
+                    table.delete().where(table.c[partition_column].in_(dates))
+                )
+                for offset in range(0, len(records), chunk_size):
+                    conn.execute(table.insert(), records[offset : offset + chunk_size])
+            elif engine.dialect.name == "mysql":
+                from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-                    statement = mysql_insert(table)
-                    if update_existing:
-                        updates = {
-                            column.name: statement.inserted[column.name]
-                            for column in table.columns
-                            if column.name not in {"ts_code", partition_column}
-                        }
-                        statement = statement.on_duplicate_key_update(**updates)
-                    else:
-                        statement = statement.prefix_with("IGNORE")
-                    for offset in range(0, len(records), chunk_size):
-                        conn.execute(statement, records[offset : offset + chunk_size])
+                statement = mysql_insert(table)
+                if update_existing:
+                    updates = {
+                        column.name: statement.inserted[column.name]
+                        for column in table.columns
+                        if column.name not in {"ts_code", partition_column}
+                    }
+                    statement = statement.on_duplicate_key_update(**updates)
                 else:
-                    dates = sorted(frame[partition_column].astype(str).unique().tolist())
-                    conn.execute(table.delete().where(table.c[partition_column].in_(dates)))
-                    conn.execute(table.insert(), records)
-            return len(records)
-        finally:
-            engine.dispose()
+                    statement = statement.prefix_with("IGNORE")
+                for offset in range(0, len(records), chunk_size):
+                    conn.execute(statement, records[offset : offset + chunk_size])
+            else:
+                dates = sorted(frame[partition_column].astype(str).unique().tolist())
+                conn.execute(table.delete().where(table.c[partition_column].in_(dates)))
+                conn.execute(table.insert(), records)
+        return len(records)
 
     def _read_sql(self, dataset: str, key: str) -> pd.DataFrame:
         return self._read_sql_range(dataset, symbols=[str(key)])
@@ -500,74 +548,68 @@ class MarketDataStore:
         symbols: list[str] | set[str] | tuple[str, ...] | None = None,
         columns: list[str] | tuple[str, ...] | None = None,
     ) -> pd.DataFrame:
-        from sqlalchemy import bindparam, text
+        with self._sql_connection(dataset, "read_market_range") as connection:
+            from sqlalchemy import bindparam, text
 
-        clauses: list[str] = []
-        params: dict[str, object] = {}
-        if start_date:
-            clauses.append("trade_date >= :start_date")
-            params["start_date"] = str(start_date).replace("-", "")
-        if end_date:
-            clauses.append("trade_date <= :end_date")
-            params["end_date"] = str(end_date).replace("-", "")
-        selected = "*"
-        if columns:
-            safe_columns = [column for column in columns if column.replace("_", "").isalnum()]
-            selected = ", ".join(f"`{column}`" for column in safe_columns)
-        statement = f"SELECT {selected} FROM `{self._dataset_table_name(dataset)}`"
-        symbol_values = [str(value) for value in symbols] if symbols else []
-        if symbol_values:
-            clauses.append("ts_code IN :symbols")
-            params["symbols"] = symbol_values
-        if clauses:
-            statement += " WHERE " + " AND ".join(clauses)
-        query = text(statement)
-        if symbol_values:
-            query = query.bindparams(bindparam("symbols", expanding=True))
-        engine = self._engine()
-        try:
-            frame = pd.read_sql_query(query, engine, params=params)
+            clauses: list[str] = []
+            params: dict[str, object] = {}
+            if start_date:
+                clauses.append("trade_date >= :start_date")
+                params["start_date"] = str(start_date).replace("-", "")
+            if end_date:
+                clauses.append("trade_date <= :end_date")
+                params["end_date"] = str(end_date).replace("-", "")
+            selected = "*"
+            if columns:
+                safe_columns = [column for column in columns if column.replace("_", "").isalnum()]
+                selected = ", ".join(f"`{column}`" for column in safe_columns)
+            statement = f"SELECT {selected} FROM `{self._dataset_table_name(dataset)}`"
+            symbol_values = [str(value) for value in symbols] if symbols else []
+            if symbol_values:
+                clauses.append("ts_code IN :symbols")
+                params["symbols"] = symbol_values
+            if clauses:
+                statement += " WHERE " + " AND ".join(clauses)
+            query = text(statement)
+            if symbol_values:
+                query = query.bindparams(bindparam("symbols", expanding=True))
+            frame = pd.read_sql_query(query, connection, params=params)
             if "trade_date" in frame.columns:
-                frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime("%Y%m%d")
+                frame["trade_date"] = pd.to_datetime(
+                    frame["trade_date"], format="mixed", errors="raise"
+                ).dt.strftime("%Y%m%d")
             return frame
-        except Exception:
-            return pd.DataFrame()
-        finally:
-            engine.dispose()
 
     def _latest_trade_date_sql(self, dataset: str, key: str) -> pd.Timestamp | None:
-        engine = self._engine()
-        try:
+        with self._sql_connection(dataset, "latest_trade_date") as connection:
             from sqlalchemy import text
 
-            with engine.connect() as conn:
-                value = conn.execute(
-                    text(
-                        f"SELECT MAX(`trade_date`) FROM `{self._dataset_table_name(dataset)}` "
-                        "WHERE ts_code = :ts_code"
-                    ),
-                    {"ts_code": str(key)},
-                ).scalar()
-        finally:
-            engine.dispose()
-        latest = pd.to_datetime(str(value).replace("-", ""), format="%Y%m%d", errors="coerce")
-        return latest if pd.notna(latest) else None
+            value = connection.execute(
+                text(
+                    f"SELECT MAX(`trade_date`) FROM `{self._dataset_table_name(dataset)}` "
+                    "WHERE ts_code = :ts_code"
+                ),
+                {"ts_code": str(key)},
+            ).scalar_one()
+            return self._sql_trade_date(value)
 
     def _latest_dataset_trade_date_sql(self, dataset: str) -> pd.Timestamp | None:
-        engine = self._engine()
-        try:
+        with self._sql_connection(dataset, "latest_dataset_trade_date") as connection:
             from sqlalchemy import text
 
-            with engine.connect() as conn:
-                value = conn.execute(
-                    text(f"SELECT MAX(`trade_date`) FROM `{self._dataset_table_name(dataset)}`")
-                ).scalar()
-            latest = pd.to_datetime(str(value).replace("-", ""), format="%Y%m%d", errors="coerce")
-            return latest if pd.notna(latest) else None
-        except Exception:
+            value = connection.execute(
+                text(f"SELECT MAX(`trade_date`) FROM `{self._dataset_table_name(dataset)}`")
+            ).scalar_one()
+            return self._sql_trade_date(value)
+
+    @staticmethod
+    def _sql_trade_date(value: Any) -> pd.Timestamp | None:
+        if value is None:
             return None
-        finally:
-            engine.dispose()
+        latest = pd.to_datetime(str(value), errors="raise")
+        if pd.isna(latest):
+            raise ValueError("SQL returned an invalid trade date")
+        return latest
 
     @staticmethod
     def _merge_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -678,7 +720,7 @@ def read_partitioned_symbol_file(
     start_date: str | pd.Timestamp | None = None,
     end_date: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    """Read one legacy symbol file plus all newer trade-date partitions beside it."""
+    """Read a symbol through the configured backend, never an implicit mirror."""
 
     symbol_path = Path(path)
     store = MarketDataStore(
@@ -702,6 +744,6 @@ def list_partitioned_symbol_paths(daily_dir: Path | str) -> list[Path]:
     directory = Path(daily_dir)
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=directory.parent))
     symbols = store.list_symbols(directory.name)
-    if symbols:
+    if symbols or store._pinned_reader() is not None or store.config.backend in {"mysql", "sql"}:
         return [directory / f"{symbol}.parquet" for symbol in symbols]
     return sorted(directory.glob("*.parquet"))

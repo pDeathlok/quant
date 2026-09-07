@@ -11,6 +11,8 @@ import pandas as pd
 
 from quant.core.paths import PROJECT_ROOT
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.market_data_store import MarketDataUnavailableError
+from quant.data.market_snapshot import MarketSnapshotError, current_market_snapshot
 from quant.research.byd_daily_t_plan import build_daily_t_plan
 from quant.strategies.custom.byd_minute_t import (
     BydHolding,
@@ -138,12 +140,12 @@ def load_byd_daily_frame(
     cache_dir: Path = PROJECT_ROOT / "data/cache",
     expected_trade_date: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    """Load current BYD daily features; only use a date-verified qfq fallback."""
+    """Load canonical BYD features; date-checked qfq is file-backend-only."""
 
     expected_date = _normalized_date(expected_trade_date)
-    store: MarketDataStore | None = None
+    config = MarketDataStoreConfig.from_env(root=daily_dir.parent)
     try:
-        store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+        store = MarketDataStore(config)
         if expected_date is None:
             expected_date = _normalized_date(store.latest_dataset_trade_date(daily_dir.name))
         daily = store.read_frame(daily_dir.name, "002594.SZ")
@@ -152,7 +154,12 @@ def load_byd_daily_frame(
             expected_date=expected_date,
             source="canonical_market_store",
         )
+    except (MarketDataUnavailableError, MarketSnapshotError):
+        raise
     except Exception as canonical_error:
+        if current_market_snapshot() is not None or config.backend in {"mysql", "sql"}:
+            # Same-date qfq data does not prove equality to the SQL revision.
+            raise
         try:
             fallback = load_daily_qfq(cache_dir)
         except Exception as fallback_error:

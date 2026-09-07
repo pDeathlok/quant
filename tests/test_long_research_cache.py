@@ -4,8 +4,16 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from quant.webapp import services
+
+
+@pytest.fixture(autouse=True)
+def _isolated_market_backend(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    monkeypatch.delenv("MARKET_DATA_ROOT", raising=False)
 
 
 def _write_daily_history(path: Path) -> None:

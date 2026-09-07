@@ -1,13 +1,176 @@
 from __future__ import annotations
 
 import os
+import argparse
+import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from scripts.research import rebuild_strategy_signal_cache as signal_cache
+
+
+@pytest.fixture
+def complete_sql_run(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
+    from quant.data.market_snapshot import export_market_snapshot
+    from tests.test_daily_factor_layer import _daily
+
+    url = f"sqlite:///{tmp_path / 'canonical.sqlite'}"
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        _daily().to_sql("market_daily", connection, index=False)
+    store = MarketDataStore(MarketDataStoreConfig(backend="sql", sql_url=url))
+    snapshot = export_market_snapshot(store, tmp_path / "sealed")
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "sql")
+    monkeypatch.setenv("MARKET_DATA_SQL_URL", url)
+    for key in ("QUANT_PINNED_MARKET_MANIFEST", "QUANT_PINNED_MARKET_FINGERPRINT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DAILY_FACTOR_ROOT", str(tmp_path / "factors"))
+    monkeypatch.setenv("SIGNAL_FACTOR_ROOT", str(tmp_path / "factors"))
+    # Exercise real calculations, merges and publication with observable local workers.
+    monkeypatch.setattr(signal_cache, "ProcessPoolExecutor", ThreadPoolExecutor)
+    arguments = argparse.Namespace(
+        daily_dir=tmp_path / "daily", family_cache=tmp_path / "family.parquet",
+        extended_cache=tmp_path / "extended.parquet", b1_gate_cache=tmp_path / "gate.parquet",
+        b1_gate_manifest=tmp_path / "manifest.json", start_date="2020-01-01",
+        incremental_start_date=None, force_refresh=False, factor_mode="stateful",
+        factor_root=tmp_path / "factors", workers=1, batch_size=16,
+    )
+    reads = []
+    original_read = MarketDataStore.read_market_range
+
+    def read_market_range(self, *args, **kwargs):
+        reads.append((args, kwargs))
+        return original_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(MarketDataStore, "read_market_range", read_market_range)
+    try:
+        yield arguments, snapshot, reads
+    finally:
+        engine.dispose()
+
+
+def test_pinned_sql_complete_run_reads_market_once_and_rerun_reads_no_rows(
+    complete_sql_run, monkeypatch,
+):
+    from quant.data.market_snapshot import pinned_market_snapshot
+
+    arguments, snapshot, reads = complete_sql_run
+    # A leftover SQL URL must never select the mutable source or frame-hash fallback.
+    monkeypatch.setenv("MARKET_DATA_SQL_URL", "invalid-driver://must-not-open")
+    monkeypatch.setattr(signal_cache, "_market_frame_source_identity", lambda *a, **kw: pytest.fail("mutable SQL identity selected"))
+    with pinned_market_snapshot(snapshot.manifest_path):
+        first = signal_cache.run(arguments)
+        assert first["status"] == "success"
+        assert len(reads) == 1
+        source = json.loads(arguments.b1_gate_manifest.read_text())["cache_identity"]["source"]
+        assert source["source_type"] == "sealed_canonical_export"
+        reads.clear()
+        repeated = signal_cache.run(arguments)
+        assert repeated["execution_mode"] == "input_contract_cache_hit"
+        assert repeated["checkpoint_reused"] is True
+        assert reads == []
+
+
+@pytest.mark.parametrize("phase", ["final", "locked"])
+def test_pinned_sql_run_revalidates_expected_manifest_before_publish(
+    complete_sql_run, monkeypatch, phase,
+):
+    from quant.data.market_snapshot import MarketSnapshotError, pinned_market_snapshot
+
+    arguments, snapshot, reads = complete_sql_run
+    with pinned_market_snapshot(snapshot.manifest_path):
+        signal_cache.run(arguments)
+        outputs = [arguments.family_cache, arguments.extended_cache, arguments.b1_gate_cache, arguments.b1_gate_manifest]
+        before = {path: path.read_bytes() for path in outputs}
+
+        def invalidate_manifest():
+            manifest = json.loads(snapshot.manifest_path.read_text())
+            manifest["status"] = "building"
+            snapshot.manifest_path.write_text(json.dumps(manifest))
+
+        if phase == "final":
+            original_compare = signal_cache._frames_exactly_equal
+
+            def compare(*args):
+                invalidate_manifest()
+                return original_compare(*args)
+
+            monkeypatch.setattr(signal_cache, "_frames_exactly_equal", compare)
+        else:
+            original_lock = signal_cache._publish_lock
+
+            @contextmanager
+            def locked(path):
+                with original_lock(path):
+                    invalidate_manifest()
+                    yield
+
+            monkeypatch.setattr(signal_cache, "_publish_lock", locked)
+        arguments.force_refresh = True
+        reads.clear()
+        with pytest.raises(MarketSnapshotError):
+            signal_cache.run(arguments)
+        assert len(reads) == 1
+        assert {path: path.read_bytes() for path in outputs} == before
+
+
+def test_unpinned_sql_without_revision_keeps_frame_identity_recheck(
+    complete_sql_run, monkeypatch,
+):
+    arguments, _, reads = complete_sql_run
+    monkeypatch.setattr(signal_cache.MarketDataStore, "dataset_revision", lambda *args: None)
+    first = signal_cache.run(arguments)
+    assert first["status"] == "success"
+    assert len(reads) == 2
+    source = json.loads(arguments.b1_gate_manifest.read_text())["cache_identity"]["source"]
+    assert source.get("source_type") != "sealed_canonical_export"
+    reads.clear()
+    repeated = signal_cache.run(arguments)
+    assert repeated["execution_mode"] == "input_contract_cache_hit"
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("incremental_date", [None, "2026-09-04"])
+def test_changed_contract_rebuilds_history_instead_of_reusing_old_signals(tmp_path, monkeypatch, incremental_date):
+    arguments = argparse.Namespace(
+        daily_dir=tmp_path / "daily", family_cache=tmp_path / "family.parquet",
+        extended_cache=tmp_path / "extended.parquet", b1_gate_cache=tmp_path / "gate.parquet",
+        b1_gate_manifest=tmp_path / "manifest.json", start_date="2020-01-01",
+        incremental_start_date=incremental_date, force_refresh=False, factor_mode="stateful",
+    )
+    monkeypatch.setattr(signal_cache, "_read_manifest", lambda path: {
+        "cache_identity": {"contract_fingerprint": "old-calculator"},
+    })
+    monkeypatch.setattr(signal_cache, "_contract_fingerprint", lambda: "new-calculator")
+    monkeypatch.setattr(signal_cache, "_load_cache", lambda *a, **kw: pytest.fail("old cache reuse"))
+    monkeypatch.setattr(signal_cache, "_fast_path_result", lambda **kw: pytest.fail("old identity reuse"))
+
+    class Source:
+        config = type("Config", (), {"sql_url": None})()
+
+        def latest_dataset_trade_date(self, dataset):
+            return None
+
+        def dataset_revision(self, dataset):
+            return None
+
+        def read_market_range(self, dataset, *, start_date):
+            assert start_date == (pd.Timestamp("2020-01-01") - pd.Timedelta(days=600)).strftime("%Y%m%d")
+            raise RuntimeError("verified full history request")
+
+    monkeypatch.setattr(signal_cache, "MarketDataStore", lambda config: Source())
+    with pytest.raises(RuntimeError, match="verified full history request"):
+        signal_cache.run(arguments)
+    assert arguments.force_refresh is False
+    assert arguments.incremental_start_date == incremental_date
 
 
 def _write_market_partition(

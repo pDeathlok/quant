@@ -43,12 +43,18 @@ from quant.features.right_side_factor_contract import (
     RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS,
     factor_contract_sha256,
 )
+from quant.features.variable_library import DAILY_BASIC_PROJECT_FACTOR_COLUMNS
+from quant.infrastructure.publication import publication_path
+from quant.research.right_side_unified import load_signal_universe
 from quant.research.right_side_unified_features import (
     RULE_FEATURE_COLUMNS,
     RULE_FEATURE_COLUMNS_SHA256,
     rule_feature_columns_sha256,
 )
 from quant.routine.paths import PROJECT_ROOT
+from quant.routine.project_feature_cache import (
+    load_exact_date_project_feature_cache,
+)
 from quant.routine.right_side_unified_shadow import (
     DEFAULT_CONFIG_PATH as DEFAULT_SHADOW_CONFIG_PATH,
     ShadowPaths,
@@ -71,6 +77,13 @@ NORMALIZATION_REFERENCE_PREDICTION_COLUMN = (
     "pred_unified_long_task_deep"
 )
 NORMALIZATION_QUANTILE_COUNT = 1001
+ACTIVE_PROJECT_FEATURE_PATH = (
+    PROJECT_ROOT / "data/features/b1/active_candidate_project_features.parquet"
+)
+ACTIVE_PROJECT_FEATURE_MANIFEST_PATH = (
+    PROJECT_ROOT
+    / "data/features/b1/active_candidate_project_features_manifest.json"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -308,7 +321,12 @@ def _production_input_snapshot(
     target: pd.Timestamp,
     *,
     project_root: Path,
+    project_feature_path: Path | None = None,
+    project_feature_manifest_path: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    project_feature_path, project_feature_manifest_path = _project_feature_paths(
+        project_root, project_feature_path, project_feature_manifest_path,
+    )
     month_partition = (
         config.paths.market_data_root
         / "daily_partitioned"
@@ -321,14 +339,18 @@ def _production_input_snapshot(
         "z_signal_cache": config.paths.z_signal_cache,
         "family_signal_cache": config.paths.family_signal_cache,
         "market_month_partition": month_partition,
+        "project_feature_cache": project_feature_path,
+        "project_feature_manifest": project_feature_manifest_path,
     }
     contract_files = (
         "configs/strategies/right_side_ranking_selector.yaml",
         "src/quant/application/selector_ranking.py",
         "src/quant/features/right_side_factor_contract.py",
         "src/quant/features/project_factor_layer.py",
+        "src/quant/features/variable_library.py",
         "src/quant/research/right_side_unified_features.py",
         "src/quant/research/right_side_unified_signals.py",
+        "src/quant/routine/project_feature_cache.py",
         "src/quant/routine/right_side_unified_shadow.py",
         "src/quant/routine/right_side_unified_production.py",
     )
@@ -515,16 +537,60 @@ def _shadow_compatible_config(config: SelectorRankingConfig) -> ShadowReleaseCon
     )
 
 
+def _project_feature_paths(
+    project_root: Path,
+    feature_path: Path | None,
+    manifest_path: Path | None,
+) -> tuple[Path, Path]:
+    if (feature_path is None) != (manifest_path is None):
+        raise ValueError("shared project feature cache and manifest paths must be supplied together")
+    if feature_path is None:
+        feature_path = project_root / ACTIVE_PROJECT_FEATURE_PATH.relative_to(PROJECT_ROOT)
+        manifest_path = project_root / ACTIVE_PROJECT_FEATURE_MANIFEST_PATH.relative_to(PROJECT_ROOT)
+    assert manifest_path is not None
+    return publication_path(feature_path), publication_path(manifest_path)
+
+
 def build_right_side_unified_production_features(
     target_date: str,
     *,
     config: SelectorRankingConfig,
+    project_root: Path = PROJECT_ROOT,
+    project_feature_path: Path | None = None,
+    project_feature_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Build the exact-date canonical project-v5/rule-v4 production sidecar."""
-
+    project_feature_path, project_feature_manifest_path = _project_feature_paths(
+        project_root, project_feature_path, project_feature_manifest_path,
+    )
+    target = pd.to_datetime(target_date, errors="raise").normalize()
+    if not config.paths.z_signal_cache.is_file():
+        raise FileNotFoundError(config.paths.z_signal_cache)
+    if not config.paths.family_signal_cache.is_file():
+        raise FileNotFoundError(config.paths.family_signal_cache)
+    signals = load_signal_universe(
+        config.paths.z_signal_cache,
+        config.paths.family_signal_cache,
+        start_date=target,
+        end_date=target,
+    )
+    snapshot = load_exact_date_project_feature_cache(
+        target,
+        signals,
+        feature_path=project_feature_path,
+        manifest_path=project_feature_manifest_path,
+        context="right-side",
+    )
+    project_features = snapshot.features.copy()
+    project_features[list(DAILY_BASIC_PROJECT_FACTOR_COLUMNS)] = np.nan
     return build_right_side_shadow_features(
-        target_date,
+        target,
         config=_shadow_compatible_config(config),
+        signals=snapshot.eligible_signals,
+        project_features=project_features,
+        source_signal_candidate_count=len(signals),
+        policy_excluded_symbols=snapshot.policy_excluded_symbols,
+        project_feature_cache_sha256=_sha256(project_feature_path),
     )
 
 
@@ -548,7 +614,23 @@ def score_right_side_unified_production(
         raise RuntimeError("right-side production features are stale or incompatible")
     if feature_manifest.get("output_sha256") != _sha256(config.paths.feature_output):
         raise RuntimeError("right-side production feature checksum mismatch")
+    policy_excluded = sorted(
+        {
+            str(symbol)
+            for symbol in feature_manifest.get(
+                "policy_excluded_candidate_symbols"
+            )
+            or ()
+            if str(symbol)
+        }
+    )
     frame = pd.read_parquet(config.paths.feature_output)
+    overlap = set(frame["symbol"].astype(str)) & set(policy_excluded)
+    if overlap:
+        raise RuntimeError(
+            "right-side production policy exclusions overlap feature rows: "
+            f"{sorted(overlap)[:20]}"
+        )
     features = tuple(str(value) for value in (bundle.get("features") or ()))
     missing = sorted(set(features) - set(frame.columns))
     if missing:
@@ -599,6 +681,8 @@ def score_right_side_unified_production(
             "source_input_fingerprint"
         ),
         "candidate_count": int(len(scored)),
+        "policy_excluded_candidate_count": len(policy_excluded),
+        "policy_excluded_candidate_symbols": policy_excluded,
         "score_field": "ranking_score",
         "normalized_score_field": NORMALIZED_RANKING_SCORE_FIELD,
         "probability_calibration": config.probability_calibration,
@@ -644,6 +728,8 @@ def run_right_side_unified_production(
     project_root: Path = PROJECT_ROOT,
     config: SelectorRankingConfig | None = None,
     factor_workers: int | None = None,
+    project_feature_path: Path | None = None,
+    project_feature_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Build and publish one exact-date score, reusing an unchanged checkpoint."""
 
@@ -654,10 +740,15 @@ def run_right_side_unified_production(
         config = replace(config, factor_workers=factor_workers)
     validate_production_ranking_artifact(config, project_root=project_root)
     target = pd.to_datetime(target_date, errors="raise").normalize()
+    project_feature_path, project_feature_manifest_path = _project_feature_paths(
+        project_root, project_feature_path, project_feature_manifest_path,
+    )
     input_fingerprint, input_snapshot = _production_input_snapshot(
         config,
         target,
         project_root=project_root,
+        project_feature_path=project_feature_path,
+        project_feature_manifest_path=project_feature_manifest_path,
     )
     try:
         feature_manifest = _load_json(config.paths.feature_manifest)
@@ -691,6 +782,9 @@ def run_right_side_unified_production(
     feature_manifest = build_right_side_unified_production_features(
         target.date().isoformat(),
         config=config,
+        project_root=project_root,
+        project_feature_path=project_feature_path,
+        project_feature_manifest_path=project_feature_manifest_path,
     )
     feature_manifest = {
         **feature_manifest,

@@ -7,10 +7,12 @@ import json
 import multiprocessing as mp
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Callable, Iterator
 from uuid import uuid4
@@ -25,6 +27,7 @@ from quant.data import (
     read_partitioned_symbol_file,
 )
 from quant.data.factors.technical import KDJ
+from quant.infrastructure.publication import ContextThreadPoolExecutor as ThreadPoolExecutor
 
 
 _MATRIX_CACHE_SCHEMA_VERSION = 1
@@ -32,9 +35,13 @@ _MATRIX_CACHE_DIRNAME = "_matrix_cache_v1"
 _MATRIX_CACHE_CHUNK_SYMBOLS = 96
 _MATRIX_CACHE_CHUNK_MAX_SOURCE_BYTES = 64 * 1024 * 1024
 _VECTOR_CACHE_SOURCE_METADATA_FILENAME = "_refresh_metadata.json"
+VECTOR_CACHE_PENDING_FILENAME = "_publication_pending.json"
+_VECTOR_CACHE_COMMIT_FILENAME = "_publication_commit.json"
 _VECTOR_SOURCE_COLUMNS = (
     "ts_code",
     "trade_date",
+    "symbol",
+    "date",
     "name",
     "open",
     "high",
@@ -45,6 +52,8 @@ _VECTOR_SOURCE_COLUMNS = (
     "pct_chg",
     "pct_change",
 )
+_VECTOR_SOURCE_BATCH_SYMBOLS = 16
+_VECTOR_INCREMENTAL_SCHEMA = 1
 _PARTITION_CONTENT_DIGEST_CACHE: dict[tuple[str, int, int, int], str] = {}
 _PARTITION_CONTENT_DIGEST_CACHE_MAX_ENTRIES = 512
 _MATRIX_CACHE_FLOAT_FIELDS = (
@@ -119,6 +128,13 @@ def normalize_daily_frame(frame: pd.DataFrame, symbol_hint: str | None = None) -
     """Normalize local Tushare/cache daily frames into ascending OHLCV rows."""
     if frame.empty:
         return frame
+    return _continuous_ohlc_from_pct_change(_normalize_daily_source(frame, symbol_hint))
+
+
+def _normalize_daily_source(frame: pd.DataFrame, symbol_hint: str | None = None) -> pd.DataFrame:
+    """Canonical rows before the latest-close-dependent price adjustment."""
+    if frame.empty:
+        return frame
     out = frame.copy()
     if "trade_date" in out.columns:
         trade_dates = pd.to_datetime(out["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
@@ -155,7 +171,6 @@ def normalize_daily_frame(frame: pd.DataFrame, symbol_hint: str | None = None) -
     out = out[cols].dropna(subset=["date", "open", "high", "low", "close"]).copy()
     out = out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     out["symbol"] = out["symbol"].fillna(symbol_hint or "").astype(str)
-    out = _continuous_ohlc_from_pct_change(out)
     return out
 
 
@@ -200,6 +215,7 @@ def vector_cache_key(config: SimilarPatternConfig) -> str:
         "forward_days": config.forward_days,
         "candidate_step_days": config.candidate_step_days,
         "candidate_start_date": config.candidate_start_date,
+        "max_candidates_per_symbol": config.max_candidates_per_symbol,
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()[:12]
@@ -208,6 +224,79 @@ def vector_cache_key(config: SimilarPatternConfig) -> str:
 def vector_cache_path(cache_dir: Path, symbol: str, config: SimilarPatternConfig) -> Path:
     safe_symbol = symbol.replace(".", "_")
     return cache_dir / vector_cache_key(config) / f"{safe_symbol}.npz"
+
+
+class VectorCachePendingError(RuntimeError):
+    """The library needs complete repair before any cache-backed read is safe."""
+
+
+def assert_vector_cache_ready(config_dir: Path) -> None:
+    """Fail closed on any pending marker; callers also hold the config read lock."""
+    try:
+        (config_dir / VECTOR_CACHE_PENDING_FILENAME).lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise VectorCachePendingError("vector publication state is unreadable") from exc
+    raise VectorCachePendingError(f"vector publication pending; repair required: {config_dir}")
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_vector_json(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, ensure_ascii=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _clear_vector_pending(config_dir: Path) -> None:
+    (config_dir / VECTOR_CACHE_PENDING_FILENAME).unlink()
+    _fsync_directory(config_dir)
+
+
+def _publication_symbols(config_dir: Path, config: SimilarPatternConfig) -> set[str]:
+    """Recover the complete repair scope, including symbols deleted at the source."""
+    symbols: set[str] = set()
+    for filename in (VECTOR_CACHE_PENDING_FILENAME, _VECTOR_CACHE_COMMIT_FILENAME):
+        path = config_dir / filename
+        try:
+            if path.is_symlink():
+                raise ValueError("symlink publication state")
+            payload = json.loads(path.read_text("utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise VectorCachePendingError(f"invalid publication state: {path}") from exc
+        if (not isinstance(payload, dict) or payload.get("schema_version") != 1
+                or payload.get("config_key") != vector_cache_key(config)
+                or not isinstance(payload.get("expected_symbols"), list)):
+            raise VectorCachePendingError(f"invalid publication scope: {path}")
+        for symbol in payload["expected_symbols"]:
+            if (not isinstance(symbol, str) or not symbol or symbol in {".", ".."}
+                    or "/" in symbol or "\\" in symbol):
+                raise VectorCachePendingError(f"invalid publication symbol: {path}")
+            symbols.add(symbol)
+    for path in config_dir.glob("*.npz"):
+        # This is the reversible A-share cache filename convention. Never read a
+        # partial NPZ merely to discover which source must repair it.
+        symbol = path.stem.replace("_", ".")
+        if vector_cache_path(config_dir.parent, symbol, config).name != path.name:
+            raise VectorCachePendingError(f"unrecognized vector cache filename: {path}")
+        symbols.add(symbol)
+    return symbols
 
 
 @dataclass(frozen=True)
@@ -230,6 +319,7 @@ def _vector_cache_inventory(
     config: SimilarPatternConfig,
 ) -> list[_VectorCacheEntry]:
     """Resolve the exact legacy cache inputs represented by a matrix generation."""
+    assert_vector_cache_ready(cache_dir / vector_cache_key(config))
     entries: list[_VectorCacheEntry] = []
     for daily_path in daily_paths:
         symbol = daily_path.stem
@@ -245,6 +335,7 @@ def _vector_cache_inventory(
                 mtime_ns=int(stat.st_mtime_ns),
             )
         )
+    assert_vector_cache_ready(cache_dir / vector_cache_key(config))
     return entries
 
 
@@ -278,21 +369,14 @@ def _matrix_cache_lock(cache_root: Path, *, exclusive: bool) -> Iterator[None]:
     cache_root.mkdir(parents=True, exist_ok=True)
     lock_path = cache_root / ".lock"
     with lock_path.open("a+b") as handle:
-        try:
-            import fcntl
+        import fcntl
 
-            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(handle.fileno(), mode)
-        except (ImportError, OSError):
-            fcntl = None  # type: ignore[assignment]
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(handle.fileno(), mode)
         try:
             yield
         finally:
-            if fcntl is not None:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _compiled_manifest_is_valid(
@@ -455,6 +539,10 @@ def _build_compiled_vector_cache(
     inventory_fingerprint: str,
 ) -> dict[str, object]:
     temp_dir = cache_root / f".{generation_dir.name}.building-{os.getpid()}-{uuid4().hex[:8]}"
+    registry = _vector_artifact_registry(cache_root.parent.parent)
+    registry.register(temp_dir, producer="similar_patterns", retention_class="temporary",
+                      state="building", input_versions={"inventory": inventory_fingerprint},
+                      ownership_boundary=True)
     temp_dir.mkdir(parents=True, exist_ok=False)
     chunks: list[dict[str, object]] = []
     source_fingerprints: list[str] = []
@@ -492,21 +580,11 @@ def _build_compiled_vector_cache(
         if generation_dir.exists():
             shutil.rmtree(generation_dir)
         temp_dir.replace(generation_dir)
+        registry.retire(temp_dir)
         return manifest
     except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        registry.retire(temp_dir)
         raise
-
-
-def _prune_compiled_vector_generations(cache_root: Path, current: Path) -> None:
-    """Remove stale generations while the caller holds the exclusive cache lock."""
-    generations = (
-        path
-        for path in cache_root.iterdir()
-        if path.is_dir() and not path.name.startswith(".") and path != current
-    )
-    for stale in generations:
-        shutil.rmtree(stale, ignore_errors=True)
 
 
 def _ensure_compiled_vector_cache(
@@ -516,19 +594,30 @@ def _ensure_compiled_vector_cache(
 ) -> _CompiledVectorCache:
     if not entries:
         raise ValueError("no legacy vector caches are available")
-    inventory_fingerprint = _vector_cache_inventory_fingerprint(entries, config)
-    cache_root = cache_dir / vector_cache_key(config) / _MATRIX_CACHE_DIRNAME
-    generation_dir = cache_root / inventory_fingerprint[:24]
-    with _matrix_cache_lock(cache_root, exclusive=True):
-        for abandoned in cache_root.glob(".*.building-*"):
-            if abandoned.is_dir():
-                shutil.rmtree(abandoned, ignore_errors=True)
+    config_dir = cache_dir.resolve() / vector_cache_key(config)
+    registry = _vector_artifact_registry(cache_dir)
+    cache_root = config_dir / _MATRIX_CACHE_DIRNAME
+    with registry.lease([config_dir], owner="similar_patterns:compile", kind="build"), _matrix_cache_lock(config_dir, exclusive=False), _matrix_cache_lock(cache_root, exclusive=True):
+        assert_vector_cache_ready(config_dir)
+        entries = [_VectorCacheEntry(entry.symbol, entry.path, stat.st_size, stat.st_mtime_ns)
+                   for entry in entries if entry.path.exists() for stat in [entry.path.stat()]]
+        inventory_fingerprint = _vector_cache_inventory_fingerprint(entries, config)
+        generation_dir = cache_root / inventory_fingerprint[:24]
+        for artifact in registry.inventory([cache_root])["entries"]:
+            abandoned = registry.root / artifact["path"]
+            if (abandoned.parent == cache_root and ".building-" in abandoned.name
+                    and artifact.get("producer") == "similar_patterns"
+                    and artifact.get("ownership_boundary") and artifact.get("state") == "building"):
+                registry.retire(abandoned)
         manifest = _compiled_manifest_is_valid(
             generation_dir,
             inventory_fingerprint=inventory_fingerprint,
             config=config,
         )
         if manifest is None:
+            registry.register(generation_dir, producer="similar_patterns", retention_class="rebuildable",
+                              state="building", input_versions={"inventory": inventory_fingerprint},
+                              ownership_boundary=True)
             manifest = _build_compiled_vector_cache(
                 cache_root,
                 generation_dir,
@@ -536,8 +625,31 @@ def _ensure_compiled_vector_cache(
                 config,
                 inventory_fingerprint,
             )
-        _prune_compiled_vector_generations(cache_root, generation_dir)
+        registry.register(generation_dir, producer="similar_patterns", retention_class="rebuildable",
+                          state="committed", input_versions={"inventory": inventory_fingerprint},
+                          ownership_boundary=True)
+        consumer = f"similar_patterns:{vector_cache_key(config)}:compiled"
+        registry.commit(consumer, generation_dir)
+        # Reconcile all superseded owned outputs, including a commit interrupted
+        # before retirement. The matrix writer lock excludes other compilers;
+        # current/previous references and reader leases still prevent collection.
+        for artifact in registry.inventory([cache_root])["entries"]:
+            previous = registry.root / artifact["path"]
+            if (previous.parent == cache_root and previous != generation_dir
+                    and artifact.get("producer") == "similar_patterns"
+                    and artifact.get("ownership_boundary")
+                    and artifact.get("retention_class") in {"rebuildable", "temporary"}
+                    and not artifact.get("protected")):
+                registry.retire(previous)
+    _collect_compiled_vector_caches(cache_dir, config)
     return _CompiledVectorCache(generation_dir=generation_dir, manifest=manifest)
+
+
+def _collect_compiled_vector_caches(cache_dir: Path, config: SimilarPatternConfig) -> None:
+    registry = _vector_artifact_registry(cache_dir)
+    root = cache_dir.resolve() / vector_cache_key(config) / _MATRIX_CACHE_DIRNAME
+    if root.exists():
+        registry.collect_retired_children(root, dry_run=False)
 
 
 def _semantic_daily_frame_fingerprint(frame: pd.DataFrame) -> str | None:
@@ -580,33 +692,40 @@ def _semantic_daily_frame_fingerprint(frame: pd.DataFrame) -> str | None:
     return f"{latest}:{len(normalized)}:{digest.hexdigest()}"
 
 
-def _read_sql_vector_source(store: MarketDataStore, dataset: str) -> pd.DataFrame:
+def _read_sql_vector_source(
+    store: MarketDataStore, dataset: str, *, symbols: list[str] | None = None,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
     """Read only columns relevant to vector generation from the SQL canonical source."""
-    selected_columns = list(_VECTOR_SOURCE_COLUMNS)
-    engine = None
+    if columns is None:
+        columns = _sql_vector_columns(store, dataset)
+    from quant.data.market_snapshot import current_market_snapshot
+
+    snapshot = current_market_snapshot()
+    if snapshot is not None:
+        return snapshot.read(dataset, symbols=symbols, columns=columns)
+    # Successful empty canonical reads are not permission to use an older mirror.
+    return store._read_sql_range(dataset, symbols=symbols, columns=columns)
+
+
+def _sql_vector_columns(store: MarketDataStore, dataset: str) -> list[str] | None:
+    from quant.data.market_snapshot import current_market_snapshot
+
+    snapshot = current_market_snapshot()
+    if snapshot is not None:
+        available = snapshot.manifest["datasets"][dataset]["columns"]
+        return [column for column in _VECTOR_SOURCE_COLUMNS if column in available]
     try:
         from sqlalchemy import inspect
 
-        engine = store._engine()
-        table_name = store._dataset_table_name(dataset)
-        available = {
-            str(column["name"])
-            for column in inspect(engine).get_columns(table_name)
-        }
-        selected_columns = [column for column in selected_columns if column in available]
+        available = {str(column["name"]) for column in inspect(store._engine()).get_columns(
+            store._dataset_table_name(dataset)
+        )}
+        return [column for column in _VECTOR_SOURCE_COLUMNS if column in available]
     except Exception:
-        # The range reader remains the authority for whether SQL is usable.  This
-        # fallback also keeps custom/test stores that do not expose inspection usable.
-        selected_columns = list(_VECTOR_SOURCE_COLUMNS)
-    finally:
-        if engine is not None:
-            engine.dispose()
-    frame = store._read_sql_range(dataset, columns=selected_columns)
-    if frame.empty:
-        # If schema inspection raced a migration or lacked metadata privileges,
-        # let the store perform one unprojected SQL read before considering a mirror.
-        frame = store._read_sql_range(dataset)
-    return frame
+        # Unknown optional columns are not safe to project. The canonical reader
+        # still fails closed on source errors, even with an unprojected batch.
+        return None
 
 
 def _partition_content_digest(path: Path) -> str:
@@ -647,17 +766,94 @@ def _parquet_daily_source_fingerprint(daily_dir: Path) -> str | None:
 
 
 def partitioned_daily_source_fingerprint(daily_dir: Path) -> str | None:
-    """Return an input identity for the backend that canonical reads actually use."""
+    """Compatibility diagnostic; vector cache validity uses symbol identities instead."""
     config = MarketDataStoreConfig.from_env(root=daily_dir.parent)
     store = MarketDataStore(config)
-    if config.backend in {"mysql", "sql"} and config.sql_url:
+    from quant.data.market_snapshot import current_market_snapshot
+
+    if current_market_snapshot() is not None or config.backend in {"mysql", "sql"}:
         sql_frame = _read_sql_vector_source(store, daily_dir.name)
         sql_identity = _semantic_daily_frame_fingerprint(sql_frame)
         if sql_identity is not None:
             return f"sql-semantic:{sql_identity}"
-        if not config.mirror_parquet:
-            return None
+        return None
     return _parquet_daily_source_fingerprint(daily_dir)
+
+
+class VectorSourceChangedError(RuntimeError):
+    """A staged vector build no longer represents a single source revision."""
+
+
+def _source_rows_fingerprint(source: pd.DataFrame) -> str:
+    columns = [column for column in source.columns if column != "amount"]
+    digest = hashlib.sha256("\0".join(columns).encode("utf-8"))
+    canonical = source[columns].copy()
+    for column in ("open", "high", "low", "close", "volume", "pct_change"):
+        canonical[column] = pd.to_numeric(canonical[column], errors="coerce").astype("float64")
+    for column in ("symbol", "name"):
+        canonical[column] = canonical[column].fillna("").astype(str)
+    digest.update(pd.util.hash_pandas_object(canonical, index=False).to_numpy("uint64").tobytes())
+    return digest.hexdigest()
+
+
+class _VectorSource:
+    """Bounded projected reads; identities never depend on another symbol's values."""
+
+    def __init__(self, daily_dir: Path):
+        from quant.data.market_snapshot import current_market_snapshot
+
+        self.daily_dir = daily_dir
+        self.store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
+        self.pinned = current_market_snapshot() is not None
+        self.sql = self.store.config.backend in {"mysql", "sql"}
+        self.columns = _sql_vector_columns(self.store, daily_dir.name) if self.pinned or self.sql else None
+
+    def token(self) -> object:
+        if self.pinned:
+            from quant.data.market_snapshot import current_market_snapshot
+
+            return current_market_snapshot().manifest["fingerprint"]
+        if self.sql:
+            # The revision is a race guard, never a per-symbol cache key.
+            return self.store.dataset_revision(self.daily_dir.name)
+        partition_root = self.daily_dir.parent / f"{self.daily_dir.name}_partitioned"
+        paths = sorted(partition_root.glob("year_month=*/data.parquet"))
+        if not paths:
+            paths = sorted(self.daily_dir.glob("*.parquet"))
+        return tuple((str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+                     for path in paths for stat in [path.stat()])
+
+    def assert_token(self, expected: object) -> None:
+        if self.token() != expected:
+            raise VectorSourceChangedError("daily source revision changed during vector construction")
+
+    def read(self, paths: list[Path]) -> dict[str, pd.DataFrame]:
+        symbols = [path.stem for path in paths]
+        if self.pinned or self.sql:
+            frame = _read_sql_vector_source(self.store, self.daily_dir.name,
+                                            symbols=symbols, columns=self.columns)
+            groups = dict(tuple(frame.groupby("ts_code", sort=False))) if not frame.empty else {}
+            return {symbol: groups.get(symbol, pd.DataFrame()) for symbol in symbols}
+        import pyarrow.parquet as pq
+
+        partitions = sorted((self.daily_dir.parent / f"{self.daily_dir.name}_partitioned").glob(
+            "year_month=*/data.parquet"
+        ))
+        if not partitions:
+            return {path.stem: pd.read_parquet(path, columns=[
+                column for column in _VECTOR_SOURCE_COLUMNS if column in pq.read_schema(path).names
+            ]) if path.exists() else pd.DataFrame() for path in paths}
+        frames = []
+        for path in partitions:
+            columns = [column for column in _VECTOR_SOURCE_COLUMNS if column in pq.read_schema(path).names]
+            frame = pd.read_parquet(path, columns=columns, filters=[("ts_code", "in", symbols)])
+            if not frame.empty:
+                frames.append(frame)
+        # Preserve the store's date ordering and duplicate precedence before
+        # normalization derives returns for sources without pct_change columns.
+        combined = self.store._merge_frames(frames)
+        groups = dict(tuple(combined.groupby("ts_code", sort=False))) if not combined.empty else {}
+        return {symbol: groups.get(symbol, pd.DataFrame()) for symbol in symbols}
 
 
 def save_stock_vector_cache(
@@ -672,9 +868,65 @@ def save_stock_vector_cache(
     source_mtime_ns: int,
     source_size: int,
     source_fingerprint: str,
+    *,
+    source: pd.DataFrame | None = None,
+    previous: dict[str, object] | None = None,
 ) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     dates = np.array([pd.Timestamp(daily.iloc[idx]["date"]).strftime("%Y-%m-%d") for idx in indices])
+    close = daily["close"].to_numpy(dtype=float)
+    old_positions = {int(idx): pos for pos, idx in enumerate(previous["indices"])} if previous else {}
+    old_rows = int(previous["source_rows"]) if previous else 0
+    horizons = {f"fwd_{days}d": days for days in config.forward_days}
+    horizons.update({"fwd_1d_volume_ratio": 1, "max_runup_3d": 3, "max_drawdown_3d": 3,
+                     "max_runup_60d": max(config.forward_days), "max_drawdown_60d": max(config.forward_days)})
+    # Only new candidates and previously immature horizons need label evaluation.
+    dirty = [idx for idx in indices if idx not in old_positions or idx + max(3, max(config.forward_days)) >= old_rows]
+    updated = _forward_labels(daily, dirty, config)
+    dirty_positions = {idx: pos for pos, idx in enumerate(dirty)}
+    future = {}
+    for field, horizon in horizons.items():
+        future[field] = np.asarray([
+            previous[field][old_positions[idx]]
+            if idx in old_positions and idx + horizon < old_rows
+            else updated[field][dirty_positions[idx]] for idx in indices
+        ], dtype=np.float32)
+    incremental = {}
+    if source is not None:
+        incremental = {
+            "incremental_schema": np.array(_VECTOR_INCREMENTAL_SCHEMA),
+            "source_rows": np.array(len(source)),
+            "source_prefix_fingerprint": np.array(_source_rows_fingerprint(source)),
+            "source_adjusted": np.array(_source_is_adjusted(source)),
+        }
+    # A reader must never observe a partially written npz, even for standalone builds.
+    temp_path = cache_path.with_name(f".{cache_path.name}.{uuid4().hex}.tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            np.savez(
+                handle,
+                symbol=np.array(symbol), name=np.array(name), industry=np.array(industry),
+                indices=np.array(indices, dtype=np.int32), dates=dates,
+                close=np.array([close[idx] for idx in indices], dtype=np.float32),
+                vectors=matrix.astype(np.float32),
+                source_mtime_ns=np.array(source_mtime_ns, dtype=np.int64),
+                source_size=np.array(source_size, dtype=np.int64),
+                source_fingerprint=np.array(source_fingerprint),
+                **incremental, **future,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(cache_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _source_is_adjusted(source: pd.DataFrame) -> bool:
+    return (len(source) >= 2 and pd.to_numeric(source["pct_change"], errors="coerce").notna().sum() >= 2
+            and pd.to_numeric(source["close"], errors="coerce").iloc[-1] > 0)
+
+
+def _forward_labels(daily: pd.DataFrame, indices: list[int], config: SimilarPatternConfig) -> dict[str, np.ndarray]:
     close = daily["close"].to_numpy(dtype=float)
     high = daily["high"].to_numpy(dtype=float)
     low = daily["low"].to_numpy(dtype=float)
@@ -722,25 +974,21 @@ def save_stock_vector_cache(
         ],
         dtype=np.float32,
     )
-    np.savez(
-        cache_path,
-        symbol=np.array(symbol),
-        name=np.array(name),
-        industry=np.array(industry),
-        indices=np.array(indices, dtype=np.int32),
-        dates=dates,
-        close=np.array([close[idx] for idx in indices], dtype=np.float32),
-        vectors=matrix.astype(np.float32),
-        source_mtime_ns=np.array(source_mtime_ns, dtype=np.int64),
-        source_size=np.array(source_size, dtype=np.int64),
-        source_fingerprint=np.array(source_fingerprint),
-        **future,
-    )
+    return future
 
 
 def load_stock_vector_cache(cache_path: Path) -> dict[str, object]:
+    config_dir = cache_path.absolute().parent
+    registry = _vector_artifact_registry(config_dir.parent)
+    with registry.lease([config_dir], owner="similar_patterns:read", kind="read"), _matrix_cache_lock(config_dir, exclusive=False):
+        assert_vector_cache_ready(config_dir)
+        return _load_stock_vector_cache(cache_path)
+
+
+def _load_stock_vector_cache(cache_path: Path) -> dict[str, object]:
+    """Unchecked I/O for workers/repair already protected by the owning build lease."""
     with np.load(cache_path, allow_pickle=False) as data:
-        return {
+        cached = {
             "symbol": str(data["symbol"].item()),
             "name": str(data["name"].item()),
             "industry": str(data["industry"].item()),
@@ -766,6 +1014,27 @@ def load_stock_vector_cache(cache_path: Path) -> dict[str, object]:
             if "source_fingerprint" in data.files
             else None,
         }
+        for field in ("incremental_schema", "source_rows", "source_prefix_fingerprint", "source_adjusted"):
+            if field in data.files:
+                cached[field] = data[field].item()
+        # Preserve additional configured forward horizons as well as the legacy fields.
+        for field in data.files:
+            if field.startswith("fwd_"):
+                cached[field] = data[field]
+        return cached
+
+
+def _stock_cache_shape_valid(cached: dict[str, object], config: SimilarPatternConfig) -> bool:
+    indices = np.asarray(cached["indices"])
+    vectors = np.asarray(cached["vectors"])
+    dimension = config.lookback_days * 4 + config.weekly_lookback + config.monthly_lookback + 12
+    return (
+        indices.ndim == 1 and len(indices) > 0 and np.all(np.diff(indices) > 0)
+        and vectors.shape == (len(indices), dimension) and np.isfinite(vectors).all()
+        and all(np.asarray(cached[field]).shape == indices.shape
+                for field in ("dates", *_MATRIX_CACHE_FLOAT_FIELDS,
+                              *(f"fwd_{days}d" for days in config.forward_days)))
+    )
 
 
 def build_stock_vector_cache(
@@ -776,54 +1045,83 @@ def build_stock_vector_cache(
     force: bool = False,
     source_fingerprint: str | None = None,
 ) -> dict[str, object]:
+    """Build one symbol using the same staged, revision-checked path as batch builds.
+
+    ``source_fingerprint`` remains accepted for caller compatibility, but a global
+    fingerprint is deliberately not trusted as a symbol identity.
+    """
+    records = _build_vector_cache_files([path], {path.stem: info}, config, cache_dir, force, 1, None)
+    return records.iloc[0].to_dict()
+
+
+def _build_stock_vector_cache_worker(
+    args: tuple[Path, dict[str, object], SimilarPatternConfig, Path, bool, pd.DataFrame, Path],
+) -> dict[str, object]:
+    path, info, config, cache_dir, force, raw, staging = args
     symbol = path.stem
     cache_path = vector_cache_path(cache_dir, symbol, config)
-    source_stat = path.stat() if path.exists() else None
-    effective_source_fingerprint = source_fingerprint
-    if effective_source_fingerprint is None:
-        effective_source_fingerprint = partitioned_daily_source_fingerprint(path.parent)
-    if effective_source_fingerprint is None and source_stat is not None:
-        effective_source_fingerprint = (
-            f"file:{source_stat.st_mtime_ns}:{source_stat.st_size}"
-        )
-    if cache_path.exists() and not force:
-        cached = load_stock_vector_cache(cache_path)
-        fingerprint_matches = (
-            effective_source_fingerprint is not None
-            and cached.get("source_fingerprint") == effective_source_fingerprint
-        )
-        legacy_file_stat_matches = (
-            source_stat is not None
-            and cached.get("source_fingerprint") is None
-            and cached.get("source_mtime_ns") == source_stat.st_mtime_ns
-            and cached.get("source_size") == source_stat.st_size
-        )
-        if fingerprint_matches or legacy_file_stat_matches:
-            return {
-                "symbol": symbol,
-                "status": "cache_hit",
-                "cache_path": str(cache_path),
-                "vectors": int(cached["vectors"].shape[0]),
-                "elapsed_sec": 0.0,
-            }
-
     started = perf_counter()
+    record: dict[str, object] = {
+        "symbol": symbol, "cache_path": str(cache_path), "vectors": 0,
+        "vectors_built": 0, "vectors_reused": 0, "source_rows_read": len(raw),
+        "vector_windows_evaluated": 0,
+        "elapsed_sec": 0.0,
+    }
     try:
-        daily = load_daily_file(path)
+        source = _normalize_daily_source(raw, symbol)
+        daily = _continuous_ohlc_from_pct_change(source) if not source.empty else source
         if len(daily) < config.min_history_days + min(config.forward_days) + 1:
-            return {"symbol": symbol, "status": "too_short", "cache_path": str(cache_path), "vectors": 0, "elapsed_sec": 0.0}
+            return {**record, "status": "too_short"}
         industry = str(info.get("industry", ""))
         if info.get("name"):
             daily["name"] = daily["name"].replace("", np.nan).fillna(str(info["name"]))
         name = stock_name_from_basic_or_daily(info, daily)
         if is_excluded_stock(name):
-            return {"symbol": symbol, "status": "excluded", "cache_path": str(cache_path), "vectors": 0, "elapsed_sec": 0.0}
+            return {**record, "status": "excluded"}
+        identity = "symbol-semantic:" + _source_rows_fingerprint(source)
+        record["source_fingerprint"] = identity
+        cached = None
+        if cache_path.exists() and not force:
+            try:
+                cached = _load_stock_vector_cache(cache_path)
+                if not _stock_cache_shape_valid(cached, config):
+                    cached = None
+            except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+                cached = None
+        if (cached is not None and cached.get("source_fingerprint") == identity
+                and cached["name"] == name and cached["industry"] == industry):
+            return {**record, "status": "cache_hit", "vectors": len(cached["indices"]),
+                    "vectors_reused": len(cached["indices"]), "build_mode": "unchanged"}
+        previous = None
+        if cached is not None and cached.get("incremental_schema") == _VECTOR_INCREMENTAL_SCHEMA:
+            old_rows = int(cached["source_rows"])
+            if (0 < old_rows <= len(source)
+                    and cached["source_prefix_fingerprint"] == _source_rows_fingerprint(source.iloc[:old_rows])
+                    and cached["source_adjusted"] == _source_is_adjusted(source)):
+                previous = cached
         weekly_close, monthly_close = resample_close_series(daily)
-        indices, matrix = build_stock_candidate_matrix(daily, config, weekly_close, monthly_close)
+        old_positions = {int(idx): pos for pos, idx in enumerate(previous["indices"])} if previous else {}
+        evaluated = candidate_end_indices(daily.iloc[:int(previous["source_rows"])], config) if previous else range(0)
+        indices, vectors = [], []
+        for idx in candidate_end_indices(daily, config):
+            if idx in old_positions:
+                vector = previous["vectors"][old_positions[idx]]
+                record["vectors_reused"] += 1
+            elif idx in evaluated:
+                continue
+            else:
+                vector = build_pattern_vector(daily, idx, config, weekly_close, monthly_close)
+                record["vector_windows_evaluated"] += 1
+                if vector is not None:
+                    record["vectors_built"] += 1
+            if vector is not None:
+                indices.append(idx)
+                vectors.append(vector)
         if len(indices) == 0:
-            return {"symbol": symbol, "status": "no_vectors", "cache_path": str(cache_path), "vectors": 0, "elapsed_sec": 0.0}
+            return {**record, "status": "no_vectors"}
+        matrix = np.vstack(vectors).astype(np.float32)
         save_stock_vector_cache(
-            cache_path,
+            staging / cache_path.name,
             symbol,
             name,
             industry,
@@ -831,40 +1129,27 @@ def build_stock_vector_cache(
             indices,
             matrix,
             config,
-            source_mtime_ns=source_stat.st_mtime_ns if source_stat is not None else -1,
-            source_size=source_stat.st_size if source_stat is not None else -1,
-            source_fingerprint=effective_source_fingerprint or "unavailable",
+            source_mtime_ns=-1,
+            source_size=-1,
+            source_fingerprint=identity,
+            source=source,
+            previous=previous,
         )
         return {
-            "symbol": symbol,
+            **record,
             "status": "built",
-            "cache_path": str(cache_path),
+            "build_mode": "append" if previous else "full",
             "vectors": int(matrix.shape[0]),
             "elapsed_sec": round(perf_counter() - started, 4),
         }
     except Exception as exc:
         return {
-            "symbol": symbol,
+            **record,
             "status": "error",
             "error": str(exc),
-            "cache_path": str(cache_path),
             "vectors": 0,
             "elapsed_sec": round(perf_counter() - started, 4),
         }
-
-
-def _build_stock_vector_cache_worker(
-    args: tuple[str, dict[str, object], SimilarPatternConfig, str, bool, str | None],
-) -> dict[str, object]:
-    path_text, info, config, cache_dir_text, force, source_fingerprint = args
-    return build_stock_vector_cache(
-        Path(path_text),
-        info,
-        config,
-        Path(cache_dir_text),
-        force,
-        source_fingerprint,
-    )
 
 
 def _should_use_thread_pool_for_vector_cache() -> bool:
@@ -886,55 +1171,199 @@ def build_vector_caches_parallel(
     force: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> pd.DataFrame:
+    source = _VectorSource(daily_dir)
+    token = source.token()
     files = list_partitioned_symbol_paths(daily_dir)
+    source.assert_token(token)
     if max_symbols is not None:
         files = files[:max_symbols]
     target_symbols = {symbol.upper() for symbol in (target_symbols or set())}
     files = [path for path in files if path.stem.upper() not in target_symbols]
     basic_map = basic.set_index("ts_code").to_dict("index") if not basic.empty else {}
-    source_fingerprint = partitioned_daily_source_fingerprint(daily_dir)
-    tasks = [
-        (
-            str(path),
-            basic_map.get(path.stem, {}),
-            config,
-            str(cache_dir),
-            force,
-            source_fingerprint,
-        )
-        for path in files
-    ]
+    return _build_vector_cache_files(files, basic_map, config, cache_dir, force, workers, progress_callback,
+                                     source_snapshot=(source, token))
 
+
+def _vector_artifact_registry(cache_dir: Path):
+    from quant.infrastructure.artifact_registry import ArtifactRegistry
+
+    cache_dir = cache_dir.resolve()
+    root = next((parent for parent in (cache_dir, *cache_dir.parents)
+                 if (parent / "pyproject.toml").exists()), None)
+    if root is None:
+        # Standalone research trees need the same registry before and after the
+        # cache itself is created; do not select the nearest *existing* ancestor.
+        root = cache_dir.parent
+        root.mkdir(parents=True, exist_ok=True)
+    return ArtifactRegistry(root)
+
+
+def _build_vector_cache_files(
+    files: list[Path], basic_map: dict[str, dict[str, object]], config: SimilarPatternConfig,
+    cache_dir: Path, force: bool, workers: int, progress_callback: Callable[[str], None] | None,
+    *, source_snapshot: tuple[_VectorSource, object] | None = None,
+) -> pd.DataFrame:
+    if not files and source_snapshot is None:
+        return pd.DataFrame()
+    cache_dir = cache_dir.resolve()
+    config_dir = cache_dir / vector_cache_key(config)
+    registry = _vector_artifact_registry(cache_dir)
+    source = source_snapshot[0] if source_snapshot else _VectorSource(files[0].parent)
     records: list[dict[str, object]] = []
     started = perf_counter()
-    if workers <= 1:
-        for n, task in enumerate(tasks, start=1):
-            records.append(_build_stock_vector_cache_worker(task))
-            if n % 200 == 0 or n == len(tasks):
-                built = sum(1 for record in records if record.get("status") in {"built", "cache_hit"})
-                message = f"vector cache {n}/{len(tasks)} files usable={built:,} elapsed={perf_counter() - started:.1f}s"
-                print(f"  {message}", flush=True)
-                if progress_callback:
-                    progress_callback(message)
-    else:
-        executor_cls = ThreadPoolExecutor if _should_use_thread_pool_for_vector_cache() else ProcessPoolExecutor
+    with registry.lease([config_dir], owner="similar_patterns:build", kind="build"), _matrix_cache_lock(config_dir, exclusive=True):
         try:
-            executor = executor_cls(max_workers=workers)
-        except (AssertionError, BrokenPipeError, PermissionError):
-            print("  process pool unavailable; falling back to thread pool", flush=True)
-            executor_cls = ThreadPoolExecutor
-            executor = executor_cls(max_workers=workers)
-        with executor:
-            futures = [executor.submit(_build_stock_vector_cache_worker, task) for task in tasks]
-            for n, future in enumerate(as_completed(futures), start=1):
-                records.append(future.result())
-                if n % 200 == 0 or n == len(futures):
-                    built = sum(1 for record in records if record.get("status") in {"built", "cache_hit"})
-                    message = f"vector cache {n}/{len(futures)} files usable={built:,} elapsed={perf_counter() - started:.1f}s"
-                    print(f"  {message}", flush=True)
-                    if progress_callback:
-                        progress_callback(message)
+            assert_vector_cache_ready(config_dir)
+            repairing = False
+        except VectorCachePendingError:
+            repairing = True
+        expected_symbols = _publication_symbols(config_dir, config) | {path.stem for path in files}
+        if repairing:
+            # A partial retry cannot certify a library left half-published by a
+            # dead process. Revalidate every existing and previously expected symbol.
+            files = [source.daily_dir / f"{symbol}.parquet" for symbol in sorted(expected_symbols)]
+        if not files:
+            if repairing:
+                raise VectorCachePendingError("pending vector publication has no recoverable scope")
+            return pd.DataFrame()
+        token = source_snapshot[1] if source_snapshot else source.token()
+        source.assert_token(token)
+        executor = None
+        if workers > 1:
+            if _should_use_thread_pool_for_vector_cache():
+                executor = ThreadPoolExecutor(max_workers=workers)
+            else:
+                try:
+                    # Source I/O stays in the parent. Never inherit its SQL pool.
+                    executor = ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"))
+                except (AssertionError, BrokenPipeError, PermissionError):
+                    executor = ThreadPoolExecutor(max_workers=workers)
+        batch_size = min(_VECTOR_SOURCE_BATCH_SYMBOLS, max(1, workers) * 2)
+        identities: dict[str, str] = {}
+        with TemporaryDirectory(prefix=".vectors-building-", dir=config_dir) as temp, executor or nullcontext():
+            staging = Path(temp)
+            for start in range(0, len(files), batch_size):
+                batch = files[start:start + batch_size]
+                frames = source.read(batch)
+                source.assert_token(token)
+                for path in batch:
+                    normalized = _normalize_daily_source(frames[path.stem], path.stem)
+                    identities[path.stem] = _source_rows_fingerprint(normalized) if not normalized.empty else "empty"
+                tasks = [(path, basic_map.get(path.stem, {}), config, cache_dir, force, frames[path.stem], staging)
+                         for path in batch]
+                if executor is None:
+                    records.extend(_build_stock_vector_cache_worker(task) for task in tasks)
+                else:
+                    futures = [executor.submit(_build_stock_vector_cache_worker, task) for task in tasks]
+                    records.extend(future.result() for future in as_completed(futures))
+                if progress_callback:
+                    progress_callback(f"vector cache {len(records)}/{len(files)} staged elapsed={perf_counter() - started:.1f}s")
+            source.assert_token(token)
+            if source.sql:
+                # Some SQL writers predate the revision journal. Re-read bounded
+                # projections, so those corrections cannot silently publish stale hits.
+                for start in range(0, len(files), batch_size):
+                    batch = files[start:start + batch_size]
+                    frames = source.read(batch)
+                    for path in batch:
+                        normalized = _normalize_daily_source(frames[path.stem], path.stem)
+                        identity = _source_rows_fingerprint(normalized) if not normalized.empty else "empty"
+                        if identity != identities[path.stem]:
+                            raise VectorSourceChangedError(f"daily source content changed for {path.stem}")
+                source.assert_token(token)
+            if any(record["status"] == "error" for record in records):
+                for record in records:
+                    if record["status"] == "built":
+                        record["status"] = "aborted"
+                return pd.DataFrame(records)
+            pending = {
+                "schema_version": 1, "config_key": vector_cache_key(config),
+                "build_id": uuid4().hex, "phase": "repairing" if repairing else "publishing",
+                "source_revision": str(token), "expected_symbols": sorted(expected_symbols),
+                "affected_symbols": sorted(record["symbol"] for record in records if record["status"] != "cache_hit"),
+                "symbol_sources": identities,
+            }
+
+            def commit() -> None:
+                _validate_published_vector_records(records, identities, config)
+                _durable_vector_json(config_dir / _VECTOR_CACHE_COMMIT_FILENAME, {
+                    **pending, "phase": "committed",
+                    "symbol_statuses": {record["symbol"]: record["status"] for record in records},
+                })
+                registry.register(config_dir, producer="similar_patterns", retention_class="rebuildable",
+                                  state="committed", input_versions={"config": vector_cache_key(config),
+                                  "source_revision": str(token),
+                                  "symbol_sources": hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()})
+                registry.commit(f"similar_patterns:{vector_cache_key(config)}:vectors", config_dir)
+
+            _publish_vector_caches(records, staging, source, token, pending=pending,
+                                   commit=commit, repairing=repairing)
     return pd.DataFrame(records)
+
+
+def _validate_published_vector_records(
+    records: list[dict[str, object]], identities: dict[str, str], config: SimilarPatternConfig,
+) -> None:
+    for record in records:
+        path = Path(record["cache_path"])
+        if record["status"] in {"built", "cache_hit"}:
+            cached = _load_stock_vector_cache(path)
+            if (cached["symbol"] != record["symbol"] or not _stock_cache_shape_valid(cached, config)
+                    or cached["source_fingerprint"] != "symbol-semantic:" + identities[record["symbol"]]):
+                raise VectorCachePendingError(f"published vector identity is incomplete: {path}")
+        elif path.exists():
+            raise VectorCachePendingError(f"ineligible vector remains published: {path}")
+
+
+def _publish_vector_caches(
+    records: list[dict[str, object]], staging: Path, source: _VectorSource, token: object,
+    *, pending: dict[str, object], commit: Callable[[], None], repairing: bool,
+) -> None:
+    """A durable marker quarantines interrupted multi-file publication and repair."""
+    config_dir = staging.parent
+    marker = config_dir / VECTOR_CACHE_PENDING_FILENAME
+    changed = [record for record in records if record["status"] != "cache_hit"]
+    backups: dict[Path, Path | None] = {}
+    commit_started = False
+    source.assert_token(token)
+    _durable_vector_json(marker, pending)
+    try:
+        for record in changed:
+            destination = Path(record["cache_path"])
+            backup = staging / f"{destination.name}.previous"
+            if destination.exists():
+                os.link(destination, backup)
+                backups[destination] = backup
+            else:
+                backups[destination] = None
+            if record["status"] == "built":
+                (staging / destination.name).replace(destination)
+            else:
+                destination.unlink(missing_ok=True)
+        _fsync_directory(config_dir)
+        source.assert_token(token)
+        commit_started = True
+        commit()
+        source.assert_token(token)
+        _clear_vector_pending(config_dir)
+    except BaseException:
+        rollback_errors = []
+        for destination, backup in backups.items():
+            try:
+                if backup is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    backup.replace(destination)
+            except OSError as exc:
+                rollback_errors.append(exc)
+        _fsync_directory(config_dir)
+        # A failed repair rolls back to an already mixed library. Once a commit
+        # starts, its metadata may also be partially durable; only repair can certify it.
+        if not rollback_errors and not repairing and not commit_started:
+            _clear_vector_pending(config_dir)
+        elif not marker.exists():
+            _durable_vector_json(marker, pending)
+        raise
 
 
 def latest_snapshot(daily: pd.DataFrame, idx: int) -> dict[str, float | str | None]:
@@ -1257,7 +1686,10 @@ def _scan_compiled_threshold_cache(
         raise ValueError("compiled cache manifest has invalid chunks")
     scanned_candidates = 0
     started = perf_counter()
-    with _matrix_cache_lock(compiled.generation_dir.parent, exclusive=False):
+    config_dir = compiled.generation_dir.parent.parent
+    registry = _vector_artifact_registry(config_dir.parent)
+    with registry.lease([config_dir, compiled.generation_dir], owner="similar_patterns:read", kind="read"), _matrix_cache_lock(config_dir, exclusive=False), _matrix_cache_lock(compiled.generation_dir.parent, exclusive=False):
+        assert_vector_cache_ready(config_dir)
         for chunk_number, chunk in enumerate(chunks, start=1):
             if not isinstance(chunk, dict) or not isinstance(chunk.get("path"), str):
                 raise ValueError("compiled cache manifest has an invalid chunk")
@@ -1578,6 +2010,35 @@ def analyze_targets_by_threshold(
     vector_cache_dir: Path | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, SimilarPatternResult]:
+    access = nullcontext()
+    if vector_cache_dir is not None:
+        config_dir = vector_cache_dir.resolve() / vector_cache_key(config)
+        registry = _vector_artifact_registry(vector_cache_dir)
+        access = registry.lease([config_dir], owner="similar_patterns:read", kind="read")
+    with access, _matrix_cache_lock(config_dir, exclusive=False) if vector_cache_dir is not None else nullcontext():
+        if vector_cache_dir is not None:
+            assert_vector_cache_ready(config_dir)
+        result = _analyze_targets_by_threshold(
+            daily_dir, basic, config, target_symbols, target_date, max_symbols,
+            vector_cache_dir, progress_callback,
+        )
+    if vector_cache_dir is not None:
+        _collect_compiled_vector_caches(vector_cache_dir, config)
+    return result
+
+
+def _analyze_targets_by_threshold(
+    daily_dir: Path,
+    basic: pd.DataFrame,
+    config: SimilarPatternConfig,
+    target_symbols: list[str],
+    target_date: str | None = None,
+    max_symbols: int | None = None,
+    vector_cache_dir: Path | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict[str, SimilarPatternResult]:
+    if vector_cache_dir is not None:
+        assert_vector_cache_ready(vector_cache_dir / vector_cache_key(config))
     if config.similarity_threshold is None:
         raise ValueError("similarity_threshold is required for threshold mode")
 
@@ -1635,6 +2096,8 @@ def analyze_targets_by_threshold(
             )
             cache_mode = "matrix_chunks"
             compiled_scan_complete = True
+        except VectorCachePendingError:
+            raise
         except Exception as exc:
             message = f"matrix cache unavailable; falling back to legacy scan: {exc}"
             print(f"  {message}", flush=True)
@@ -1655,7 +2118,7 @@ def analyze_targets_by_threshold(
                 cache_path = vector_cache_path(vector_cache_dir, symbol, config)
                 if not cache_path.exists():
                     continue
-                cached = load_stock_vector_cache(cache_path)
+                cached = _load_stock_vector_cache(cache_path)
                 candidate_indices = [int(value) for value in cached["indices"]]
                 candidate_matrix = cached["vectors"]
             else:

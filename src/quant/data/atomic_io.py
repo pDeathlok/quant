@@ -9,6 +9,8 @@ from typing import Any
 
 import pandas as pd
 
+from quant.infrastructure.publication import publication_write_path
+
 
 def _temporary_path(target: Path) -> Path:
     suffix = target.suffix
@@ -20,7 +22,7 @@ def _publish(temp_path: Path, target: Path) -> None:
 
 
 def atomic_write_parquet(frame: pd.DataFrame, target: Path, **kwargs: Any) -> Path:
-    target = Path(target)
+    target = publication_write_path(Path(target))
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_path = _temporary_path(target)
     try:
@@ -32,7 +34,7 @@ def atomic_write_parquet(frame: pd.DataFrame, target: Path, **kwargs: Any) -> Pa
 
 
 def atomic_write_csv(frame: pd.DataFrame, target: Path, **kwargs: Any) -> Path:
-    target = Path(target)
+    target = publication_write_path(Path(target))
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_path = _temporary_path(target)
     try:
@@ -44,7 +46,7 @@ def atomic_write_csv(frame: pd.DataFrame, target: Path, **kwargs: Any) -> Path:
 
 
 def atomic_write_json(payload: Any, target: Path, *, indent: int = 2) -> Path:
-    target = Path(target)
+    target = publication_write_path(Path(target))
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_path = _temporary_path(target)
     try:
@@ -60,7 +62,7 @@ def atomic_write_json(payload: Any, target: Path, *, indent: int = 2) -> Path:
 
 
 def atomic_write_text(text: str, target: Path) -> Path:
-    target = Path(target)
+    target = publication_write_path(Path(target))
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_path = _temporary_path(target)
     try:
@@ -78,7 +80,7 @@ def atomic_link_or_copy(source: Path, target: Path) -> Path:
     """Atomically publish an alias, preferring a zero-copy hard link."""
 
     source = Path(source)
-    target = Path(target)
+    target = publication_write_path(Path(target))
     if not source.is_file():
         raise FileNotFoundError(source)
     target.parent.mkdir(parents=True, exist_ok=True)

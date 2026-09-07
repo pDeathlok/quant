@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import filecmp
 import hashlib
 import json
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
+
+from quant.infrastructure.artifact_registry import ArtifactRegistry
 
 
 LONG_CACHE_PATTERNS = (
@@ -307,10 +310,13 @@ def _cleanup_factor_schema_caches(root: Path, errors: list[str]) -> dict[str, An
             if path.name == current_version:
                 continue
             try:
-                size = _directory_size(path)
-                shutil.rmtree(path)
-                deleted_directories += 1
-                reclaimed_bytes += size
+                with ArtifactRegistry(root).deletion_guard(path, require_owned=False) as reason:
+                    if reason:
+                        continue
+                    size = _directory_size(path)
+                    shutil.rmtree(path)
+                    deleted_directories += 1
+                    reclaimed_bytes += size
             except OSError as exc:
                 errors.append(f"daily_factor_schema:{path.name}:{exc}")
     return {
@@ -403,11 +409,15 @@ def _cleanup_abandoned_cache_builds(
     root: Path,
     today: date,
     errors: list[str],
+    *,
+    protected_paths: Iterable[Path | str] = (),
 ) -> dict[str, Any]:
     cutoff = today - timedelta(days=ABANDONED_CACHE_RETENTION_DAYS)
     deleted_files = 0
     deleted_directories = 0
     reclaimed_bytes = 0
+    kept_paths: dict[str, str] = {}
+    registry = ArtifactRegistry(root)
     cache_roots = (
         root / "data/features/daily_factor_layer",
         root / "data/research/similar_patterns/vector_cache",
@@ -432,17 +442,22 @@ def _cleanup_abandoned_cache_builds(
             if not is_temp_file and not is_build_directory:
                 continue
             try:
-                modified_date = datetime.fromtimestamp(path.stat().st_mtime).date()
-                if modified_date >= cutoff:
-                    continue
-                size = path.stat().st_size if is_temp_file else _directory_size(path)
-                if is_temp_file:
-                    path.unlink()
-                    deleted_files += 1
-                else:
-                    shutil.rmtree(path)
-                    deleted_directories += 1
-                reclaimed_bytes += size
+                with registry.deletion_guard(
+                    path,
+                    older_than=datetime.combine(cutoff, datetime.min.time()).timestamp(),
+                    protected_paths=protected_paths,
+                ) as reason:
+                    if reason:
+                        kept_paths[str(path.relative_to(root))] = reason
+                        continue
+                    size = path.stat().st_size if is_temp_file else _directory_size(path)
+                    if is_temp_file:
+                        path.unlink()
+                        deleted_files += 1
+                    else:
+                        shutil.rmtree(path)
+                        deleted_directories += 1
+                    reclaimed_bytes += size
             except OSError as exc:
                 errors.append(f"abandoned_cache_build:{path.name}:{exc}")
     return {
@@ -451,6 +466,7 @@ def _cleanup_abandoned_cache_builds(
         "deleted_files": deleted_files,
         "deleted_directories": deleted_directories,
         "reclaimed_bytes": reclaimed_bytes,
+        "kept_paths": kept_paths,
     }
 
 
@@ -967,17 +983,333 @@ def _cleanup_sql_snapshots(root: Path, today: date, errors: list[str]) -> dict[s
     }
 
 
-def cleanup_daily_caches(project_root: Path, reference_date: date | None = None) -> dict[str, Any]:
+def activate_vector_config(project_root: Path, config_dir: Path) -> dict[str, Any]:
+    """Rotate the production config only after successful vector publication.
+
+    Call from services after pending-marker removal and validation, not from
+    arbitrary research builds. Keep one prior config for rollback. Only older
+    similar_patterns-owned trees and their exact producer cache-consumer names
+    are retired; model/report references and live leases remain untouched.
+    """
+    from quant.routine.vector_refresh_policy import VECTOR_PUBLICATION_PENDING_FILENAME
+
+    root = project_root.resolve()
+    config_dir = config_dir.absolute()
+    vector_root = root / "data/research/similar_patterns/vector_cache"
+    if config_dir.parent != vector_root or not config_dir.is_dir() or config_dir.is_symlink():
+        raise ValueError("expected a production vector configuration directory")
+    try:
+        (config_dir / VECTOR_PUBLICATION_PENDING_FILENAME).lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("cannot activate a pending vector publication")
+    registry = ArtifactRegistry(root)
+    record = next(
+        item for item in registry.inventory([config_dir])["entries"]
+        if item["path"] == str(config_dir.relative_to(root))
+    )
+    if record.get("producer") != "similar_patterns" or record.get("state") != "committed":
+        raise ValueError("activation requires a committed similar_patterns-owned configuration")
+    consumer = "similar_patterns:active_config"
+    displaced = registry.commit(consumer, config_dir)
+    retired = {}
+    for path in displaced:
+        if path.parent != vector_root:
+            retired[str(path)] = {"keep_reason": "unknown_config_location"}
+            continue
+        prefix = f"similar_patterns:{path.name}"
+        retired[path.name] = registry.retire_owned_tree(
+            path, producer="similar_patterns",
+            consumers=(prefix + ":vectors", prefix + ":vectors:previous",
+                       prefix + ":compiled", prefix + ":compiled:previous"),
+            protected_consumers=(consumer, consumer + ":previous"),
+        )
+    return {
+        "active_config": config_dir.name,
+        "previous_configs": [path.name for path in registry.referenced_paths(consumer + ":previous")],
+        "retired_configs": retired,
+    }
+
+
+def cleanup_vector_artifacts(
+    project_root: Path, *, active_vector_paths: Iterable[Path | str] = (), dry_run: bool = True,
+) -> dict[str, Any]:
+    """Collect owned retired configs/independent generations, never select by mtime.
+
+    Producers should durably pin config and committed generation references in
+    ArtifactRegistry. The explicit paths also protect unmigrated callers; without
+    ownership registration all existing/experimental caches are kept.
+    """
+    root = project_root.resolve()
+    registry = ArtifactRegistry(root)
+    protected = tuple(active_vector_paths)
+    similar_root = root / "data/research/similar_patterns"
+    vector_root = similar_root / "vector_cache"
+    candidates = sorted(vector_root.iterdir()) if vector_root.is_dir() else []
+    candidates += [similar_root / name for name in SIMILAR_PATTERN_SMOKE_CACHE_DIRECTORIES]
+    result: dict[str, Any] = {
+        "dry_run": dry_run, "kept_directory": None, "kept_directories": [],
+        "kept_reasons": {}, "candidates": [], "deleted_directories": 0,
+        "reclaimed_bytes": 0, "errors": [],
+        "smoke": {"deleted_directories": 0, "reclaimed_bytes": 0},
+        "compiled": {"deleted_directories": 0, "reclaimed_bytes": 0, "collections": {}},
+    }
+    for path in candidates:
+        if not path.is_dir():
+            continue
+        try:
+            with registry.deletion_guard(path, protected_paths=protected) as reason:
+                if not reason:
+                    result["candidates"].append(str(path.relative_to(root)))
+                if reason or dry_run:
+                    if path.parent == vector_root:
+                        result["kept_directories"].append(path.name)
+                    if reason:
+                        result["kept_reasons"][str(path.relative_to(root))] = reason
+                    continue
+            # Recheck under the same registry protocol immediately before deletion.
+            deleted = registry.delete_if_eligible(path, protected_paths=protected)
+            if not deleted["deleted"]:
+                result["kept_reasons"][str(path.relative_to(root))] = deleted["reason"]
+                if path.parent == vector_root:
+                    result["kept_directories"].append(path.name)
+                continue
+            bucket = result if path.parent == vector_root else result["smoke"]
+            bucket["deleted_directories"] += 1
+            bucket["reclaimed_bytes"] += deleted["reclaimed_bytes"]
+        except OSError as exc:
+            result["errors"].append(f"similar_patterns:{path.name}:{exc}")
+    for config_dir in candidates:
+        matrix_root = config_dir / "_matrix_cache_v1"
+        if config_dir.parent != vector_root or not matrix_root.is_dir():
+            continue
+        try:
+            collection = registry.collect_retired_children(
+                matrix_root, dry_run=dry_run, protected_paths=protected,
+            )
+            result["compiled"]["collections"][config_dir.name] = collection
+            result["compiled"]["deleted_directories"] += len(collection["deleted_paths"])
+            result["compiled"]["reclaimed_bytes"] += collection["reclaimed_bytes"]
+            result["reclaimed_bytes"] += collection["reclaimed_bytes"]
+            result["errors"].extend(collection["errors"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result["errors"].append(f"similar_patterns_compiled:{config_dir.name}:{exc}")
+    if len(result["kept_directories"]) == 1:
+        result["kept_directory"] = result["kept_directories"][0]
+    return result
+
+
+def cache_storage_inventory(
+    project_root: Path, *, paths: Iterable[Path | str] | None = None,
+    budgets: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Explicit read-only inventory; research/raw are measured, never auto-purged."""
+    return ArtifactRegistry(project_root).inventory(
+        paths if paths is not None else ("data", "reports"), budgets=budgets,
+    )
+
+
+def cleanup_publication_generations(
+    project_root: Path, *, dry_run: bool = True, minimum_age_days: int = 2,
+    completed_grace_days: int = 0, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Preview/apply registered retired publication retention after writer release.
+
+    Integration: register each generation before cloning (state='building'), hold
+    a build lease, and call registry.commit('publication:current', generation_dir)
+    after validated pointer publication while still holding writer.lock. Retire
+    superseded generations or failed/abandoned stages explicitly. Read leases
+    must cover pointer selection and full consumption (retry if selection raced
+    collection). This hook never infers ownership/abandonment from directory age.
+
+    Both preview and apply recheck writer exclusion and reachability. Unknown
+    generations and current/previous references are kept even over budget.
+    Unreferenced retired completed generations have no default grace period,
+    retaining current + previous complete (plus any other references/readers).
+    Aborted stages keep the two-day minimum; staging is never collected here.
+    """
+    if minimum_age_days < 0 or completed_grace_days < 0:
+        raise ValueError("minimum publication age must be nonnegative")
+    root = project_root.resolve()
+    registry = ArtifactRegistry(root)
+    directory = root / "data/publications"
+    result: dict[str, Any] = {
+        "status": "success", "dry_run": dry_run, "candidates": [], "kept": {},
+        "deleted_directories": 0, "reclaimed_bytes": 0, "errors": [],
+    }
+    if not directory.exists():
+        return result
+    try:
+        lock_path = directory / "writer.lock"
+        if any(path.is_symlink() for path in (directory, lock_path, directory / "current.json")):
+            raise ValueError("symlink publication metadata")
+        # Never create or replace the writer's lock inode, even during dry-run.
+        with lock_path.open("rb") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                result["status"] = "skipped_writer_active"
+                return result
+            pointer = json.loads((directory / "current.json").read_text("utf-8"))
+            generation = pointer["generation"]
+            if not isinstance(generation, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", generation):
+                raise ValueError("invalid publication generation")
+            current = directory / generation
+            if not (current / "tree").is_dir() or current.is_symlink():
+                raise ValueError("current publication tree missing or unsafe")
+            previous = registry.referenced_paths("publication:current:previous")
+            if pointer.get("previous") is not None:
+                previous_id = pointer["previous"]
+                if not isinstance(previous_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", previous_id):
+                    raise ValueError("invalid previous publication generation")
+                previous = (*previous, directory / previous_id)
+            if any(not (path / "tree").is_dir() or path.is_symlink() for path in previous):
+                raise ValueError("previous publication tree missing or unsafe")
+            protected = (current, *previous)
+            for path in protected:
+                state_path = path / "state.json"
+                if state_path.is_symlink() or (path / "tree").is_symlink():
+                    raise ValueError("symlink committed publication tree/state")
+                state = json.loads(state_path.read_text("utf-8"))
+                if not isinstance(state, dict) or state.get("status") != "validated":
+                    raise ValueError("committed publication is not validated")
+            current_time = now or datetime.now()
+            result["inventory"] = registry.inventory([directory])
+            for path in sorted(directory.iterdir()):
+                if not path.is_dir() or path.is_symlink():
+                    continue
+                try:
+                    state_path = path / "state.json"
+                    if state_path.is_symlink():
+                        raise ValueError("symlink publication state")
+                    state = json.loads(state_path.read_text("utf-8"))
+                except (OSError, ValueError):
+                    state = {}
+                if not isinstance(state, dict) or state.get("status") not in {"validated", "aborted"}:
+                    result["kept"][path.name] = "staging_or_unknown_state"
+                    continue
+                if not previous and path != current:
+                    # Until the writer migrates the previous pointer, no old
+                    # complete tree is proven safe to retire (including baseline).
+                    if state.get("status") != "aborted":
+                        result["kept"][path.name] = "previous_generation_unknown"
+                        continue
+                grace_days = completed_grace_days if state["status"] == "validated" else minimum_age_days
+                cutoff = current_time - timedelta(days=grace_days)
+                with registry.deletion_guard(
+                    path, older_than=cutoff.timestamp(), protected_paths=protected,
+                ) as reason:
+                    if reason:
+                        result["kept"][path.name] = reason
+                        continue
+                    result["candidates"].append(str(path.relative_to(root)))
+                    if dry_run:
+                        continue
+                # Writer lock stays held; delete_if_eligible rechecks leases that
+                # may have started since inventory/preview under the registry lock.
+                deletion = registry.delete_if_eligible(
+                    path, protected_paths=protected, older_than=cutoff.timestamp(),
+                )
+                if deletion["deleted"]:
+                    result["deleted_directories"] += 1
+                    result["reclaimed_bytes"] += deletion["reclaimed_bytes"]
+                else:
+                    result["kept"][path.name] = deletion["reason"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        result["status"] = "unavailable"
+        result["errors"].append(f"publication_retention:{exc}")
+    return result
+
+
+def prune_staged_publication_snapshots(
+    staged_tree: Path, reference_date: date | None = None,
+) -> dict[str, Any]:
+    """Apply only JSON snapshot policies to a writer-owned unpublished copy.
+
+    Call inside PublicationStore.begin's writer/build-lease context, before the
+    strict audit and commit. Raises on an unsafe target; no SQL, source caches,
+    raw inputs, or committed trees are touched. The caller should block commit
+    on a partial result, just as with other staging/validation failures.
+    """
+    tree = staged_tree.absolute()
+    if (
+        tree.name != "tree" or len(tree.parents) < 4
+        or tree.parents[1].name != "publications" or tree.parents[2].name != "data"
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", tree.parent.name)
+    ):
+        raise ValueError("expected a publication generation tree")
+    root = tree.parents[3]
+    generation_dir = tree.parent
+    publication_dir = generation_dir.parent
+    registry = ArtifactRegistry(root)
+    with registry.build_mutation_guard(generation_dir):
+        if not tree.is_dir() or tree.is_symlink():
+            raise ValueError("staged tree missing or unsafe")
+        # A separate nonblocking lock attempt verifies the publisher still owns
+        # its stable writer lock. Never acquire a blocking lock in this order.
+        lock_path = publication_dir / "writer.lock"
+        if lock_path.is_symlink():
+            raise ValueError("symlink publication writer lock")
+        with lock_path.open("rb") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise ValueError("staged pruning requires an active publication writer")
+        pointer_path = publication_dir / "current.json"
+        state_path = generation_dir / "state.json"
+        if pointer_path.is_symlink() or state_path.is_symlink():
+            raise ValueError("symlink publication metadata")
+        pointer = json.loads(pointer_path.read_text("utf-8"))
+        state = json.loads(state_path.read_text("utf-8"))
+        if not isinstance(pointer, dict) or not isinstance(state, dict):
+            raise ValueError("invalid publication metadata")
+        committed = pointer.get("committed_generations", [])
+        if not isinstance(committed, list):
+            raise ValueError("invalid committed generation inventory")
+        if state.get("status") != "staging" or generation_dir.name in (
+            pointer.get("generation"), pointer.get("previous"), *committed,
+        ):
+            raise ValueError("only unpublished staging trees can be pruned")
+        # Existing snapshot policies follow glob paths; reject links before
+        # invoking them so a malformed clone cannot redirect deletion outside it.
+        snapshot_roots = [tree / relative for relative in (
+            "data/selector_snapshots", "data/long_stock_pool_snapshots", "data/workspace_snapshots",
+        )]
+        for path in snapshot_roots:
+            if (tree / "data").is_symlink() or path.is_symlink() or any(
+                child.is_symlink() for child in path.rglob("*")
+            ):
+                raise ValueError("snapshot staging tree contains symlinks")
+        errors: list[str] = []
+        today = reference_date or date.today()
+        snapshots = _cleanup_snapshot_files(tree, today, errors)
+        return {
+            "status": "partial" if errors else "success", "reference_date": today.isoformat(),
+            "snapshots": snapshots, "reclaimed_bytes": snapshots["reclaimed_bytes"],
+            "errors": errors,
+        }
+
+
+def cleanup_daily_caches(
+    project_root: Path, reference_date: date | None = None, *,
+    active_vector_paths: Iterable[Path | str] = (),
+) -> dict[str, Any]:
     """Apply retention rules after a successful daily refresh."""
 
     root = project_root.resolve()
     today = reference_date or date.today()
     errors: list[str] = []
+    active_vector_paths = tuple(active_vector_paths)
     storage_before = _managed_cache_storage(root)
 
     factor_schemas = _cleanup_factor_schema_caches(root, errors)
     root_market_requests = _cleanup_root_market_request_cache(root, today, errors)
-    abandoned_cache_builds = _cleanup_abandoned_cache_builds(root, today, errors)
+    abandoned_cache_builds = _cleanup_abandoned_cache_builds(
+        root, today, errors, protected_paths=active_vector_paths,
+    )
 
     long_cache_dir = root / "data/research/long_dividend_quality"
     deleted_long_files = 0
@@ -1009,41 +1341,12 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
             except OSError as exc:
                 errors.append(f"long_strategy:{path.name}:{exc}")
 
-    vector_cache_root = root / "data/research/similar_patterns/vector_cache"
-    vector_directories = sorted(
-        (
-            path
-            for path in vector_cache_root.iterdir()
-            if path.is_dir() and not path.is_symlink()
-        ),
-        key=lambda path: (path.stat().st_mtime_ns, path.name),
-    ) if vector_cache_root.exists() else []
-    kept_vector_directory = vector_directories[-1] if vector_directories else None
-    deleted_vector_directories = 0
-    reclaimed_vector_bytes = 0
-    for path in vector_directories[:-1]:
-        try:
-            size = _directory_size(path)
-            shutil.rmtree(path)
-            deleted_vector_directories += 1
-            reclaimed_vector_bytes += size
-        except OSError as exc:
-            errors.append(f"similar_patterns:{path.name}:{exc}")
-
-    similar_pattern_root = root / "data/research/similar_patterns"
-    deleted_smoke_directories = 0
-    reclaimed_smoke_bytes = 0
-    for directory_name in SIMILAR_PATTERN_SMOKE_CACHE_DIRECTORIES:
-        path = similar_pattern_root / directory_name
-        if not path.is_dir() or path.is_symlink():
-            continue
-        try:
-            size = _directory_size(path)
-            shutil.rmtree(path)
-            deleted_smoke_directories += 1
-            reclaimed_smoke_bytes += size
-        except OSError as exc:
-            errors.append(f"similar_patterns_smoke:{path.name}:{exc}")
+    vector_summary = cleanup_vector_artifacts(
+        root, active_vector_paths=active_vector_paths, dry_run=False,
+    )
+    reclaimed_vector_bytes = vector_summary["reclaimed_bytes"]
+    reclaimed_smoke_bytes = vector_summary["smoke"]["reclaimed_bytes"]
+    errors.extend(vector_summary["errors"])
 
     tushare_cache_dir = root / "data/cache/source_merge/tushare"
     tushare_cutoff = today - timedelta(days=TUSHARE_SINGLE_SYMBOL_CACHE_RETENTION_DAYS)
@@ -1153,15 +1456,7 @@ def cleanup_daily_caches(project_root: Path, reference_date: date | None = None)
             "deleted_files": deleted_long_files,
             "reclaimed_bytes": reclaimed_long_bytes,
         },
-        "similar_patterns": {
-            "kept_directory": kept_vector_directory.name if kept_vector_directory else None,
-            "deleted_directories": deleted_vector_directories,
-            "reclaimed_bytes": reclaimed_vector_bytes,
-            "smoke": {
-                "deleted_directories": deleted_smoke_directories,
-                "reclaimed_bytes": reclaimed_smoke_bytes,
-            },
-        },
+        "similar_patterns": vector_summary,
         "tushare_single_symbol": {
             "retention_days": TUSHARE_SINGLE_SYMBOL_CACHE_RETENTION_DAYS,
             "cutoff_date": tushare_cutoff.isoformat(),

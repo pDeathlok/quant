@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 from datetime import date, datetime
 from pathlib import Path
@@ -7,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from quant.data.market_data_store import MarketDataStore
+from quant.infrastructure.artifact_registry import ArtifactRegistry
+from quant.infrastructure.publication import PublicationStore
 from quant.routine import cache_retention
 from quant.routine.cache_retention import _snapshot_keys_to_delete, cleanup_daily_caches
 
@@ -31,6 +35,15 @@ def _write_factor_symbol(schema_dir: Path, symbol: str, *, size: int = 16) -> No
     (symbol_dir / "2026.parquet").write_bytes(b"x" * size)
 
 
+def _register_retired(root: Path, path: Path, *, last_access: float = 1) -> ArtifactRegistry:
+    registry = ArtifactRegistry(root)
+    registry.register(
+        path, producer="test", input_versions={"source": "v1"},
+        retention_class="rebuildable", state="retired", last_access=last_access,
+    )
+    return registry
+
+
 def test_cleanup_daily_caches_applies_requested_retention_rules(tmp_path: Path) -> None:
     long_cache = tmp_path / "data/research/long_dividend_quality"
     expired_return = long_cache / "daily_returns_expired.parquet"
@@ -51,6 +64,7 @@ def test_cleanup_daily_caches_applies_requested_retention_rules(tmp_path: Path) 
     _write_with_mtime(current_vector / "000001_SZ.npz", datetime(2026, 7, 15), size=80)
     os.utime(old_vector, (datetime(2026, 6, 1).timestamp(),) * 2)
     os.utime(current_vector, (datetime(2026, 7, 15).timestamp(),) * 2)
+    _register_retired(tmp_path, old_vector)
 
     tushare_cache = tmp_path / "data/cache/source_merge/tushare"
     tushare_file = tushare_cache / "tushare_000001.SZ_20260714_20260715_None.parquet"
@@ -105,7 +119,7 @@ def test_cleanup_daily_caches_applies_requested_retention_rules(tmp_path: Path) 
     assert summary["errors"] == []
 
 
-def test_cleanup_daily_caches_keeps_only_newest_vector_directory(tmp_path: Path) -> None:
+def test_cleanup_daily_caches_keeps_unowned_vectors_including_smoke(tmp_path: Path) -> None:
     vector_root = tmp_path / "data/research/similar_patterns/vector_cache"
     for name, modified_at in [
         ("first", datetime(2026, 5, 1)),
@@ -125,14 +139,14 @@ def test_cleanup_daily_caches_keeps_only_newest_vector_directory(tmp_path: Path)
 
     summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
 
-    assert sorted(path.name for path in vector_root.iterdir()) == ["latest"]
-    assert not (similar_pattern_root / "vector_cache_smoke").exists()
-    assert not (similar_pattern_root / "vector_cache_model_smoke").exists()
-    assert summary["similar_patterns"]["kept_directory"] == "latest"
-    assert summary["similar_patterns"]["deleted_directories"] == 2
+    assert sorted(path.name for path in vector_root.iterdir()) == ["first", "latest", "second"]
+    assert (similar_pattern_root / "vector_cache_smoke").exists()
+    assert (similar_pattern_root / "vector_cache_model_smoke").exists()
+    assert summary["similar_patterns"]["kept_directory"] is None
+    assert summary["similar_patterns"]["deleted_directories"] == 0
     assert summary["similar_patterns"]["smoke"] == {
-        "deleted_directories": 2,
-        "reclaimed_bytes": 43,
+        "deleted_directories": 0,
+        "reclaimed_bytes": 0,
     }
 
 
@@ -240,6 +254,9 @@ def test_cleanup_daily_caches_removes_only_old_abandoned_build_outputs(
     _write_with_mtime(recent_temp, datetime(2026, 7, 14), size=52)
     _write_with_mtime(old_build / "vectors.npy", datetime(2026, 7, 10), size=53)
     os.utime(old_build, (datetime(2026, 7, 10).timestamp(),) * 2)
+    _register_retired(tmp_path, old_temp, last_access=datetime(2026, 7, 10).timestamp())
+    _register_retired(tmp_path, recent_temp, last_access=datetime(2026, 7, 14).timestamp())
+    _register_retired(tmp_path, old_build, last_access=datetime(2026, 7, 10).timestamp())
 
     summary = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 15))
 
@@ -450,3 +467,314 @@ def test_cleanup_sql_snapshots_returns_failure_when_engine_creation_fails(
 
     assert summary["status"] == "failed"
     assert errors == ["sql:connection:database offline"]
+
+
+def test_vectors_pin_production_previous_and_interrupted_build_not_newest_mtime(
+    tmp_path: Path,
+) -> None:
+    vector_root = tmp_path / "data/research/similar_patterns/vector_cache"
+    paths = {name: vector_root / name for name in ("production", "previous", "experiment", "retired")}
+    for path in paths.values():
+        _write_with_mtime(path / "cache.npz", datetime(2026, 1, 1))
+        _register_retired(tmp_path, path)
+    registry = ArtifactRegistry(tmp_path)
+    registry.set_references("vectors:active", [paths["production"]])
+    registry.set_references("vectors:previous", [paths["previous"]])
+    registry.register(paths["experiment"], producer="test", input_versions={}, state="building")
+    os.utime(paths["experiment"], (datetime(2026, 9, 6).timestamp(),) * 2)
+
+    preview = cache_retention.cleanup_vector_artifacts(tmp_path)
+    assert preview["candidates"] == [str(paths["retired"].relative_to(tmp_path))]
+    assert paths["retired"].exists()
+    result = cleanup_daily_caches(tmp_path, reference_date=date(2026, 9, 6))
+    assert result["similar_patterns"]["deleted_directories"] == 1
+    assert all(paths[name].exists() for name in ("production", "previous", "experiment"))
+    assert not paths["retired"].exists()
+
+
+@pytest.mark.parametrize("kind", ["read", "build"])
+def test_vector_leases_prevent_parent_and_abandoned_build_cleanup(tmp_path: Path, kind: str) -> None:
+    config = tmp_path / "data/research/similar_patterns/vector_cache/config"
+    abandoned = config / "_matrix_cache_v1/.generation.building-123"
+    temporary = abandoned / ".vectors.tmp.npy"
+    _write_with_mtime(temporary, datetime(2020, 1, 1))
+    for path in (config, abandoned, temporary):
+        _register_retired(tmp_path, path)
+    with ArtifactRegistry(tmp_path).lease([config], owner="vector-worker", kind=kind):
+        result = cleanup_daily_caches(tmp_path, reference_date=date(2026, 9, 6))
+        assert temporary.exists()
+        assert result["similar_patterns"]["deleted_directories"] == 0
+        assert result["abandoned_cache_builds"]["deleted_directories"] == 0
+
+
+def test_unowned_old_build_and_explicit_active_config_are_kept(tmp_path: Path) -> None:
+    config = tmp_path / "data/research/similar_patterns/vector_cache/config"
+    temporary = config / "_matrix_cache_v1/.generation.building-123/vectors.npy"
+    _write_with_mtime(temporary, datetime(2020, 1, 1))
+    os.utime(temporary.parent, (1, 1))
+    result = cleanup_daily_caches(tmp_path, reference_date=date(2026, 9, 6))
+    assert temporary.exists()
+    assert result["abandoned_cache_builds"]["deleted_directories"] == 0
+    _register_retired(tmp_path, config)
+    result = cleanup_daily_caches(
+        tmp_path, reference_date=date(2026, 9, 6), active_vector_paths=[config],
+    )
+    assert config.exists()
+    assert result["similar_patterns"]["deleted_directories"] == 0
+
+
+def test_factor_schema_cleanup_respects_live_reader(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "data/features/daily_factor_layer"
+    for name in ("old", "current"):
+        _write_factor_symbol(root / name, "000001.SZ")
+    monkeypatch.setattr(cache_retention, "_current_factor_schema_version", lambda: "current")
+    with ArtifactRegistry(tmp_path).lease([root / "old"], owner="factor-reader"):
+        result = cleanup_daily_caches(tmp_path, reference_date=date(2026, 9, 6))
+        assert result["daily_factor_schemas"]["deleted_directories"] == 0
+        assert (root / "old").exists()
+
+
+def _publication_generations(root: Path) -> tuple[Path, ArtifactRegistry]:
+    directory = root / "data/publications"
+    registry = ArtifactRegistry(root)
+    for name in ("baseline-old", "previous", "current", "staging", "failed", "unknown"):
+        path = directory / name
+        _write_with_mtime(path / "tree/outputs/snapshot.json", datetime(2026, 1, 1))
+        (path / "state.json").write_text(json.dumps({
+            "status": "staging" if name == "staging" else "aborted" if name == "failed" else "validated",
+        }))
+        if name != "unknown":
+            _register_retired(root, path)
+    registry.commit("publication:current", directory / "baseline-old")
+    registry.commit("publication:current", directory / "previous")
+    registry.commit("publication:current", directory / "current")
+    for name in ("baseline-old", "previous", "current"):
+        registry.retire(directory / name)
+    registry.register(directory / "staging", producer="test", input_versions={}, state="building")
+    (directory / "current.json").write_text(json.dumps({"generation": "current"}))
+    (directory / "writer.lock").touch()
+    return directory, registry
+
+
+def test_publication_retention_preview_and_apply_keep_previous_staging_readers(tmp_path: Path) -> None:
+    directory, registry = _publication_generations(tmp_path)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    preview = cache_retention.cleanup_publication_generations(tmp_path)
+    assert preview["status"] == "success" and preview["dry_run"] is True
+    assert {Path(path).name for path in preview["candidates"]} == {"baseline-old", "failed"}
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+    with registry.lease([directory / "baseline-old"], owner="old-reader"):
+        applied = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+        assert applied["deleted_directories"] == 1
+        assert (directory / "baseline-old/tree/outputs/snapshot.json").exists()
+    assert not (directory / "failed").exists()
+    for name in ("current", "previous", "staging", "unknown"):
+        assert (directory / name / "tree/outputs/snapshot.json").exists()
+
+
+def test_publication_retention_cannot_enter_active_writer_or_delete_recent_stage(tmp_path: Path) -> None:
+    directory, registry = _publication_generations(tmp_path)
+    _register_retired(tmp_path, directory / "failed", last_access=datetime.now().timestamp())
+    with (directory / "writer.lock").open("rb") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+        assert result["status"] == "skipped_writer_active"
+        assert (directory / "baseline-old").exists()
+    result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+    assert result["kept"]["failed"] == "not_expired"
+    assert (directory / "failed/tree/outputs/snapshot.json").exists()
+
+
+def test_publication_unknown_previous_and_corrupt_pointer_fail_closed(tmp_path: Path) -> None:
+    directory, registry = _publication_generations(tmp_path)
+    registry.set_references("publication:current:previous", [])
+    result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+    assert result["kept"]["previous"] == "previous_generation_unknown"
+    assert (directory / "baseline-old").exists()
+    (directory / "current.json").write_text("{")
+    result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+    assert result["status"] == "unavailable"
+    assert result["deleted_directories"] == 0
+
+
+def test_storage_inventory_budgets_do_not_delete_research_raw_or_reports(tmp_path: Path) -> None:
+    for name in ("data/research/experiment", "data/raw/history", "reports/evidence"):
+        _write_with_mtime(tmp_path / name, datetime(2020, 1, 1))
+    before = sorted(tmp_path.rglob("*"))
+    result = cache_retention.cache_storage_inventory(tmp_path, budgets={"data": 0, "reports": 0})
+    assert result["dry_run"]
+    assert result["totals"]["logical_bytes"] == 48
+    assert result["budgets"]["data"]["over_budget_bytes"] > 0
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_publication_pointer_previous_is_pinned_without_registry_reference(tmp_path: Path) -> None:
+    directory, registry = _publication_generations(tmp_path)
+    registry.set_references("publication:current:previous", [])
+    (directory / "current.json").write_text(json.dumps({"generation": "current", "previous": "previous"}))
+    result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+    assert result["status"] == "success"
+    assert result["deleted_directories"] == 2
+    assert (directory / "previous/tree/outputs/snapshot.json").exists()
+    assert (directory / "current/tree/outputs/snapshot.json").exists()
+
+
+def test_publication_staging_state_overrides_retirement_and_old_access(tmp_path: Path) -> None:
+    directory, registry = _publication_generations(tmp_path)
+    registry.retire(directory / "staging")
+    result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+    assert result["kept"]["staging"] == "staging_or_unknown_state"
+    assert (directory / "staging/tree/outputs/snapshot.json").exists()
+
+
+def test_publication_missing_previous_fails_closed(tmp_path: Path) -> None:
+    directory, _ = _publication_generations(tmp_path)
+    (directory / "current.json").write_text('{"generation":"current","previous":"missing"}')
+    result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+    assert result["status"] == "unavailable"
+    assert result["deleted_directories"] == 0
+    assert (directory / "baseline-old").exists()
+
+
+def test_completed_publications_cap_to_current_previous_without_two_day_accumulation(tmp_path: Path) -> None:
+    directory, _ = _publication_generations(tmp_path)
+    _register_retired(tmp_path, directory / "baseline-old", last_access=datetime.now().timestamp())
+    result = cache_retention.cleanup_publication_generations(tmp_path, dry_run=False)
+    assert not (directory / "baseline-old").exists()
+    assert (directory / "current").exists() and (directory / "previous").exists()
+    assert result["deleted_directories"] == 2
+
+
+def test_staged_snapshot_pruning_is_file_only_and_does_not_mutate_current(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "data/workspace_snapshots/example/params"
+    for day in range(1, 13):
+        _write_with_mtime(workspace / f"2026-09-{day:02d}.json", datetime(2026, 9, day))
+    _write_with_mtime(workspace / "latest.json", datetime(2026, 9, 12))
+    raw = tmp_path / "data/raw/important.json"
+    _write_with_mtime(raw, datetime(2020, 1, 1))
+    store = PublicationStore(tmp_path, managed=("data/workspace_snapshots",))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("staged snapshot pruning must not run other cleanup")
+
+    monkeypatch.setattr(cache_retention, "_cleanup_sql_snapshots", forbidden)
+    monkeypatch.setattr(cache_retention, "cleanup_daily_caches", forbidden)
+    with store.begin("new-generation") as view:
+        current = store.view()
+        committed_workspace = current.resolve(workspace)
+        staged_workspace = view.resolve(workspace)
+        assert len(list(committed_workspace.glob("*.json"))) == 13
+        result = cache_retention.prune_staged_publication_snapshots(
+            view.directory / view.generation / "tree", date(2026, 9, 12),
+        )
+        assert result["status"] == "success"
+        assert result["snapshots"]["workspace"]["deleted_files"] == 9
+        assert len(list(staged_workspace.glob("*.json"))) == 4
+        assert len(list(committed_workspace.glob("*.json"))) == 13
+        assert len(list(workspace.glob("*.json"))) == 13
+        assert raw.exists()
+        with pytest.raises(ValueError):
+            cache_retention.prune_staged_publication_snapshots(current.directory / current.generation / "tree")
+
+
+@pytest.mark.parametrize("unsafe", ["no_lease", "no_writer", "committed", "symlink"])
+def test_staged_snapshot_pruning_rejects_unowned_or_published_tree(tmp_path: Path, unsafe: str) -> None:
+    directory, registry = _publication_generations(tmp_path)
+    stage = directory / "staging"
+    tree = stage / "tree"
+    if unsafe == "committed":
+        (directory / "current.json").write_text(json.dumps({
+            "generation": "current", "committed_generations": ["staging"],
+        }))
+    if unsafe == "symlink":
+        (tree / "data").mkdir()
+        (tree / "data/workspace_snapshots").symlink_to(directory / "current/tree", target_is_directory=True)
+    if unsafe == "no_lease":
+        with pytest.raises(ValueError, match="live build lease"):
+            cache_retention.prune_staged_publication_snapshots(tree)
+    else:
+        with registry.lease([stage], owner="publisher", kind="build"):
+            with (directory / "writer.lock").open("rb") as lock:
+                if unsafe != "no_writer":
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                with pytest.raises(ValueError):
+                    cache_retention.prune_staged_publication_snapshots(tree)
+    assert (directory / "current/tree/outputs/snapshot.json").exists()
+
+
+def test_daily_vector_retention_retries_independent_compiled_generation_gc(tmp_path: Path) -> None:
+    registry = ArtifactRegistry(tmp_path)
+    config = tmp_path / "data/research/similar_patterns/vector_cache/production"
+    config.mkdir(parents=True)
+    registry.register(config, producer="vectors", input_versions={}, retention_class="rebuildable", state="committed")
+    registry.set_references("active-config", [config])
+    for name in ("retired", "previous", "current"):
+        path = config / "_matrix_cache_v1" / name
+        _write_with_mtime(path / "vectors.npy", datetime(2026, 9, 6))
+        registry.register(
+            path, producer="vectors", input_versions={}, retention_class="rebuildable",
+            state="committed", ownership_boundary=True,
+        )
+        registry.commit("compiled", path)
+        for previous in registry.referenced_paths("compiled:previous"):
+            registry.retire(previous)
+    preview = cache_retention.cleanup_vector_artifacts(tmp_path)
+    assert len(preview["compiled"]["collections"]["production"]["candidates"]) == 1
+    assert (config / "_matrix_cache_v1/retired").exists()
+    with registry.lease([config], owner="reader"):
+        kept = cache_retention.cleanup_vector_artifacts(tmp_path, dry_run=False)
+        assert kept["compiled"]["deleted_directories"] == 0
+    applied = cache_retention.cleanup_vector_artifacts(tmp_path, dry_run=False)
+    assert applied["compiled"]["deleted_directories"] == 1
+    assert applied["reclaimed_bytes"] == 16
+    assert not (config / "_matrix_cache_v1/retired").exists()
+    assert (config / "_matrix_cache_v1/previous").exists()
+    assert (config / "_matrix_cache_v1/current").exists()
+
+
+@pytest.mark.parametrize("pin_config", [False, True])
+def test_explicit_active_paths_protect_compiled_children(tmp_path: Path, pin_config: bool) -> None:
+    registry = ArtifactRegistry(tmp_path)
+    config = tmp_path / "data/research/similar_patterns/vector_cache/production"
+    generation = config / "_matrix_cache_v1/retired"
+    generation.mkdir(parents=True)
+    registry.register(config, producer="vectors", input_versions={},
+                      retention_class="rebuildable", state="committed")
+    registry.register(generation, producer="vectors", input_versions={},
+                      retention_class="rebuildable", state="retired", ownership_boundary=True)
+    protected = config if pin_config else generation
+    for dry_run in (True, False):
+        result = cache_retention.cleanup_vector_artifacts(
+            tmp_path, active_vector_paths=[protected], dry_run=dry_run,
+        )
+        collection = result["compiled"]["collections"]["production"]
+        assert collection["candidates"] == []
+        assert collection["kept"][str(generation.relative_to(tmp_path))] == "explicit_reference"
+        assert generation.exists()
+
+
+def test_activation_rotates_configs_but_keeps_production_previous_and_leases(tmp_path: Path) -> None:
+    registry = ArtifactRegistry(tmp_path)
+    root = tmp_path / "data/research/similar_patterns/vector_cache"
+    configs = [root / name for name in ("old", "previous", "production", "experiment")]
+    for config in configs:
+        config.mkdir(parents=True)
+        registry.register(config, producer="similar_patterns", input_versions={},
+                          retention_class="rebuildable", state="committed")
+        registry.commit(f"similar_patterns:{config.name}:vectors", config)
+    for config in configs[:2]:
+        cache_retention.activate_vector_config(tmp_path, config)
+    with registry.lease([configs[0]], owner="reader"):
+        result = cache_retention.activate_vector_config(tmp_path, configs[2])
+        assert result["active_config"] == "production"
+        assert result["previous_configs"] == ["previous"]
+        cache_retention.cleanup_vector_artifacts(tmp_path, dry_run=False)
+        assert all(config.exists() for config in configs)
+    cache_retention.cleanup_vector_artifacts(tmp_path, dry_run=False)
+    assert not configs[0].exists()
+    assert all(config.exists() for config in configs[1:])
+    marker = configs[3] / "_publication_pending.json"
+    marker.write_text("{")
+    with pytest.raises(ValueError, match="pending"):
+        cache_retention.activate_vector_config(tmp_path, configs[3])
+    assert registry.referenced_paths("similar_patterns:active_config") == (configs[2],)

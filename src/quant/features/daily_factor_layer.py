@@ -8,11 +8,14 @@ features once.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import os
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -37,8 +40,8 @@ from quant.features.factor_execution import (
 
 
 FACTOR_LAYER_VERSION = "v2-causal-price"
-SIGNAL_FACTOR_LAYER_VERSION = "signal-v2-causal-price"
-SIGNAL_STATE_SCHEMA_VERSION = 1
+SIGNAL_FACTOR_LAYER_VERSION = "signal-v3-causal-state"
+SIGNAL_STATE_SCHEMA_VERSION = 2
 DEFAULT_FACTOR_ROOT = Path("data/features/daily_factor_layer")
 KEY_COLUMNS = ["ts_code", "symbol", "trade_date", "date"]
 Z_FACTOR_COLUMNS = [
@@ -109,6 +112,43 @@ SIGNAL_SOURCE_COLUMNS = [
     "volume",
     "pct_chg",
 ]
+
+
+@lru_cache(maxsize=1)
+def _signal_calculation_fingerprint() -> str:
+    """Fingerprint signal formulas and their local callable dependencies once per worker."""
+
+    sources: dict[str, Any] = {"numpy": np.__version__, "pandas": pd.__version__}
+    visited: set[int] = set()
+
+    def visit(value: Any) -> None:
+        if id(value) in visited:
+            return
+        visited.add(id(value))
+        if inspect.isclass(value):
+            if not value.__module__.startswith("quant."):
+                return
+            sources[f"{value.__module__}.{value.__qualname__}"] = inspect.getsource(value)
+            for base in value.__bases__:
+                visit(base)
+            for member in vars(value).values():
+                visit(member.__func__ if isinstance(member, (staticmethod, classmethod)) else member)
+        elif inspect.isfunction(value):
+            if not value.__module__.startswith("quant."):
+                return
+            sources[f"{value.__module__}.{value.__qualname__}"] = inspect.getsource(value)
+            closure = inspect.getclosurevars(value)
+            for name, dependency in {**closure.globals, **closure.nonlocals}.items():
+                if inspect.isfunction(dependency) or inspect.isclass(dependency):
+                    visit(dependency)
+                elif isinstance(dependency, (str, int, float, bool, tuple, list, dict)):
+                    sources[f"{value.__module__}.{name}"] = dependency
+
+    for calculator in (
+        calculate_daily_signal_factors, _signal_state_from_prepared, _signal_state_step,
+    ):
+        visit(calculator)
+    return hashlib.sha256(json.dumps(sources, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _prepare_daily(daily: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
@@ -331,6 +371,8 @@ def _signal_state_from_prepared(prepared: pd.DataFrame) -> dict[str, Any]:
     return {
         "schema_version": SIGNAL_STATE_SCHEMA_VERSION,
         "factor_version": SIGNAL_FACTOR_LAYER_VERSION,
+        "first_date": pd.Timestamp(prepared["date"].iloc[0]).strftime("%Y-%m-%d"),
+        "source_rows": len(prepared),
         "last_date": pd.Timestamp(last["date"]).strftime("%Y-%m-%d"),
         "last_raw_close": float(last["close"]),
         "close": [float(value) for value in close.tail(120)],
@@ -535,27 +577,26 @@ def _signal_state_step(
         pd.Series([row.get("pre_close")]),
         errors="coerce",
     ).iloc[0]
-    scale = (
-        float(current_pre_close) / last_raw_close
-        if pd.notna(current_pre_close) and last_raw_close
+    # Advance the causal price chain without rescaling historical state.
+    # Bootstrap and append must share the same initial price basis.
+    basis = float(state["close"][-1]) / last_raw_close
+    action_ratio = (
+        last_raw_close / float(current_pre_close)
+        if pd.notna(current_pre_close) and float(current_pre_close) > 0
         else 1.0
     )
-    if not np.isfinite(scale) or scale <= 0:
-        scale = 1.0
+    if not np.isfinite(action_ratio) or action_ratio <= 0:
+        action_ratio = 1.0
+    scale = basis * action_ratio
 
-    closes = [float(value) * scale for value in state["close"]]
-    highs = [float(value) * scale for value in state["high"]]
-    lows = [float(value) * scale for value in state["low"]]
+    closes = [float(value) for value in state["close"]]
+    highs = [float(value) for value in state["high"]]
+    lows = [float(value) for value in state["low"]]
     volumes = [float(value) for value in state["volume"]]
-    for key in ("z_white_first", "z_white_second"):
-        value = state[key].get("value")
-        if value is not None:
-            state[key]["value"] = float(value) * scale
-
-    current_open = float(row["open"])
-    current_high = float(row["high"])
-    current_low = float(row["low"])
-    current_close = float(row["close"])
+    current_open = float(row["open"]) * scale
+    current_high = float(row["high"]) * scale
+    current_low = float(row["low"]) * scale
+    current_close = float(row["close"]) * scale
     current_volume = float(row["volume"])
     previous_close = closes[-1] if closes else np.nan
     previous_volume = volumes[-1] if volumes else np.nan
@@ -712,7 +753,8 @@ def _signal_state_step(
         "factor_version": SIGNAL_FACTOR_LAYER_VERSION,
     }
     state["last_date"] = pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
-    state["last_raw_close"] = current_close
+    state["source_rows"] += 1
+    state["last_raw_close"] = float(row["close"])
     state["close"] = closes[-120:]
     state["high"] = highs[-9:]
     state["low"] = lows[-9:]
@@ -731,13 +773,21 @@ def _load_signal_state(
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
+    if not isinstance(state, dict):
+        return None
     if (
         state.get("schema_version") != SIGNAL_STATE_SCHEMA_VERSION
         or state.get("factor_version") != SIGNAL_FACTOR_LAYER_VERSION
+        or state.get("calculation_fingerprint") != _signal_calculation_fingerprint()
     ):
         return None
     try:
         last_date = pd.Timestamp(state["last_date"])
+        first_date = pd.Timestamp(state["first_date"])
+        if pd.isna(first_date) or first_date > last_date:
+            return None
+        if type(state["source_rows"]) is not int or state["source_rows"] < 1:
+            return None
         last_raw_close = float(state["last_raw_close"])
         if pd.isna(last_date) or not np.isfinite(last_raw_close) or last_raw_close <= 0:
             return None
@@ -782,6 +832,7 @@ def _write_signal_state(
     factor_root: Path,
     symbol: str,
 ) -> Path:
+    state["calculation_fingerprint"] = _signal_calculation_fingerprint()
     directory = signal_factor_symbol_dir(factor_root, symbol)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "state.json"
@@ -972,6 +1023,8 @@ def _refresh_signal_factor_cache(
                 state is not None
                 and pd.notna(state_date)
                 and cached["date"].max() == state_date
+                and prepared["date"].min() == pd.Timestamp(state["first_date"])
+                and len(cached) == state["source_rows"]
             )
             if (
                 hashes_match
@@ -1044,7 +1097,9 @@ def attach_daily_signal_factors(
 ) -> pd.DataFrame:
     """Attach exact signal factors, advancing versioned state when possible."""
 
-    factor_root = Path(os.getenv("DAILY_FACTOR_ROOT", str(factor_root)))
+    factor_root = Path(
+        os.getenv("SIGNAL_FACTOR_ROOT") or os.getenv("DAILY_FACTOR_ROOT") or str(factor_root)
+    )
     prepared = _prepare_daily(daily, symbol)
     if prepared.empty:
         return prepared
@@ -1152,7 +1207,16 @@ def refresh_symbol_factor_cache(
     source_frame: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
-    daily = source_frame.copy() if source_frame is not None else pd.read_parquet(daily_path)
+    if source_frame is not None:
+        daily = source_frame.copy()
+    else:
+        config = MarketDataStoreConfig.from_env(root=daily_path.parent.parent)
+        if config.backend in {"mysql", "sql"}:
+            daily = MarketDataStore(config).read_frame(daily_path.parent.name, daily_path.stem)
+        else:
+            daily = pd.read_parquet(daily_path)
+    if daily.empty:
+        raise ValueError(f"No daily source rows for factor cache: {daily_path.stem}")
     symbol = daily_path.stem
     for column in ("ts_code", "symbol"):
         if column in daily.columns:
@@ -1206,6 +1270,11 @@ def refresh_daily_factor_layer(
     daily_dir = Path(daily_dir)
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=daily_dir.parent))
     market = store.read_market_range(daily_dir.name)
+    if store.config.backend in {"mysql", "sql"}:
+        if market.empty:
+            raise RuntimeError(f"No canonical SQL daily data found for {daily_dir.name}")
+        if "ts_code" not in market.columns:
+            raise ValueError("Invalid canonical SQL daily data: missing ts_code")
     tasks: list[tuple[Path, pd.DataFrame | None]]
     if not market.empty and "ts_code" in market.columns:
         grouped = [

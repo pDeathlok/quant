@@ -534,6 +534,7 @@ def test_market_daily_availability_accepts_source_confirmed_suspension() -> None
 
 
 def test_refresh_daily_data_writes_failed_symbols(monkeypatch, tmp_path):
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
     class DummyPro:
         def trade_cal(self, **kwargs):
             return pd.DataFrame({"cal_date": ["20260606"]})

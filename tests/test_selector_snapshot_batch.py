@@ -172,7 +172,7 @@ def test_strategy_pool_snapshots_batch_files_sql_and_cache_invalidation(
     assert len(alters) == 2
     assert len(engines) == 1
     assert engines[0].begin_count == 2  # one-time schema setup + one batch UPSERT
-    assert engines[0].dispose_count == 1
+    assert engines[0].dispose_count == 0
 
     services._write_strategy_pool_snapshots(_selector_payload(), include_extended=True)
 
@@ -182,11 +182,11 @@ def test_strategy_pool_snapshots_batch_files_sql_and_cache_invalidation(
     assert len(inserts) == 2
     assert len(engines) == 2
     assert engines[1].begin_count == 1
-    assert engines[1].dispose_count == 1
+    assert engines[1].dispose_count == 0
     assert cache_clears == ["clear", "clear"]
 
 
-def test_strategy_pool_snapshot_file_failure_clears_cache_once_and_skips_sql(
+def test_strategy_pool_snapshot_file_failure_does_not_publish_generation(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -212,11 +212,11 @@ def test_strategy_pool_snapshot_file_failure_clears_cache_once_and_skips_sql(
         services._write_strategy_pool_snapshots(_selector_payload(), include_extended=True)
 
     assert len(list((tmp_path / "snapshots").glob("*.json"))) == 1
-    assert cache_clears == ["clear"]
-    assert engines == []
+    assert cache_clears == []
+    assert len(engines) == 1
 
 
-def test_strategy_pool_snapshot_sql_failure_keeps_atomic_files_and_invalidates_schema_cache(
+def test_strategy_pool_snapshot_sql_failure_preserves_files_and_invalidates_schema_cache(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -234,8 +234,8 @@ def test_strategy_pool_snapshot_sql_failure_keeps_atomic_files_and_invalidates_s
             include_extended=True,
         )
 
-    assert len(list((tmp_path / "snapshots").glob("*.json"))) == 3
-    assert cache_clears == ["clear"]
+    assert len(list((tmp_path / "snapshots").glob("*.json"))) == 0
+    assert cache_clears == []
     assert len([sql for sql, _ in events if sql.startswith("INSERT INTO")]) == 1
-    assert engines[0].dispose_count == 1
+    assert engines[0].dispose_count == 0
     assert services._SELECTOR_SNAPSHOT_SCHEMA_READY_URLS == set()

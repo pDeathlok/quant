@@ -10,6 +10,21 @@ import pytest
 from quant.routine import pipeline
 
 
+def test_daily_lookback_start_is_not_used_as_publication_watermark(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        pipeline,
+        "_latest_daily_trade_date",
+        lambda: "20260901",
+    )
+    monkeypatch.setenv("ROUTINE_DAILY_LOOKBACK_DAYS", "10")
+
+    assert pipeline._incremental_daily_start() == "20260822"
+    assert pipeline._incremental_feature_start() == "20260901"
+    assert pipeline.refresh_reference_inputs(dry_run=True)["end_date"] == "20260901"
+
+
 def test_daily_basic_incremental_start_revalidates_rolling_window(
     monkeypatch,
     tmp_path,
@@ -52,6 +67,7 @@ def test_refresh_daily_basic_reports_partial_failure(monkeypatch) -> None:
 
 
 def test_reference_and_analyst_interfaces_run_in_parallel(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260904")
     barrier = threading.Barrier(2, timeout=2)
     thread_ids: set[int] = set()
 
@@ -77,6 +93,49 @@ def test_reference_and_analyst_interfaces_run_in_parallel(monkeypatch) -> None:
     assert result["execution_mode"] == "parallel_tushare_and_akshare"
     assert result["steps"]["analyst_forecast_snapshot"]["status"] == "success"
     assert len(thread_ids) == 2
+
+
+def test_reference_inputs_preserve_stale_index_as_tushare_missing(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260901")
+    monkeypatch.setattr(
+        "quant.routine.reference_data_refresh.refresh_reference_data",
+        lambda **kwargs: {
+            "status": "partial",
+            "end_date": kwargs["end_date"],
+            "steps": {
+                "index_000300": {
+                    "status": "partial",
+                    "data_missing": True,
+                    "requested_end": "20260901",
+                    "latest_trade_date": "20260831",
+                    "error": (
+                        "Tushare index_daily missing requested trade date 20260901; "
+                        "latest available is 20260831"
+                    ),
+                }
+            },
+            "critical_errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "refresh_market_regime_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale index must not reach market-regime calculation")
+        ),
+    )
+
+    result = pipeline.refresh_reference_inputs(
+        dry_run=False,
+        include_financials=False,
+        include_analyst=False,
+    )
+
+    assert result["status"] == "failed"
+    assert result["data_missing"] is True
+    assert result["steps"]["market_regime"]["data_missing"] is True
+    assert result["steps"]["market_regime"]["latest_trade_date"] == "20260831"
+    assert "index_daily missing requested trade date" in result["error_summary"]
 
 
 def test_market_regime_snapshot_is_published_from_canonical_data(tmp_path) -> None:
@@ -402,6 +461,7 @@ def test_chan_refresh_requires_current_completion_manifest(monkeypatch, tmp_path
     scored_path = report_dir / "chan_model_scored_candidates.parquet"
     monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260721")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260721")
 
     class Result:
         returncode = 0
@@ -440,6 +500,7 @@ def test_chan_refresh_uses_explicit_worker_budget(monkeypatch, tmp_path) -> None
     captured: dict[str, object] = {}
     monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260723")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260723")
 
     class Result:
         returncode = 0
@@ -491,6 +552,7 @@ def test_build_features_uses_process_executor_by_default(monkeypatch) -> None:
     monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(pipeline, "_incremental_feature_start", lambda: "20260721")
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260721")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260721")
 
     result = pipeline.build_features()
 
@@ -531,6 +593,7 @@ def test_build_features_accepts_daily_basic_repair_start(monkeypatch) -> None:
 
     monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260722")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260722")
 
     result = pipeline.build_features(incremental_start_date="20260718")
 
@@ -575,6 +638,7 @@ def test_pipeline_subprocesses_stay_in_web_service_process_group(
 
     monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260721")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260721")
 
     result = operation()
 
@@ -697,6 +761,7 @@ def test_strategy_signal_cache_reports_family_and_z_skill_progress(monkeypatch) 
 
     monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260721")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260721")
 
     result = pipeline.refresh_strategy_signal_cache(
         workers=1,
@@ -735,6 +800,7 @@ def test_model_scoring_uses_batched_processes_and_exposes_manifest(
 
     monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260812")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260812")
     monkeypatch.setenv("ROUTINE_MODEL_SCORE_EXECUTOR", "processes")
     monkeypatch.setenv("ROUTINE_MODEL_SCORE_BATCH_SIZE", "8")
 
@@ -778,6 +844,7 @@ def test_model_scoring_rejects_a_stale_success_manifest(monkeypatch) -> None:
 
     monkeypatch.setattr(pipeline.subprocess, "run", lambda *args, **kwargs: Result())
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260812")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260812")
 
     result = pipeline.score_latest_models(workers=1)
 
@@ -814,6 +881,7 @@ def test_promoted_model_scoring_runs_only_preserved_legacy_signals(
     monkeypatch.setattr(pipeline, "DEFAULT_SELECTOR_RANKING_CONFIG", promoted)
     monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260812")
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20260812")
 
     result = pipeline.score_latest_models(workers=1)
 

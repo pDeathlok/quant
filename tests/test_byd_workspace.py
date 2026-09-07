@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pandas as pd
 import pytest
 
@@ -9,6 +11,7 @@ from quant.application.workspaces.byd import (
     build_byd_daily_strategy,
     load_byd_daily_frame,
 )
+from quant.data.market_data_store import MarketDataUnavailableError
 
 
 def _daily_frame(date: str) -> pd.DataFrame:
@@ -191,6 +194,8 @@ def test_byd_workspace_builds_and_persists_daily_plan() -> None:
 
 
 def test_load_byd_daily_frame_rejects_unverified_stale_fallback(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "file")
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
     class FakeStore:
         def read_frame(self, *args, **kwargs):
             raise RuntimeError("canonical unavailable")
@@ -207,6 +212,65 @@ def test_load_byd_daily_frame_rejects_unverified_stale_fallback(monkeypatch, tmp
 
     with pytest.raises(RuntimeError, match="expected=2026-08-12 actual=2026-06-16"):
         load_byd_daily_frame(daily_dir=tmp_path / "daily", cache_dir=tmp_path / "cache")
+
+
+@pytest.mark.parametrize("failure_stage", ["latest_dataset_trade_date", "read_frame"])
+@pytest.mark.parametrize("fallback_date", ["2026-09-03", "2026-09-04"])
+def test_load_byd_daily_frame_propagates_canonical_unavailability_without_qfq(
+    monkeypatch, tmp_path, failure_stage: str, fallback_date: str
+) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "sql")
+    fake_store = MagicMock()
+    fake_store.latest_dataset_trade_date.return_value = pd.Timestamp("2026-09-04")
+    error = MarketDataUnavailableError("Canonical SQL read unavailable")
+    getattr(fake_store, failure_stage).side_effect = error
+    monkeypatch.setattr(byd_workspace, "MarketDataStore", lambda *args, **kwargs: fake_store)
+    fallback = MagicMock(return_value=_daily_frame(fallback_date))
+    monkeypatch.setattr(byd_workspace, "load_daily_qfq", fallback)
+
+    with pytest.raises(MarketDataUnavailableError) as caught:
+        load_byd_daily_frame(daily_dir=tmp_path / "daily", cache_dir=tmp_path / "cache")
+
+    assert caught.value is error
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("canonical_date", [None, "2026-09-03"])
+def test_load_byd_daily_frame_does_not_replace_empty_or_stale_sql_with_same_date_qfq(
+    monkeypatch, tmp_path, canonical_date: str | None
+) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "mysql")
+    fake_store = MagicMock()
+    fake_store.read_frame.return_value = (
+        _daily_frame(canonical_date) if canonical_date else pd.DataFrame()
+    )
+    monkeypatch.setattr(byd_workspace, "MarketDataStore", lambda *args, **kwargs: fake_store)
+    fallback = MagicMock(return_value=_daily_frame("2026-09-04"))
+    monkeypatch.setattr(byd_workspace, "load_daily_qfq", fallback)
+
+    with pytest.raises(RuntimeError, match="BYD daily"):
+        load_byd_daily_frame(
+            daily_dir=tmp_path / "daily", cache_dir=tmp_path / "cache", expected_trade_date="2026-09-04"
+        )
+
+    fallback.assert_not_called()
+
+
+def test_load_byd_daily_frame_keeps_explicit_file_backend_qfq_fallback(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MARKET_DATA_BACKEND", "file")
+    monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
+    fake_store = MagicMock()
+    fake_store.read_frame.return_value = pd.DataFrame()
+    monkeypatch.setattr(byd_workspace, "MarketDataStore", lambda *args, **kwargs: fake_store)
+    fallback = MagicMock(return_value=_daily_frame("2026-09-04"))
+    monkeypatch.setattr(byd_workspace, "load_daily_qfq", fallback)
+
+    result = load_byd_daily_frame(
+        daily_dir=tmp_path / "daily", cache_dir=tmp_path / "cache", expected_trade_date="2026-09-04"
+    )
+
+    assert result.attrs["daily_feature_source"] == "local_qfq_fallback"
+    fallback.assert_called_once()
 
 
 def test_byd_workspace_rejects_daily_feature_date_different_from_expected() -> None:

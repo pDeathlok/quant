@@ -144,7 +144,8 @@ def refresh_index_daily(fetcher: TushareDataFetcher, raw_dir: Path, end_date: st
         sort=["trade_date", "ts_code"],
     )
     latest_text = str(combined["trade_date"].astype(str).max()) if not combined.empty else None
-    return {
+    data_missing = latest_text != end_date
+    result = {
         "status": "success" if latest_text == end_date else "partial",
         "requested_start": start,
         "requested_end": end_date,
@@ -152,7 +153,14 @@ def refresh_index_daily(fetcher: TushareDataFetcher, raw_dir: Path, end_date: st
         "total_rows": len(combined),
         "latest_trade_date": latest_text,
         "path": str(path),
+        "data_missing": data_missing,
     }
+    if data_missing:
+        result["error"] = (
+            f"Tushare index_daily missing requested trade date {end_date}; "
+            f"latest available is {latest_text or 'none'}"
+        )
+    return result
 
 
 def _request_frame_with_retries(
