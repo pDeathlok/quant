@@ -175,7 +175,7 @@ def test_online_ewm_state_matches_pandas_across_missing_values() -> None:
         alpha=1 / 3,
         adjust=False,
     ).mean().iloc[-1]
-    assert next_value == expected_next
+    np.testing.assert_allclose(next_value, expected_next, rtol=1e-14, atol=1e-14)
 
 
 def test_signal_factor_subset_matches_legacy_formulas() -> None:

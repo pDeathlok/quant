@@ -63,6 +63,7 @@ def _store(
     mirror_parquet: bool = True,
     sql_url: str | None = SECRET_URL,
 ) -> market.MarketDataStore:
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(root))
     monkeypatch.setenv("MARKET_DATA_BACKEND", backend)
     monkeypatch.setenv("MARKET_DATA_MIRROR_PARQUET", str(int(mirror_parquet)))
     if sql_url is None:
