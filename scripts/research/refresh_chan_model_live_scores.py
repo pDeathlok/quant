@@ -55,7 +55,7 @@ from quant.strategies.custom.chan_model import (
 DEFAULT_DAILY_DIR = PROJECT_ROOT / "data/raw/daily"
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports/chan_daily"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models/research/chan_daily"
-DEFAULT_TOP_LIST_DIR = PROJECT_ROOT / "data/raw/moneyflow"
+DEFAULT_TOP_LIST_DIR = PROJECT_ROOT / "data/raw/top_list"
 DEFAULT_DAILY_BASIC_DIR = PROJECT_ROOT / "data/raw/daily_basic"
 DEFAULT_SCORED_PATH = DEFAULT_REPORT_DIR / "model_filter/chan_model_scored_candidates.parquet"
 DEFAULT_REFRESH_MANIFEST_PATH = DEFAULT_REPORT_DIR / "model_filter/live_refresh_manifest.json"

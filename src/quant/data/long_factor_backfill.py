@@ -9,6 +9,8 @@ work.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,7 +45,9 @@ TRADE_DATE_DATASETS: dict[str, dict[str, Any]] = {
         "directory": "top_list",
         "prefix": "tushare_top_list",
         "limit": 10000,
-        "required": {"trade_date", "ts_code", "reason"},
+        "required": {
+            "trade_date", "ts_code", "reason", "net_amount", "amount", "net_rate", "pct_change",
+        },
         "dedupe": ["trade_date", "ts_code", "reason"],
     },
 }
@@ -51,6 +55,10 @@ TRADE_DATE_DATASETS: dict[str, dict[str, Any]] = {
 
 class DeferredRequest(RuntimeError):
     """The source asked for a wait longer than this foreground run permits."""
+
+
+class IncompletePartition(ValueError):
+    """The provider response cannot establish a complete daily partition."""
 
 
 @dataclass(frozen=True)
@@ -139,7 +147,66 @@ def load_open_trade_dates(pro: Any, start_date: str, end_date: str) -> list[str]
     )
     if calendar is None or calendar.empty or "cal_date" not in calendar.columns:
         raise RuntimeError("Tushare trade_cal returned no open dates")
-    return sorted(calendar["cal_date"].dropna().astype(str).unique().tolist())
+    if "is_open" in calendar.columns:
+        calendar = calendar.loc[calendar["is_open"].astype(str).eq("1")]
+    dates = sorted({_date_text(value) for value in calendar["cal_date"].dropna()})
+    start, end = _date_text(start_date), _date_text(end_date)
+    dates = [value for value in dates if start <= value <= end]
+    if not dates:
+        raise RuntimeError("Tushare trade_cal returned no open dates in requested range")
+    return dates
+
+
+def _fetch_trade_date_partition(
+    method: Callable[..., pd.DataFrame],
+    dataset: str,
+    spec: dict[str, Any],
+    trade_date: str,
+) -> pd.DataFrame:
+    # Validate inside the retry operation so every retry reaches the provider.
+    frame = method(trade_date=trade_date)
+    if not isinstance(frame, pd.DataFrame):
+        raise IncompletePartition(f"Tushare {dataset} {trade_date} returned no DataFrame")
+    if dataset == "top_list" and frame.empty and not len(frame.columns):
+        frame = pd.DataFrame(columns=sorted(spec["required"]))
+    if len(frame) >= int(spec["limit"]):
+        raise IncompletePartition(
+            f"Tushare {dataset} {trade_date} returned {len(frame)} rows at provider limit; "
+            "partition may be truncated"
+        )
+    missing = set(spec["required"]) - set(frame.columns)
+    if missing:
+        raise IncompletePartition(
+            f"Tushare {dataset} {trade_date} missing columns: {sorted(missing)}"
+        )
+    if not frame.empty:
+        if dataset == "top_list":
+            frame = frame.assign(**_top_list_numeric_values(frame))
+        dates = frame["trade_date"].astype(str).str.replace("-", "", regex=False)
+        if not dates.eq(trade_date).all():
+            raise IncompletePartition(
+                f"Tushare {dataset} missing requested trade date {trade_date}: wrong-date rows"
+            )
+        if frame[list(spec["dedupe"])].isna().any().any():
+            raise IncompletePartition(f"Tushare {dataset} {trade_date} missing partition keys")
+        frame = frame.assign(trade_date=dates)
+    return frame.drop_duplicates(spec["dedupe"], keep="last")
+
+
+def _top_list_numeric_values(frame: pd.DataFrame) -> dict[str, pd.Series]:
+    # Tushare top_list documents these as default float outputs (doc_id=106).
+    # They feed Chan features; missing values must not become synthetic zeros.
+    values = {
+        column: pd.to_numeric(frame[column], errors="coerce")
+        for column in ("net_amount", "amount", "net_rate", "pct_change")
+    }
+    invalid = [
+        column for column, series in values.items()
+        if series.isna().any() or series.isin([float("inf"), float("-inf")]).any()
+    ]
+    if invalid:
+        raise IncompletePartition(f"Tushare top_list invalid numeric feature inputs: {invalid}")
+    return values
 
 
 def _partition_valid(path: Path, spec: dict[str, Any], trade_date: str) -> bool:
@@ -151,13 +218,114 @@ def _partition_valid(path: Path, spec: dict[str, Any], trade_date: str) -> bool:
         return False
     if not set(spec["required"]) <= set(frame.columns):
         return False
+    if len(frame) >= int(spec["limit"]):
+        return False
     if frame.empty:
         return True
-    dates = frame["trade_date"].astype(str).str.replace("-", "", regex=False)
+    if spec["method"] == "top_list":
+        try:
+            _top_list_numeric_values(frame)
+        except (IncompletePartition, TypeError, ValueError):
+            return False
+    dates = frame["trade_date"].astype(str)
+    if spec["method"] != "top_list":
+        dates = dates.str.replace("-", "", regex=False)
     if not dates.eq(trade_date).all():
         return False
     keys = [column for column in spec["dedupe"] if column in frame.columns]
-    return not keys or not frame.duplicated(keys).any()
+    return not keys or (not frame[keys].isna().any().any() and not frame.duplicated(keys).any())
+
+
+def refresh_top_list_partitions(
+    pro: Any,
+    trade_date: str,
+    raw_dir: Path,
+    audit_dir: Path,
+    *,
+    policy: RequestPolicy,
+    context_lookback_calendar_days: int,
+    poll_overlap_calendar_days: int,
+) -> dict[str, Any]:
+    """Repair bounded known history and freshly poll the latest overlap.
+
+    Filenames establish only the historical boundary, never completeness.
+    Every expected session inside that boundary is validated or requested.
+    No canonical history means target-only bootstrap, not historical coverage.
+    """
+    if context_lookback_calendar_days < 0 or poll_overlap_calendar_days < 0:
+        raise ValueError("top_list lookback and overlap must be nonnegative")
+    target = _date_text(trade_date)
+    lower_bound = (
+        pd.Timestamp(target) - pd.Timedelta(days=context_lookback_calendar_days)
+    ).strftime("%Y%m%d")
+    spec = TRADE_DATE_DATASETS["top_list"]
+    directory = raw_dir / spec["directory"]
+    pending_state_path = directory / "daily_poll_state.json"
+    pending_dates: list[str] = []
+    if pending_state_path.exists():
+        state = json.loads(pending_state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("schema_version") != "top_list_daily_poll_v1":
+            raise ValueError("Invalid top_list daily poll state")
+        pending_dates = state.get("pending_trade_dates")
+        if not isinstance(pending_dates, list) or not all(
+            isinstance(value, str) and len(value) == 8 and value.isdigit()
+            and _date_text(value) == value for value in pending_dates
+        ):
+            raise ValueError("Invalid top_list pending trade dates")
+    known: dict[str, Path] = {}
+    for path in directory.glob(f"{spec['prefix']}_*.parquet"):
+        suffix = path.stem.removeprefix(f"{spec['prefix']}_")
+        if len(suffix) != 8 or not suffix.isdigit():
+            continue
+        try:
+            value = _date_text(suffix)
+        except (ValueError, TypeError):
+            continue
+        if value <= target:
+            known[value] = path
+    history_dates = set(known) | {value for value in pending_dates if value <= target}
+    history_start = min(history_dates) if history_dates else None
+    start = max(lower_bound, history_start) if history_start else target
+    valid = [
+        value for value, path in known.items()
+        if start <= value <= target and _partition_valid(path, spec, value)
+    ]
+    last_available = max(valid) if valid else None
+    repoll_from = max(start, (
+        pd.Timestamp(last_available or start) - pd.Timedelta(days=poll_overlap_calendar_days)
+    ).strftime("%Y%m%d"))
+    result = backfill_trade_date_partitions(
+        pro, "top_list", start, target, raw_dir, audit_dir,
+        policy=policy, repoll_from=repoll_from, force_dates=pending_dates,
+        pending_state_path=pending_state_path,
+    )
+    result.update({
+        "history_start": history_start,
+        "last_available_trade_date": last_available,
+        "coverage_start": start,
+        "coverage_end": target,
+        "repoll_from": repoll_from,
+        "context_lookback_calendar_days": context_lookback_calendar_days,
+        "poll_overlap_calendar_days": poll_overlap_calendar_days,
+        "history_before_coverage_not_checked": bool(history_start and history_start < start),
+        "bootstrap_target_only": not history_dates,
+        "pending_dates_outside_coverage": [value for value in pending_dates if not start <= value <= target],
+    })
+    omitted_pending = sorted(
+        value for value in pending_dates
+        if start <= value <= target and value not in result["expected_trade_dates"]
+    )
+    if omitted_pending:
+        result.update(
+            status="failed", data_missing=True,
+            error=f"Tushare trade_cal omitted pending top_list dates: {omitted_pending}",
+            unresolved_dates=sorted(set(result["unresolved_dates"]) | set(omitted_pending)),
+        )
+    if result["status"] == "success" and target in result["polled_partitions"]:
+        result["polled_through"] = target
+    elif result["status"] == "success":
+        result.update(status="failed", data_missing=True, error=f"Tushare top_list missing target poll {target}")
+    return result
 
 
 def backfill_trade_date_partitions(
@@ -170,6 +338,9 @@ def backfill_trade_date_partitions(
     *,
     policy: RequestPolicy = RequestPolicy(),
     force: bool = False,
+    repoll_from: str | None = None,
+    force_dates: Iterable[str] = (),
+    pending_state_path: Path | None = None,
     max_dates: int | None = None,
     progress_every: int = 20,
 ) -> dict[str, Any]:
@@ -181,48 +352,63 @@ def backfill_trade_date_partitions(
     output_dir = raw_dir / str(spec["directory"])
     output_dir.mkdir(parents=True, exist_ok=True)
     dates = load_open_trade_dates(pro, start_date, end_date)
+    forced = {_date_text(value) for value in force_dates}
+    repoll_start = _date_text(repoll_from) if repoll_from is not None else None
     pending: list[str] = []
+    validated_partitions: dict[str, str] = {}
     skipped = 0
     for trade_date in dates:
         path = output_dir / f"{spec['prefix']}_{trade_date}.parquet"
-        if not force and _partition_valid(path, spec, trade_date):
+        repoll = force or trade_date in forced or (repoll_start is not None and trade_date >= repoll_start)
+        if not repoll and _partition_valid(path, spec, trade_date):
             skipped += 1
+            if dataset == "top_list":
+                validated_partitions[trade_date] = hashlib.sha256(path.read_bytes()).hexdigest()
         else:
             pending.append(trade_date)
+    remaining_pending = set(pending) | forced
+    if pending_state_path is not None:
+        atomic_write_json({
+            "schema_version": "top_list_daily_poll_v1",
+            "pending_trade_dates": sorted(remaining_pending),
+        }, pending_state_path)
     if max_dates is not None:
         pending = pending[: max(0, max_dates)]
 
     audits: list[dict[str, Any]] = []
+    polled_partitions: dict[str, str] = {}
     method = getattr(pro, str(spec["method"]))
     for index, trade_date in enumerate(pending, start=1):
         path = output_dir / f"{spec['prefix']}_{trade_date}.parquet"
         status = "failed"
         rows = 0
         error: str | None = None
+        data_missing = False
         try:
             frame = request_frame(
-                lambda d=trade_date: method(trade_date=d),
+                lambda d=trade_date: _fetch_trade_date_partition(method, dataset, spec, d),
                 policy,
             )
             rows = int(len(frame))
-            if rows >= int(spec["limit"]):
-                raise RuntimeError(
-                    f"{dataset} {trade_date} returned {rows} rows at provider limit; "
-                    "partition may be truncated"
-                )
-            missing = set(spec["required"]) - set(frame.columns)
-            if missing:
-                raise ValueError(f"{dataset} {trade_date} missing columns: {sorted(missing)}")
-            keys = [column for column in spec["dedupe"] if column in frame.columns]
-            if keys:
-                frame = frame.drop_duplicates(keys, keep="last")
             atomic_write_parquet(frame, path, index=False)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if dataset == "top_list" else None
+            if pending_state_path is not None:
+                updated_pending = remaining_pending - {trade_date}
+                atomic_write_json({
+                    "schema_version": "top_list_daily_poll_v1",
+                    "pending_trade_dates": sorted(updated_pending),
+                }, pending_state_path)
+                remaining_pending = updated_pending
+            if digest is not None:
+                polled_partitions[trade_date] = digest
+                validated_partitions[trade_date] = digest
             status = "success"
         except DeferredRequest as exc:
             status = "deferred"
             error = _redacted_error(exc)
         except Exception as exc:
             error = _redacted_error(exc)
+            data_missing = isinstance(exc, IncompletePartition)
         audits.append(
             {
                 "dataset": dataset,
@@ -231,6 +417,7 @@ def backfill_trade_date_partitions(
                 "rows": rows,
                 "path": str(path),
                 "error": error,
+                "data_missing": data_missing,
             }
         )
         if index % max(1, progress_every) == 0 or index == len(pending):
@@ -251,9 +438,15 @@ def backfill_trade_date_partitions(
     success = sum(item["status"] == "success" for item in audits)
     failed = sum(item["status"] == "failed" for item in audits)
     deferred = sum(item["status"] == "deferred" for item in audits)
+    failures = [item for item in audits if item["status"] != "success"]
+    unresolved_dates = (
+        sorted(set(dates) - set(validated_partitions)) if dataset == "top_list" else []
+    )
     return {
         "dataset": dataset,
-        "status": "failed" if failed else ("deferred" if deferred else "success"),
+        "status": "failed" if failed else (
+            "deferred" if deferred else ("partial" if unresolved_dates else "success")
+        ),
         "open_dates": len(dates),
         "already_complete": skipped,
         "requested": len(audits),
@@ -263,6 +456,12 @@ def backfill_trade_date_partitions(
         "rows": int(sum(item["rows"] for item in audits if item["status"] == "success")),
         "output_dir": str(output_dir),
         "audit_path": str(audit_path.with_suffix(".parquet")),
+        "polled_partitions": polled_partitions,
+        "expected_trade_dates": dates,
+        "validated_partitions": validated_partitions,
+        "unresolved_dates": unresolved_dates,
+        "data_missing": bool(failures) and all(item["data_missing"] for item in failures),
+        "error": " | ".join(item["error"] for item in failures if item["error"]) or None,
     }
 
 

@@ -47,15 +47,18 @@ DEFAULT_CONTRACT_DIR = Path("data/contracts/daily_dependencies")
 
 
 _VOLATILE_RESULT_KEYS = {
+    "capture_metrics",
     "checkpoint_reused",
     "command",
     "elapsed_seconds",
     "error",
     "finished_at",
+    "finalization_timings",
     "script_elapsed_seconds",
     "started_at",
     "stderr_tail",
     "stdout_tail",
+    "timings",
     "updated_at",
 }
 _CONTENT_HASH_CACHE: dict[tuple[str, int, int], str] = {}
@@ -449,10 +452,41 @@ def _evidence_value(
             return None
         value = manifest["signal_date"]
         return _parse_date(value), _parse_datetime(value), manifest["data_sha256"]
-    if adapter == "result":
+    if adapter in {"result", "top_list_poll"}:
         payload = _lookup(results, locator)
         if not isinstance(payload, Mapping):
             return None
+        if adapter == "top_list_poll":
+            polled = _parse_date(_lookup(payload, date_field or "polled_through"))
+            receipts = payload.get("polled_partitions")
+            if payload.get("status") != "success" or polled is None or not isinstance(receipts, Mapping):
+                return None
+            trade_date = polled.strftime("%Y%m%d")
+            expected = payload.get("expected_trade_dates")
+            validated = payload.get("validated_partitions")
+            start, end = payload.get("coverage_start"), payload.get("coverage_end")
+            repoll_from = payload.get("repoll_from")
+            if (
+                not isinstance(expected, list) or not expected
+                or not all(isinstance(value, str) and len(value) == 8 and value.isdigit() for value in expected)
+                or not isinstance(validated, Mapping)
+                or not isinstance(start, str) or end != trade_date
+                or not isinstance(repoll_from, str) or not start <= repoll_from <= trade_date
+                or not all(start <= value <= trade_date for value in expected)
+                or set(expected) != set(validated) or payload.get("unresolved_dates") != []
+                or trade_date not in receipts or trade_date not in expected
+                or any(value not in receipts for value in expected if value >= repoll_from)
+            ):
+                return None
+            try:
+                for value in expected:
+                    path = project_root / "data/raw/top_list" / f"tushare_top_list_{value}.parquet"
+                    if not validated[value] or validated[value] != _sha256(path):
+                        return None
+                    if value in receipts and receipts[value] != validated[value]:
+                        return None
+            except OSError:
+                return None
         status = str(payload.get("status") or "success")
         if status not in {"success", "skipped", "degraded"}:
             return None

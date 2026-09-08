@@ -14,7 +14,7 @@ import json
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -549,6 +549,127 @@ def _row_uses_supported_strategy(
     return False
 
 
+_RankingInput = TypeVar("_RankingInput")
+_FileIdentity = tuple[int, int, int, int, int]
+
+
+def _ranking_input_identities(paths: Sequence[Path]) -> dict[Path, _FileIdentity]:
+    identities = {}
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise RuntimeError(f"ranking batch input is unavailable: {path}") from exc
+        identities[path] = (
+            stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+        )
+    return identities
+
+
+class SelectorRankingBatch:
+    """Lazy validated inputs for one serial pool refresh, never a process cache.
+
+    Construct inside the refresh's publication context and discard afterwards.
+    The composition root injects its context provider to preserve layer boundaries.
+    Pass the same effective configs to the adapter. Every first load uses the
+    existing validator; reuse checks all files it read (including approval
+    evidence), even in writable staging or outside a publication. Changed inputs
+    require a new batch, not an in-place reload that could mix pool generations.
+    """
+
+    def __init__(
+        self,
+        signal_date: str,
+        *,
+        config: SelectorRankingConfig | None = None,
+        left_config: LeftSideRankingConfig | None = None,
+        context_provider: Callable[[], object] | None = None,
+    ) -> None:
+        target = pd.Timestamp(signal_date)
+        if pd.isna(target):
+            raise ValueError("ranking batch requires signal_date")
+        self._signal_date = target.normalize()
+        self._config = config or DEFAULT_SELECTOR_RANKING_CONFIG
+        self._left_config = (
+            left_config
+            if left_config is not None
+            else DEFAULT_LEFT_SIDE_RANKING_CONFIG
+            if config is None
+            else None
+        )
+        self._context_provider = context_provider or (lambda: None)
+        self._publication = self._context_provider()
+        self._identities: dict[Path, _FileIdentity] = {}
+        self._right: tuple[dict[str, tuple[float, float]], dict[str, Any]] | None = None
+        self._left: tuple[dict[str, tuple[float, float]], dict[str, Any]] | None = None
+
+    def _check_inputs(self) -> None:
+        if self._context_provider() != self._publication:
+            raise RuntimeError("ranking batch publication context mismatch")
+        if _ranking_input_identities(tuple(self._identities)) != self._identities:
+            raise RuntimeError("ranking batch inputs changed; create a new batch")
+
+    def _validate(
+        self,
+        signal_date: str | None,
+        config: SelectorRankingConfig,
+        left_config: LeftSideRankingConfig | None,
+    ) -> None:
+        target = pd.Timestamp(signal_date)
+        if pd.isna(target) or target.normalize() != self._signal_date:
+            raise RuntimeError("ranking batch signal_date mismatch")
+        if config != self._config or left_config != self._left_config:
+            raise RuntimeError("ranking batch config mismatch")
+        self._check_inputs()
+
+    def _load(
+        self,
+        loader: Callable[[], _RankingInput],
+        identities: dict[Path, _FileIdentity],
+    ) -> _RankingInput:
+        result = loader()
+        self._check_inputs()
+        if _ranking_input_identities(tuple(identities)) != identities:
+            raise RuntimeError("ranking batch inputs changed during validation")
+        self._identities.update(identities)
+        return result
+
+    def _right_scores(
+        self, signal_date: str
+    ) -> tuple[dict[str, tuple[float, float]], dict[str, Any]]:
+        if self._right is None:
+            paths = self._config.paths
+            identities = _ranking_input_identities((
+                paths.artifact, paths.artifact_manifest, paths.score_output,
+                paths.score_manifest, paths.promotion_approval,
+            ))
+            # Evidence paths are part of the validator's transitive read set.
+            approval = _load_score_manifest(paths.promotion_approval)
+            evidence_paths = []
+            for field in ("research_decision", "shadow_acceptance"):
+                evidence = approval.get(field)
+                if isinstance(evidence, Mapping) and evidence.get("path"):
+                    path = Path(str(evidence["path"]))
+                    evidence_paths.append(path if path.is_absolute() else PROJECT_ROOT / path)
+            identities.update(_ranking_input_identities(evidence_paths))
+            self._right = self._load(
+                lambda: load_right_side_ranking_scores(signal_date, config=self._config),
+                identities,
+            )
+        return self._right
+
+    def _left_scores(
+        self, signal_date: str
+    ) -> tuple[dict[str, tuple[float, float]], dict[str, Any]]:
+        assert self._left_config is not None
+        if self._left is None:
+            paths = self._left_config.paths
+            self._left = self._load(
+                lambda: load_left_side_ranking_scores(signal_date, config=self._left_config),
+                _ranking_input_identities((paths.score_output, paths.score_manifest)),
+            )
+        return self._left
+
 def apply_selector_ranking_source(
     rows: list[dict[str, Any]],
     signal_date: str | None,
@@ -556,6 +677,7 @@ def apply_selector_ranking_source(
     config: SelectorRankingConfig | None = None,
     left_config: LeftSideRankingConfig | None = None,
     require_all_ranked_candidates: bool = False,
+    ranking_batch: SelectorRankingBatch | None = None,
 ) -> list[dict[str, Any]]:
     """Apply the two unified rankers with deterministic right-side precedence."""
 
@@ -567,6 +689,8 @@ def apply_selector_ranking_source(
         if config is None
         else None
     )
+    if ranking_batch is not None:
+        ranking_batch._validate(signal_date, active, active_left)
     right_eligible_symbols = {
         str(row.get("symbol") or "")
         for row in rows
@@ -577,8 +701,10 @@ def apply_selector_ranking_source(
     if right_eligible_symbols:
         if not signal_date:
             raise RuntimeError("right-side unified selector ranking requires signal_date")
-        right_scores, right_manifest = load_right_side_ranking_scores(
-            signal_date, config=active
+        right_scores, right_manifest = (
+            load_right_side_ranking_scores(signal_date, config=active)
+            if ranking_batch is None
+            else ranking_batch._right_scores(signal_date)
         )
         right_policy_excluded_symbols = {
             str(symbol)
@@ -628,8 +754,10 @@ def apply_selector_ranking_source(
     if left_eligible_symbols:
         if not signal_date:
             raise RuntimeError("left-side unified selector ranking requires signal_date")
-        left_scores, left_manifest = load_left_side_ranking_scores(
-            signal_date, config=active_left
+        left_scores, left_manifest = (
+            load_left_side_ranking_scores(signal_date, config=active_left)
+            if ranking_batch is None
+            else ranking_batch._left_scores(signal_date)
         )
         left_policy_excluded_symbols = {
             str(symbol)
@@ -667,6 +795,9 @@ def apply_selector_ranking_source(
             if str(row.get("symbol") or "") not in left_policy_excluded_symbols
             or str(row.get("symbol") or "") in right_eligible_symbols
         ]
+
+    if ranking_batch is not None:
+        ranking_batch._check_inputs()
 
     for row in rows:
         symbol = str(row.get("symbol") or "")
@@ -710,6 +841,7 @@ __all__ = [
     "RIGHT_SIDE_PRODUCTION_APPROVAL_SCHEMA_VERSION",
     "RIGHT_SIDE_PRODUCTION_SCORE_SCHEMA_VERSION",
     "SelectorRankingConfig",
+    "SelectorRankingBatch",
     "SelectorRankingPaths",
     "SelectorRankingSource",
     "apply_selector_ranking_source",

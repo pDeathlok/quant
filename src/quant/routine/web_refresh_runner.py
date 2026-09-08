@@ -579,7 +579,18 @@ def wait_for_terminal_status(
     last_signature: tuple[Any, ...] | None = None
     last_change_at = monotonic_fn()
     while True:
-        status = client.get_status()
+        try:
+            status = client.get_status()
+        except requests.RequestException as exc:
+            # A transport failure is not a failed refresh attempt. Keep the
+            # last observed progress deadline so a dead endpoint is bounded.
+            if monotonic_fn() - last_change_at > config.no_progress_timeout_seconds:
+                raise TimeoutError(
+                    f"刷新状态超过 {config.no_progress_timeout_seconds:.0f}s 无法确认，停止等待"
+                ) from exc
+            print_fn(f"[monitor] 状态读取暂时失败，保留现有任务并继续监控: {exc}")
+            sleep_fn(config.poll_seconds)
+            continue
         signature = _status_signature(status)
         if signature != last_signature:
             last_signature = signature
@@ -641,6 +652,9 @@ def _run_refresh_workflow_locked(
             active_status = client.get_status()
         except Exception:
             active_status = {}
+            if is_service_port_listening(config.base_url):
+                force_restart = False
+                print_fn("[service] 无法确认任务状态但端口仍在监听，跳过重启以保护现有任务")
         if active_status.get("status") in {"running", "queued"} or active_status.get("job_active"):
             force_restart = False
             print_fn("[service] 检测到活动刷新任务，跳过显式服务重启并接管监控")

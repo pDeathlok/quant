@@ -497,7 +497,7 @@ def test_postflight_result_backed_nodes_do_not_request_second_refresh() -> None:
     assert completed == {"data.cb_daily", "feature.cb_grid", "product.cb_grid"}
 
 
-def test_chan_effective_artifact_features_prune_unused_top_list_source() -> None:
+def test_chan_effective_artifact_features_keep_daily_top_list_source() -> None:
     registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
     full_contract = ModelContract(
         node_id="score.chan",
@@ -543,7 +543,7 @@ def test_chan_effective_artifact_features_prune_unused_top_list_source() -> None
         )
     )
     assert "data.top_list" in unpruned
-    assert "data.top_list" not in pruned
+    assert "data.top_list" in pruned
     assert {"feature.chan_live", "score.chan", "product.chan"} <= pruned
 
     required_top_list = set(

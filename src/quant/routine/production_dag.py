@@ -92,6 +92,7 @@ def sealed_core_market_inputs(project_root: Path) -> Iterator[InputSnapshot]:
                     for dataset, entry in manifest["datasets"].items()
                 },
                 "export_seconds": round(monotonic() - started, 3),
+                "capture_metrics": sealed.metrics,
                 "export_bytes": sum(path.stat().st_size for path in sealed.root.rglob("*") if path.is_file()),
             },
             changes=NodeChanges(full_rebuild=True),

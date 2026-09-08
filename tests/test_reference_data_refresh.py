@@ -98,6 +98,10 @@ class FakePro:
                 "trade_date": [kwargs["trade_date"]],
                 "ts_code": ["000001.SZ"],
                 "reason": ["test"],
+                "net_amount": [2.0],
+                "amount": [10.0],
+                "net_rate": [0.2],
+                "pct_change": [5.0],
             }
         )
 

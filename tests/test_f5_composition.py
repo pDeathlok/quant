@@ -50,7 +50,8 @@ def test_sealed_export_lifetime_and_failure_cleanup(monkeypatch, tmp_path):
         events.append(directory)
         manifest = directory / "manifest.json"
         manifest.write_text(json.dumps(content))
-        return SimpleNamespace(manifest_path=manifest, root=directory, fingerprint=fingerprint)
+        return SimpleNamespace(manifest_path=manifest, root=directory, fingerprint=fingerprint,
+                               metrics={"canonical_export_seconds": 1.25})
 
     @contextmanager
     def pin(manifest):
@@ -69,6 +70,7 @@ def test_sealed_export_lifetime_and_failure_cleanup(monkeypatch, tmp_path):
         with sealed_core_market_inputs(tmp_path) as snapshot:
             assert require_pinned_market() is snapshot
             assert snapshot.changes.full_rebuild
+            assert snapshot.payload["capture_metrics"] == {"canonical_export_seconds": 1.25}
             raise RuntimeError("consumer failed")
     assert events[1:] == ["entered", "exited"]
     assert not events[0].exists()
