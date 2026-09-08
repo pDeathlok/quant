@@ -1,3 +1,4 @@
+import hashlib
 import json
 import queue
 import threading
@@ -166,7 +167,22 @@ def test_selector_api_passes_and_validates_side_filter(monkeypatch) -> None:
     assert invalid.json()["detail"] == "未知短线策略侧: middle"
 
 
-def test_selector_score_probability_bands_match_active_artifacts() -> None:
+def test_selector_score_probability_bands_match_active_artifacts(monkeypatch, tmp_path) -> None:
+    fixture_payload = json.loads(services.SELECTOR_SCORE_PROBABILITY_BANDS.read_text())
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"probability calibration test artifact")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    for calibration in fixture_payload["calibrations"]:
+        for path_field, hash_field in (
+            ("artifact_path", "artifact_sha256"),
+            ("sample_path", "sample_sha256"),
+        ):
+            calibration["source"][path_field] = str(artifact)
+            calibration["source"][hash_field] = digest
+    config = tmp_path / "bands.json"
+    config.write_text(json.dumps(fixture_payload))
+    monkeypatch.setattr(services, "SELECTOR_SCORE_PROBABILITY_BANDS", config)
+    monkeypatch.setattr(services, "PROJECT_ROOT", tmp_path)
     services._selector_score_probability_bands.cache_clear()
 
     payload = services._selector_score_probability_bands()
@@ -192,6 +208,11 @@ def test_selector_score_probability_bands_match_active_artifacts() -> None:
             left["max_score"] == right["min_score"]
             for left, right in zip(bands, bands[1:])
         )
+
+    artifact.write_bytes(b"changed after calibration")
+    services._selector_score_probability_bands.cache_clear()
+    assert services._selector_score_probability_bands()["available"] is False
+    services._selector_score_probability_bands.cache_clear()
 
 
 def test_materialize_left_side_ranked_candidates_adds_missing_groups(
@@ -3090,6 +3111,10 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
     monkeypatch.setattr(services, "_build_long_stock_pool_cached", type("Cache", (), {"cache_clear": staticmethod(lambda: None)})())
     monkeypatch.setattr(services, "get_chan_model_strategy_plan", lambda *args, **kwargs: {"signal_date": "2026-07-20", "candidates": []})
     monkeypatch.setattr(services, "_refresh_long_stock_pool_variants", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        services, "get_blood_chip_long_plan",
+        lambda **kwargs: {"signal_date": "2026-07-20", "candidates": []},
+    )
     monkeypatch.setattr(services, "get_convertible_bond_grid_plan", lambda *args, **kwargs: {"trade_date": "20260720", "candidates": []})
     monkeypatch.setattr(
         services,

@@ -102,7 +102,7 @@ def _selector_payload() -> dict:
 
 
 def _install_filtered_payload_stub(monkeypatch) -> None:
-    def filtered(payload: dict, strategies: list[str]) -> dict:
+    def filtered(payload: dict, strategies: list[str], **kwargs) -> dict:
         return {
             **payload,
             "stocks": [{
@@ -119,6 +119,7 @@ def _install_filtered_payload_stub(monkeypatch) -> None:
         }
 
     monkeypatch.setattr(services, "_filtered_selector_payload", filtered)
+    monkeypatch.setattr(services, "_selector_feature_rows_for_score_rows", lambda rows: {})
 
 
 def test_snapshot_writer_rejects_stale_temporal_provenance(

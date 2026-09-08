@@ -848,14 +848,17 @@ def build_default_daily_dependency_registry(
             "data.top_list", Layer.DATA_SOURCE, "routine.reference_data_refresh",
             Lifecycle.PRODUCTION, Cadence.EVENT_POLL_DAILY, (),
             _polled(
-                _result(
+                EvidenceSpec(
+                    "top_list_poll",
                     "refresh_reference_inputs.steps.long_factor_sources.datasets.top_list",
                     "polled_through",
                 )
             ),
-            IncrementalPolicy("trade_date", ("trade_date", "ts_code"),
-                              write_mode="upsert_target_partition", poll_overlap_calendar_days=3),
+            IncrementalPolicy("trade_date", ("trade_date", "ts_code", "reason"),
+                              write_mode="upsert_target_partition",
+                              context_lookback_calendar_days=120, poll_overlap_calendar_days=3),
             "refresh_top_list",
+            contract_version="3",
             contract_sources=(
                 "src/quant/routine/reference_data_refresh.py",
                 "src/quant/data/long_factor_backfill.py",
@@ -1094,11 +1097,9 @@ def build_default_daily_dependency_registry(
             (
                 _edge("data.market_daily"),
                 _edge("data.daily_basic"),
-                DependencyEdge(
-                    "data.top_list",
-                    ColumnMode.EXPLICIT,
-                    ("top_list_count", "top_net_amount_ratio", "top_net_rate"),
-                ),
+                # The live builder reads this source even with zero model
+                # importance. Daily polling is not a feature projection.
+                _edge("data.top_list"),
             ),
             _exact(
                 _file("reports/chan_daily/model_filter/chan_model_scored_candidates.parquet"),

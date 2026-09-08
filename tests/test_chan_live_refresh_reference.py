@@ -9,6 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts/research")
 import refresh_chan_model_live_scores as refresh
 
 
+def test_live_top_list_default_matches_daily_refresh_output():
+    assert refresh.DEFAULT_TOP_LIST_DIR == refresh.PROJECT_ROOT / "data/raw/top_list"
+
+
 @pytest.fixture
 def setup_refresh(monkeypatch, tmp_path):
     reference = pd.DataFrame({

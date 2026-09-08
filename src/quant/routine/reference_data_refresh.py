@@ -16,6 +16,7 @@ from quant.data.long_factor_backfill import (
     RequestPolicy,
     backfill_trade_date_partitions,
     refresh_holder_trade_recent,
+    refresh_top_list_partitions,
 )
 from quant.data.tradability import build_daily_tradability
 from quant.routine.paths import PROJECT_ROOT
@@ -326,8 +327,10 @@ def refresh_long_factor_daily_sources(
     ]
     if missing_methods:
         return {
-            "status": "skipped",
+            "status": "failed",
             "reason": f"provider does not expose: {','.join(missing_methods)}",
+            "error": f"provider does not expose: {','.join(missing_methods)}",
+            "data_missing": False,
         }
     policy = RequestPolicy(
         retries=max(1, int(os.getenv("ROUTINE_LONG_FACTOR_RETRIES", "3"))),
@@ -342,17 +345,22 @@ def refresh_long_factor_daily_sources(
         for dataset in ("margin_detail", "moneyflow", "top_list")
         if dataset in selected
     ):
-        dataset_result = backfill_trade_date_partitions(
-            fetcher.pro,
-            dataset,
-            trade_date,
-            trade_date,
-            raw_dir,
-            audit_dir,
-            policy=policy,
-        )
-        if dataset_result.get("status") == "success":
-            dataset_result["polled_through"] = trade_date
+        if dataset == "top_list":
+            from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+
+            incremental = DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes["data.top_list"].incremental
+            dataset_result = refresh_top_list_partitions(
+                fetcher.pro, trade_date, raw_dir, audit_dir, policy=policy,
+                context_lookback_calendar_days=incremental.context_lookback_calendar_days,
+                poll_overlap_calendar_days=incremental.poll_overlap_calendar_days,
+            )
+        else:
+            dataset_result = backfill_trade_date_partitions(
+                fetcher.pro, dataset, trade_date, trade_date, raw_dir, audit_dir,
+                policy=policy,
+            )
+            if dataset_result.get("status") == "success":
+                dataset_result["polled_through"] = trade_date
         datasets[dataset] = dataset_result
     if "holder_trade_recent" in selected:
         datasets["holder_trade_recent"] = refresh_holder_trade_recent(
@@ -369,7 +377,13 @@ def refresh_long_factor_daily_sources(
         if "failed" in statuses
         else ("partial" if statuses & {"partial", "deferred"} else "success")
     )
-    return {"status": status, "datasets": datasets}
+    failures = [item for item in datasets.values() if item.get("status") != "success"]
+    return {
+        "status": status,
+        "datasets": datasets,
+        "data_missing": bool(failures) and all(item.get("data_missing") for item in failures),
+        "error": " | ".join(str(item["error"]) for item in failures if item.get("error")) or None,
+    }
 
 
 def refresh_reference_data(
@@ -494,9 +508,17 @@ def refresh_reference_data(
     index_status = steps["index_000300"].get("status")
     financial_status = steps["financials"].get("status")
     long_factor_status = steps["long_factor_sources"].get("status")
+    top_list_required = include_long_factor_sources and (
+        selected_long_datasets is None or "top_list" in selected_long_datasets
+    )
+    top_list_result = steps["long_factor_sources"].get("datasets", {}).get("top_list", {})
+    top_list_failed = top_list_required and (
+        top_list_result.get("status") != "success"
+        or top_list_result.get("polled_through") != end_date
+    )
     status = (
         "failed"
-        if critical_errors or (include_index and index_status == "failed")
+        if critical_errors or (include_index and index_status == "failed") or top_list_failed
         else (
             "partial"
             if (include_index and index_status != "success")
@@ -512,6 +534,10 @@ def refresh_reference_data(
         "steps": steps,
         "critical_errors": critical_errors,
     }
+    if top_list_failed:
+        failure = steps["long_factor_sources"]
+        manifest["data_missing"] = not critical_errors and bool(failure.get("data_missing"))
+        manifest["error_summary"] = failure.get("error") or "top_list daily poll failed"
     manifest_path = audit_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest["manifest_path"] = str(manifest_path)

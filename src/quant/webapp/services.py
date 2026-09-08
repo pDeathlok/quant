@@ -39,6 +39,7 @@ from quant.application.refresh_contracts import (
 )
 from quant.application.selector_ranking import (
     DEFAULT_SELECTOR_RANKING_CONFIG,
+    SelectorRankingBatch,
     SelectorRankingSource,
     apply_selector_ranking_source,
 )
@@ -5305,7 +5306,11 @@ def _strategy_keys_from_payload(payload: dict[str, Any]) -> list[str]:
     return sorted(set(keys))
 
 
-def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -> dict[str, Any]:
+def _filtered_selector_payload(
+    payload: dict[str, Any], strategies: list[str], *,
+    feature_rows_by_symbol: dict[str, dict[str, Any]] | None = None,
+    ranking_batch: SelectorRankingBatch | None = None,
+) -> dict[str, Any]:
     selected = {item.upper() for item in strategies if item}
     selected_members = _strategy_filter_members(strategies)
     selected_groups = _strategy_filter_groups(strategies)
@@ -5329,10 +5334,11 @@ def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
         reverse=True,
     )
-    rows = _apply_historical_score_normalization(rows)
+    rows = _apply_historical_score_normalization(rows, feature_rows_by_symbol)
     rows = apply_selector_ranking_source(
         rows,
         str(payload.get("signal_date") or "") or None,
+        **({"ranking_batch": ranking_batch} if ranking_batch is not None else {}),
     )
     rows = sorted(
         rows,
@@ -5346,21 +5352,54 @@ def _filtered_selector_payload(payload: dict[str, Any], strategies: list[str]) -
     return filtered
 
 
-def _write_strategy_pool_snapshots(payload: dict[str, Any], include_extended: bool) -> dict[str, Any]:
+def _build_strategy_pool_snapshots(
+    payload: dict[str, Any], include_extended: bool, *, metrics: dict[str, Any],
+) -> tuple[list[tuple[dict[str, Any], list[str] | None, bool]], dict[str, int]]:
+    started = monotonic()
     strategy_keys = _strategy_keys_from_payload(payload)
+    source_rows = payload.get("stocks") or []
+    _require_exact_selector_row_dates(source_rows, payload.get("signal_date"))
+    feature_rows = _selector_feature_rows_for_score_rows(source_rows) if strategy_keys and source_rows else {}
+    ranking_batch = (
+        SelectorRankingBatch(payload["signal_date"], context_provider=current_publication)
+        if strategy_keys else None
+    )
+    metrics.update(
+        feature_prepare_seconds=round(monotonic() - started, 3),
+        candidate_count=len(source_rows), shared_feature_count=len(feature_rows),
+        strategy_count=len(strategy_keys), strategy_seconds={},
+    )
     extended_keys = {str(item.get("key") or "").upper() for item in EXTENDED_STRATEGIES}
     snapshots: list[tuple[dict[str, Any], list[str] | None, bool]] = [
         (payload, None, include_extended)
     ]
     written = {"ALL": len(payload.get("stocks") or [])}
     for strategy_key in strategy_keys:
-        filtered = _filtered_selector_payload(payload, [strategy_key])
+        pool_started = monotonic()
+        filtered = _filtered_selector_payload(
+            payload, [strategy_key], feature_rows_by_symbol=feature_rows,
+            ranking_batch=ranking_batch,
+        )
         members = STRATEGY_GROUP_MEMBERS.get(strategy_key, {strategy_key})
         snapshots.append(
             (filtered, [strategy_key], bool(members & extended_keys))
         )
         written[strategy_key] = len(filtered.get("stocks") or [])
+        metrics["strategy_seconds"][strategy_key] = round(monotonic() - pool_started, 3)
+    metrics["build_seconds"] = round(monotonic() - started, 3)
+    return snapshots, written
+
+
+def _write_strategy_pool_snapshots(
+    payload: dict[str, Any], include_extended: bool, *, metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    measurements = metrics if metrics is not None else {}
+    started = monotonic()
+    snapshots, written = _build_strategy_pool_snapshots(payload, include_extended, metrics=measurements)
+    writing_started = monotonic()
     _write_selector_snapshot_batch(snapshots)
+    measurements["batch_write_seconds"] = round(monotonic() - writing_started, 3)
+    measurements["total_seconds"] = round(monotonic() - started, 3)
     return written
 
 
@@ -8918,11 +8957,13 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
 
     if refresh_scope == "short":
         _set_refresh_progress(step_key="snapshot", message="检测到断点，正在补写短线策略股票池快照", percent=98)
-        written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+        snapshot_timings: dict[str, Any] = {}
+        written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True, metrics=snapshot_timings)
         results["snapshot"] = {
             "status": "success",
             "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
             "strategy_pools": written_pools,
+            "timings": snapshot_timings,
         }
         _run_post_snapshot_cache_cleanup(results)
         return results
@@ -9044,11 +9085,13 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                 )
 
     _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
-    written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True)
+    snapshot_timings = {}
+    written_pools = _write_strategy_pool_snapshots(full_payload, include_extended=True, metrics=snapshot_timings)
     results["snapshot"] = {
         "status": "success",
         "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
         "strategy_pools": written_pools,
+        "timings": snapshot_timings,
     }
     if "long_stock_pool" in results:
         results["snapshot"]["long_stock_pools"] = results["long_stock_pool"].get("variants")
@@ -9238,6 +9281,8 @@ def _run_latest_refresh_job_in_generation(
         phase: str,
         strict_freshness: bool,
     ) -> dict[str, Any]:
+        gate_started = monotonic()
+        timings = results.setdefault("finalization_timings", {}) if phase == "postflight" else {}
         if phase == "postflight":
             from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
             from quant.routine.default_operations import COMPOSED_OPERATION_GROUPS
@@ -9274,13 +9319,16 @@ def _run_latest_refresh_job_in_generation(
 
             staged_view = current_publication()
             if staged_view is not None and staged_view.writable:
+                pruning_started = monotonic()
                 retention = prune_staged_publication_snapshots(
                     staged_view.directory / staged_view.generation / "tree",
                     pd.Timestamp(target_date).date(),
                 )
                 results["staged_snapshot_retention"] = retention
+                timings["staged_retention_seconds"] = round(monotonic() - pruning_started, 3)
                 if retention["status"] != "success":
                     raise RuntimeError("Staged snapshot retention failed")
+        validation_started = monotonic()
         result = publish_daily_dependency_contract(
             target_date,
             refresh_scope,
@@ -9289,6 +9337,7 @@ def _run_latest_refresh_job_in_generation(
             strict_freshness=strict_freshness,
         )
         results[f"dependency_{phase}"] = result
+        timings["dependency_validation_seconds"] = round(monotonic() - validation_started, 3)
         unresolved = result.get("refresh_node_ids") or []
         if strict_freshness and (
             result.get("status") != "success" or unresolved
@@ -9312,11 +9361,14 @@ def _run_latest_refresh_job_in_generation(
             )
         view = current_publication()
         if strict_freshness and phase == "postflight" and view is not None:
+            commit_started = monotonic()
             _publication_store().commit(view, result)
+            timings["publication_commit_seconds"] = round(monotonic() - commit_started, 3)
             results["publication"] = {
                 "status": "success", "generation": view.generation,
                 "target_trade_date": target_date,
             }
+        timings["postflight_seconds"] = round(monotonic() - gate_started, 3)
         return result
 
     resume_contract_preview: dict[str, Any] = {}
@@ -9738,6 +9790,7 @@ def _run_latest_refresh_job_in_generation(
                 "datasets": list(sealed_input.payload.get("sealed_datasets", ())),
                 "acquired_after_source_refresh": True,
                 "export_seconds": sealed_input.payload.get("export_seconds"),
+                "capture_metrics": sealed_input.payload.get("capture_metrics"),
                 "export_bytes": sealed_input.payload.get("export_bytes"),
             }
 
@@ -10557,14 +10610,16 @@ def _run_latest_refresh_job_in_generation(
             if strict_core:
                 save_core_source_manifest(PROJECT_ROOT, sealed_input)
             _set_refresh_progress(step_key="snapshot", message="正在写入短线策略股票池快照", percent=98)
+            snapshot_timings = {}
             written_pools = composed(
                 "write_strategy_pool_snapshots", _write_strategy_pool_snapshots,
-                full_payload, include_extended=True,
+                full_payload, include_extended=True, metrics=snapshot_timings,
             )
             results["snapshot"] = {
                 "status": "success",
                 "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
                 "strategy_pools": written_pools,
+                "timings": snapshot_timings,
             }
             _run_post_snapshot_cache_cleanup(results)
             publish_dependency_gate(
@@ -10722,14 +10777,16 @@ def _run_latest_refresh_job_in_generation(
         if strict_core:
             save_core_source_manifest(PROJECT_ROOT, sealed_input)
         _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
+        snapshot_timings = {}
         written_pools = composed(
             "write_strategy_pool_snapshots", _write_strategy_pool_snapshots,
-            full_payload, include_extended=True,
+            full_payload, include_extended=True, metrics=snapshot_timings,
         )
         results["snapshot"] = {
             "status": "success",
             "storage": "mysql" if MarketDataStore(MarketDataStoreConfig.from_env()).config.sql_url else "json",
             "strategy_pools": written_pools,
+            "timings": snapshot_timings,
             "long_stock_pools": results["long_stock_pool"]["variants"],
         }
         _run_post_snapshot_cache_cleanup(results)
