@@ -59,7 +59,7 @@ function harness(page = "long", { generationTransport = false } = {}) {
   const renderers = [
     "renderShortPage", "renderLongStockPool", "renderLongOverview", "renderLongStrategies",
     "renderChanModelPage", "renderConvertibleBondPage", "renderConvertibleBondAllotments",
-    "renderBydPage", "renderSimilarPatternsPage", "renderOperationPlans", "renderDateStatus",
+    "renderTransitionPage", "renderSimilarPatternsPage", "renderOperationPlans", "renderDateStatus",
     "renderPageShell",
   ];
   vm.runInContext(`
@@ -67,7 +67,6 @@ function harness(page = "long", { generationTransport = false } = {}) {
     ${renderers.map((name) => `${name} = () => renders.push("${name}");`).join("\n")}
     showError = (error) => errors.push(error.message);
     showWatchlistToast = (message) => notices.push(message);
-    maybeShowBydTradeToast = (payload) => notices.push(payload.marker);
   `, context);
   const run = (code) => vm.runInContext(code, context);
   const state = run("state");
@@ -96,7 +95,7 @@ const pages = [
     data: (marker) => ({ marker, strategy_plans: [{ strategy: { key: "grid" }, candidates: [{ ts_code: marker }] }] }) },
   { scope: "cbAllotment", loader: "loadConvertibleBondAllotments", loading: "cbAllotmentLoading", payload: "cbAllotmentPayload",
     data: (marker) => ({ marker }) },
-  { scope: "byd", loader: "loadBydMinuteStrategy", loading: "bydLoading", payload: "bydPayload",
+  { scope: "byd", loader: "loadTransitionPlan", loading: "bydLoading", payload: "bydPayload",
     data: (marker) => ({ marker }) },
   { scope: "plans", loader: "loadOperationPlans", loading: "operationPlansLoading", payload: "operationPlans",
     data: (marker) => ({ plans: [marker] }) },
@@ -204,18 +203,17 @@ test("selector: actual debounced filter clicks invalidate before a new fetch, in
   assert.equal(h.state.payload.marker, "latest");
 });
 
-test("BYD: input changes invalidate without submitting a replacement request", async () => {
+test("transition strategy switch cannot be overwritten by old variant", async () => {
   const h = harness("byd");
-  const old = h.run("loadBydMinuteStrategy().catch(showError)");
-  const input = h.element("#bydSharesInput");
-  input.value = "5000";
-  input.listeners.input();
-  input.value = "";
-  input.listeners.input();
+  const old = h.run("loadTransitionPlan().catch(showError)");
+  h.element("#transitionStrategy").listeners.change({ target: { value: "win" } });
+  h.requests[1].resolve({ marker: "current variant" });
+  await tick();
   const snapshot = h.snapshot();
-  h.requests[0].resolve({ marker: "old holding toast" });
+  h.requests[0].resolve({ marker: "old variant" });
   await old;
   assert.equal(h.snapshot(), snapshot);
+  assert.equal(h.state.bydPayload.marker, "current variant");
 });
 
 test("navigation invalidates a pending page even when the destination is cached", async () => {

@@ -45,6 +45,11 @@ from quant.features.left_side_factor_contract import (
     LEFT_SIDE_SCORING_INPUT_CONTRACT_SHA256,
     left_side_contract_payload,
 )
+from quant.features.left_side_v5_shadow import (
+    LEFT_SIDE_V5_SHADOW_SCHEMA_VERSION,
+    build_left_side_v5_shadow_feature_frame,
+    score_left_side_v5_shadow,
+)
 from quant.features.project_factor_layer import (
     PROJECT_FACTOR_SCHEMA_VERSION,
 )
@@ -65,6 +70,12 @@ from quant.routine.project_feature_cache import (
 LEFT_SIDE_NORMALIZATION_SCHEMA_VERSION = "daily-cross-section-percentile-v1"
 LEFT_SIDE_PRODUCTION_FEATURE_BUILDER_VERSION = "left-side-production-feature-builder-v4"
 LEFT_SIDE_PRODUCTION_SCORE_BUILDER_VERSION = "left-side-production-score-builder-v2"
+LEFT_SIDE_V5_SHADOW_ARTIFACT = (
+    PROJECT_ROOT / "models/shadow/left_side_absolute_v5/bundle.joblib"
+)
+LEFT_SIDE_V5_SHADOW_MANIFEST = (
+    PROJECT_ROOT / "models/shadow/left_side_absolute_v5/manifest.json"
+)
 DEFAULT_RESEARCH_MODEL = (
     PROJECT_ROOT
     / "models/research/left_side_unified_v3_group4_input_parity/next_close/h5/"
@@ -454,12 +465,18 @@ def _score_input_fingerprint(
     target: pd.Timestamp,
     config: LeftSideRankingConfig,
 ) -> str:
+    shadow_paths = tuple(
+        path
+        for path in (LEFT_SIDE_V5_SHADOW_ARTIFACT, LEFT_SIDE_V5_SHADOW_MANIFEST)
+        if path.is_file()
+    )
     paths = (
         config.paths.artifact,
         config.paths.artifact_manifest,
         config.paths.feature_output,
         config.paths.feature_manifest,
         PROJECT_ROOT / "configs/strategies/left_side_unified.yaml",
+        *shadow_paths,
     )
     return _fingerprint(paths, {
         "target_date": target.date().isoformat(),
@@ -467,6 +484,107 @@ def _score_input_fingerprint(
         "score_schema_version": LEFT_SIDE_SCORE_SCHEMA_VERSION,
         "normalization_schema_version": LEFT_SIDE_NORMALIZATION_SCHEMA_VERSION,
     })
+
+
+def _read_daily_basic_history(
+    root: Path,
+    *,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Read the bounded daily-basic history needed by the v5 shadow factors."""
+
+    from quant.data.market_snapshot import pinned_dataset_path
+
+    pinned_root = pinned_dataset_path("daily_basic")
+    read_parquet = pd.read_parquet
+    if pinned_root is not None:
+        from quant.data.market_snapshot import read_pinned_parquet
+
+        root = pinned_root
+        read_parquet = read_pinned_parquet
+
+    start_text = start_date.strftime("%Y%m%d")
+    end_text = end_date.strftime("%Y%m%d")
+    paths = [
+        path
+        for path in sorted(root.glob("*.parquet"))
+        if start_text <= path.stem <= end_text
+    ]
+    if not paths:
+        raise FileNotFoundError(
+            f"left-side v5 daily_basic history is unavailable: {start_text}..{end_text}"
+        )
+    frames = [
+        read_parquet(
+            path,
+            columns=["ts_code", "trade_date", "turnover_rate", "circ_mv"],
+        )
+        for path in paths
+    ]
+    result = pd.concat(frames, ignore_index=True, sort=False)
+    if result.duplicated(["ts_code", "trade_date"]).any():
+        raise RuntimeError("left-side v5 daily_basic history contains duplicate keys")
+    return result
+
+
+def _load_left_side_v5_shadow_bundle(
+    production_artifact_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest = _load_json(LEFT_SIDE_V5_SHADOW_MANIFEST)
+    if manifest.get("schema_version") != "left-side-absolute-shadow-v5-manifest-v1":
+        raise RuntimeError("left-side v5 shadow manifest schema mismatch")
+    if manifest.get("lifecycle") != "shadow":
+        raise RuntimeError("left-side v5 artifact is not shadow-only")
+    if manifest.get("artifact_sha256") != _sha256(LEFT_SIDE_V5_SHADOW_ARTIFACT):
+        raise RuntimeError("left-side v5 shadow artifact checksum mismatch")
+    if manifest.get("production_artifact_sha256") != production_artifact_sha256:
+        raise RuntimeError("left-side v5 shadow production baseline drifted")
+    bundle = joblib.load(LEFT_SIDE_V5_SHADOW_ARTIFACT)
+    if not isinstance(bundle, dict):
+        raise RuntimeError("left-side v5 shadow artifact must be a mapping")
+    if bundle.get("schema_version") != "left-side-absolute-shadow-v5-bundle-v1":
+        raise RuntimeError("left-side v5 shadow bundle schema mismatch")
+    return bundle, manifest
+
+
+def _build_left_side_v5_shadow_features(
+    frame: pd.DataFrame,
+    *,
+    target: pd.Timestamp,
+    config: LeftSideRankingConfig,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    store = MarketDataStore(
+        MarketDataStoreConfig(backend="parquet", root=config.paths.market_data_root)
+    )
+    market = store.read_market_range(
+        "daily",
+        start_date=(target - pd.DateOffset(months=18)).strftime("%Y%m%d"),
+        end_date=target.strftime("%Y%m%d"),
+        columns=(
+            "ts_code",
+            "trade_date",
+            "close",
+            "pre_close",
+            "pct_chg",
+            "vol",
+            "volume",
+            "amount",
+        ),
+    )
+    daily_basic = _read_daily_basic_history(
+        config.paths.market_data_root / "daily_basic",
+        start_date=target - pd.DateOffset(years=1),
+        end_date=target,
+    )
+    return build_left_side_v5_shadow_feature_frame(
+        frame,
+        market_daily=market,
+        daily_basic=daily_basic,
+        target_date=target,
+    )
 
 
 def stage_left_side_ranking_release(
@@ -717,7 +835,35 @@ def score_left_side_production(
     scored = frame[["ts_code", "symbol", "trade_date", "date", *LEFT_SIDE_SIGNALS]].copy()
     scored["ranking_score"] = probabilities
     scored["ranking_score_normalized"] = normalize_daily_percentile(probabilities)
-    scored["model_artifact_sha256"] = _sha256(config.paths.artifact)
+    production_artifact_sha256 = _sha256(config.paths.artifact)
+    scored["model_artifact_sha256"] = production_artifact_sha256
+    shadow_status = "unavailable"
+    shadow_reason: str | None = None
+    shadow_artifact_sha256: str | None = None
+    try:
+        shadow_bundle, shadow_manifest = _load_left_side_v5_shadow_bundle(
+            production_artifact_sha256
+        )
+        shadow_features = _build_left_side_v5_shadow_features(
+            frame,
+            target=target,
+            config=config,
+        )
+        shadow_scores = score_left_side_v5_shadow(
+            shadow_features,
+            production_probability=probabilities,
+            bundle=shadow_bundle,
+        )
+        for column in shadow_scores.columns:
+            scored[column] = shadow_scores[column].to_numpy()
+        shadow_status = "success"
+        shadow_artifact_sha256 = str(shadow_manifest["artifact_sha256"])
+    except Exception as exc:
+        # The candidate is deliberately observe-only.  A shadow-data outage,
+        # including a corrupt serialized bundle, must remain visible in the
+        # manifest but cannot break the active v4 ranking path or change
+        # downstream selection.
+        shadow_reason = str(exc)
     atomic_write_parquet(scored, config.paths.score_output, index=False)
     manifest = {
         "status": "success",
@@ -738,6 +884,16 @@ def score_left_side_production(
         "selection_policy": "downstream_top_n_ordering",
         "strategy_thresholds": bundle["strategy_thresholds"],
         "selector_adapter_status": "ready",
+        "shadow_v5": {
+            "status": shadow_status,
+            "lifecycle": "shadow",
+            "production_action": "observe_only",
+            "schema_version": LEFT_SIDE_V5_SHADOW_SCHEMA_VERSION,
+            "score_field": "shadow_v5_absolute_score",
+            "trade_gate_field": "shadow_v5_trade_gate_open",
+            "artifact_sha256": shadow_artifact_sha256,
+            "reason": shadow_reason,
+        },
         "output_sha256": _sha256(config.paths.score_output),
     }
     if find_forbidden_aliases_in_payload(manifest):

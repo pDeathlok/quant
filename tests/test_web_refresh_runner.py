@@ -116,6 +116,19 @@ def test_runner_reuses_service_by_default_and_supports_explicit_restart() -> Non
     assert runner.build_parser().parse_args(["--no-restart-service"]).restart_service is False
 
 
+def test_runner_accepts_explicit_trade_date_for_non_trading_day_catchup(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_refresh_workflow(**kwargs):
+        captured.update(kwargs)
+        return {"status": "success"}
+
+    monkeypatch.setattr(runner, "run_refresh_workflow", fake_run_refresh_workflow)
+
+    assert runner.main(["--trade-date", "2026-10-23"]) == 0
+    assert captured["target_date"] == date(2026, 10, 23)
+
+
 def test_run_refresh_workflow_retries_after_failed_status(tmp_path: Path) -> None:
     responses = [
         FakeResponse({"status": "ok", "service": "quant-webapp"}),

@@ -9,6 +9,14 @@ from quant.data.tushare_fetcher import TushareDataFetcher, validate_daily_basic_
 from quant.routine import daily_basic_refresh
 
 
+@pytest.fixture(autouse=True)
+def disable_live_valuation_requests(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("live valuation requests disabled in unit tests")
+
+    monkeypatch.setattr(daily_basic_refresh, "supplement_pe_ttm", unavailable)
+
+
 def _complete_daily_basic(trade_date: str = "20260722") -> pd.DataFrame:
     rows = 4
     return pd.DataFrame(
@@ -85,6 +93,134 @@ def test_validate_daily_basic_reports_required_feature_coverage() -> None:
 
     assert frame.attrs["feature_coverage"]["volume_ratio"] == 1.0
     assert frame.attrs["feature_coverage"]["dv_ratio"] == 0.5
+
+
+def test_refresh_saves_verified_valuation_and_reuses_local_evidence(monkeypatch, tmp_path):
+    from quant.data.daily_basic_valuation import supplement_pe_ttm
+
+    frame = _complete_daily_basic()
+    frame["pe_ttm"] = None
+    reference = frame[["ts_code", "trade_date", "pe_ttm", "total_mv"]].copy()
+    reference["pe_ttm"] = [12.0, -20.0, -30.0, -40.0]
+
+    class Fetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date):
+            return frame.copy()
+
+    monkeypatch.setattr(daily_basic_refresh, "TushareDataFetcher", Fetcher)
+    monkeypatch.setattr(daily_basic_refresh, "supplement_pe_ttm", lambda df, date, cache:
+        supplement_pe_ttm(df, date, cache, fetch=lambda _: reference))
+    kwargs = dict(
+        trade_date="20260722", output_dir=tmp_path / "basic", cache_dir=tmp_path / "cache",
+        limiter=daily_basic_refresh.RequestLimiter(0), retries=0,
+        retry_base_delay=0, retry_max_delay=0,
+    )
+    result = daily_basic_refresh.fetch_one_trade_date(**kwargs)
+    assert result["status"] == "success"
+    assert result["feature_coverage"]["pe_ttm"] == 0.25
+    assert result["resolved_feature_coverage"]["pe_ttm"] == 1
+    saved = pd.read_parquet(result["path"])
+    assert saved.pe_ttm.isna().sum() == 3
+    assert saved.pe_ttm_reference.tolist() == [12, -20, -30, -40]
+    monkeypatch.setattr(daily_basic_refresh, "supplement_pe_ttm", lambda *a: pytest.fail("re-fetched"))
+    assert daily_basic_refresh.fetch_one_trade_date(**kwargs)["source"] == "local_validated"
+
+
+def test_reference_verification_runs_above_numeric_coverage_threshold(monkeypatch, tmp_path):
+    from quant.data.daily_basic_valuation import supplement_pe_ttm, resolved_feature_mask
+
+    frame = _complete_daily_basic()
+    frame.loc[3, "pe_ttm"] = None
+    reference = frame[["ts_code", "trade_date", "pe_ttm", "total_mv"]].copy()
+    reference.loc[3, "pe_ttm"] = -20
+
+    class Fetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date):
+            return frame.copy()
+
+    monkeypatch.setattr(daily_basic_refresh, "TushareDataFetcher", Fetcher)
+    monkeypatch.setattr(daily_basic_refresh, "supplement_pe_ttm", lambda df, day, cache:
+        supplement_pe_ttm(df, day, cache, fetch=lambda _: reference))
+    result = daily_basic_refresh.fetch_one_trade_date(
+        "20260722", tmp_path / "basic", tmp_path / "cache", daily_basic_refresh.RequestLimiter(0),
+        retries=0, retry_base_delay=0, retry_max_delay=0,
+    )
+    assert result["status"] == "success"
+    assert result["feature_coverage"]["pe_ttm"] == 0.75
+    assert resolved_feature_mask(pd.read_parquet(result["path"]), "pe_ttm").all()
+
+
+def test_valuation_source_failure_keeps_original_gate_closed(monkeypatch, tmp_path):
+    frame = _complete_daily_basic()
+    frame["pe_ttm"] = None
+
+    class Fetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date):
+            return frame.copy()
+
+    def unavailable(*args):
+        raise RuntimeError("reference unavailable")
+
+    monkeypatch.setattr(daily_basic_refresh, "TushareDataFetcher", Fetcher)
+    monkeypatch.setattr(daily_basic_refresh, "supplement_pe_ttm", unavailable)
+    result = daily_basic_refresh.fetch_one_trade_date(
+        "20260722", tmp_path / "basic", tmp_path / "cache",
+        daily_basic_refresh.RequestLimiter(0), retries=0, retry_base_delay=0, retry_max_delay=0,
+    )
+    assert result["status"] == "failed"
+    assert "feature coverage" in result["error"]
+
+
+def test_income_fallback_survives_reference_outage_and_is_persisted(monkeypatch, tmp_path):
+    from quant.data.daily_basic_valuation import INCOME_SOURCE, resolved_feature_mask
+
+    frame = _complete_daily_basic("20261030")
+    frame["pe_ttm"] = None
+    income = pd.DataFrame([
+        {"ts_code": symbol, "end_date": period, "ann_date": announced,
+         "report_type": "1", "n_income_attr_p": profit}
+        for symbol in frame.ts_code
+        for period, announced, profit in [
+            ("20251231", "20260410", 100000),
+            ("20260930", "20261025", -50000),
+            ("20250930", "20251025", 100000),
+        ]
+    ])
+    income.to_parquet(tmp_path / "income.parquet")
+
+    class Fetcher:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_daily_basic(self, trade_date):
+            return frame.copy()
+
+    def unavailable(*args):
+        raise RuntimeError("reference unavailable")
+
+    monkeypatch.setattr(daily_basic_refresh, "TushareDataFetcher", Fetcher)
+    monkeypatch.setattr(daily_basic_refresh, "supplement_pe_ttm", unavailable)
+    kwargs = dict(trade_date="20261030", output_dir=tmp_path / "basic",
+                  cache_dir=tmp_path / "cache", limiter=daily_basic_refresh.RequestLimiter(0),
+                  retries=0, retry_base_delay=0, retry_max_delay=0)
+    result = daily_basic_refresh.fetch_one_trade_date(**kwargs)
+    assert result["status"] == "success"
+    assert result["derived_features"]["pe_ttm"]["income_derivation"]["confirmed_loss_rows"] == 4
+    saved = pd.read_parquet(result["path"])
+    assert saved.pe_ttm.isna().all()
+    assert saved.pe_ttm_reference_source.eq(INCOME_SOURCE).all()
+    assert resolved_feature_mask(saved, "pe_ttm").all()
+    assert daily_basic_refresh.fetch_one_trade_date(**kwargs)["source"] == "local_validated"
+    assert not (tmp_path / "basic/20260722.parquet").exists()
 
 
 def test_fetch_one_trade_date_preserves_last_good_file_on_empty_response(

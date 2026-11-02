@@ -15,6 +15,8 @@ from quant.application.workspaces.convertible_bonds import (
 from quant.webapp.services import (
     add_similar_pattern_watch_symbol,
     get_byd_daily_strategy,
+    get_transition_daily_strategy,
+    save_transition_account,
     get_b1_plan,
     get_chan_model_strategy_plan,
     get_convertible_bond_allotments,
@@ -54,6 +56,7 @@ class RefreshPlanRequest(BaseModel):
 
 class RefreshLatestRequest(BaseModel):
     scope: str = "all"
+    trade_date: date | None = None
 
 
 class SimilarPatternWatchRequest(BaseModel):
@@ -405,7 +408,8 @@ def selector_calendar(
 def selector_refresh_latest(body: RefreshLatestRequest | None = None) -> dict[str, Any]:
     try:
         payload = body or RefreshLatestRequest()
-        return start_latest_refresh(scope=payload.scope)
+        options = {"target_trade_date": payload.trade_date.isoformat()} if payload.trade_date else {}
+        return start_latest_refresh(scope=payload.scope, **options)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -508,3 +512,29 @@ def refresh_similar_pattern_analysis_api() -> dict[str, Any]:
         return refresh_similar_pattern_analysis()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"相似走势分析刷新失败: {exc}") from exc
+
+
+class TransitionPositionRequest(BaseModel):
+    symbol: str = Field(pattern=r"^(?:3\d{5}(?:\.SZ)?|688\d{3}(?:\.SH)?)$")
+    entry_date: date
+    quantity: int = Field(gt=0, strict=True)
+    cost: float = Field(gt=0, allow_inf_nan=False)
+
+
+class TransitionAccountRequest(BaseModel):
+    revision: int = Field(ge=0)
+    cash: float = Field(ge=0, allow_inf_nan=False)
+    positions: list[TransitionPositionRequest] = Field(default_factory=list, max_length=50)
+
+
+@router.get("/transition/plan")
+def transition_plan(strategy: Literal["return", "win"] = "return", refresh: bool = False) -> dict[str, Any]:
+    return get_transition_daily_strategy(strategy, refresh)
+
+
+@router.put("/transition/account/{strategy}")
+def transition_account(strategy: Literal["return", "win"], body: TransitionAccountRequest) -> dict[str, Any]:
+    try:
+        return save_transition_account(strategy, body.model_dump(mode="json"))
+    except ValueError as exc:
+        raise HTTPException(status_code=409 if "其他页面" in str(exc) else 400, detail=str(exc)) from exc

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -26,6 +27,8 @@ RAW_DIR = PROJECT_ROOT / "data/raw"
 AUDIT_ROOT = RAW_DIR / "source_audit"
 REFERENCE_STATE_PATH = RAW_DIR / "reference_refresh_state.json"
 INDEX_CODE = "000300.SH"
+FINANCIAL_POLL_VERSION = 2
+FINANCIAL_PAGE_SIZE = 4000
 
 FINANCIAL_DATASETS: dict[str, dict[str, Any]] = {
     "fina_indicator": {
@@ -42,7 +45,7 @@ FINANCIAL_DATASETS: dict[str, dict[str, Any]] = {
         "method": "income_vip",
         "path": "income.parquet",
         "fields": (
-            "ts_code,ann_date,end_date,report_type,revenue,operate_profit,total_profit,"
+            "ts_code,ann_date,f_ann_date,end_date,report_type,revenue,operate_profit,total_profit,"
             "n_income,n_income_attr_p,total_revenue,income_tax,minority_gain"
         ),
         "dedupe": ["ts_code", "ann_date", "end_date", "report_type"],
@@ -80,6 +83,7 @@ def _financial_checkpoint_current(state_path: Path, end_date: str) -> bool:
         return False
     return (
         state.get("financial_status") == "success"
+        and state.get("financial_poll_version") == FINANCIAL_POLL_VERSION
         and str(state.get("end_date") or "") == end_date
         and str(state.get("refreshed_on") or "") == datetime.now().date().isoformat()
     )
@@ -237,6 +241,32 @@ def refresh_daily_tradability(
     }
 
 
+def _financial_period_pages(
+    method: Callable[..., pd.DataFrame], *, period: str, fields: str, sleep_seconds: float,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    seen: set[str] = set()
+    for page in range(50):
+        frame = method(period=period, fields=fields, limit=FINANCIAL_PAGE_SIZE,
+                       offset=page * FINANCIAL_PAGE_SIZE)
+        if frame is None or frame.empty:
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if len(frame) > FINANCIAL_PAGE_SIZE:
+            raise ValueError("financial provider ignored page size")
+        fingerprint = hashlib.sha256(
+            pd.util.hash_pandas_object(frame, index=False).values.tobytes(),
+        ).hexdigest()
+        if fingerprint in seen:
+            raise ValueError("financial provider repeated a page; offset may be ignored")
+        seen.add(fingerprint)
+        frames.append(frame)
+        if len(frame) < FINANCIAL_PAGE_SIZE:
+            return pd.concat(frames, ignore_index=True)
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    raise ValueError("financial pagination exceeded safety limit")
+
+
 def refresh_financial_periods(
     fetcher: TushareDataFetcher,
     raw_dir: Path,
@@ -252,7 +282,9 @@ def refresh_financial_periods(
         method = getattr(fetcher.pro, spec["method"])
         for period in periods:
             try:
-                frame = method(period=period, fields=spec["fields"])
+                frame = _financial_period_pages(
+                    method, period=period, fields=spec["fields"], sleep_seconds=sleep_seconds,
+                )
                 if frame is not None and not frame.empty:
                     frames.append(frame)
             except Exception as exc:
@@ -500,7 +532,7 @@ def refresh_reference_data(
             fetcher,
             raw_dir,
             end_date,
-            period_count=financial_periods or int(os.getenv("ROUTINE_FINANCIAL_PERIODS", "4")),
+            period_count=financial_periods or int(os.getenv("ROUTINE_FINANCIAL_PERIODS", "5")),
             sleep_seconds=float(os.getenv("ROUTINE_FINANCIAL_SLEEP", "0.15")),
         )
     else:
@@ -548,6 +580,7 @@ def refresh_reference_data(
                 "refreshed_on": datetime.now().date().isoformat(),
                 "refreshed_at": manifest["created_at"],
                 "financial_status": "success",
+                "financial_poll_version": FINANCIAL_POLL_VERSION,
                 "manifest_path": str(manifest_path),
             },
             effective_state_path,

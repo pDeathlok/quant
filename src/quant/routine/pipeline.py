@@ -82,6 +82,18 @@ def _incremental_daily_basic_start() -> str:
     from quant.routine.daily_basic_refresh import list_pending_daily_basic_repairs
 
     pending_repairs = list_pending_daily_basic_repairs(daily_basic_dir)
+    integrity_report = PROJECT_ROOT / "data/routine/historical_integrity_latest.json"
+    try:
+        report = json.loads(integrity_report.read_text(encoding="utf-8"))
+        pending_repairs.extend(
+            str(item["trade_date"])
+            for item in report.get("failures", [])
+            if item.get("dataset") == "daily_basic"
+            and str(item.get("trade_date", "")).isdigit()
+            and len(str(item["trade_date"])) == 8
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
     dates = [
         path.stem
         for path in daily_basic_dir.glob("*.parquet")
@@ -99,7 +111,9 @@ def _incremental_daily_basic_start() -> str:
     return min([rolling_start, *pending_repairs])
 
 
-def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
+def refresh_data(
+    dry_run: bool = True, progress_callback=None, *, source_end_date: str | None = None,
+) -> dict:
     started = time.monotonic()
     start_date = _incremental_daily_start()
     workers = os.getenv("ROUTINE_DAILY_WORKERS", "4")
@@ -135,6 +149,10 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         "--availability-retry-interval",
         os.getenv("ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL", "600"),
     ]
+    if source_end_date is not None:
+        command.extend(["--end", source_end_date])
+        start_date = min(start_date, source_end_date)
+        command[command.index("--start") + 1] = start_date
     if dry_run:
         return {
             "status": "skipped",
@@ -193,12 +211,53 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
     manifest = _extract_last_json_object(stdout)
     expected_trade_date = str(manifest.get("expected_trade_date") or "")
     dataset_trade_date = str(manifest.get("dataset_trade_date") or "")
+    history_repair = None
+    integrity_path = PROJECT_ROOT / "data/routine/historical_integrity_latest.json"
+    try:
+        integrity = json.loads(integrity_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        integrity = {}
+    repairable_reasons = {"missing_traded_price", "missing_trade_date", "missing_partition"}
+    if (
+        returncode == 0
+        and integrity.get("status") == "failed"
+        and str(integrity.get("target_trade_date") or "") <= expected_trade_date
+        and any(
+            item.get("dataset") == "daily" and item.get("reason") in repairable_reasons
+            for item in integrity.get("failures", [])
+        )
+    ):
+        repair_command = [
+            sys.executable, "scripts/backfill_historical_daily.py", "--candidate-only",
+            "--end", expected_trade_date,
+        ]
+        if progress_callback is not None:
+            progress_callback(percent=10, message="正在补齐历史日行情缺口")
+        repair = subprocess.run(
+            repair_command, cwd=PROJECT_ROOT, env=env,
+            capture_output=True, text=True,
+        )
+        history_repair = {
+            "returncode": repair.returncode,
+            "stdout_tail": repair.stdout[-2000:],
+            "stderr_tail": repair.stderr[-2000:],
+        }
+        if repair.returncode:
+            return {
+                "status": "failed", "error": "historical daily repair failed",
+                "history_repair": history_repair,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
     complete = (
         returncode == 0
         and manifest.get("status") == "success"
         and bool(expected_trade_date)
         and dataset_trade_date == expected_trade_date
     )
+    from quant.routine.historical_integrity import pending_backfill_change_dates
+
+    backfill_dates = pending_backfill_change_dates()
+    changed_dates = sorted(set(manifest.get("source_changed_dates") or []) | set(backfill_dates))
     return {
         **manifest,
         "status": "success" if complete else "failed",
@@ -209,11 +268,16 @@ def refresh_data(dry_run: bool = True, progress_callback=None) -> dict:
         "start_date": start_date,
         "expected_trade_date": expected_trade_date or None,
         "dataset_trade_date": dataset_trade_date or None,
+        "source_changed_dates": changed_dates,
+        "historical_backfill_changed_dates": backfill_dates,
+        "history_repair": history_repair,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
 
-def refresh_daily_basic_data(dry_run: bool = True, progress_callback=None) -> dict:
+def refresh_daily_basic_data(
+    dry_run: bool = True, progress_callback=None, *, source_end_date: str | None = None,
+) -> dict:
     started = time.monotonic()
     start_date = _incremental_daily_basic_start()
     if dry_run:
@@ -228,16 +292,18 @@ def refresh_daily_basic_data(dry_run: bool = True, progress_callback=None) -> di
     from quant.routine.daily_basic_refresh import refresh_daily_basic
 
     manifest = refresh_daily_basic(
-        start_date=start_date,
+        start_date=min(start_date, source_end_date) if source_end_date else start_date,
+        **({"end_date": source_end_date} if source_end_date else {}),
         workers=int(os.getenv("ROUTINE_DAILY_BASIC_WORKERS", "4")),
         sleep_between=float(os.getenv("ROUTINE_DAILY_BASIC_SLEEP", "0.25")),
         retries=int(os.getenv("ROUTINE_DAILY_BASIC_RETRIES", "3")),
         progress_callback=progress_callback,
     )
     failed = int(manifest.get("failed") or 0)
+    pending_repairs = manifest.get("pending_repair_dates") or []
     return {
         **manifest,
-        "status": "success" if failed == 0 else "failed",
+        "status": "success" if failed == 0 and not pending_repairs else "failed",
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
 
@@ -1333,8 +1399,6 @@ def run_daily_pipeline(
         }
         results["refresh_data"] = refresh_data(dry_run=skip_data)
         require_complete("refresh_data", allow_skipped=skip_data)
-        results["refresh_daily_basic"] = refresh_daily_basic_data(dry_run=skip_data)
-        require_complete("refresh_daily_basic", allow_skipped=skip_data)
         results["refresh_reference_inputs"] = refresh_reference_inputs(
             dry_run=skip_data,
             include_financials=source_options["include_financials"],
@@ -1346,6 +1410,8 @@ def run_daily_pipeline(
             long_factor_datasets=source_options["long_factor_datasets"],
         )
         require_complete("refresh_reference_inputs", allow_skipped=skip_data)
+        results["refresh_daily_basic"] = refresh_daily_basic_data(dry_run=skip_data)
+        require_complete("refresh_daily_basic", allow_skipped=skip_data)
         results["refresh_factor_registry"] = refresh_factor_registry_snapshot()
         require_complete("refresh_factor_registry")
         # The signal pass owns the target-date B1 gate.  Run it first so the

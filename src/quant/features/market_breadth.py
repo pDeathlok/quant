@@ -103,7 +103,10 @@ def _normalize_market_daily(market_daily: pd.DataFrame) -> pd.DataFrame:
     if parsed.isna().any():
         raise ValueError("market breadth input has invalid trade_date values")
     frame["ts_code"] = frame["ts_code"].astype(str)
-    frame["trade_date"] = parsed.dt.strftime("%Y%m%d")
+    # A full-market table repeats each date thousands of times. On macOS,
+    # scalar strftime repeatedly checks system timezone state; format once/date.
+    date_text = {value: value.strftime("%Y%m%d") for value in parsed.drop_duplicates()}
+    frame["trade_date"] = parsed.map(date_text)
     frame["date"] = parsed.dt.normalize()
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
     if frame.duplicated(["ts_code", "trade_date"]).any():

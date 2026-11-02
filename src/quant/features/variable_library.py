@@ -733,7 +733,24 @@ def load_daily_basic_features(
     if not frames:
         return pd.DataFrame()
 
-    out = pd.concat(frames, ignore_index=True)
+    result = derive_daily_basic_features(pd.concat(frames, ignore_index=True))
+    print(
+        "loaded daily_basic features: "
+        f"files={files_read}/{len(files)} rows={len(result)} elapsed={perf_counter() - started:.1f}s",
+        flush=True,
+    )
+    return result
+
+
+def derive_daily_basic_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Derive the shared daily-basic factors from supplied observation history.
+
+    Callers must supply preceding rolling history (20 observations, plus any
+    older non-null MV seed needed by pct_change's legacy filling semantics),
+    or all available history for a newly listed stock. No future data is needed.
+    This separates the existing formulas from filesystem selection.
+    """
+    out = frame.copy()
     out["trade_date"] = _daily_basic_date_keys(out["trade_date"])
     out = out.dropna(subset=["ts_code", "trade_date"]).drop_duplicates(["ts_code", "trade_date"], keep="last")
     out = out.rename(columns={"volume_ratio": "ts_volume_ratio"})
@@ -769,13 +786,7 @@ def load_daily_basic_features(
     for source_col, out_col in [("pe_ttm", "pe_ttm_inv"), ("pb", "pb_inv"), ("ps_ttm", "ps_ttm_inv")]:
         if source_col in out.columns:
             out[out_col] = 1 / out[source_col].replace(0, np.nan)
-    result = out.replace([np.inf, -np.inf], np.nan)
-    print(
-        "loaded daily_basic features: "
-        f"files={files_read}/{len(files)} rows={len(result)} elapsed={perf_counter() - started:.1f}s",
-        flush=True,
-    )
-    return result
+    return out.replace([np.inf, -np.inf], np.nan)
 
 
 def _daily_basic_coverage_details(

@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +10,7 @@ import pandas as pd
 
 from quant.core.paths import PROJECT_ROOT
 from quant.data import MarketDataStore, MarketDataStoreConfig
+from quant.data.byd_intraday import read_byd_training_frame
 from quant.data.market_data_store import MarketDataUnavailableError
 from quant.data.market_snapshot import MarketSnapshotError, current_market_snapshot
 from quant.research.byd_daily_t_plan import build_daily_t_plan
@@ -179,19 +179,12 @@ def load_byd_daily_frame(
         )
 
 
-@lru_cache(maxsize=1)
 def load_byd_intraday_validation_frame(
     cache_dir: Path = PROJECT_ROOT / "data/cache",
 ) -> pd.DataFrame:
-    """Load historical five-minute samples used for model training and validation."""
+    """Read validated historical samples locally; refresh is an explicit routine."""
 
-    paths = list(cache_dir.glob("baostock_002594_5min_*_qfq.parquet"))
-    if not paths:
-        raise FileNotFoundError("缺少比亚迪历史5分钟验证数据")
-    path = max(paths, key=lambda item: item.stat().st_size)
-    frame = pd.read_parquet(path)
-    frame.attrs["intraday_training_source"] = str(path)
-    return frame
+    return read_byd_training_frame(cache_dir)
 
 
 def _intraday_training_sla_days(configured: int | None) -> int:
@@ -299,7 +292,7 @@ def build_byd_daily_strategy(
         intraday_training_max_staleness_days
     )
     params = {
-        "plan_version": 4,
+        "plan_version": 5,
         "shares": int(shares),
         "cost": round(float(cost), 6),
         "intraday_training_max_staleness_days": training_sla_days,
@@ -359,9 +352,8 @@ def build_byd_daily_strategy(
         primary_action = {
             "action": "WAIT",
             "title": "今日不挂正T买单",
-            "detail": (
-                "历史规则本身已通过验证，但下一交易日质量分未过闸门；"
-                "不为增加次数而追价。反T仍暂停。"
+            "detail": positive.get("disabled_reason") or daily_plan["validation"].get(
+                "decision", "当日执行条件未满足，暂停新开正T仓。反T仍暂停。"
             ),
             "shares_delta": 0,
         }

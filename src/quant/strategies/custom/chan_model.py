@@ -8,6 +8,25 @@ import numpy as np
 import pandas as pd
 
 
+CHAN_MODEL_LOGIC_VERSION = 2
+
+
+def resolve_chan_signal_date(
+    scored: pd.DataFrame,
+    trade_date: str | pd.Timestamp | None = None,
+    processed_through: str | None = None,
+) -> pd.Timestamp:
+    """Resolve the requested/latest processed day, including days with no signals."""
+    if trade_date is not None:
+        return pd.Timestamp(trade_date).normalize()
+    latest = pd.to_datetime(scored["date"], errors="coerce").max()
+    if processed_through:
+        processed = pd.Timestamp(processed_through).normalize()
+        if pd.isna(latest) or processed >= latest:
+            return processed
+    return latest
+
+
 @dataclass(frozen=True)
 class ChanModelRule:
     id: str
@@ -96,6 +115,9 @@ def add_chan_model_strategy_columns(
     out["chan_model_rule_id"] = ""
     out["chan_model_rule_name"] = ""
     out["chan_model_signal"] = 0
+    out["chan_model_setup_signal"] = 0
+    out["chan_model_execution_status"] = "not_selected"
+    out["chan_model_execution_label"] = "未入选"
     out["chan_model_position_pct"] = np.nan
     out["chan_model_buy_plan"] = ""
     out["chan_model_sell_plan"] = ""
@@ -108,16 +130,17 @@ def add_chan_model_strategy_columns(
             mask &= out["chan_signal_name"].eq("三买确认")
         if rule.min_chan_score is not None:
             mask &= chan_score >= rule.min_chan_score
-        if rule.max_entry_gap_pct is not None:
-            mask &= entry_gap <= rule.max_entry_gap_pct
-
         update = mask & (
             out["chan_model_rule_id"].eq("")
             | ((rule.id == "chan_model_primary") & out["chan_model_rule_id"].ne("chan_model_primary"))
         )
         out.loc[update, "chan_model_rule_id"] = rule.id
         out.loc[update, "chan_model_rule_name"] = rule.name
-        out.loc[update, "chan_model_signal"] = 1
+        out.loc[update, "chan_model_setup_signal"] = 1
+        executable = update & entry_gap.notna()
+        if rule.max_entry_gap_pct is not None:
+            executable &= entry_gap <= rule.max_entry_gap_pct
+        out.loc[executable, "chan_model_signal"] = 1
         out.loc[update, "chan_model_position_pct"] = rule.base_position_pct
         out.loc[update, "chan_model_description"] = rule.description
         out.loc[update, "chan_model_buy_plan"] = (
@@ -126,6 +149,16 @@ def add_chan_model_strategy_columns(
         out.loc[update, "chan_model_sell_plan"] = (
             "优先持有5-10个交易日；跌破信号日低点或最近中枢下沿退出，放量长阴提前减仓。"
         )
+
+    setup = out["chan_model_setup_signal"].eq(1)
+    for mask, status, label in (
+        (entry_gap.isna(), "pending_open", "待开盘核验"),
+        (out["chan_model_signal"].eq(1), "executable", "可执行"),
+        (entry_gap.gt(3) & entry_gap.le(6), "reduce_watch", "降仓观察"),
+        (entry_gap.gt(6), "skip", "高开超限，放弃"),
+    ):
+        out.loc[setup & mask, "chan_model_execution_status"] = status
+        out.loc[setup & mask, "chan_model_execution_label"] = label
 
     out["chan_model_rank_score"] = (
         pred_good.rank(pct=True) * 45
@@ -145,18 +178,17 @@ def select_chan_model_candidates(
 ) -> pd.DataFrame:
     """Select model-filtered Chan candidates for a trade date.
 
-    If ``trade_date`` is omitted, the latest date with any strategy signal is used.
+    If ``trade_date`` is omitted, use the latest scored date without falling back
+    to an earlier day. Candidates are close-confirmed setups; next-open execution
+    status is reported separately, including pending and rejected entries.
     """
     out = add_chan_model_strategy_columns(scored)
-    selected = out[out["chan_model_signal"].eq(1)].copy()
+    selected = out[out["chan_model_setup_signal"].eq(1)].copy()
     if not include_expanded:
         selected = selected[selected["chan_model_rule_id"].isin(["chan_model_primary", "chan_model_high_conviction"])]
     if selected.empty:
         return selected
-    if trade_date is None:
-        trade_ts = selected["date"].max()
-    else:
-        trade_ts = pd.to_datetime(trade_date)
+    trade_ts = resolve_chan_signal_date(out, trade_date)
     selected = selected[selected["date"].eq(trade_ts)].copy()
     if selected.empty:
         return selected

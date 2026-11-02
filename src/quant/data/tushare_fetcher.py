@@ -17,6 +17,7 @@ from pathlib import Path
 import tushare as ts
 
 from quant.data.atomic_io import atomic_write_parquet
+from quant.data.daily_basic_valuation import resolved_feature_mask
 from quant.data.market_data_store import MarketDataStore, MarketDataStoreConfig
 
 
@@ -66,13 +67,17 @@ def validate_daily_basic_frame(
             column: float(pd.to_numeric(frame[column], errors="coerce").notna().mean())
             for column in required_feature_coverage
         }
+        resolved_coverage = {
+            column: float(resolved_feature_mask(frame, column).mean())
+            for column in required_feature_coverage
+        }
         inadequate = {
             column: {
-                "actual": round(feature_coverage[column], 6),
+                "actual": round(resolved_coverage[column], 6),
                 "required": float(minimum),
             }
             for column, minimum in required_feature_coverage.items()
-            if feature_coverage[column] < float(minimum)
+            if resolved_coverage[column] < float(minimum)
         }
         if inadequate:
             raise ValueError(
@@ -80,6 +85,7 @@ def validate_daily_basic_frame(
                 f"{trade_date}: {inadequate}"
             )
         frame.attrs["feature_coverage"] = feature_coverage
+        frame.attrs["resolved_feature_coverage"] = resolved_coverage
     return frame
 
 

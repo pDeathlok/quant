@@ -289,3 +289,97 @@ def test_allotment_quality_gate_persists_failed_payload_before_raising() -> None
 
     assert payload["quality"]["status"] == "failed"
     assert writes == ["daily", "snapshot"]
+
+
+@pytest.mark.parametrize("publish_success", [True, False])
+def test_standalone_allotment_refresh_uses_committed_page_generation(
+    monkeypatch, tmp_path, publish_success,
+):
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from quant.webapp import services
+    from quant.infrastructure.publication import PublicationView, current_publication
+
+    cases = json.loads((Path(__file__).parent / "fixtures/convertible_bond_announcement_cases.json").read_text())
+    case = next(row for row in cases["timeline_cases"] if row["id"] == "hangya_20260912_registration_after_published_committee")
+    views = [PublicationView(tmp_path, tmp_path / "data/publications", "old", ())]
+    monkeypatch.setattr(services, "_publication_store", lambda: SimpleNamespace(view=lambda: views[0]))
+    monkeypatch.setattr(services, "_REFRESH_STATUS", {})
+    runs = []
+    builds = []
+    def run(scope, *, run_id):
+        runs.append(scope)
+        services._REFRESH_STATUS.update(run_id=run_id, status="success" if publish_success else "failed", error=None if publish_success else "quality failure")
+        if publish_success:
+            views[0] = PublicationView(tmp_path, tmp_path / "data/publications", "new", ())
+    monkeypatch.setattr(services, "_run_latest_refresh_job", run)
+    def build(**kwargs):
+        builds.append(kwargs["refresh"])
+        view = current_publication()
+        index = 1 if kwargs["refresh"] or (view and view.generation == "new") else 0
+        announcement = case["announcements"][index]
+        return {"asof": "2026-09-12", "event_poll_status": "success", "event_polled_through": "2026-09-12", "quality": {"status": "success", "expected_trade_date": "2026-09-11"}, "data_sources": {"stock_daily": {"requested": 1, "matched": 1}, "daily_basic": {"matched": 1}}, "records": [{"stock_code": case["stock_code"], "stock_price_date": "2026-09-11", "kdj_daily_j": 10.0, "kdj_weekly_j": 20.0, "kdj_monthly_j": 30.0, "stage": "registered" if index else "exchange_approved", "announcement_title": announcement["title"], "announcement_url": announcement["url"]}]}
+    monkeypatch.setattr(services, "build_convertible_bond_allotment_workspace", build)
+    if publish_success:
+        result = services.get_convertible_bond_allotments(refresh=True, validate_quality=True)
+        assert runs == ["cbAllotment"]
+        assert builds == [False]
+        assert result["records"][0]["stage"] == "registered"
+        assert result["records"][0]["announcement_url"] == case["expected"]["url"]
+    else:
+        with pytest.raises(RuntimeError, match="配债股发布失败"):
+            services.get_convertible_bond_allotments(refresh=True, validate_quality=True)
+        assert runs == ["cbAllotment"]
+        assert builds == []
+        assert views[0].generation == "old"
+
+
+@pytest.mark.parametrize("gate_passes", [True, False])
+def test_score_sync_updates_published_cache_atomically(monkeypatch, tmp_path, gate_passes):
+    import json
+    from quant.webapp import services
+    from quant.routine import pipeline
+    from quant.infrastructure.publication import PublicationStore, publication_path, publication_context
+    from quant.data.atomic_io import atomic_write_json
+
+    path = tmp_path / "scores.json"
+    old = {"target_date": "2026-09-11", "watchlist": [{"symbol": "688510.SH", "opportunity_score": 1, "holding_score": 2}], "results": [{"target": {"symbol": "688510.SH"}}]}
+    path.write_text(json.dumps(old))
+    store = PublicationStore(tmp_path, ("scores.json",))
+    audit = {"status": "success", "freshness_audit": {"status": "success", "failures": []}, "refresh_node_ids": []}
+    with store.begin("initial") as view:
+        store.commit(view, audit)
+    before = store.view().generation
+    monkeypatch.setattr(services, "_publication_store", lambda: store)
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_ANALYSIS_PATH", path)
+    monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: None)
+    monkeypatch.setattr(services, "_similar_pattern_watchlist_profiles", lambda *a, **kw: [{"symbol": "688510.SH", "opportunity_score": 70, "holding_score": 80, "score_date": "2026-09-11", "feature_quality": {"status": "complete"}}])
+    monkeypatch.setattr(services, "_read_similar_pattern_watchlist_symbols", lambda: ["688510.SH"])
+    monkeypatch.setattr(services, "_REFRESH_STATUS", {})
+    def run(scope, *, run_id):
+        assert scope == "similar"
+        try:
+            with store.begin("score-refresh") as staged:
+                services.refresh_similar_pattern_watchlist_scores()
+                store.commit(staged, audit if gate_passes else {"status": "failed"})
+        except Exception as exc:
+            services._REFRESH_STATUS.update(run_id=run_id, status="failed", error=str(exc))
+        else:
+            services._REFRESH_STATUS.update(run_id=run_id, status="success")
+    monkeypatch.setattr(services, "_run_latest_refresh_job", run)
+    if gate_passes:
+        result = services.refresh_similar_pattern_watchlist_scores()
+        assert result["scored_count"] == 1
+        assert store.view().generation != before
+        with publication_context(store.view()):
+            saved = json.loads(publication_path(path).read_text())
+        assert saved["watchlist"][0]["opportunity_score"] == 70
+        assert saved["results"] == old["results"]
+    else:
+        with pytest.raises(Exception, match="freshness audit"):
+            services.refresh_similar_pattern_watchlist_scores()
+        assert store.view().generation == before
+        with publication_context(store.view()):
+            assert json.loads(publication_path(path).read_text()) == old
+    assert json.loads(path.read_text()) == old

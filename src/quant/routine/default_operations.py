@@ -85,7 +85,7 @@ _IMPLEMENTATION_PATHS = {
         "src/quant/research/right_side_unified.py",
     ),
     "run_left_side_unified": (
-        "src/quant/routine/project_feature_cache.py",
+        "src/quant/routine/project_feature_cache.py", "src/quant/features/left_side_v5_shadow.py",
         "src/quant/features/candlestick_context.py",
     ),
     "refresh_chan_model_scores": (
@@ -269,7 +269,8 @@ def build_default_operation_registry(
                     output_paths=outputs,
                     contract_paths=contract_paths,
                     optional_contract_paths=(
-                        (".env",)
+                        ((".env", "models/shadow/left_side_absolute_v5")
+                         if operation_id == "run_left_side_unified" else (".env",))
                         if operation_id in CORE_OPERATION_INPUTS else ()
                     ),
                     environment_keys=(

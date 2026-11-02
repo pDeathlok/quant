@@ -3,12 +3,53 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from quant.data.tushare_fetcher import TushareDataFetcher
 from quant.routine.reference_data_refresh import (
     refresh_financial_periods,
     refresh_reference_data,
 )
+
+
+def test_financial_poll_fetches_all_pages(monkeypatch):
+    from quant.routine import reference_data_refresh as module
+
+    monkeypatch.setattr(module, "FINANCIAL_PAGE_SIZE", 2)
+    rows = pd.DataFrame({"ts_code": ["A", "B", "C", "D", "603316.SH"]})
+    calls = []
+
+    def method(**kwargs):
+        calls.append(kwargs)
+        return rows.iloc[kwargs["offset"]:kwargs["offset"] + kwargs["limit"]]
+
+    result = module._financial_period_pages(method, period="20260630", fields="ts_code", sleep_seconds=0)
+    assert result.ts_code.tolist() == rows.ts_code.tolist()
+    assert [call["offset"] for call in calls] == [0, 2, 4]
+
+
+def test_financial_poll_rejects_ignored_offsets(monkeypatch):
+    from quant.routine import reference_data_refresh as module
+
+    monkeypatch.setattr(module, "FINANCIAL_PAGE_SIZE", 2)
+    with pytest.raises(ValueError, match="repeated a page"):
+        module._financial_period_pages(lambda **_: pd.DataFrame({"x": [1, 2]}),
+                                       period="20260630", fields="x", sleep_seconds=0)
+
+
+def test_old_single_page_financial_checkpoint_is_not_reused(tmp_path):
+    import json
+    from datetime import datetime
+    from quant.routine.reference_data_refresh import _financial_checkpoint_current, FINANCIAL_POLL_VERSION
+
+    path = tmp_path / "state.json"
+    state = {"financial_status": "success", "end_date": "20261030",
+             "refreshed_on": datetime.now().date().isoformat()}
+    path.write_text(json.dumps(state))
+    assert not _financial_checkpoint_current(path, "20261030")
+    state["financial_poll_version"] = FINANCIAL_POLL_VERSION
+    path.write_text(json.dumps(state))
+    assert _financial_checkpoint_current(path, "20261030")
 
 
 class FakePro:

@@ -82,6 +82,7 @@ def test_byd_workspace_rebuilds_stale_parameterized_snapshot() -> None:
             "signal_date": "2026-08-07",
             "positive": {
                 "execution_enabled": False,
+                "disabled_reason": "规则未通过滚动监测，暂停新开仓。",
                 "shares": 0,
                 "buy_price": 0.0,
                 "entry_rule": "等待",
@@ -102,8 +103,9 @@ def test_byd_workspace_rebuilds_stale_parameterized_snapshot() -> None:
 
     assert result is not cached
     assert result["planned_t"]["signal_date"] == "2026-08-07"
+    assert result["primary_action"]["detail"] == "规则未通过滚动监测，暂停新开仓。"
     assert writes[0]["params"] == {
-        "plan_version": 4,
+        "plan_version": 5,
         "shares": 10_500,
         "cost": 110.6061,
         "intraday_training_max_staleness_days": 60,
@@ -183,7 +185,7 @@ def test_byd_workspace_builds_and_persists_daily_plan() -> None:
             "snapshot_date": "2026-07-29",
             "payload": result,
             "params": {
-                "plan_version": 4,
+                "plan_version": 5,
                 "shares": 10_500,
                 "cost": 108.0,
                 "intraday_training_max_staleness_days": 60,

@@ -288,6 +288,15 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
                     "close": 1505.0,
                     "vol": 20.0,
                 },
+                {
+                    "ts_code": "000005.SZ",
+                    "trade_date": trade_date,
+                    "open": 3.0,
+                    "high": 3.1,
+                    "low": 2.9,
+                    "close": 3.05,
+                    "vol": 50.0,
+                },
             ]
             return pd.DataFrame(rows)
 
@@ -356,17 +365,19 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
     )
     ping_an = store.read_frame("daily", "000001.SZ")
     mao_tai = store.read_frame("daily", "600519.SH")
+    delisted = store.read_frame("daily", "000005.SZ")
     assert ping_an["trade_date"].tolist() == ["20260604", "20260605", "20260606"]
     assert mao_tai["trade_date"].tolist() == ["20260605", "20260606"]
+    assert delisted["trade_date"].tolist() == ["20260605", "20260606"]
     assert pd.read_parquet(output_dir / "000001.SZ.parquet")["trade_date"].tolist() == ["20260604"]
     storage = manifest["batch_storage"]
-    assert storage["rows"] == 4
+    assert storage["rows"] == 6
     assert storage["sql_rows"] == 0
     assert storage["parquet_partitions"] == 1
     assert storage["table"] == "market_daily"
     assert storage["dataset_revision"] == 2
     assert storage["changed_partitions"] == ["20260605", "20260606"]
-    assert storage["changed_keys"] == ["000001.SZ", "600519.SH"]
+    assert storage["changed_keys"] == ["000001.SZ", "000005.SZ", "600519.SH"]
     assert storage["coverage"]["minimum_rate"] == 0.995
     assert storage["coverage"]["strict_dates"] == ["20260606"]
     for trade_date in ("20260605", "20260606"):

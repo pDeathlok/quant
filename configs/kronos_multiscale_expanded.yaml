@@ -1,0 +1,23 @@
+name: kronos_multiscale_expanded_v2
+output_dir: reports/research/kronos_multiscale_expanded_v2
+source_dir: models/research/kronos/source
+daily_dir: data/stocks_daily
+raw_bars: reports/research/overnight_unfiltered_universe_v1/daily_bars.parquet
+limits_dir: reports/research/overnight_unfiltered_limits_v1
+left_predictions: reports/research/left_side_unified_v3_group4_input_parity/test_predictions.parquet
+right_predictions: reports/research/right_side_unified_canonical_v5_rule113/test_predictions.parquet
+symbol_limit: 256
+seed: 20261021
+lengths: {daily: 128, weekly: 104, monthly: 60}
+encoder: {hidden: 128, layers: 4, heads: 4, dropout: 0.1}
+pretrain_end: '2022-12-31'
+pretrain_validation_end: '2023-12-31'
+pretrain_windows_per_symbol_scale: 12
+pretrain_epochs: 5
+pretrain_batch_size: 32
+learning_rate: 0.0003
+embedding_batch_size: 64
+subscore_epochs: 20
+slots: 20
+round_trip_cost: 0.002
+minimum_rule_samples: 30

@@ -268,3 +268,27 @@ pe_ttm_inv
 ```
 
 原因是亏损公司或未分红公司在估值/股息字段上可能为空或异常。
+
+## 新增研究变量：关键指数均线状态（2026-11-01）
+
+这些变量注册为 `research_candidate`，由 `quant.features.index_ma_state.compute_index_ma_state_features` 统一计算；完整清单见 `factor_catalog.md`。不属于上文早期132字段合同，也未自动加入生产模型。
+
+覆盖上证综指、深证成指、创业板指、科创50、上证50、沪深300、中证500、中证1000、北证50；分别计算 MA20、MA60、MA120、MA250（年线），共341字段。字段模板为 `index_{指数slug}_ma{周期}_{后缀}`，例如：
+
+| 字段 | 含义 |
+|---|---|
+| `index_csi300_ma250_value` | 沪深300的250交易日收盘价均值 |
+| `index_csi300_ma250_distance_pct` | `(收盘价 / MA250 - 1) × 100`，负值表示跌破 |
+| `index_csi300_ma250_below` / `above` | 严格低于/高于均线为1；等于时两者均0 |
+| `index_csi300_ma250_below_days` / `above_days` | 连续跌破/站上交易日数；相等、反向或缺测打断连续计数 |
+| `index_csi300_ma250_cross_down` / `cross_up` | 当日下穿/上穿，要求前一日状态可知 |
+| `index_csi300_ma250_slope5_pct` | `(当日MA250 / 5交易日前MA250 - 1) × 100` |
+| `index_csi300_trend_state` | +1：收盘>MA250、MA60>MA120>MA250且MA250斜率向上；-1为严格反向；其余已知状态为0 |
+| `market_index_ma250_above_ratio` | 7个固定核心指数中站上年线的比例；任一核心指数缺有效历史则为NaN |
+| `market_index_ma250_eligible_count` | 当日具备有效年线的核心指数数量，最大7 |
+
+核心共识不包含科创50、北证50，避免指数新增导致历史分母变化。两者各自指标从正式实时发布日起预热（科创50：2020-07-23；北证50：2022-11-21），不提前使用后来发布的回溯点位。
+
+所有均线要求完整窗口。缺失交易日不会前向补价，会重新预热窗口；历史不足的状态为NaN，而不是“未跌破”。连续天数从首个可计算的状态起累计。信号日收盘后可得，研究按次日入场；精确按日期关联，不用未来值补缺。
+
+验证脚本：`scripts/research/validate_left_side_index_ma.py`；结果目录：`reports/research/left_side_index_ma_20261101/`。训练验证单独比较年线58字段、多均线239字段；均线绝对点位不输入模型。

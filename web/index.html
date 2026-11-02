@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1-20261101-transition-right-v3-20261102-watchlist-alert-filter-v1" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -21,7 +21,7 @@
         </div>
         <div class="sidebar-brief">
             <span>工作区</span>
-          <p>顶部 Tab 切换短线、缠论、长线、可转债、配债股、BYD 做T、自选池与操作计划。左侧区域跟随当前工作区显示对应策略选择。</p>
+          <p>顶部 Tab 切换短线、缠论、长线、可转债、配债股、过渡期右侧、自选池与操作计划。左侧区域跟随当前工作区显示对应策略选择。</p>
         </div>
         <div class="global-refresh-card">
           <span>全局更新</span>
@@ -74,8 +74,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>BYD 做T</strong>
-            <span>盘前计划 / 正T优先</span>
+            <strong>过渡期右侧</strong>
+            <span>趋势候选 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -214,8 +214,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>BYD 做T</strong>
-            <span>盘前计划 / 正T优先</span>
+            <strong>过渡期右侧</strong>
+            <span>趋势候选 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -305,8 +305,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>BYD 做T</strong>
-            <span>盘前计划 / 正T优先</span>
+            <strong>过渡期右侧</strong>
+            <span>趋势候选 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -574,8 +574,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>BYD 做T</strong>
-            <span>盘前计划 / 正T优先</span>
+            <strong>过渡期右侧</strong>
+            <span>趋势候选 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -658,8 +658,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>BYD 做T</strong>
-            <span>盘前计划 / 正T优先</span>
+            <strong>过渡期右侧</strong>
+            <span>趋势候选 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -788,8 +788,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab active" type="button" data-page="byd">
-            <strong>BYD 做T</strong>
-            <span>盘前计划 / 正T优先</span>
+            <strong>过渡期右侧</strong>
+            <span>趋势候选 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -797,89 +797,16 @@
           </button>
         </nav>
 
-        <section class="toolbar byd-toolbar">
-          <div>
-            <p class="eyebrow">BYD Inventory Desk</p>
-            <h2>比亚迪日线做T计划</h2>
-            <p id="bydSubline" class="subline">10000 股 · 成本 110.6061 · 等待历史验证计划</p>
-          </div>
-          <div class="byd-toolbar-actions">
-            <label>
-              <span>持仓股数</span>
-              <input id="bydSharesInput" type="number" min="0" step="100" value="10000" />
-            </label>
-            <label>
-              <span>成本价</span>
-              <input id="bydCostInput" type="number" min="0" step="0.0001" value="110.6061" />
-            </label>
-            <button id="bydRefreshButton" type="button">刷新日线计划</button>
-            <button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页</button>
-            <span id="bydHoldingSaveStatus" class="byd-save-status" role="status" aria-live="polite">持仓修改后自动保存</span>
-          </div>
+        <section class="toolbar transition-toolbar">
+          <div><p class="eyebrow">Transition · Right-side strategy</p><h2>过渡期右侧 · 次日操作台</h2><p id="transitionSubline" class="subline">核对收盘数据、账户与下一交易日，再执行计划。</p></div>
+          <div class="transition-controls"><label>策略版本<select id="transitionStrategy"><option value="return">收益型 · 趋势跟踪</option><option value="win">胜率型 · 半仓退出</option></select></label><button id="transitionReload" type="button">重算计划</button><button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页行情</button></div>
         </section>
-
-        <section class="panel byd-validation-panel">
-          <div class="panel-head">
-            <div>
-              <h3>横盘期历史验证</h3>
-              <span id="bydValidationStatus">等待加载</span>
-            </div>
-          </div>
-          <p id="bydValidationDecision" class="subline">只使用2022年后的横盘期选择参数；历史分钟线只负责验证成交先后，盘中计划不刷新。</p>
-          <div id="bydValidationMetrics" class="byd-validation-metrics"></div>
-        </section>
-
-        <section class="panel byd-range-panel">
-          <div class="panel-head">
-            <div>
-              <h3>正T / 反T 分开计划</h3>
-              <span>正T优先 · 反T未通过则暂停</span>
-            </div>
-          </div>
-          <div id="bydIntradayZones" class="byd-dynamic-zones"></div>
-        </section>
-
-        <section class="byd-grid">
-          <article class="panel byd-primary-panel">
-            <div class="panel-head">
-              <h3>当前操作单</h3>
-              <span id="bydDataStatus">等待加载</span>
-            </div>
-            <div id="bydPrimaryAction" class="byd-primary-action"></div>
-          </article>
-          <article class="panel">
-            <div class="panel-head">
-              <h3>持仓状态</h3>
-              <span id="bydStageLabel">-</span>
-            </div>
-            <div id="bydPositionMetrics" class="byd-metrics"></div>
-          </article>
-        </section>
-
-        <section class="panel byd-ladder-panel">
-          <div class="panel-head">
-            <h3>固定计划价位</h3>
-            <span>正T买卖 / 尾盘退出 / 反T观察</span>
-          </div>
-          <div id="bydPriceLadder" class="byd-ladder"></div>
-        </section>
-
-        <section class="split byd-split">
-          <div class="panel">
-            <div class="panel-head">
-              <h3>计划提醒</h3>
-              <span id="bydAlertCount">-</span>
-            </div>
-            <div id="bydAlerts" class="byd-alerts"></div>
-          </div>
-          <div class="panel">
-            <div class="panel-head">
-              <h3>执行路线</h3>
-              <span>先验证，再交易</span>
-            </div>
-            <ol id="bydPlaybook" class="byd-playbook"></ol>
-          </div>
-        </section>
+        <section class="panel transition-summary"><div class="panel-head"><h3>次日执行状态</h3><span id="transitionStatus" role="status">正在核对</span></div><div id="transitionOverview" class="transition-metrics"></div><div id="transitionIssues" role="status"></div></section>
+        <section class="transition-order-grid"><article class="panel"><div class="panel-head"><h3>01 · 次日卖出 / 持有</h3><span>卖出成交后才释放资金和槽位</span></div><div id="transitionSellHold"></div></article><article class="panel"><div class="panel-head"><h3>02 · 次日条件买入</h3><span>收盘执行 · 空槽留现金</span></div><div id="transitionBuySummary"></div></article></section>
+        <section class="panel"><div class="panel-head"><h3>实际账户与持仓</h3><span>两套策略分别保存；不会自动记录成交或下单</span></div><form id="transitionAccountForm"><div class="transition-account-controls"><label>可用现金（元）<input id="transitionCash" type="number" min="0" step="0.01" required /></label><button id="transitionAddHolding" type="button">添加实际持仓</button><button type="submit" id="transitionSaveAccount">保存账户并重算</button><button type="button" id="transitionRestoreAccount">重新读取已保存记录</button></div><div class="transition-table-scroll"><table class="transition-table"><thead><tr><th>股票代码</th><th>实际入场日</th><th>当前股数</th><th>实际每股成本</th><th>编辑</th></tr></thead><tbody id="transitionHoldingInputs"></tbody></table></div><p id="transitionAccountStatus" class="subline" role="status">请确认现金与实际持仓后保存，才能启用买入清单。</p></form></section>
+        <section class="panel"><div class="panel-head"><h3>买入备选队列</h3><span>按20日波动升序 · 最多10只备选，最多5仓</span></div><div id="transitionBuys" class="transition-table-scroll"></div></section>
+        <details class="panel transition-rules" open><summary>明确的次日买卖逻辑</summary><div id="transitionExecutionRules"></div><p class="subline">固定研究候选：收益型采用6%最高收盘回撤跟踪退出；胜率型采用收盘涨3% / 跌5%触发。触发后的下一交易日收盘尝试成交，实际盈亏可能超过阈值。价格退出以入场日参考收盘为基准，实际成本仅作账户记录。上述阈值用于收盘判断，不是次日委托价。市场标签变化不强制清仓。</p></details>
+        <details class="panel transition-rules"><summary>七个指数如何判定市场状态</summary><div id="transitionIndices" class="transition-table-scroll"></div><p class="subline">每条均线至少4个指数站上即记为多数站上；牛市、熊市、回调、反弹之外的组合记为过渡阶段。数据不完整时暂停新买入。</p></details>
       </main>
 
       <main id="similarPage" class="main page-view active">
@@ -901,8 +828,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>BYD 做T</strong>
-            <span>盘前计划 / 正T优先</span>
+            <strong>过渡期右侧</strong>
+            <span>趋势候选 / 次日执行</span>
           </button>
           <button class="page-tab active" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -934,7 +861,13 @@
               <h3>自选股票</h3>
               <span id="similarWatchCount">-</span>
             </div>
-            <span>点击股票查看下方决策详情</span>
+            <div class="similar-watch-actions">
+              <label class="watchlist-alert-filter">
+                <input id="similarTriggeredAlertsOnly" type="checkbox" role="switch" />
+                <span>只显示触发提醒</span>
+              </label>
+              <span>点击股票查看下方决策详情</span>
+            </div>
           </div>
           <div class="table-wrap similar-watch-table-wrap">
             <table class="similar-watch-table">
@@ -1116,7 +1049,7 @@
         </section>
       </main>
     </div>
-    <div id="bydTradeToast" class="byd-trade-toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
     <div id="watchlistContextMenu" class="watchlist-context-menu" role="menu" hidden>
       <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
       <button type="button" role="menuitem" data-watchlist-context-pin hidden>置顶</button>
@@ -1177,6 +1110,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1-20261101-transition-right-v3-20261102-watchlist-alert-filter-v1"></script>
   </body>
 </html>

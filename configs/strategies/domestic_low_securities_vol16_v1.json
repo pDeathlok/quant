@@ -1,0 +1,43 @@
+{
+  "strategy_id": "domestic_low_securities_vol16_v1",
+  "status": "retained_research_baseline",
+  "retained_on": "2026-10-13",
+  "basket_targets": {
+    "BYD": 0.2,
+    "broad": 0.15,
+    "gold": 0.2,
+    "bond": 0.2,
+    "securities": 0.05,
+    "dividend": 0.2
+  },
+  "broad_split": {
+    "510300.SH": 0.5,
+    "510500.SH": 0.5
+  },
+  "risk_budget": {
+    "lookback": 63,
+    "annualization": 252,
+    "volatility_target": 0.16,
+    "scale": "min(1, target/known_portfolio_volatility)",
+    "leverage": false
+  },
+  "execution": {
+    "frequency": 21,
+    "deadband": 0.03,
+    "target_basket_cap": 0.2,
+    "repair_open_threshold": 0.23,
+    "repair_nonscheduled_target": 0.225
+  },
+  "cash_interest": 0,
+  "history_start": "2014-08-01",
+  "history_end": "2026-10-12",
+  "base_net_cagr": 0.101246,
+  "base_max_drawdown": -0.212094,
+  "targets_archive": "reports/research/domestic_relative_risk_20261013/expert_targets.npz",
+  "targets_key": "core_vol16",
+  "validated_ledger": "reports/research/domestic_relative_risk_20261013/soft_cap_audit/ledger_base_core_vol16.csv",
+  "report": "reports/research/domestic_relative_risk_20261013/report.md",
+  "live_trading_enabled": false,
+  "frozen_archive": "reports/research/domestic_strategy_v1_20261013",
+  "target_array_sha256": "efe2e5572ffaa6368452f39de7574ff3f7b7fb871ca5962ba93e837c7680effa"
+}

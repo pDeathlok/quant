@@ -10,6 +10,10 @@ from quant.features.active_market_value import (
     ACTIVE_MARKET_VALUE_FEATURE_SCHEMA_VERSION,
     ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS,
 )
+from quant.features.index_ma_state import (
+    INDEX_MA_STATE_FEATURE_COLUMNS,
+    INDEX_MA_STATE_SCHEMA_VERSION,
+)
 from quant.features.candlestick_context import (
     CANDLE_CONTEXT_FEATURE_SCHEMA_VERSION,
     CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS,
@@ -526,6 +530,7 @@ FACTOR_LEVELS = frozenset(
 )
 
 _LAYER_CALCULATOR = {
+    "index_ma_state_research": "index_ma_state_research",
     "market_breadth_research": "market_breadth_research",
     "active_market_value_research": "active_market_value_research",
     "candlestick_context_research": "candlestick_context_research",
@@ -542,6 +547,7 @@ _LAYER_CALCULATOR = {
     "long_external_candidate": "long_external",
 }
 _CALCULATION_OWNER = {
+    "index_ma_state_research": "factor_core_research",
     "market_breadth_research": "factor_core_research",
     "active_market_value_research": "factor_core_research",
     "candlestick_context_research": "factor_core_research",
@@ -562,6 +568,8 @@ _CALCULATION_OWNER = {
 def _semantic_category(definition: FactorDefinition) -> str:
     name = definition.name.lower()
     family = definition.family
+    if family == "index_ma_state":
+        return "trend"
     if definition.role == "strategy_identity" or name.startswith("group__"):
         return "signal_state"
     if name.startswith("analyst_"):
@@ -646,6 +654,7 @@ def _semantic_category(definition: FactorDefinition) -> str:
     if any(token in name for token in ("open", "high", "low", "close", "gap", "body", "shadow", "price", "support", "center")):
         return "price_structure"
     family_defaults = {
+        "index_ma_state": "trend",
         "active_market_value": "volume_liquidity",
         "market_breadth": "relative_cross_section",
         "analyst_expectation": "analyst_expectation",
@@ -769,6 +778,29 @@ def build_factor_registry() -> tuple[FactorDefinition, ...]:
                     if canonical_name != name
                     else "production_materialized"
                 ),
+            )
+        )
+        existing.add(name)
+    for name in INDEX_MA_STATE_FEATURE_COLUMNS:
+        if name in existing:
+            continue
+        definitions.append(
+            FactorDefinition(
+                name=name,
+                family="index_ma_state",
+                frequency="daily",
+                source="key_index_daily_close",
+                point_in_time=True,
+                consumers=("left_side_unified_research", "market_regime_research"),
+                role="research_feature",
+                canonical_name=name,
+                layer="index_ma_state_research",
+                calculation_entrypoint=(
+                    "quant.features.index_ma_state.compute_index_ma_state_features"
+                ),
+                calculation_version=INDEX_MA_STATE_SCHEMA_VERSION,
+                refresh_cadence="on_demand",
+                lifecycle="research_candidate",
             )
         )
         existing.add(name)

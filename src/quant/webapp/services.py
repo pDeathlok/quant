@@ -143,7 +143,9 @@ from quant.strategies.custom.z_skill_patterns import (
     _stock_basic_map,
 )
 from quant.strategies.custom.chan_model import (
+    CHAN_MODEL_LOGIC_VERSION,
     add_chan_model_strategy_columns,
+    resolve_chan_signal_date,
     select_chan_model_candidates,
     summarize_chan_model_strategy,
 )
@@ -167,6 +169,10 @@ SELECTOR_BUY_HOLD_ROLLBACK_MODEL_DIR = (
     PROJECT_ROOT / "models/production/selector_buy_hold"
 )
 SELECTOR_SCORE_PROBABILITY_BANDS = PROJECT_ROOT / "config/selector_score_probability_bands.json"
+LEFT_SIDE_ENTRY_TOPN_METRICS = (
+    PROJECT_ROOT
+    / "reports/research/left_side_unified_v3_group4_input_parity/entry_threshold_topn_metrics.csv"
+)
 SELECTOR_MODEL_HISTORY = (
     PROJECT_ROOT
     / "data/research/selector_buy_hold_registry_v2/selector_buy_hold_registry_dataset.parquet"
@@ -428,7 +434,7 @@ SIMILAR_PATTERN_VECTOR_CACHE_DIR = SIMILAR_PATTERN_STATE_DIR / "vector_cache"
 SIMILAR_PATTERN_VALIDATION_PATH = PROJECT_ROOT / "reports/similar_patterns/validation_2025/calibration.json"
 SIMILAR_PATTERN_CALIBRATION_MAX_FLAT_SPAN = 15.0
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_DAYS = 7
-SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS = 5
+SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS = 0
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY = 4  # Friday
 SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR = 15
 SIMILAR_PATTERN_VECTOR_CACHE_METADATA = "_refresh_metadata.json"
@@ -546,6 +552,13 @@ def _similar_pattern_vector_cache_refresh_decision(
     source_trade_date: str | None = None,
 ) -> dict[str, Any]:
     from quant.routine.vector_refresh_policy import vector_cache_refresh_decision
+    from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    from quant.data.market_snapshot import current_market_snapshot
+
+    snapshot = current_market_snapshot()
+    expected_date = snapshot.latest_date("daily") if snapshot is not None else None
+    if snapshot is not None and pd.isna(expected_date):
+        raise RuntimeError("Pinned market snapshot has no verified daily date")
 
     force_from_env = os.getenv("SIMILAR_PATTERN_FORCE_VECTOR_CACHE", "").strip().lower() in {
         "1",
@@ -559,10 +572,14 @@ def _similar_pattern_vector_cache_refresh_decision(
         force=force or force_from_env,
         now=now,
         source_trade_date=source_trade_date,
+        expected_trade_date=pd.Timestamp(expected_date).date().isoformat() if snapshot is not None else None,
         metadata=_read_similar_pattern_vector_cache_metadata(),
         minimum_refresh_age_days=SIMILAR_PATTERN_VECTOR_CACHE_MIN_REFRESH_AGE_DAYS,
         refresh_weekday=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_WEEKDAY,
         refresh_hour=SIMILAR_PATTERN_VECTOR_CACHE_REFRESH_HOUR,
+        maximum_refresh_age_days=DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[
+            "feature.similar_reference"
+        ].freshness.max_age_days,
     )
 
 
@@ -818,6 +835,16 @@ def _completed_checkpoint_ready(
         and str(postflight.get("target_trade_date") or "").replace("-", "")
         == expected_trade_date
     )
+
+
+def _historical_input_repair_dates(results: Mapping[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    basic = sorted(set(str(value) for value in (
+        (results.get("refresh_daily_basic") or {}).get("downstream_refresh_dates") or []
+    ) if str(value)))
+    market = sorted(set(str(value) for value in (
+        (results.get("refresh_data") or {}).get("historical_backfill_changed_dates") or []
+    ) if str(value)))
+    return basic, market, sorted(set(basic) | set(market))
 
 
 def _retry_preflight_identity_stable(
@@ -1115,12 +1142,45 @@ def _load_project_env() -> None:
             os.environ[key] = value
 
 
+def get_transition_daily_strategy(strategy: str = "return", refresh: bool = False) -> dict[str, Any]:
+    from quant.application.workspaces.transition import workspace
+    return workspace(PROJECT_ROOT, strategy, refresh)
+
+
+def save_transition_account(strategy: str, body: dict[str, Any]) -> dict[str, Any]:
+    from quant.application.workspaces.transition import save_account, verified_calendar
+    calendar, _, _ = verified_calendar(PROJECT_ROOT)
+    return save_account(PROJECT_ROOT, strategy, body, calendar)
+
+
+def _refresh_transition_workspace() -> dict[str, Any]:
+    payload = get_transition_daily_strategy("return", refresh=True)
+    if payload.get("status") == "blocked":
+        raise ValueError("过渡期右侧数据未就绪：" + "；".join(payload.get("issues", [])))
+    for variant in ("return", "win"):
+        item = payload if variant == "return" else get_transition_daily_strategy(variant)
+        _write_workspace_snapshot("transition_daily_plan", item["signal_date"], item,
+                                  params={"strategy": variant}, write_sql=False)
+    return payload
+
+
 def get_byd_daily_strategy(
     shares: int = 10000,
     cost: float = 110.6061,
     refresh: bool = False,
 ) -> dict[str, Any]:
     """Compatibility facade for the application-layer BYD workspace."""
+
+    training_refresh = None
+    if refresh:
+        from quant.routine.byd_intraday_worker import refresh_byd_training_isolated
+
+        trade_date = _local_market_trade_date()
+        if not trade_date:
+            raise RuntimeError("BYD training refresh requires a verified market trade date")
+        training_refresh = refresh_byd_training_isolated(
+            expected_trade_date=pd.Timestamp(trade_date).date().isoformat(),
+        )
 
     def is_snapshot_current(payload: dict[str, Any]) -> bool:
         view = current_publication()
@@ -1131,7 +1191,7 @@ def get_byd_daily_strategy(
         actual = str(planned.get("signal_date") or "").replace("-", "")
         return not expected or actual == expected
 
-    return build_byd_daily_strategy(
+    payload = build_byd_daily_strategy(
         shares=shares,
         cost=cost,
         refresh=refresh,
@@ -1141,6 +1201,9 @@ def get_byd_daily_strategy(
             is_snapshot_current=is_snapshot_current,
         ),
     )
+    if training_refresh is not None:
+        payload["intraday_training_refresh"] = training_refresh
+    return payload
 
 
 @lru_cache(maxsize=1)
@@ -1757,9 +1820,9 @@ def _chan_model_strategy_dates() -> set[str]:
         return set()
     try:
         frame = pd.read_parquet(source)
-        if "chan_model_signal" not in frame.columns:
+        if "chan_model_setup_signal" not in frame.columns:
             frame = add_chan_model_strategy_columns(frame)
-        selected = frame[frame["chan_model_signal"].eq(1)].copy()
+        selected = frame[frame["chan_model_setup_signal"].eq(1)].copy()
         if selected.empty:
             return set()
         dates = pd.to_datetime(selected["date"], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -4286,6 +4349,49 @@ def _read_similar_pattern_analysis_cache() -> dict[str, Any] | None:
 def refresh_similar_pattern_watchlist_scores() -> dict[str, Any]:
     """Refresh lightweight buy/hold scores without rebuilding pattern analysis."""
 
+    if current_publication() is None:
+        store = _publication_store()
+        previous = store.view()
+        if previous.generation:
+            # The similarity product gate also owns source/reference freshness.
+            # Use its existing daily workflow rather than publishing scores with
+            # an incomplete dependency audit. Failure propagates to apply rollback.
+            run_id = _new_refresh_run_id("similar")
+            _run_latest_refresh_job("similar", run_id=run_id)
+            published = store.view()
+            with _REFRESH_LOCK:
+                status = dict(_REFRESH_STATUS)
+            if (
+                status.get("run_id") != run_id
+                or status.get("status") != "success"
+                or published.generation == previous.generation
+            ):
+                raise RuntimeError(
+                    "评分发布失败: " + str(status.get("error") or "未提交新快照")
+                )
+            with publication_context(published):
+                cached = _read_similar_pattern_analysis_cache() or {}
+            profiles = cached.get("watchlist") or []
+            symbols = _read_similar_pattern_watchlist_symbols()
+            if {item.get("symbol") for item in profiles} != set(symbols):
+                raise RuntimeError("已发布评分未覆盖当前全部自选股")
+            if any(
+                _safe_float(item.get("opportunity_score")) is None
+                or _safe_float(item.get("holding_score")) is None
+                or not item.get("score_date")
+                or not item.get("feature_quality")
+                for item in profiles
+            ):
+                raise RuntimeError("已发布评分、日期或特征质量缺失")
+            return {
+                "status": "success",
+                "watchlist_count": len(profiles),
+                "scored_count": len(profiles),
+                "score_dates": sorted({item["score_date"] for item in profiles}),
+                "analysis_results_refreshed": len(cached.get("results") or []),
+                "publication_generation": published.generation,
+            }
+
     profiles = _similar_pattern_watchlist_profiles(
         _stock_basic_for_similar_patterns(),
         include_scores=True,
@@ -4452,6 +4558,11 @@ def _refresh_similar_pattern_analysis_once(
         force=force_vector_cache,
         source_trade_date=source_trade_date,
     )
+    if cache_schedule.get("status") == "unavailable":
+        raise RuntimeError(
+            "Historical reference library unavailable: "
+            f"{cache_schedule['reason']}; source_trade_date={source_trade_date}"
+        )
     if cache_schedule["due"]:
         cache_audit = build_vector_caches_parallel(
             DAILY_DIR,
@@ -5468,6 +5579,7 @@ def _display_selector_payload(
         display_rows,
         str(payload.get("signal_date") or "") or None,
     )
+    _apply_left_side_ranked_metrics(display_rows)
     all_actionable_total = len(display_rows)
     if normalized_side != "all":
         display_rows = [
@@ -5503,11 +5615,13 @@ def _display_selector_payload(
         "rank_method": "competition_rank_descending",
         "fields": {
             "model": "model_score_normalized",
+            "model_left_v5_shadow": "model_score_shadow_v5",
             "buy": "buy_score_normalized",
             "hold": "hold_score_normalized",
         },
         "targets": {
             "model": "T+5 好路径排序（冲高且控制回撤）",
+            "model_left_v5_shadow": "T+5 净收益为正的绝对市场状态与个股混合分（影子）",
             "buy": "T+5 最大冲高收益",
             "hold": "T+5 收盘收益",
         },
@@ -5563,6 +5677,11 @@ def _apply_selector_score_presentation(
                 row.get("ranking_score_normalized", row.get("ranking_score_percent"))
             )
         row["model_score_normalized"] = model_score
+        row["model_score_shadow_v5"] = _score_in_display_range(
+            row.get("shadow_v5_absolute_score")
+            if ranking_source == "left_side_unified"
+            else None
+        )
         score_failed = (row.get("feature_quality") or {}).get("status") == "failed"
         row["buy_score_normalized"] = _score_in_display_range(
             None if score_failed else row.get("opportunity_score")
@@ -5583,6 +5702,11 @@ def _apply_selector_score_presentation(
             score_field=f"{prefix}_score_normalized",
             rank_field=f"{prefix}_score_rank",
         )
+    _competition_ranks(
+        rows,
+        score_field="model_score_shadow_v5",
+        rank_field="model_score_shadow_v5_rank",
+    )
     return rows
 
 
@@ -5864,6 +5988,47 @@ def get_convertible_bond_allotments(
     expected_trade_date: str | None = None,
     validate_quality: bool = False,
 ) -> dict[str, Any]:
+    # Standalone refreshes must publish through the same transaction as the
+    # daily job. Writing legacy paths while a generation is active leaves the
+    # page pinned to old announcements even when a review reports success.
+    if refresh and current_publication() is None:
+        store = _publication_store()
+        previous = store.view()
+        if previous.generation:
+            if (limit, include_listed_days, stage_scope) != (
+                DEFAULT_ALLOTMENT_LIMIT,
+                DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
+                DEFAULT_ALLOTMENT_STAGE_SCOPE,
+            ):
+                raise ValueError("已启用发布快照，独立配债刷新必须使用每日更新的默认参数")
+            run_id = _new_refresh_run_id("cbAllotment")
+            _run_latest_refresh_job("cbAllotment", run_id=run_id)
+            published = store.view()
+            with _REFRESH_LOCK:
+                status = dict(_REFRESH_STATUS)
+            if (
+                status.get("run_id") != run_id
+                or status.get("status") != "success"
+                or published.generation == previous.generation
+            ):
+                raise RuntimeError(
+                    "配债股发布失败，拒绝使用未发布的复核数据: "
+                    + str(status.get("error") or "刷新未完成或未提交新快照")
+                )
+            with publication_context(published):
+                payload = get_convertible_bond_allotments(
+                    limit=limit,
+                    include_listed_days=include_listed_days,
+                    stage_scope=stage_scope,
+                )
+            if validate_quality:
+                quality = _convertible_bond_allotment_quality(
+                    payload, expected_trade_date=expected_trade_date,
+                )
+                if quality["status"] != "success":
+                    raise RuntimeError("配债股数据质量门禁失败: 已发布快照未满足请求条件")
+            return payload
+
     dependencies = ConvertibleBondAllotmentDependencies(
         read_snapshot=_read_workspace_snapshot,
         read_daily_cache=lambda: _read_daily_payload_cache(
@@ -5951,6 +6116,8 @@ def _chan_candidate_record(row: pd.Series) -> dict[str, Any]:
         "pred_big10": _numeric(row.get("pred_target_big10")),
         "pred_win10": _numeric(row.get("pred_target_win10")),
         "entry_gap_pct": _numeric(row.get("entry_gap_pct")),
+        "execution_status": _clean_text(row.get("chan_model_execution_status")),
+        "execution_label": _clean_text(row.get("chan_model_execution_label")),
         "position_pct": _numeric(row.get("chan_model_position_pct")),
         "close": _numeric(row.get("close")),
         "entry_open": _numeric(row.get("entry_open")),
@@ -5982,12 +6149,21 @@ def _chan_summary_records(summary: pd.DataFrame) -> list[dict[str, Any]]:
     ]
 
 
-def _build_chan_model_strategy_payload(top_n: int = 20, signal_date: str | None = None) -> dict[str, Any]:
-    if not CHAN_MODEL_SCORED_PATH.exists():
-        raise FileNotFoundError(f"缺少缠论模型评分文件: {CHAN_MODEL_SCORED_PATH}")
-    scored = pd.read_parquet(CHAN_MODEL_SCORED_PATH)
+def _build_chan_model_strategy_payload(
+    top_n: int = 20, signal_date: str | None = None, *, persist: bool = True,
+) -> dict[str, Any]:
+    scored_path = publication_path(CHAN_MODEL_SCORED_PATH)
+    if not scored_path.exists():
+        raise FileNotFoundError(f"缺少缠论模型评分文件: {scored_path}")
+    scored = pd.read_parquet(scored_path)
     strategy_frame = add_chan_model_strategy_columns(scored)
-    if signal_date is None:
+    refresh_manifest_path = scored_path.parent / "live_refresh_manifest.json"
+    refresh_manifest = read_json_file(refresh_manifest_path) if refresh_manifest_path.exists() else {}
+    resolved_date = resolve_chan_signal_date(
+        scored, signal_date,
+        refresh_manifest.get("processed_through") if refresh_manifest.get("status") == "success" else None,
+    )
+    if persist and signal_date is None:
         atomic_write_parquet(strategy_frame, CHAN_MODEL_STRATEGY_SCORED_PATH, index=False)
         atomic_write_csv(
             strategy_frame,
@@ -5995,18 +6171,14 @@ def _build_chan_model_strategy_payload(top_n: int = 20, signal_date: str | None 
             index=False,
         )
 
-    candidates = select_chan_model_candidates(strategy_frame, trade_date=signal_date, top_n=top_n)
-    if signal_date is None:
+    candidates = select_chan_model_candidates(strategy_frame, trade_date=resolved_date, top_n=top_n)
+    if persist and signal_date is None:
         atomic_write_csv(candidates, CHAN_MODEL_LATEST_CANDIDATES_PATH, index=False)
     summary = summarize_chan_model_strategy(strategy_frame)
-    if signal_date is None:
+    if persist and signal_date is None:
         atomic_write_csv(summary, CHAN_MODEL_SUMMARY_PATH, index=False)
 
-    signal_date = (
-        str(pd.to_datetime(candidates["date"].iloc[0]).date())
-        if not candidates.empty
-        else signal_date
-    )
+    signal_date = str(resolved_date.date()) if pd.notna(resolved_date) else signal_date
     records = [_chan_candidate_record(row) for _, row in candidates.iterrows()]
     summary_records = _chan_summary_records(summary)
     oot_primary = next(
@@ -6018,18 +6190,21 @@ def _build_chan_model_strategy_payload(top_n: int = 20, signal_date: str | None 
         None,
     )
     payload = {
+        "logic_version": CHAN_MODEL_LOGIC_VERSION,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "signal_date": signal_date,
         "top_n": int(top_n),
         "candidate_count": len(records),
         "primary_count": sum(1 for item in records if item["rule_id"] == "chan_model_primary"),
         "expanded_count": sum(1 for item in records if item["rule_id"] == "chan_model_expanded"),
+        "pending_open_count": sum(1 for item in records if item["execution_status"] == "pending_open"),
+        "executable_count": sum(1 for item in records if item["execution_status"] == "executable"),
         "candidates": records,
         "summary": summary_records,
         "oot_primary": oot_primary,
         "oot_expanded": oot_expanded,
         "execution_notes": [
-            "T日收盘确认缠论三买与模型分，T+1 开盘执行。",
+            "T日收盘按结构与模型分入选；开盘价未知时标记待核验，T+1 满足开盘条件后执行。",
             "主策略优先，扩容策略仅在候选不足时补充。",
             "T+1 高开不超过 3% 可执行；3%-6% 降仓观察；超过 6% 放弃。",
             "优先持有 5-10 个交易日；跌破信号日低点或最近中枢下沿退出。",
@@ -6056,8 +6231,15 @@ def get_chan_model_strategy_plan(
             params=params,
             allow_sql=False,
         )
-        if cached is not None:
+        if cached is not None and cached.get("logic_version") == CHAN_MODEL_LOGIC_VERSION:
             return cached
+        view = current_publication()
+        if cached is not None and view is not None and not view.writable:
+            # Upgrade old snapshot presentation from this same committed score
+            # generation without mutating immutable published artifacts.
+            return _build_chan_model_strategy_payload(
+                top_n=top_n, signal_date=signal_date, persist=False,
+            )
     assert_publication_writable()
     payload = _build_chan_model_strategy_payload(top_n=top_n, signal_date=signal_date)
     if signal_date and str(payload.get("signal_date") or "") != str(signal_date):
@@ -8443,6 +8625,7 @@ def _family_signals_for_date(signal_date: str | None = None) -> dict[str, list[d
 
 def _left_side_ranked_signal(strategy_group: str) -> dict[str, Any]:
     label = STRATEGY_GROUP_LABELS.get(strategy_group, strategy_group)
+    metrics = _left_side_ranked_metrics()
     return _enrich_signal_group(
         {
             "strategy_key": strategy_group,
@@ -8455,13 +8638,110 @@ def _left_side_ranked_signal(strategy_group: str) -> dict[str, Any]:
             "reason": "已进入当日左侧统一排序候选池。",
             "buy_plan": "T+1 开盘观察，按统一排序与策略既有风控执行。",
             "sell_plan": "按该策略既有退出规则执行。",
-            "metrics": None,
-            "metrics_text": "",
+            "metrics": dict(metrics) if metrics is not None else None,
+            "metrics_text": _metrics_text(metrics),
             "action_level": "观察",
-            "playbook_source": "左侧统一排序",
+            "playbook_source": "左侧统一排序 · Fold C Top20",
             "strength_score": 0.0,
         }
     )
+
+
+@lru_cache(maxsize=1)
+def _left_side_ranked_metrics() -> dict[str, Any] | None:
+    """Load the production Top20's strict OOT metrics for left-side rows."""
+
+    try:
+        frame = pd.read_csv(LEFT_SIDE_ENTRY_TOPN_METRICS)
+    except (FileNotFoundError, OSError, pd.errors.ParserError):
+        return None
+    required = {
+        "fold",
+        "top_n",
+        "candidate_average_net_return",
+        "candidate_win_rate",
+        "candidate_profit_factor",
+        "trades",
+    }
+    if frame.empty or not required.issubset(frame.columns):
+        return None
+    selected = frame[
+        frame["fold"].astype(str).eq("C")
+        & pd.to_numeric(frame["top_n"], errors="coerce").eq(20)
+    ]
+    if len(selected) != 1:
+        return None
+    row = selected.iloc[0]
+    average_net_return = _safe_float(row.get("candidate_average_net_return"))
+    win_rate = _safe_float(row.get("candidate_win_rate"))
+    profit_factor = _safe_float(row.get("candidate_profit_factor"))
+    trades = _safe_float(row.get("trades"))
+    if None in {average_net_return, win_rate, profit_factor, trades}:
+        return None
+    return _metrics_payload(
+        {
+            "trades": int(trades),
+            "avg_return_pct": float(average_net_return) * 100.0,
+            "win_rate": float(win_rate),
+            "max_drawdown_pct": None,
+            "profit_factor": float(profit_factor),
+        }
+    )
+
+
+def _apply_left_side_ranked_metrics(rows: list[dict[str, Any]]) -> None:
+    """Backfill cached selector snapshots created before unified OOT metrics."""
+
+    metrics = _left_side_ranked_metrics()
+    if metrics is None:
+        return
+    average_return = metrics.get("avg_return_pct")
+    profit_factor = metrics.get("profit_factor")
+    for row in rows:
+        if str(row.get("ranking_source") or "") != "left_side_unified":
+            continue
+        if _safe_float(row.get("best_avg_return_pct")) is None:
+            row["best_avg_return_pct"] = average_return
+        if (_safe_float(row.get("best_profit_factor"), 0.0) or 0.0) <= 0.0:
+            row["best_profit_factor"] = profit_factor
+        enriched_signals: list[dict[str, Any]] = []
+        attached = False
+        for signal in row.get("signals") or []:
+            enriched = dict(signal)
+            signal_metrics = enriched.get("metrics") or {}
+            has_metrics = any(
+                _safe_float(signal_metrics.get(field)) is not None
+                for field in ("avg_return_pct", "profit_factor")
+            )
+            is_unified_rank = (
+                str(enriched.get("operation_key") or "") == "rank_only_top_n"
+                or str(enriched.get("playbook_source") or "").startswith(
+                    "左侧统一排序"
+                )
+            )
+            if is_unified_rank and not has_metrics:
+                enriched["metrics"] = dict(metrics)
+                enriched["metrics_text"] = _metrics_text(metrics)
+                enriched["playbook_source"] = "左侧统一排序 · Fold C Top20"
+                attached = True
+            enriched_signals.append(enriched)
+        if not attached:
+            for enriched in enriched_signals:
+                group = _signal_group_key(enriched)
+                if SHORT_GROUP_SIDE.get(group) != "left":
+                    continue
+                signal_metrics = enriched.get("metrics") or {}
+                if any(
+                    _safe_float(signal_metrics.get(field)) is not None
+                    for field in ("avg_return_pct", "profit_factor")
+                ):
+                    break
+                enriched["metrics"] = dict(metrics)
+                enriched["metrics_text"] = _metrics_text(metrics)
+                enriched["playbook_source"] = "左侧统一排序 · Fold C Top20"
+                break
+        row["signals"] = enriched_signals
+        row["historical_metrics_source"] = "left_side_unified_fold_c_top20"
 
 
 def _materialize_left_side_ranked_candidates(
@@ -8999,7 +9279,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
             ),
             "配债股数据刷新失败",
         ),
-        ("byd_daily_plan", lambda: get_byd_daily_strategy(refresh=True), "BYD 做T日线计划刷新失败"),
+        ("byd_daily_plan", lambda: _refresh_transition_workspace(), "过渡期右侧次日计划刷新失败"),
         ("similar_patterns", lambda: _run_similar_pattern_analysis_isolated(), "相似走势决策台刷新失败"),
     ]
     pending_steps = [item for item in pending_steps if step_map.get(item[0]) != "success"]
@@ -9075,6 +9355,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                         "status": "success",
                         "signal_date": planned_t.get("signal_date"),
                         "alerts": len(payload.get("alerts") or []),
+                        "intraday_training_refresh": payload.get("intraday_training_refresh"),
                     }
                 _set_refresh_progress(
                     step_key=step_key,
@@ -9103,6 +9384,7 @@ def _run_latest_refresh_job(
     scope: str = "all",
     resume_status: dict[str, Any] | None = None,
     run_id: str | None = None,
+    target_trade_date: str | None = None,
 ) -> None:
     refresh_run_id = run_id or _new_refresh_run_id(_normalize_refresh_scope(scope))
     owner = threading.current_thread()
@@ -9119,7 +9401,8 @@ def _run_latest_refresh_job(
     )
     try:
         heartbeat.start()
-        _run_latest_refresh_job_owned(scope, resume_status, refresh_run_id)
+        options = {"target_trade_date": target_trade_date} if target_trade_date else {}
+        _run_latest_refresh_job_owned(scope, resume_status, refresh_run_id, **options)
     finally:
         stopped.set()
         if heartbeat.ident is not None:
@@ -9133,6 +9416,7 @@ def _run_latest_refresh_job_owned(
     scope: str = "all",
     resume_status: dict[str, Any] | None = None,
     run_id: str | None = None,
+    target_trade_date: str | None = None,
 ) -> None:
     refresh_run_id = run_id or _new_refresh_run_id(_normalize_refresh_scope(scope))
     with _REFRESH_LOCK:
@@ -9140,7 +9424,8 @@ def _run_latest_refresh_job_owned(
             return
     try:
         with _publication_store().begin(f"{refresh_run_id}-{uuid.uuid4().hex[:8]}") as staged:
-            _run_latest_refresh_job_in_generation(scope, resume_status, refresh_run_id)
+            options = {"target_trade_date": target_trade_date} if target_trade_date else {}
+            _run_latest_refresh_job_in_generation(scope, resume_status, refresh_run_id, **options)
             if _REFRESH_STATUS.get("status") == "success" and _publication_store().view().generation != staged.generation:
                 raise RuntimeError("Refresh finished without a committed publication")
     except Exception as exc:
@@ -9196,6 +9481,7 @@ def _run_latest_refresh_job_in_generation(
     scope: str = "all",
     resume_status: dict[str, Any] | None = None,
     run_id: str | None = None,
+    target_trade_date: str | None = None,
 ) -> None:
     from quant.routine.checkpoint_store import CheckpointStore
     from quant.routine.operation_contracts import NodeChanges, ResourceClaim
@@ -9253,7 +9539,10 @@ def _run_latest_refresh_job_in_generation(
 
         payload = execute_composed_operation(
             operation_id, callback, *args,
-            target_trade_date=expected_signal_date or datetime.now().date().isoformat(),
+            target_trade_date=expected_signal_date or (
+                pd.Timestamp(target_trade_date).date().isoformat()
+                if target_trade_date else datetime.now().date().isoformat()
+            ),
             scope=refresh_scope, project_root=PROJECT_ROOT, **kwargs,
         )
         with early_workspace_results_lock:
@@ -9368,6 +9657,20 @@ def _run_latest_refresh_job_in_generation(
                 "status": "success", "generation": view.generation,
                 "target_trade_date": target_date,
             }
+            refreshed_basic = results.get("refresh_daily_basic") or {}
+            if refreshed_basic.get("status") == "success":
+                from quant.routine.daily_basic_refresh import acknowledge_daily_basic_change_dates
+
+                acknowledge_daily_basic_change_dates(
+                    list(refreshed_basic.get("downstream_refresh_dates") or [])
+                )
+            refreshed_market = results.get("refresh_data") or {}
+            if refreshed_market.get("status") == "success":
+                from quant.routine.historical_integrity import acknowledge_backfill_change_dates
+
+                acknowledge_backfill_change_dates(
+                    list(refreshed_market.get("historical_backfill_changed_dates") or [])
+                )
         timings["postflight_seconds"] = round(monotonic() - gate_started, 3)
         return result
 
@@ -9573,6 +9876,7 @@ def _run_latest_refresh_job_in_generation(
         if not resume_inputs:
             _set_refresh_progress(step_key="refresh_data", message=f"{refresh_label}：正在共享拉取 Tushare 最新日线数据", percent=10)
             results["refresh_data"] = composed("refresh_data", refresh_data,
+                **({"source_end_date": target_trade_date} if target_trade_date else {}),
                 dry_run=False,
                 progress_callback=lambda percent, message: _set_refresh_progress(
                     step_key="refresh_data",
@@ -9583,19 +9887,7 @@ def _run_latest_refresh_job_in_generation(
             if results["refresh_data"].get("status") == "failed":
                 raise RuntimeError(results["refresh_data"].get("stderr_tail") or "Tushare 数据刷新失败")
 
-            if source_options["include_daily_basic"]:
-                results["refresh_daily_basic"] = composed("refresh_daily_basic", refresh_daily_basic_data,
-                    dry_run=False,
-                    progress_callback=lambda percent, message: _set_refresh_progress(
-                        step_key="refresh_data",
-                        message=message,
-                        percent=percent,
-                        complete_previous=False,
-                    ),
-                )
-                if results["refresh_daily_basic"].get("status") == "failed":
-                    raise RuntimeError("Tushare daily_basic 刷新失败")
-
+            # PE derivation consumes income reports acquired in this source stage.
             results["refresh_reference_inputs"] = composed("refresh_reference_inputs", refresh_reference_inputs,
                 dry_run=False,
                 include_financials=source_options["include_financials"],
@@ -9609,6 +9901,20 @@ def _run_latest_refresh_job_in_generation(
             if results["refresh_reference_inputs"].get("status") not in {"success", "skipped"}:
                 details = results["refresh_reference_inputs"].get("critical_errors") or []
                 raise RuntimeError(f"参考数据刷新失败: {details}")
+
+            if source_options["include_daily_basic"]:
+                results["refresh_daily_basic"] = composed("refresh_daily_basic", refresh_daily_basic_data,
+                    **({"source_end_date": target_trade_date} if target_trade_date else {}),
+                    dry_run=False,
+                    progress_callback=lambda percent, message: _set_refresh_progress(
+                        step_key="refresh_data",
+                        message=message,
+                        percent=percent,
+                        complete_previous=False,
+                    ),
+                )
+                if results["refresh_daily_basic"].get("status") == "failed":
+                    raise RuntimeError("Tushare daily_basic 刷新失败")
 
         results["factor_registry"] = refresh_factor_registry_snapshot()
         if results["factor_registry"].get("status") != "success":
@@ -9631,12 +9937,28 @@ def _run_latest_refresh_job_in_generation(
         )
         _clear_selector_caches()
         expected_trade_date = _source_expected_trade_date(results)
+        if target_trade_date and expected_trade_date != target_trade_date:
+            raise RuntimeError(
+                f"Requested refresh date mismatch: requested={target_trade_date} actual={expected_trade_date}"
+            )
         local_trade_date = _local_market_trade_date()
         if expected_trade_date is None or local_trade_date != expected_trade_date:
             raise RuntimeError(
                 "行情新鲜度门禁失败: "
                 f"expected={expected_trade_date} actual={local_trade_date}"
             )
+        if refresh_scope == "all" and source_options["include_daily_basic"]:
+            from quant.routine.historical_integrity import audit_with_tushare
+
+            integrity = audit_with_tushare(expected_trade_date)
+            results["historical_integrity"] = integrity
+            if integrity["status"] != "success":
+                sample = integrity["failures"][:3]
+                raise RuntimeError(
+                    "历史底层数据完整性门禁失败: "
+                    f"{integrity['failure_count']} 项; sample={sample}; "
+                    "details=data/routine/historical_integrity_latest.json"
+                )
         expected_signal_date = pd.to_datetime(
             expected_trade_date,
             format="%Y%m%d",
@@ -9657,22 +9979,14 @@ def _run_latest_refresh_job_in_generation(
         planned_refresh_nodes = set(
             dependency_preflight.get("refresh_node_ids") or []
         )
-        daily_basic_repair_dates = sorted(
-            str(value)
-            for value in (
-                (results.get("refresh_daily_basic") or {}).get(
-                    "downstream_refresh_dates"
-                )
-                or []
-            )
-            if str(value)
+        daily_basic_repair_dates, market_repair_dates, input_repair_dates = (
+            _historical_input_repair_dates(results)
         )
-        daily_basic_repair_start = (
-            daily_basic_repair_dates[0] if daily_basic_repair_dates else None
-        )
+        input_repair_start = input_repair_dates[0] if input_repair_dates else None
         dependency_preflight["daily_basic_repair_dates"] = (
             daily_basic_repair_dates
         )
+        dependency_preflight["market_repair_dates"] = market_repair_dates
         prior_attempt_preflight = (
             ((resume_status or {}).get("result") or {}).get(
                 "dependency_preflight"
@@ -9824,9 +10138,9 @@ def _run_latest_refresh_job_in_generation(
                 ),
                 (
                     "byd_daily_plan",
-                    lambda: get_byd_daily_strategy(refresh=True),
-                    "BYD 做T日线计划刷新失败",
-                    "BYD 做T日线计划已提前刷新完成",
+                    lambda: _refresh_transition_workspace(),
+                    "过渡期右侧次日计划刷新失败",
+                    "过渡期右侧次日计划已提前刷新完成",
                 ),
             ]
 
@@ -9840,7 +10154,7 @@ def _run_latest_refresh_job_in_generation(
                     composed, {
                         "convertible_bond_plan": "build_convertible_bond_grid_workspace",
                         "convertible_bond_allotment": "build_convertible_bond_allotment_workspace",
-                        "byd_daily_plan": "build_byd_daily_workspace",
+                        "byd_daily_plan": "build_transition_daily_workspace",
                     }[step_key], operation,
                 )
                 if step_key == "convertible_bond_plan":
@@ -9856,7 +10170,7 @@ def _run_latest_refresh_job_in_generation(
                     ).replace("-", "")
                     if actual_date != early_trade_date:
                         raise RuntimeError(
-                            "BYD 日线计划日期未更新到目标交易日: "
+                            "过渡期右侧计划日期未更新到目标交易日: "
                             f"expected={early_trade_date} actual={actual_date}"
                         )
                 with early_workspace_results_lock:
@@ -9883,6 +10197,7 @@ def _run_latest_refresh_job_in_generation(
                             "status": "success",
                             "signal_date": planned_t.get("signal_date"),
                             "alerts": len(payload.get("alerts") or []),
+                            "intraday_training_refresh": payload.get("intraday_training_refresh"),
                         }
                 _set_refresh_progress(
                     step_key=step_key,
@@ -10022,24 +10337,25 @@ def _run_latest_refresh_job_in_generation(
                     complete_previous=False,
                 )
             elif refresh_scope == "byd":
-                _set_refresh_progress(step_key="byd_daily_plan", message="正在刷新 BYD 做T日线计划", percent=92)
-                payload = get_byd_daily_strategy(refresh=True)
+                _set_refresh_progress(step_key="byd_daily_plan", message="正在刷新 过渡期右侧次日计划", percent=92)
+                payload = _refresh_transition_workspace()
                 planned_t = payload.get("planned_t") or {}
                 actual_date = str(planned_t.get("signal_date") or "").replace("-", "")
                 if actual_date != trade_date:
                     raise RuntimeError(
-                        "BYD 日线计划日期未更新到目标交易日: "
+                        "过渡期右侧计划日期未更新到目标交易日: "
                         f"expected={trade_date} actual={actual_date}"
                     )
                 results["byd_daily_plan"] = {
                     "status": "success",
                     "signal_date": planned_t.get("signal_date"),
                     "alerts": len(payload.get("alerts") or []),
+                    "intraday_training_refresh": payload.get("intraday_training_refresh"),
                 }
                 _set_refresh_progress(
                     step_key="byd_daily_plan",
                     step_status="success",
-                    message="BYD 做T日线计划刷新完成",
+                    message="过渡期右侧次日计划刷新完成",
                     percent=98,
                     complete_previous=False,
                 )
@@ -10162,7 +10478,7 @@ def _run_latest_refresh_job_in_generation(
         reusable_checkpoints = resume_inputs or reuse_completed
         feature_ready = (
             reusable_checkpoints
-            and daily_basic_repair_start is None
+            and input_repair_start is None
             and "feature.project_daily" not in planned_refresh_nodes
             and (results.get("feature_cache") or {}).get("status") == "success"
             and active_feature_sidecar_current()
@@ -10263,11 +10579,18 @@ def _run_latest_refresh_job_in_generation(
                 require_identity=strict_core,
                 input_snapshots=production_stage_inputs(
                     PROJECT_ROOT, feature_stage_nodes,
-                    changes={"data.daily_basic": NodeChanges(
-                        partitions=tuple(daily_basic_repair_dates), full_rebuild=True,
-                    )},
+                    changes={
+                        "data.market_daily": NodeChanges(
+                            partitions=tuple(market_repair_dates),
+                            full_rebuild=bool(market_repair_dates),
+                        ),
+                        "data.daily_basic": NodeChanges(
+                            partitions=tuple(daily_basic_repair_dates),
+                            full_rebuild=bool(daily_basic_repair_dates),
+                        ),
+                    },
                 ) if strict_core else None,
-                dirty_partitions=daily_basic_repair_dates,
+                dirty_partitions=input_repair_dates,
                 progress_callback=feature_stage_progress,
             )
             if feature_stage["status"] != "success":
@@ -10758,6 +11081,7 @@ def _run_latest_refresh_job_in_generation(
                         "status": "success",
                         "signal_date": planned_t.get("signal_date"),
                         "alerts": len(payload.get("alerts") or []),
+                        "intraday_training_refresh": payload.get("intraday_training_refresh"),
                     }
                 if future not in early_workspace_futures:
                     _set_refresh_progress(
@@ -10826,7 +11150,16 @@ def _run_latest_refresh_job_in_generation(
             delattr(_REFRESH_CONTEXT, "run_id")
 
 
-def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
+def start_latest_refresh(scope: str = "all", target_trade_date: str | None = None) -> dict[str, Any]:
+    if target_trade_date is not None:
+        target = date.fromisoformat(target_trade_date)
+        if target > date.today():
+            raise ValueError("Cannot refresh a future trade date")
+        target_trade_date = target.strftime("%Y%m%d")
+        from quant.routine.pipeline import _latest_daily_trade_date
+
+        if _latest_daily_trade_date() > target_trade_date:
+            raise ValueError("Historical refresh cannot replace a newer canonical daily watermark")
     refresh_scope = _normalize_refresh_scope(scope)
     refresh_label = REFRESH_SCOPE_LABELS[refresh_scope]
     resume_status: dict[str, Any] | None = None
@@ -10858,6 +11191,10 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
                     resume_status = dict(persisted)
                 elif _completed_checkpoint_ready(persisted, refresh_scope):
                     resume_status = dict(persisted)
+        if target_trade_date and _source_expected_trade_date(
+            (resume_status or {}).get("result")
+        ) != target_trade_date:
+            resume_status = None
         reuse_completed = _completed_checkpoint_ready(
             resume_status,
             refresh_scope,
@@ -10865,6 +11202,7 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
         thread = threading.Thread(
             target=_run_latest_refresh_job,
             args=(refresh_scope, resume_status, run_id),
+            kwargs={"target_trade_date": target_trade_date} if target_trade_date else {},
             name=f"quant-{refresh_scope}-refresh",
             daemon=True,
         )
@@ -10873,7 +11211,7 @@ def start_latest_refresh(scope: str = "all") -> dict[str, Any]:
             {
                 "status": "queued",
                 "run_id": run_id,
-                "trade_date": _source_expected_trade_date(
+                "trade_date": target_trade_date or _source_expected_trade_date(
                     (resume_status or {}).get("result")
                 ),
                 "attempt": 1 if reuse_completed else _refresh_attempt_number(resume_status),

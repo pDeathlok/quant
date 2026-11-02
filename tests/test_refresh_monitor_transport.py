@@ -17,7 +17,7 @@ class StatusClient:
             raise status
         return status
 
-    def start_refresh(self, _scope):
+    def start_refresh(self, _scope, trade_date=None):
         self.starts += 1
         return {"status": "queued"}
 

@@ -56,7 +56,7 @@ def test_add_chan_model_strategy_columns_marks_primary_and_expanded():
 
     assert not primary.empty
     assert (primary["chan_signal_name"] == "三买确认").all()
-    assert (primary["entry_gap_pct"] <= 3).all()
+    assert (primary.loc[primary["chan_model_signal"].eq(1), "entry_gap_pct"] <= 3).all()
     assert not expanded.empty
 
 
@@ -73,3 +73,34 @@ def test_summarize_chan_model_strategy_returns_rule_metrics():
 
     assert not summary.empty
     assert {"rule_id", "avg_return_10d", "win_rate_10d"} <= set(summary.columns)
+
+
+def test_close_candidate_survives_unknown_next_open_without_becoming_executable():
+    frame = _scored_frame()
+    frame.loc[frame.index[-1], "entry_gap_pct"] = float("nan")
+    selected = select_chan_model_candidates(frame)
+    assert selected["symbol"].tolist() == ["000010"]
+    assert selected.iloc[0]["chan_model_execution_status"] == "pending_open"
+    assert selected.iloc[0]["chan_model_signal"] == 0
+    assert "oot" not in summarize_chan_model_strategy(frame)["split"].tolist()
+
+
+def test_open_gap_status_boundaries_and_historical_execution_filter():
+    frame = _scored_frame()
+    latest = frame.iloc[[-1]].copy()
+    cases = [(float("nan"), "pending_open", 0), (3.0, "executable", 1),
+             (3.01, "reduce_watch", 0), (6.0, "reduce_watch", 0), (6.01, "skip", 0)]
+    for gap, status, executable in cases:
+        latest["entry_gap_pct"] = gap
+        out = add_chan_model_strategy_columns(pd.concat([frame.iloc[:-1], latest]))
+        row = out.iloc[-1]
+        assert row["chan_model_setup_signal"] == 1
+        assert row["chan_model_execution_status"] == status
+        assert row["chan_model_signal"] == executable
+
+
+def test_latest_empty_date_does_not_fall_back_to_old_candidates():
+    frame = _scored_frame()
+    frame.loc[frame.index[-1], "pred_target_good"] = 0.01
+    assert select_chan_model_candidates(frame).empty
+    assert not select_chan_model_candidates(frame, trade_date="2026-01-01").empty

@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股全市场扫描与条件选股"
+  short_description: "核验全市场扫描、筛选产业及事件候选，形成可追踪的条件操作名单"
+  default_prompt: "使用 $scan-a-shares 核验这份扫描报告，并补充市场覆盖检查、最终候选名单和条件操作建议。"

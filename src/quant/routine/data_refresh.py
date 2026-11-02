@@ -645,7 +645,9 @@ def _refresh_symbols_by_trade_date(
         name_by_symbol=name_by_symbol,
     )
     target_symbols = set(name_by_symbol)
-    market = market[market["ts_code"].isin(target_symbols)].copy()
+    # Coverage is checked against currently listed securities, but the dated
+    # source partition must retain delisted securities too. Replacing a date
+    # partition with the current roster silently erased their history.
     minimum_coverage_rate = float(
         os.getenv(
             "ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE",

@@ -29,6 +29,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LEFT_SIDE_RANKING_CONFIG_PATH = (
     PROJECT_ROOT / "configs/strategies/left_side_unified.yaml"
 )
+LEFT_SIDE_V5_SHADOW_SCORE_FIELDS: tuple[str, ...] = (
+    "shadow_v5_component_probability",
+    "shadow_v5_blended_percentile",
+    "shadow_v5_regime_score",
+    "shadow_v5_trade_gate_open",
+    "shadow_v5_absolute_score",
+    "shadow_v5_schema_version",
+)
 
 
 @dataclass(frozen=True)
@@ -216,6 +224,20 @@ def _load_left_side_ranking_frame(
             "left-side score output contains policy-excluded candidates: "
             f"{overlap[:20]}"
         )
+    shadow = manifest.get("shadow_v5") or {}
+    if shadow.get("status") == "success":
+        missing_shadow = set(LEFT_SIDE_V5_SHADOW_SCORE_FIELDS) - set(frame.columns)
+        if missing_shadow:
+            raise RuntimeError(
+                f"left-side v5 shadow score output missing: {sorted(missing_shadow)}"
+            )
+        absolute = pd.to_numeric(
+            frame["shadow_v5_absolute_score"], errors="coerce"
+        ).to_numpy(float)
+        if not np.isfinite(absolute).all() or (
+            (absolute < 0.0) | (absolute > 100.0)
+        ).any():
+            raise RuntimeError("left-side v5 shadow scores are outside [0, 100]")
     return frame, manifest
 
 
@@ -264,6 +286,23 @@ def load_left_side_ranking_scores(
     ), manifest
 
 
+def load_left_side_v5_shadow_scores(
+    signal_date: str | pd.Timestamp,
+    *,
+    config: LeftSideRankingConfig,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Load optional observe-only v5 fields without changing active ordering."""
+
+    frame, manifest = _load_left_side_ranking_frame(signal_date, config=config)
+    if (manifest.get("shadow_v5") or {}).get("status") != "success":
+        return {}, manifest
+    fields = list(LEFT_SIDE_V5_SHADOW_SCORE_FIELDS)
+    return {
+        str(row["symbol"]): {field: row[field] for field in fields}
+        for _, row in frame[["symbol", *fields]].iterrows()
+    }, manifest
+
+
 DEFAULT_LEFT_SIDE_RANKING_CONFIG = load_left_side_ranking_config()
 
 
@@ -272,7 +311,9 @@ __all__ = [
     "DEFAULT_LEFT_SIDE_RANKING_CONFIG_PATH",
     "LeftSideRankingConfig",
     "LeftSideRankingPaths",
+    "LEFT_SIDE_V5_SHADOW_SCORE_FIELDS",
     "load_left_side_ranking_config",
     "load_left_side_ranking_candidates",
     "load_left_side_ranking_scores",
+    "load_left_side_v5_shadow_scores",
 ]

@@ -18,6 +18,7 @@ const WORKSPACE_PAGE_BY_HASH = {
   "#chan": "chan",
   "#long": "long",
   "#byd": "byd",
+  "#transition": "byd",
   "#cb-allotment": "cbAllotment",
   "#cb": "cb",
   "#short": "short",
@@ -46,7 +47,9 @@ const state = {
   chanSelectedSymbol: null,
   bydPayload: null,
   bydLoading: false,
-  bydLastNoticeKey: "",
+  transitionStrategy: "return",
+  transitionDrafts: {},
+  transitionError: "",
   cbPayload: null,
   cbLoading: false,
   selectedCbStrategy: null,
@@ -60,6 +63,7 @@ const state = {
   similarLoading: false,
   similarError: "",
   similarSelectedSymbol: null,
+  similarTriggeredAlertsOnly: false,
   similarRefreshPromise: null,
   similarScoreRefreshPromise: null,
   similarScoreRefreshPending: false,
@@ -93,7 +97,7 @@ function isWorkspaceRead(path, options = {}) {
   if ((options.method || "GET").toUpperCase() !== "GET") return false;
   const pathname = path.split("?")[0];
   return ["/selector/calendar", "/selector/stocks", "/similar-patterns/analysis", "/similar-patterns/watchlist", "/operation-plans"].includes(pathname)
-    || ["/long/", "/chan/", "/byd/", "/convertible-bonds/"].some((prefix) => pathname.startsWith(prefix));
+    || ["/long/", "/chan/", "/byd/", "/transition/", "/convertible-bonds/"].some((prefix) => pathname.startsWith(prefix));
 }
 
 async function fetchWorkspaceResponse(path, options = {}, generation = "") {
@@ -219,12 +223,7 @@ const WATCHLIST_ALERT_INDICATORS = {
   holding_score: { label: "持有评分", unit: "分", source: "watchlist" },
 };
 const REFRESH_STATUS_STORAGE_KEY = "quant.selector.latestRefreshStatus";
-const BYD_HOLDING_STORAGE_KEY = "quant.byd.holding.v1";
 const WORKSPACE_TAB_ORDER_STORAGE_KEY = "quant.workspaceTabOrder.v1";
-const BYD_HOLDING_INPUT_IDS = [
-  "bydSharesInput",
-  "bydCostInput",
-];
 const REFRESH_SCOPE_LABELS = {
   all: "全部",
   short: "短线",
@@ -232,7 +231,7 @@ const REFRESH_SCOPE_LABELS = {
   long: "长线",
   cb: "可转债",
   cbAllotment: "配债股",
-  byd: "BYD",
+  byd: "过渡期右侧",
   similar: "自选池",
   plans: "操作计划",
 };
@@ -289,7 +288,7 @@ const WORKSPACE_TABS = [
   { key: "long", label: "长线策略", description: "好股票 / 好价格", panelId: "longPage" },
   { key: "cb", label: "可转债策略", description: "低位候选 / 分批计划", panelId: "cbPage" },
   { key: "cbAllotment", label: "配债股", description: "发行流程 / 关键日期", panelId: "cbAllotmentPage" },
-  { key: "byd", label: "BYD 做T", description: "盘前计划 / 正T优先", panelId: "bydPage" },
+  { key: "byd", label: "过渡期右侧", description: "趋势候选 / 次日执行", panelId: "bydPage" },
   { key: "similar", label: "自选池", description: "相似走势 / 策略联动", panelId: "similarPage" },
   { key: "plans", label: "操作计划", description: "次日执行 / 长期跟踪", panelId: "plansPage" },
 ];
@@ -367,57 +366,6 @@ function clearWorkspaceTabDropTargets() {
   document.querySelectorAll(".page-tab.tab-drop-before, .page-tab.tab-drop-after").forEach((button) => {
     button.classList.remove("tab-drop-before", "tab-drop-after");
   });
-}
-
-function setBydHoldingSaveStatus(message, tone = "") {
-  const status = document.querySelector("#bydHoldingSaveStatus");
-  if (!status) return;
-  status.textContent = message;
-  status.classList.toggle("saved", tone === "saved");
-  status.classList.toggle("error", tone === "error");
-}
-
-function saveBydHoldingInputs() {
-  const values = Object.fromEntries(BYD_HOLDING_INPUT_IDS.map((id) => [
-    id,
-    document.querySelector(`#${id}`)?.value ?? "",
-  ]));
-  const shares = Number(values.bydSharesInput);
-  const cost = Number(values.bydCostInput);
-  if (!Number.isFinite(shares) || shares < 0 || !Number.isFinite(cost) || cost <= 0) {
-    setBydHoldingSaveStatus("持仓股数或成本价无效，未保存", "error");
-    return false;
-  }
-  try {
-    localStorage.setItem(BYD_HOLDING_STORAGE_KEY, JSON.stringify({
-      version: 3,
-      savedAt: new Date().toISOString(),
-      values,
-    }));
-    setBydHoldingSaveStatus(`持仓已永久保存 · ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`, "saved");
-    return true;
-  } catch {
-    setBydHoldingSaveStatus("浏览器禁止本地存储，持仓未保存", "error");
-    return false;
-  }
-}
-
-function restoreBydHoldingInputs() {
-  let saved;
-  try {
-    saved = JSON.parse(localStorage.getItem(BYD_HOLDING_STORAGE_KEY) || "null");
-  } catch {
-    localStorage.removeItem(BYD_HOLDING_STORAGE_KEY);
-    setBydHoldingSaveStatus("已忽略损坏的持仓记录，请重新填写", "error");
-    return;
-  }
-  if (!saved?.values) return;
-  const values = saved.values;
-  BYD_HOLDING_INPUT_IDS.forEach((id) => {
-    const input = document.querySelector(`#${id}`);
-    if (input && values[id] !== undefined) input.value = values[id];
-  });
-  setBydHoldingSaveStatus("已恢复永久保存的持仓和成本", "saved");
 }
 
 const longStrategies = [
@@ -569,7 +517,7 @@ const formatBuyPlanText = (text) => {
     return `${signalText}${openText}${suffix}`;
   });
 };
-const pageHash = (page) => page === "plans" ? "#plans" : page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#byd" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
+const pageHash = (page) => page === "plans" ? "#plans" : page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#transition" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
 const currentLongStrategy = () => longStrategies.find((item) => item.key === state.longVariant) || longStrategies[0];
 
 function ensureWorkspaceTabs() {
@@ -632,7 +580,7 @@ function loadActivePageData() {
   } else if (state.activePage === "cbAllotment" && !state.cbAllotmentPayload && !state.cbAllotmentLoading) {
     loadConvertibleBondAllotments().catch(showError);
   } else if (state.activePage === "byd" && !state.bydPayload && !state.bydLoading) {
-    loadBydMinuteStrategy().catch(showError);
+    loadTransitionPlan().catch(showError);
   } else if (state.activePage === "similar" && !state.similarPayload && !state.similarLoading) {
     loadSimilarPatterns().catch(showError);
   } else if (state.activePage === "plans" && !state.operationPlansLoading && !state.operationPlansLoaded) {
@@ -983,7 +931,7 @@ function workspaceSelectionKey(scope, generationIdentity = state.workspaceGenera
     selection.push(state.shortSideFilter, [...state.selectedStrategies].sort());
   }
   if (scope === "byd") {
-    selection.push(...BYD_HOLDING_INPUT_IDS.map((id) => document.querySelector(`#${id}`)?.value || ""));
+    selection.push(state.transitionStrategy);
   }
   return JSON.stringify(selection);
 }
@@ -1648,6 +1596,8 @@ function renderSimilarPatternsPage() {
   const meta = document.querySelector("#similarMeta");
   const watchCount = document.querySelector("#similarWatchCount");
   const watchlist = document.querySelector("#similarWatchlist");
+  const alertFilter = document.querySelector("#similarTriggeredAlertsOnly");
+  if (alertFilter) alertFilter.checked = state.similarTriggeredAlertsOnly;
   const overview = document.querySelector("#similarSelectedOverview");
   const scenarioRows = document.querySelector("#similarScenarioRows");
   const modelList = document.querySelector("#similarSellModel");
@@ -1699,6 +1649,9 @@ function renderSimilarPatternsPage() {
   const alertStateBySymbol = new Map(alertEntries.map(({ item, alertState }) => [item.symbol, alertState]));
   const configuredAlertCount = alertEntries.reduce((total, { alertState }) => total + alertState.count, 0);
   const triggeredAlertEntries = alertEntries.filter(({ alertState }) => alertState.triggered);
+  const visibleWatch = state.similarTriggeredAlertsOnly
+    ? triggeredAlertEntries.map(({ item }) => item)
+    : rankedWatch;
   const triggeredReminderCount = triggeredAlertEntries.reduce(
     (total, { alertState }) => total + alertState.triggeredReminders.length,
     0,
@@ -1718,7 +1671,9 @@ function renderSimilarPatternsPage() {
         : payload.cache?.watchlist_changed
           ? `自选 ${watch.length} 只 · 自选池已变化，点击“刷新分析”更新结果`
       : `更新于 ${payload.generated_at || "-"} · 全池统一策略 · T+1 观望区 ${payload.config?.signal_bearish_max ?? 45}%～${payload.config?.signal_bullish_min ?? 55}% · 自选 ${watch.length} 只`;
-  if (watchCount) watchCount.textContent = `${watch.length} 只股票`;
+  if (watchCount) watchCount.textContent = state.similarTriggeredAlertsOnly
+    ? `${visibleWatch.length} / ${watch.length} 只股票`
+    : `${watch.length} 只股票`;
   if (signalSummary) {
     signalSummary.innerHTML = `
       <article class="similar-summary-card primary">
@@ -1738,7 +1693,7 @@ function renderSimilarPatternsPage() {
       </article>
     `;
   }
-  watchlist.innerHTML = rankedWatch.map((item) => {
+  watchlist.innerHTML = visibleWatch.map((item) => {
     const result = similarResultForSymbol(item.symbol);
     const target = result?.target || {};
     const snapshot = result?.latest_snapshot || {};
@@ -1820,7 +1775,9 @@ function renderSimilarPatternsPage() {
         </td>
       </tr>
     `;
-  }).join("") || `<tr><td colspan="10" class="empty-cell">暂无自选股票，请在上方输入股票代码加入</td></tr>`;
+  }).join("") || `<tr><td colspan="10" class="empty-cell">${state.similarTriggeredAlertsOnly && watch.length
+    ? "暂无触发提醒的股票，关闭筛选可查看全部自选"
+    : "暂无自选股票，请在上方输入股票代码加入"}</td></tr>`;
 
   const selectedWatchItem = similarWatchItem(state.similarSelectedSymbol);
   const selected = selectedSimilarResult();
@@ -2011,30 +1968,25 @@ async function loadLongStockPool(options = {}) {
   }
 }
 
-async function loadBydMinuteStrategy(options = {}) {
+async function loadTransitionPlan(options = {}) {
   state.bydLoading = true;
-  renderBydPage();
-  const shares = Number(document.querySelector("#bydSharesInput")?.value || 10000);
-  const cost = Number(document.querySelector("#bydCostInput")?.value || 110.6061);
-  const query = new URLSearchParams();
-  query.set("shares", String(shares));
-  query.set("cost", String(cost));
-  if (options.refresh) query.set("refresh", "true");
-  const endpoint = `/byd/daily-plan?${query.toString()}`;
+  state.transitionError = "";
+  renderTransitionPage();
+  const endpoint = `/transition/plan?strategy=${encodeURIComponent(state.transitionStrategy)}${options.refresh ? "&refresh=true" : ""}`;
   const request = beginWorkspaceRequest("byd", endpoint);
   try {
-    const payload = await fetchJson(endpoint, workspaceRequestOptions(options));
+    const payload = await fetchJson(endpoint, { timeoutMs: 0 });
     if (!isCurrentWorkspaceRequest(request)) return;
     state.bydPayload = payload;
-    maybeShowBydTradeToast(state.bydPayload, options);
   } catch (error) {
     if (!isCurrentWorkspaceRequest(request)) return;
-    showError(error);
+    state.bydPayload = null;
+    state.transitionError = error.message || "次日计划暂不可用";
     throw error;
   } finally {
     if (!isCurrentWorkspaceRequest(request)) return;
     state.bydLoading = false;
-    renderBydPage();
+    renderTransitionPage();
   }
 }
 
@@ -2159,62 +2111,6 @@ function cbCandidateGroups(filterKey = "all") {
         allStrategies: group.allStrategies,
       };
     });
-}
-
-function bydNoticeKey(item, payload) {
-  return [
-    payload?.generated_at || "",
-    item?.action || "",
-    item?.kind || "",
-    item?.price_line || "",
-    item?.shares_delta || "",
-  ].join("|");
-}
-
-function dismissBydTradeToast(markSeen = false) {
-  const toast = document.querySelector("#bydTradeToast");
-  if (!toast) return;
-  if (markSeen) {
-    const key = toast.dataset.noticeKey || "";
-    if (key) state.bydLastNoticeKey = key;
-  }
-  toast.classList.remove("show", "sell", "buy");
-  toast.innerHTML = "";
-  toast.dataset.noticeKey = "";
-}
-
-function maybeShowBydTradeToast(payload, options = {}) {
-  if (state.activePage !== "byd" || !payload) return;
-  const toast = document.querySelector("#bydTradeToast");
-  if (!toast) return;
-  const triggered = (payload.alerts || []).filter((item) => item.triggered && Math.abs(Number(item.shares_delta || 0)) > 0);
-  if (!triggered.length) {
-    if (options.refresh) dismissBydTradeToast(false);
-    return;
-  }
-  const item = triggered[0];
-  const key = bydNoticeKey(item, payload);
-  if (key === state.bydLastNoticeKey && !options.forceNotice) return;
-  const isSell = item.action === "SELL";
-  const rangeText = fmtRange(item.price_range);
-  const direction = isSell ? "卖出提醒" : "买回提醒";
-  const sharesText = `${Number(item.shares_delta) > 0 ? "+" : ""}${item.shares_delta} 股`;
-  toast.dataset.noticeKey = key;
-  toast.classList.toggle("sell", isSell);
-  toast.classList.toggle("buy", !isSell);
-  toast.classList.add("show");
-  toast.innerHTML = `
-    <div class="byd-toast-copy">
-      <span>${direction} · ${payload.minute?.asof || payload.generated_at || "-"}</span>
-      <strong>${item.title || direction}</strong>
-      <p>${isSell ? "卖出区间" : "买回区间"} <b>${rangeText}</b> · 建议 ${sharesText}</p>
-      <em>${item.detail || ""}</em>
-    </div>
-    <div class="byd-toast-actions">
-      <button type="button" data-byd-toast-action="seen">已记录</button>
-      <button type="button" data-byd-toast-action="close" aria-label="关闭 BYD 交易提醒">关闭</button>
-    </div>
-  `;
 }
 
 async function loadCalendar(options = {}) {
@@ -2360,13 +2256,13 @@ function renderChanModelPage() {
           </div>
         </td>
         <td>${Number(item.chan_score || 0).toFixed(1)}</td>
-        <td>${fmtPct(item.entry_gap_pct, 1)}</td>
+        <td>${item.entry_gap_pct == null ? escapeHtml(item.execution_label || "待开盘核验") : `${fmtPct(item.entry_gap_pct, 1)}<br><span>${escapeHtml(item.execution_label || "")}</span>`}</td>
         <td>${fmtWeight(item.position_pct)}</td>
       </tr>
     `).join("") : `<tr><td colspan="7" class="empty-cell">${state.chanLoading ? "正在加载候选" : "暂无缠论模型候选"}</td></tr>`;
   }
   if (detailTitle) detailTitle.textContent = selected ? `${selected.symbol} ${selected.name || ""}` : "选择候选";
-  if (detailMeta) detailMeta.textContent = selected ? `${chanRuleLabel(selected)} · ${selected.signal_name || "缠论结构信号"}` : "";
+  if (detailMeta) detailMeta.textContent = selected ? `${chanRuleLabel(selected)} · ${selected.signal_name || "缠论结构信号"} · ${selected.execution_label || ""}` : "";
   if (detail) {
     detail.innerHTML = selected ? `
       <div class="signal-cards chan-detail-cards">
@@ -2388,7 +2284,7 @@ function renderChanModelPage() {
         <div class="chan-mini-grid">
           ${chanMetricCard("信号收盘", fmtPrice(selected.close), "T日收盘后确认")}
           ${chanMetricCard("中枢区间", `${fmtPrice(selected.center_low)}-${fmtPrice(selected.center_high)}`, `宽度 ${fmtRate(selected.center_width)}`)}
-          ${chanMetricCard("T+1 开盘跳空", fmtPct(selected.entry_gap_pct, 1), "高开过大按计划降仓或放弃")}
+          ${chanMetricCard("T+1 开盘跳空", fmtPct(selected.entry_gap_pct, 1), selected.execution_label || "待开盘核验")}
           ${chanMetricCard("笔振幅", fmtRate(selected.stroke_amplitude), "过滤过热结构")}
         </div>
         <article class="signal-card">
@@ -2410,7 +2306,7 @@ function renderChanModelPage() {
       </div>
     ` : `<div class="empty-state">${state.chanLoading ? "正在加载缠论策略候选" : "暂无候选"}</div>`;
   }
-  if (notes) notes.innerHTML = (payload?.notes || []).map((item) => `<li>${item}</li>`).join("");
+  if (notes) notes.innerHTML = (payload?.execution_notes || payload?.notes || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
 }
 
 function monthOffset(month, offset) {
@@ -2728,6 +2624,7 @@ function renderStockRows() {
         <span class="score-stack">
           <strong>${shortScoreValue(item, "model")}</strong>
           <em>${shortScoreRankText(item, "model")} · ${item.model_score_source_label || "统一模型"}</em>
+          ${item.ranking_source === "left_side_unified" && Number.isFinite(Number(item.model_score_shadow_v5)) ? `<em>v5影子 ${Number(item.model_score_shadow_v5).toFixed(1)} · ${item.shadow_v5_trade_gate_open ? "开闸" : "观望"}</em>` : ""}
         </span>
       </td>
       <td title="评分数据 ${item.score_date || item.date || "-"} · ${item.score_feature_source === "live_daily" ? "当日日线特征" : "历史模型特征"}">
@@ -2778,7 +2675,10 @@ function renderStockDetail() {
     return;
   }
   title.textContent = `${stock.symbol} ${stock.name || ""}`;
-  meta.textContent = `行业 ${stock.industry || "-"} · 收盘 ${fmtPrice(stock.close)} · 模型分 ${shortScoreValue(stock, "model")}（${shortScoreRankText(stock, "model")}，${stock.model_score_source_label || "统一模型"}） · 买入分 ${shortScoreValue(stock, "buy")}（${shortScoreRankText(stock, "buy")}） · 持有分 ${shortScoreValue(stock, "hold")}（${shortScoreRankText(stock, "hold")}） · ${stock.score_usage_hint || ""} · ${stock.score_risk_note || ""} · 命中 ${stock.matched_count} 个策略组 · ${stock.matched_families.join(" / ")} · ${stock.rank_reason || ""}`;
+  const shadowText = stock.ranking_source === "left_side_unified" && Number.isFinite(Number(stock.model_score_shadow_v5))
+    ? ` · v5影子绝对分 ${Number(stock.model_score_shadow_v5).toFixed(1)}（${stock.shadow_v5_trade_gate_open ? "市场开闸" : "市场观望"}，暂不参与生产排序）`
+    : "";
+  meta.textContent = `行业 ${stock.industry || "-"} · 收盘 ${fmtPrice(stock.close)} · 模型分 ${shortScoreValue(stock, "model")}（${shortScoreRankText(stock, "model")}，${stock.model_score_source_label || "统一模型"}）${shadowText} · 买入分 ${shortScoreValue(stock, "buy")}（${shortScoreRankText(stock, "buy")}） · 持有分 ${shortScoreValue(stock, "hold")}（${shortScoreRankText(stock, "hold")}） · ${stock.score_usage_hint || ""} · ${stock.score_risk_note || ""} · 命中 ${stock.matched_count} 个策略组 · ${stock.matched_families.join(" / ")} · ${stock.rank_reason || ""}`;
   body.innerHTML = stock.signals.map((signal) => {
     const metrics = signal.metrics || {};
     return `
@@ -2834,7 +2734,7 @@ function shortCalibrationScores(calibration) {
     .filter((item) => (
       calibration.key === "model_right"
         ? item.ranking_source === "right_side_unified"
-        : calibration.key === "model_left"
+        : calibration.key === "model_left" || calibration.key === "model_left_v5_shadow"
         ? item.ranking_source === "left_side_unified"
         : true
     ))
@@ -2867,7 +2767,7 @@ function visibleScoreCalibrations(calibrations) {
     return calibrations.filter((item) => item.key !== "model_right");
   }
   if (state.shortSideFilter === "right") {
-    return calibrations.filter((item) => item.key !== "model_left");
+    return calibrations.filter((item) => !["model_left", "model_left_v5_shadow"].includes(item.key));
   }
   return calibrations;
 }
@@ -4041,142 +3941,66 @@ function renderConvertibleBondAllotments() {
   `).join("");
 }
 
-function renderBydPage() {
-  const payload = state.bydPayload;
-  const status = document.querySelector("#bydDataStatus");
-  const subline = document.querySelector("#bydSubline");
-  const primary = document.querySelector("#bydPrimaryAction");
-  const metrics = document.querySelector("#bydPositionMetrics");
-  const stageLabel = document.querySelector("#bydStageLabel");
-  const ladder = document.querySelector("#bydPriceLadder");
-  const intradayZones = document.querySelector("#bydIntradayZones");
-  const alerts = document.querySelector("#bydAlerts");
-  const alertCount = document.querySelector("#bydAlertCount");
-  const playbook = document.querySelector("#bydPlaybook");
-  const validationStatus = document.querySelector("#bydValidationStatus");
-  const validationDecision = document.querySelector("#bydValidationDecision");
-  const validationMetrics = document.querySelector("#bydValidationMetrics");
-  if (!primary || !metrics || !ladder || !alerts || !playbook) return;
-  if (state.bydLoading) {
-    if (status) status.textContent = "正在刷新日线计划...";
-    primary.innerHTML = `<div class="empty-state">正在生成 BYD 日线做T计划...</div>`;
-    metrics.innerHTML = "";
-    ladder.innerHTML = "";
-    if (intradayZones) intradayZones.innerHTML = "";
-    alerts.innerHTML = "";
-    playbook.innerHTML = "";
-    if (validationStatus) validationStatus.textContent = "正在读取回测结论";
-    if (validationMetrics) validationMetrics.innerHTML = "";
+function transitionMoney(value) { return Number.isFinite(Number(value)) && value != null ? Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 }) : "—"; }
+function transitionPct(value) { return Number.isFinite(Number(value)) && value != null ? `${(Number(value) * 100).toFixed(2)}%` : "—"; }
+function transitionDraftFromForm() {
+  const p = state.bydPayload;
+  if (!p || p.strategy !== state.transitionStrategy) return null;
+  return { revision: p.account.revision, cash: Number(document.querySelector("#transitionCash").value), positions: [...document.querySelectorAll("#transitionHoldingInputs tr")].map((row) => ({ symbol: row.querySelector('[data-field="symbol"]').value.trim().toUpperCase(), entry_date: row.querySelector('[data-field="entry_date"]').value, quantity: Number(row.querySelector('[data-field="quantity"]').value), cost: Number(row.querySelector('[data-field="cost"]').value) })) };
+}
+function rememberTransitionDraft() {
+  const draft = transitionDraftFromForm();
+  if (draft) state.transitionDrafts[state.transitionStrategy] = draft;
+  document.querySelector("#transitionAccountStatus").textContent = "有未保存更改；操作计划仍基于上次保存的实际账户。";
+}
+function renderTransitionHoldings(account) {
+  const draft = state.transitionDrafts[state.transitionStrategy] || account;
+  document.querySelector("#transitionCash").value = draft.cash;
+  document.querySelector("#transitionHoldingInputs").innerHTML = (draft.positions || []).map((p, i) => `<tr><td><input aria-label="股票代码${i + 1}" data-field="symbol" value="${escapeHtml(p.symbol || "")}" placeholder="300001 / 688001" required pattern="(?:3[0-9]{5}(?:\\.SZ)?|688[0-9]{3}(?:\\.SH)?)" /></td><td><input aria-label="入场日期${i + 1}" data-field="entry_date" type="date" value="${escapeHtml(p.entry_date || "")}" required /></td><td><input aria-label="当前股数${i + 1}" data-field="quantity" type="number" min="1" step="1" value="${p.quantity || ""}" required /></td><td><input aria-label="每股成本${i + 1}" data-field="cost" type="number" min="0.0001" step="0.0001" value="${p.cost || ""}" required /></td><td><button type="button" data-transition-remove="${i}">移除记录</button></td></tr>`).join("");
+  document.querySelector("#transitionAccountStatus").textContent = state.transitionDrafts[state.transitionStrategy] ? "有未保存更改；计划基于上次保存的记录。" : account.confirmed ? `已读取账户 · 版本${account.revision} · 成交后请更新实际现金和股数` : "尚未确认账户；请填写实际现金和持仓并保存，才能启用买入清单。";
+}
+function expireTransitionPlan() {
+  const p = state.bydPayload;
+  if (!p?.trade_date || p.expired) return;
+  const now = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
+  const day = now.slice(0, 10), time = now.slice(11, 16);
+  if (day > p.trade_date || (day === p.trade_date && time >= "15:00")) {
+    p.expired = true; p.status = "blocked"; p.can_open_new = false;
+    p.issues = [...(p.issues || []), "该执行交易日已结束，请重算下一交易日计划；不要继续执行旧指令。"];
+    p.buys = (p.buys || []).map((r) => ({ ...r, action: "WATCH", estimated_quantity: 0, reason: "旧计划已过期，不执行" }));
+    p.holds = [...(p.holds || []), ...(p.sells || []).map((r) => ({ ...r, action: "CHECK", reason: "旧卖出计划已过期，请核对实际成交并重算" }))]; p.sells = [];
+  }
+}
+function renderTransitionPage() {
+  expireTransitionPlan();
+  const p = state.bydPayload;
+  const status = document.querySelector("#transitionStatus");
+  if (!status) return;
+  document.querySelector("#transitionStrategy").value = state.transitionStrategy;
+  const ready = p && p.strategy === state.transitionStrategy && !state.bydLoading;
+  status.textContent = state.bydLoading ? "正在核对行情、交易日历与持仓…" : !ready ? "计划不可用" : ({ ready: "次日条件计划已生成", needs_account: "先确认实际账户", blocked: "暂停交易 · 数据待核对" }[p.status] || "待核对");
+  status.className = `transition-badge ${ready && p.status === "ready" ? "ready" : ""}`;
+  if (state.activePage === "byd") document.querySelector("#generatedAt").textContent = ready ? `收盘 ${p.signal_date || "待核对"}` : "正在核对收盘数据";
+  if (!ready) {
+    document.querySelector("#transitionOverview").textContent = "";
+    document.querySelector("#transitionIssues").textContent = state.transitionError || "等待核对完整收盘数据与实际账户。";
+    document.querySelector("#transitionBuySummary").textContent = "等待完整收盘数据与实际账户。";
+    document.querySelector("#transitionBuys").textContent = "暂无可执行买入计划";
+    document.querySelector("#transitionSellHold").textContent = "等待读取持仓";
     return;
   }
-  if (!payload) {
-    if (status) status.textContent = "等待加载";
-    primary.innerHTML = `<div class="empty-state">切到 BYD 做T页面后加载日线计划</div>`;
-    metrics.innerHTML = "";
-    ladder.innerHTML = "";
-    if (intradayZones) intradayZones.innerHTML = "";
-    alerts.innerHTML = "";
-    playbook.innerHTML = "";
-    if (validationStatus) validationStatus.textContent = "等待加载";
-    if (validationMetrics) validationMetrics.innerHTML = "";
-    return;
-  }
-  const holding = payload.holding || {};
-  const minute = payload.minute || {};
-  const plan = payload.daily_t_plan || payload.planned_t || {};
-  const positive = plan.positive || {};
-  const reverse = plan.reverse || {};
-  const inventory = plan.inventory || {};
-  const action = payload.primary_action || {};
-  const validation = payload.validation || plan.validation || {};
-  if (status) status.textContent = `${payload.data_status || "-"} · ${payload.generated_at || ""}`;
-  if (stageLabel) stageLabel.textContent = payload.stage?.label || "-";
-  if (subline) {
-    subline.textContent = `${holding.shares || 0} 股 · 成本 ${fmtPrice(holding.cost)} · 日线收盘 ${fmtPrice(plan.reference_close || minute.last)} · 数据日 ${plan.signal_date || minute.asof || ""}`;
-  }
-  if (validationStatus) {
-    validationStatus.textContent = `${validation.label || "未提供验证结果"} · ${validation.period || ""}`;
-    validationStatus.classList.toggle("positive", Boolean(validation.execution_enabled));
-    validationStatus.classList.toggle("negative", validation.execution_enabled === false);
-  }
-  if (validationDecision) validationDecision.textContent = validation.decision || "没有验证结论，不启用新开T仓。";
-  if (validationMetrics) {
-    validationMetrics.innerHTML = (validation.held_out_results || []).map((item) => `
-      <article>
-        <span>${item.name || "候选"}</span>
-        <strong class="${Number(item.net_pnl || 0) >= 0 ? "positive" : "negative"}">${fmtMoney(item.net_pnl)}</strong>
-        <em>${item.cycles || 0} 笔 · 胜率 ${fmtPct(Number(item.win_rate || 0) * 100, 1)} · 盈利因子 ${item.profit_factor == null ? "∞（无亏损）" : Number(item.profit_factor).toFixed(2)}</em>
-      </article>
-    `).join("");
-  }
-  const actionClass = positive.execution_enabled ? "triggered" : "waiting";
-  primary.innerHTML = `
-    <div class="byd-action-card ${actionClass}">
-      <span>${action.action || "-"}</span>
-      <strong>${action.title || "-"}</strong>
-      <p>${action.detail || ""}</p>
-      <div>
-        <em>建议股数 ${Number(action.shares_delta || 0) > 0 ? "+" : ""}${action.shares_delta || 0}</em>
-        <em>买入 ${fmtPrice(positive.buy_price)}</em>
-        <em>目标 ${fmtPrice(positive.target_price)}</em>
-      </div>
-    </div>
-  `;
-  metrics.innerHTML = `
-    <div><span>持仓</span><strong>${holding.shares || 0} 股</strong></div>
-    <div><span>库存比例</span><strong>${fmtPct((holding.inventory_ratio || 0) * 100, 1)}</strong></div>
-    <div><span>浮动盈亏</span><strong class="${Number(holding.unrealized_pnl || 0) < 0 ? "negative" : "positive"}">${fmtMoney(holding.unrealized_pnl)}</strong></div>
-    <div><span>盈亏率</span><strong class="${Number(holding.unrealized_pnl_pct || 0) < 0 ? "negative" : "positive"}">${fmtPct(holding.unrealized_pnl_pct, 2)}</strong></div>
-    <div><span>合理收盘仓</span><strong>${inventory.reasonable_min_shares || 8000}-${inventory.full_shares || 10000} 股</strong></div>
-    <div><span>盘中上限</span><strong>${inventory.intraday_max_shares || 12000} 股</strong></div>
-  `;
-  if (intradayZones) {
-    intradayZones.innerHTML = `
-      <article class="${positive.execution_enabled ? "buyback-zone" : "no-sell-zone"}">
-        <span>正T优先 · ${positive.status || "等待"}</span>
-        <strong>买 ${fmtPrice(positive.buy_price)} → 卖 ${fmtPrice(positive.target_price)}</strong>
-        <em>${positive.entry_rule || "买点不到不买"} ${positive.exit_rule || "目标不到尾盘退出"}</em>
-      </article>
-      <article class="no-sell-zone">
-        <span>反T · ${reverse.status || "暂停"}</span>
-        <strong>观察卖 ${fmtPrice(reverse.sell_price)} → 买回 ${fmtPrice(reverse.buyback_price)}</strong>
-        <em>${reverse.reason || "反T未通过验证，不执行"}</em>
-      </article>
-      <article class="basis-zone">
-        <span>计划口径</span>
-        <strong>${plan.signal_date || "-"} 收盘后生成</strong>
-        <em>${plan.basis || "盘前固定，盘中不更新"}</em>
-      </article>
-      <article class="basis-zone">
-        <span>仓位处理放在T计划之后</span>
-        <strong>${holding.shares || 0} / ${inventory.full_shares || 10000} 股</strong>
-        <em>${inventory.note || "完成T后再处理仓位偏离"}</em>
-      </article>
-    `;
-  }
-  ladder.innerHTML = `
-    <div><span>日线参考收盘</span><strong>${fmtPrice(plan.reference_close)}</strong><em>${plan.signal_date || "-"}</em></div>
-    <div><span>正T买入点</span><strong>${fmtPrice(positive.buy_price)}</strong><em>到价买 ${positive.shares || 0} 股；不到不买</em></div>
-    <div><span>正T目标价</span><strong>${fmtPrice(positive.target_price)}</strong><em>成交后立即准备卖出同等股数</em></div>
-    <div><span>正T兜底退出</span><strong>14:50 后</strong><em>目标未到则直接卖出完成T</em></div>
-    <div><span>反T观察卖点</span><strong>${fmtPrice(reverse.sell_price)}</strong><em>当前不执行</em></div>
-    <div><span>反T观察买回</span><strong>${fmtPrice(reverse.buyback_price)}</strong><em>未通过盈利闸门</em></div>
-  `;
-  if (alertCount) alertCount.textContent = positive.execution_enabled ? "1 条正T可执行" : "今日等待";
-  alerts.innerHTML = [positive, reverse].map((item, index) => `
-    <article class="byd-alert ${item.execution_enabled ? "triggered" : "research-only"}">
-      <div>
-        <span>${item.execution_enabled ? "可执行" : "观察"}</span>
-        <strong>${index === 0 ? "正T计划" : "反T计划"} · ${item.status || "-"}</strong>
-        <p>${index === 0 ? `${item.entry_rule || ""} ${item.exit_rule || ""}` : item.reason || ""}</p>
-      </div>
-      <aside>
-        <strong>${index === 0 ? fmtPrice(item.buy_price) : fmtPrice(item.sell_price)}</strong>
-        <em>${item.shares || 0} 股</em>
-      </aside>
-    </article>
-  `).join("");
-  playbook.innerHTML = (payload.playbook || []).map((item) => `<li>${item}</li>`).join("");
+  document.querySelector("#transitionSubline").textContent = `信号收盘：${p.signal_date || "待更新"} → 执行交易日：${p.trade_date || "待确认"} · ${p.label} · 冻结研究候选 · ${p.execution_time || "次日收盘"}`;
+  document.querySelector("#transitionOverview").innerHTML = [["市场状态", p.market.label], ["账户权益参考", transitionMoney(p.equity)], ["可用现金", transitionMoney(p.account.cash)], ["单股建仓预算", transitionMoney(p.per_stock_budget)], ["实际持仓", `${p.account.positions.length} / 5`], ["新仓条件", p.can_open_new ? "允许条件买入" : "不买入 / 待核对"]].map(([k,v]) => `<div><span>${escapeHtml(k)}</span><strong>${escapeHtml(String(v))}</strong></div>`).join("");
+  document.querySelector("#transitionIssues").innerHTML = (p.issues || []).map((x) => `<p class="transition-note">${escapeHtml(x)}</p>`).join("");
+  const positions = [...(p.sells || []), ...(p.holds || [])];
+  document.querySelector("#transitionSellHold").innerHTML = positions.length ? positions.map((x) => `<div class="transition-position"><div><span class="transition-action ${x.action.toLowerCase()}">${({ SELL: "卖出", HOLD: "持有", CHECK: "待核对" })[x.action]}</span><strong>${escapeHtml(x.name)} · ${escapeHtml(x.symbol)}</strong></div><p>${escapeHtml(x.reason)}</p><p class="subline">${x.quantity}股 · 入场${escapeHtml(x.entry_date)} · 已持${x.holding_sessions ?? "—"}个交易日 · 到期${escapeHtml(x.deadline || "待确认")}</p><p class="subline">参考收盘 ${transitionMoney(x.close)} · 入场日参考收盘 ${transitionMoney(x.entry_reference)} · ${p.strategy === "return" ? `跟踪触发参考价 ${transitionMoney(x.trailing_price)}` : `止盈参考价 ${transitionMoney(x.take_profit_price)} / 止损参考价 ${transitionMoney(x.stop_loss_price)}`}</p>${x.action === "SELL" ? `<p><b>${escapeHtml(p.trade_date || "日期待确认")}收盘尝试卖出${x.sell_quantity}股</b>；跌停/停牌/容量不足则未成交部分顺延，不因反弹取消。</p>` : ""}</div>`).join("") : '<p class="transition-empty">当前没有已记录持仓，无需卖出。实际成交后再更新账户。</p>';
+  const buys = p.buys || [];
+  const actionable = buys.filter((x) => x.action === "BUY");
+  document.querySelector("#transitionBuySummary").innerHTML = `<p class="transition-decision">${p.can_open_new ? `当前现金及空槽可支持${actionable.length}项条件买入` : p.market.state === "transition" ? "过渡阶段，等待账户或数据核对" : "市场非过渡阶段，次日不开新仓"}</p><p>按队列依次评估，先跳过已有持仓。当前无空槽或现金不足的股票保留为备选；卖出成交后才能重新核算。</p><p class="subline">数量是按信号收盘估算的参考值，次日收盘须按实际价格、现金和成交额上限重算。未成交不追单顺延，次日重新生成计划。</p>`;
+  document.querySelector("#transitionBuys").innerHTML = buys.length ? `<table class="transition-table"><thead><tr><th>顺序 / 操作</th><th>股票</th><th>参考收盘</th><th>距MA20 / 20日波动</th><th>预算 / 估算股数</th><th>条件与原因</th></tr></thead><tbody>${buys.map((x) => `<tr><td>${x.rank} <span class="transition-action ${x.action === "BUY" ? "buy" : "hold"}">${x.action === "BUY" ? "条件买入" : x.action === "AFTER_SELL" ? "卖后再评估" : "备选"}</span></td><td><b>${escapeHtml(x.name)}</b><br>${escapeHtml(x.symbol)}</td><td>${transitionMoney(x.close)}</td><td>${transitionPct(x.distance)} / ${transitionPct(x.vol20)}</td><td>${transitionMoney(x.budget)}元<br>${x.estimated_quantity}股</td><td>${escapeHtml(x.reason)}<br><small>${escapeHtml(x.execution)}</small></td></tr>`).join("")}</tbody></table>` : '<p class="transition-empty">没有满足冻结规则的备选，保持现金，等待下一收盘。</p>';
+  renderTransitionHoldings(p.account);
+  document.querySelector("#transitionExecutionRules").innerHTML = `<ol>${(p.rules || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ol><p class="transition-note">当前为冻结研究候选。每笔买卖需要人工核实并执行，页面不会连接券商自动下单。</p>`;
+  document.querySelector("#transitionIndices").innerHTML = `<table class="transition-table"><thead><tr><th>指数</th><th>收盘</th><th>MA20</th><th>MA60</th><th>MA250</th></tr></thead><tbody>${(p.market.indices || []).map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${transitionMoney(r.close)}</td>${[20,60,250].map((n) => `<td>${transitionMoney(r[`ma${n}`])} · ${r[`above${n}`] ? "站上" : "未站上"}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 }
 
 function render() {
@@ -4200,7 +4024,7 @@ function render() {
   } else if (state.activePage === "cbAllotment") {
     renderConvertibleBondAllotments();
   } else if (state.activePage === "byd") {
-    renderBydPage();
+    renderTransitionPage();
   } else if (state.activePage === "similar") {
     renderSimilarPatternsPage();
   }
@@ -4339,7 +4163,8 @@ function setRefreshStatus(status) {
   state.latestRefreshStatus = status;
   const time = status.finished_at || status.started_at || "";
   const percent = Number(status.percent || 0);
-  const scopeLabel = status.scope_label || REFRESH_SCOPE_LABELS[status.scope] || "";
+  const legacyWorkspace = status.scope === "byd" && !["running", "queued"].includes(status.status) && (status.steps || []).some((step) => (step.label || "").includes("BYD"));
+  const scopeLabel = legacyWorkspace ? "旧工作区历史任务" : status.scope_label || REFRESH_SCOPE_LABELS[status.scope] || "";
   const statusMessage = formatRefreshStatusMessage(status, scopeLabel);
   localStorage.setItem(REFRESH_STATUS_STORAGE_KEY, JSON.stringify(status));
   const statusHtml = `
@@ -4352,7 +4177,7 @@ function setRefreshStatus(status) {
     </div>
   `;
   const stepsHtml = (status.steps || []).map((step) => `
-    <span class="progress-step ${step.status || "pending"}">${step.label}</span>
+    <span class="progress-step ${step.status || "pending"}">${step.key === "byd_daily_plan" && (step.label || "").includes("BYD") ? "旧工作区计划（历史记录）" : step.label}</span>
   `).join("");
   statusEls.forEach((el) => { el.innerHTML = statusHtml; });
   stepsEls.forEach((el) => { el.innerHTML = stepsHtml; });
@@ -4399,7 +4224,7 @@ async function reloadAfterRefresh(status) {
   } else if (state.activePage === "cbAllotment" && shouldReloadAllotment) {
     await loadConvertibleBondAllotments();
   } else if (state.activePage === "byd" && shouldReloadByd) {
-    await loadBydMinuteStrategy();
+    await loadTransitionPlan();
   } else if (state.activePage === "similar" && shouldReloadSimilar) {
     await loadSimilarPatterns();
   } else if (state.activePage === "short" && shouldReloadShort) {
@@ -4646,36 +4471,33 @@ document.querySelector("#longPoolRefresh").addEventListener("click", async () =>
   }
 });
 
-document.querySelector("#bydRefreshButton")?.addEventListener("click", async () => {
-  if (!saveBydHoldingInputs()) return;
-  const button = document.querySelector("#bydRefreshButton");
-  button.disabled = true;
-  button.textContent = "刷新中";
+document.querySelector("#transitionStrategy")?.addEventListener("change", (event) => {
+  if (state.transitionDrafts[state.transitionStrategy]) rememberTransitionDraft();
+  state.transitionStrategy = event.target.value;
+  invalidateWorkspaceRequest("byd"); state.bydPayload = null;
+  loadTransitionPlan().catch(showError);
+});
+document.querySelector("#transitionReload")?.addEventListener("click", () => runDirectWorkspaceRefresh("byd", () => loadTransitionPlan({ refresh: true })).catch(showError));
+document.querySelector("#transitionCash")?.addEventListener("input", rememberTransitionDraft);
+document.querySelector("#transitionHoldingInputs")?.addEventListener("input", rememberTransitionDraft);
+document.querySelector("#transitionHoldingInputs")?.addEventListener("click", (event) => {
+  const b = event.target.closest("[data-transition-remove]"); if (!b) return;
+  const d = transitionDraftFromForm(); d.positions.splice(Number(b.dataset.transitionRemove), 1); state.transitionDrafts[state.transitionStrategy] = d; renderTransitionHoldings(state.bydPayload.account);
+});
+document.querySelector("#transitionAddHolding")?.addEventListener("click", () => {
+  const d = transitionDraftFromForm(); if (!d) return;
+  d.positions.push({ symbol: "", entry_date: "", quantity: "", cost: "" }); state.transitionDrafts[state.transitionStrategy] = d; renderTransitionHoldings(state.bydPayload.account);
+});
+document.querySelector("#transitionRestoreAccount")?.addEventListener("click", () => { delete state.transitionDrafts[state.transitionStrategy]; loadTransitionPlan().catch(showError); });
+document.querySelector("#transitionAccountForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault(); const draft = transitionDraftFromForm(); if (!draft) return;
+  const policy = state.transitionStrategy; const button = document.querySelector("#transitionSaveAccount"); button.disabled = true;
   try {
-    await runDirectWorkspaceRefresh("byd", () => loadBydMinuteStrategy({ refresh: true }));
-  } catch (error) {
-    showError(error);
-  } finally {
-    button.disabled = false;
-    button.textContent = "刷新日线计划";
-  }
-});
-
-document.querySelector("#bydTradeToast")?.addEventListener("click", (event) => {
-  const action = event.target?.dataset?.bydToastAction;
-  if (!action) return;
-  dismissBydTradeToast(action === "seen");
-});
-
-BYD_HOLDING_INPUT_IDS.map((id) => document.querySelector(`#${id}`)).filter(Boolean).forEach((input) => {
-  input.addEventListener("input", () => invalidateWorkspaceRequest("byd"));
-  input.addEventListener("change", () => {
-    invalidateWorkspaceRequest("byd");
-    if (!saveBydHoldingInputs()) return;
-    if (state.activePage === "byd") {
-      loadBydMinuteStrategy().catch(showError);
-    }
-  });
+    await fetchJson(`/transition/account/${policy}`, { method: "PUT", body: JSON.stringify(draft) });
+    delete state.transitionDrafts[policy];
+    if (state.transitionStrategy === policy) await loadTransitionPlan();
+  } catch (error) { document.querySelector("#transitionAccountStatus").textContent = error.message || "保存失败，持仓未改变"; }
+  finally { button.disabled = false; }
 });
 
 let watchlistContextTarget = null;
@@ -5196,6 +5018,11 @@ function closeSimilarNoteDialog() {
   if (form) delete form.dataset.similarNoteSymbol;
 }
 
+document.querySelector("#similarTriggeredAlertsOnly")?.addEventListener("change", (event) => {
+  state.similarTriggeredAlertsOnly = event.currentTarget.checked;
+  renderSimilarPatternsPage();
+});
+
 document.querySelector("#similarNoteCancel")?.addEventListener("click", closeSimilarNoteDialog);
 document.querySelector("#similarNoteCancelBottom")?.addEventListener("click", closeSimilarNoteDialog);
 document.querySelector("#similarNoteDialog")?.addEventListener("click", (event) => {
@@ -5524,10 +5351,12 @@ const initialDateInput = document.querySelector("#signalDateInput");
 if (initialDateInput) initialDateInput.value = "";
 state.signalDate = "";
 resetOperationPlanForm();
-restoreBydHoldingInputs();
+
 renderPageShell();
 renderLongStrategies();
 renderLongStockPool();
 restoreLatestRefreshStatus().catch(showError);
 loadCalendar().catch(showError);
 loadActivePageData();
+
+setInterval(() => { if (state.activePage === "byd" && state.bydPayload && !state.bydPayload.expired) { expireTransitionPlan(); if (state.bydPayload.expired) renderTransitionPage(); } }, 60000);

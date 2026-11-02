@@ -224,6 +224,11 @@ def test_score_manifest_propagates_policy_exclusions(
         "_score_input_fingerprint",
         lambda *_args, **_kwargs: "fingerprint",
     )
+    monkeypatch.setattr(
+        production,
+        "_load_left_side_v5_shadow_bundle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    )
 
     result = production.score_left_side_production("2026-09-01", config=config)
 

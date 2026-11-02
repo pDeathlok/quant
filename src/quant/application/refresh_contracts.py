@@ -12,7 +12,7 @@ REFRESH_SCOPE_LABELS = {
     "long": "长线策略",
     "cb": "可转债策略",
     "cbAllotment": "配债股",
-    "byd": "BYD 做T",
+    "byd": "过渡期右侧",
     "similar": "自选池",
     "rightSideShadow": "右侧统一模型影子",
     "rightSideRankingCandidate": "右侧统一模型生产候选验收",
@@ -39,7 +39,7 @@ REFRESH_STEP_DEFINITIONS = {
     "long_stock_pool": {"label": "刷新长线因子截面、页面股票池与带血筹每日计划", "percent": 92},
     "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
     "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
-    "byd_daily_plan": {"label": "刷新 BYD 做T日线计划", "percent": 97},
+    "byd_daily_plan": {"label": "刷新过渡期右侧次日计划", "percent": 97},
     "similar_patterns": {"label": "刷新自选池相似走势", "percent": 97},
     "snapshot": {"label": "写入策略股票池快照", "percent": 98},
     "right_side_shadow_features": {"label": "构建右侧影子 canonical 因子", "percent": 80},
@@ -61,6 +61,7 @@ def normalize_refresh_scope(scope: str | None = None) -> str:
         return "all"
     value = str(scope).strip()
     aliases = {
+        "transition": "byd",
         "cb-allotment": "cbAllotment",
         "allotment": "cbAllotment",
         "convertible_bond": "cb",

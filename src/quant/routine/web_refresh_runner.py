@@ -172,10 +172,13 @@ class RefreshApiClient:
         response.raise_for_status()
         return response.json()
 
-    def start_refresh(self, scope: str) -> dict[str, Any]:
+    def start_refresh(self, scope: str, trade_date: str | None = None) -> dict[str, Any]:
+        payload = {"scope": scope}
+        if trade_date is not None:
+            payload["trade_date"] = trade_date
         response = self.session.post(
             f"{self.base_url}/selector/refresh-latest",
-            json={"scope": scope},
+            json=payload,
             timeout=30,
         )
         response.raise_for_status()
@@ -694,7 +697,10 @@ def _run_refresh_workflow_locked(
         else:
             attempts += 1
             print_fn(f"[refresh] 提交刷新，第 {attempts} 次（普通错误最多 {config.max_attempts} 次）")
-            status = client.start_refresh(config.scope)
+            status = (
+                client.start_refresh(config.scope, trade_date=target_date.isoformat())
+                if target_date is not None else client.start_refresh(config.scope)
+            )
             print_fn(
                 "[refresh] "
                 f"status={status.get('status')} percent={status.get('percent')} message={status.get('message')}"
@@ -726,6 +732,17 @@ def _run_refresh_workflow_locked(
             continue
 
         if terminal.get("status") == "success":
+            actual_date = str(
+                terminal.get("trade_date")
+                or ((terminal.get("result") or {}).get("refresh_data") or {}).get("expected_trade_date")
+                or ""
+            ).replace("-", "")
+            if actual_date and actual_date != decision.trade_date:
+                print_fn(
+                    f"[refresh] 已有任务完成日期为 {actual_date}，"
+                    f"继续提交所请求的 {decision.trade_date}，不将另一日期误报为成功"
+                )
+                continue
             failed_count = extract_failed_count(terminal)
             terminal_result = terminal.get("result")
             cache_cleanup = (
@@ -826,6 +843,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default="http://127.0.0.1:8088/api", help="本地 web API 根地址")
     parser.add_argument("--frontend-url", default=None, help="本地前端首页地址，默认由 --base-url 推导")
     parser.add_argument("--scope", default="all", help="刷新范围，默认 all")
+    parser.add_argument(
+        "--trade-date",
+        type=date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="补跑指定交易日；默认检查今天是否为交易日",
+    )
     parser.add_argument("--poll-seconds", type=float, default=20.0, help="状态轮询间隔秒数")
     parser.add_argument("--health-timeout", type=float, default=60.0, help="服务启动等待秒数")
     parser.add_argument(
@@ -871,7 +895,12 @@ def main(argv: list[str] | None = None) -> int:
         service_pid_path=Path(args.pid_file).expanduser().resolve(),
         restart_service=args.restart_service,
     )
-    result = run_refresh_workflow(config=config, print_fn=lambda line: print(line, flush=True))
+    workflow_options = {"target_date": args.trade_date} if args.trade_date else {}
+    result = run_refresh_workflow(
+        config=config,
+        print_fn=lambda line: print(line, flush=True),
+        **workflow_options,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("status") in {"success", "skipped"} else 1
 

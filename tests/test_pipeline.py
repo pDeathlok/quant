@@ -3,6 +3,7 @@ import threading
 import time
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -23,6 +24,13 @@ def test_daily_lookback_start_is_not_used_as_publication_watermark(
     assert pipeline._incremental_daily_start() == "20260822"
     assert pipeline._incremental_feature_start() == "20260901"
     assert pipeline.refresh_reference_inputs(dry_run=True)["end_date"] == "20260901"
+
+
+def test_next_trading_day_rechecks_previous_failed_market_day(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "_latest_daily_trade_date", lambda: "20261015")
+    monkeypatch.setenv("ROUTINE_DAILY_LOOKBACK_DAYS", "10")
+
+    assert pipeline._incremental_daily_start() == "20261005"
 
 
 def test_daily_basic_incremental_start_revalidates_rolling_window(
@@ -64,6 +72,25 @@ def test_refresh_daily_basic_reports_partial_failure(monkeypatch) -> None:
 
     assert result["status"] == "failed"
     assert result["start_date"] == "20260720"
+
+
+def test_refresh_daily_basic_blocks_pending_source_repairs(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "_incremental_daily_basic_start", lambda: "20260720")
+    monkeypatch.setattr(
+        "quant.routine.daily_basic_refresh.refresh_daily_basic",
+        lambda **kwargs: {
+            "trade_dates": 2,
+            "success": 2,
+            "failed": 0,
+            "pending_repair_dates": ["20260721"],
+            "data_quality_status": "provisional",
+        },
+    )
+
+    result = pipeline.refresh_daily_basic_data(dry_run=False)
+
+    assert result["status"] == "failed"
+    assert result["pending_repair_dates"] == ["20260721"]
 
 
 def test_reference_and_analyst_interfaces_run_in_parallel(monkeypatch) -> None:
@@ -646,6 +673,42 @@ def test_pipeline_subprocesses_stay_in_web_service_process_group(
     assert "start_new_session" not in captured[0]
 
 
+def test_refresh_data_repairs_reported_historical_daily_before_success(monkeypatch, tmp_path) -> None:
+    report = tmp_path / "data/routine/historical_integrity_latest.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({
+        "status": "failed", "target_trade_date": "20261015",
+        "failures": [{"dataset": "daily", "reason": "missing_traded_price"}],
+    }))
+    commands = []
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO(json.dumps({
+                "status": "success", "expected_trade_date": "20261015",
+                "dataset_trade_date": "20261015",
+            }))
+
+        def wait(self):
+            return 0
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="historical merge: 1/1", stderr="")
+
+    monkeypatch.setattr(pipeline, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20261005")
+    monkeypatch.setattr(pipeline.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+
+    result = pipeline.refresh_data(dry_run=False)
+
+    assert result["status"] == "success"
+    assert commands[0][1:] == [
+        "scripts/backfill_historical_daily.py", "--candidate-only", "--end", "20261015",
+    ]
+
+
 def test_refresh_data_reports_market_availability_retry_progress(monkeypatch) -> None:
     progress: list[tuple[int, str]] = []
 
@@ -1014,7 +1077,7 @@ def test_daily_pipeline_bounds_cpu_stages_and_parallelizes_outputs(monkeypatch, 
 
     result = pipeline.run_daily_pipeline(skip_data=False, skip_backtest=True)
 
-    assert call_order[:4] == ["cleanup", "refresh", "daily_basic", "reference"]
+    assert call_order[:4] == ["cleanup", "refresh", "reference", "daily_basic"]
     assert max_active == 2
     assert result["steps"]["cache_cleanup"]["status"] == "success"
     assert result["steps"]["build_features"]["status"] == "success"

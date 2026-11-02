@@ -521,6 +521,13 @@ def _evidence_value(
             return None
         value = _lookup(payload, date_field or "")
         return _parse_date(value), _parse_datetime(value), _stat_fingerprint(path)
+    if adapter == "byd_intraday_training":
+        from quant.data.byd_intraday import read_byd_intraday_training_evidence
+
+        try:
+            return read_byd_intraday_training_evidence(_safe_path(project_root, locator))
+        except (OSError, ValueError):
+            return None
     if adapter == "parquet_max":
         path = _safe_path(project_root, locator)
         if not path.is_file() or not date_field:

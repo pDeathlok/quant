@@ -23,6 +23,7 @@ COMPOSITION_CALLBACK_IDS = frozenset({
     "refresh_long_factor_snapshot", "refresh_long_stock_pool_variants",
     "generate_chan_model_strategy", "build_convertible_bond_grid_workspace",
     "build_convertible_bond_allotment_workspace", "build_byd_daily_workspace",
+    "build_transition_daily_workspace",
     "refresh_similar_pattern_analysis",
 })
 

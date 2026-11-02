@@ -616,45 +616,26 @@ def test_long_page_explains_price_score_bands_with_backtest_evidence() -> None:
     assert "最多 7 年月末历史归一化" in INDEX_HTML
 
 
-def test_byd_holding_inputs_are_restored_and_persisted() -> None:
-    assert 'const BYD_HOLDING_STORAGE_KEY = "quant.byd.holding.v1"' in APP_JS
-    assert "function saveBydHoldingInputs()" in APP_JS
-    assert "function restoreBydHoldingInputs()" in APP_JS
-    assert "version: 3" in APP_JS
-    assert '"bydSharesInput"' in APP_JS
-    assert '"bydCostInput"' in APP_JS
-    assert "已恢复永久保存的持仓和成本" in APP_JS
-    for removed in [
-        "bydSoldTodaySharesInput",
-        "bydSoldTodayPriceInput",
-        "bydBoughtTodaySharesInput",
-        "bydBoughtTodayPriceInput",
-        "bydOpenTInput",
-        "bydOpenTPriceInput",
-        "bydOpenPositiveInput",
-        "bydOpenPositivePriceInput",
-        "sold_today_shares",
-        "bought_today_shares",
-        "open_t_shares",
-        "open_positive_shares",
-    ]:
-        assert removed not in APP_JS
-        assert removed not in INDEX_HTML
-    assert APP_JS.rindex("restoreBydHoldingInputs();") < APP_JS.rindex("loadActivePageData();")
-    assert 'id="bydHoldingSaveStatus"' in INDEX_HTML
+def test_transition_page_replaces_byd_and_uses_separate_actual_accounts() -> None:
+    assert "BYD 做T" not in INDEX_HTML
+    assert 'id="bydSharesInput"' not in INDEX_HTML
+    assert 'id="transitionAccountForm"' in INDEX_HTML
+    assert 'id="transitionStrategy"' in INDEX_HTML
+    assert '"#transition": "byd"' in APP_JS
+    assert '/transition/account/${policy}' in APP_JS
+    assert 'state.transitionDrafts' in APP_JS
+    assert 'revision: p.account.revision' in APP_JS
 
 
-def test_byd_page_shows_historical_validation_gate() -> None:
-    assert 'id="bydValidationStatus"' in INDEX_HTML
-    assert 'id="bydValidationMetrics"' in INDEX_HTML
-    assert "横盘期历史验证" in INDEX_HTML
-    assert "正T / 反T 分开计划" in INDEX_HTML
-    assert "payload.daily_t_plan" in APP_JS
-    assert "正T优先" in APP_JS
-    assert "反T计划" in APP_JS
-    assert "validation.held_out_results" in APP_JS
-    assert ".byd-validation-metrics" in STYLES_CSS
-    assert ".byd-alert.research-only" in STYLES_CSS
+def test_transition_page_distinguishes_next_close_buy_sell_and_hold() -> None:
+    assert 'id="transitionSellHold"' in INDEX_HTML
+    assert 'id="transitionBuys"' in INDEX_HTML
+    assert 'id="transitionExecutionRules"' in INDEX_HTML
+    assert "市场非过渡阶段，次日不开新仓" in APP_JS
+    assert "卖出成交后才释放资金和槽位" in INDEX_HTML
+    assert "不会自动记录成交或下单" in INDEX_HTML
+    assert "function renderTransitionPage()" in APP_JS
+    assert 'state.transitionError' in APP_JS
 
 
 def test_strategy_workspace_summaries_use_compact_layouts() -> None:

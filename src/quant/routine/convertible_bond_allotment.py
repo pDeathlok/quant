@@ -416,7 +416,7 @@ def _amount_to_yuan(value: Any, unit: str | None) -> float | None:
 def _extract_issue_size_yuan_from_text(text: str) -> float | None:
     compact = re.sub(r"\s+", "", text or "")
     patterns = [
-        r"(?:募集资金总额|募集资金总量|发行总额|发行规模|可转债总额|可转换公司债券总额)[^。；]{0,80}?(?:不超过|不超|不多于|为)?(?:人民币)?([\d,，.]+)(亿元|万元|元)",
+        r"(?:募集资金总额|募集资金总量|发行总额|发行规模|可转债总额|可转换公司债券总额)[：:]?(?:不超过|不超|不多于|为)?(?:人民币)?([\d,，.]+)(亿元|万元|元)",
         r"(?:不超过|不超|不多于)(?:人民币)?([\d,，.]+)(亿元|万元|元)[^。；]{0,80}?(?:可转换公司债券|可转债|募集资金)",
     ]
     candidates: list[float] = []
@@ -608,15 +608,18 @@ def _extract_near_date(text: str, label_pattern: str, window: int = 80) -> str |
 
 
 def _extract_issue_dates_from_text(text: str) -> dict[str, Any]:
-    compact = re.sub(r"\s+", " ", text or "")
+    compact = re.sub(r"\s+", "", text or "")
     record_date = _extract_near_date(compact, r"股权登记日")
-    pay_date = _extract_near_date(compact, r"(?:原股东缴款日|认购及缴款日为|缴款日)")
+    pay_date = _extract_near_date(compact, r"(?:原股东缴款日|原股东优先配售日|认购及缴款日为|缴款日)")
     issue_date = _extract_near_date(compact, r"(?:发行日期及时间|网上申购日|申购日)")
     allot_code_match = re.search(r"(?:原股东配售代码|配售代码)[^\d]{0,20}(\d{6})", compact)
-    allot_name_match = re.search(r"(?:原股东配售简称|配售简称)\s*([\u4e00-\u9fa5A-Za-z0-9]+)", compact)
-    bond_code_match = re.search(r"可转债代码[^\d]{0,20}(\d{6})", compact)
-    bond_name_match = re.search(r"可转债简称\s*([\u4e00-\u9fa5A-Za-z0-9]+)", compact)
+    allot_name_match = re.search(r'(?:原股东配售简称|配售简称)(?:为)?[：:“\"]*([\u4e00-\u9fa5A-Za-z0-9]+?配债)', compact)
+    bond_code_match = re.search(r"(?:可转债代码|债券代码)[^\d]{0,20}(\d{6})", compact)
+    bond_name_match = re.search(r'可转债简称(?:为)?[：:“\"]*([\u4e00-\u9fa5A-Za-z0-9]+?转债)', compact)
+    ratio_match = re.search(r"每股配售([\d.]+)元(?:面值)?可转债", compact)
     return {
+        "issue_size_yuan": _extract_issue_size_yuan_from_text(compact),
+        "rights_per_share": float(ratio_match.group(1)) if ratio_match else None,
         "record_date": record_date,
         "pay_date": pay_date,
         "issue_date": issue_date,
@@ -644,6 +647,8 @@ def _extract_issue_dates_from_pdf_bytes(content: bytes) -> dict[str, Any] | None
         except Exception:
             continue
     parsed = _extract_issue_dates_from_text("\n".join(texts))
+    if parsed.get("issue_size_yuan") is None:
+        parsed["issue_size_yuan"] = _extract_issue_size_yuan_from_pdf_bytes(content)
     if any(parsed.get(key) for key in ["record_date", "pay_date", "issue_date"]):
         return parsed
     return None
@@ -744,6 +749,8 @@ def _attach_pipeline_issue_sizes(
         cached = lookup.get(str(code)) if code else None
         if not cached:
             continue
+        if item.get("issue_size_source") == "cninfo_issuing_pdf":
+            continue
         issue_size = _number(cached.get("issue_size_yuan")) or _number(cached.get("issue_size"))
         if issue_size is None:
             continue
@@ -800,6 +807,7 @@ def _refresh_issue_dates_for_record(record: dict[str, Any], today: date | None =
             "stock_code": _clean_text(record.get("stock_code")),
             "stock_name": _clean_text(record.get("stock_name")),
             **parsed,
+            "parser_version": 2,
             "issue_date_source": "cninfo_issuing_pdf",
             "issue_date_title": doc.get("announcement_title"),
             "issue_date_url": pdf_url,
@@ -824,9 +832,12 @@ def _attach_pipeline_issue_dates(
     if refresh:
         for item in records:
             code = _clean_text(item.get("stock_code"))
-            if item.get("stage") != "issuing" or not code or code in lookup:
+            if item.get("stage") != "issuing" or not code:
                 continue
-            if all(_clean_text(item.get(field)) is not None for field in ["record_date", "pay_date", "issue_date"]):
+            cached = lookup.get(code)
+            if cached and (_number(cached.get("parser_version")) == 2 or _record_date_expired(cached, _today_text(today))):
+                continue
+            if not cached and all(_clean_text(item.get(field)) is not None for field in ["record_date", "pay_date", "issue_date"]):
                 continue
             result = _refresh_issue_dates_for_record(item, today=today)
             if result:
@@ -845,6 +856,16 @@ def _attach_pipeline_issue_dates(
             if _clean_text(item.get(field)) is None and _clean_text(value) is not None:
                 item[field] = _display_date(value) if field.endswith("_date") else value
                 applied = True
+        if _number(cached.get("parser_version")) == 2:
+            for field in ("issue_size_yuan", "rights_per_share"):
+                value = _number(cached.get(field))
+                if value is not None:
+                    item[field] = value
+            if _number(cached.get("issue_size_yuan")) is not None:
+                item["issue_size"] = cached["issue_size_yuan"]
+                item["issue_size_source"] = "cninfo_issuing_pdf"
+                item["issue_size_title"] = cached.get("issue_date_title")
+                item["issue_size_url"] = cached.get("issue_date_url")
         if applied:
             hits += 1
             item["issue_date_source"] = cached.get("issue_date_source") or "issue_date_cache"
@@ -1016,23 +1037,93 @@ def _poll_cninfo_pipeline_announcements(
         "sortType": "",
         "isHLtitle": "true",
     }
-    first_page = _cninfo_disclosure_page(
-        client,
-        payload=payload,
-        keyword=keyword,
-        page=1,
-    )
-    total = max(0, int(first_page.get("totalAnnouncement") or 0))
-    page_count = max(1, math.ceil(total / int(payload["pageSize"])))
-    announcements = list(first_page.get("announcements") or [])
-    for page in range(2, page_count + 1):
-        page_payload = _cninfo_disclosure_page(
-            client,
-            payload=payload,
-            keyword=keyword,
-            page=page,
+    def fetch_pages(page_size: int) -> tuple[int, list[dict[str, Any]]]:
+        page_payload = {**payload, "pageSize": str(page_size)}
+        first_page = _cninfo_disclosure_page(
+            client, payload=page_payload, keyword=keyword, page=1,
         )
-        announcements.extend(page_payload.get("announcements") or [])
+        total = max(0, int(first_page.get("totalAnnouncement") or 0))
+        announcements = list(first_page.get("announcements") or [])
+        if total >= 3000:
+            return total, announcements
+        for page in range(2, max(1, math.ceil(total / page_size)) + 1):
+            response = _cninfo_disclosure_page(
+                client, payload=page_payload, keyword=keyword, page=page,
+            )
+            announcements.extend(response.get("announcements") or [])
+        unique = {
+            (row.get("secCode"), row.get("announcementId")): row
+            for row in announcements
+        }
+        return total, list(unique.values())
+
+    total, announcements = fetch_pages(30)
+    def split_history() -> pd.DataFrame:
+        middle = start + (end - start) // 2
+        older = _poll_cninfo_pipeline_announcements(
+            keyword=keyword, start=start, end=middle, session=client,
+        )
+        newer = _poll_cninfo_pipeline_announcements(
+            keyword=keyword, start=middle + timedelta(days=1), end=end, session=client,
+        )
+        return pd.concat([older, newer], ignore_index=True).drop_duplicates()
+
+    # Broad searches may cap at 3,000 or return fewer distinct announcements
+    # than declared. Recover with disjoint date ranges, bounded at one day.
+    if total >= 3000:
+        if start >= end:
+            raise RuntimeError(f"巨潮公告单日结果可能截断: keyword={keyword} date={start}")
+        return split_history()
+    # CNinfo's search shards can return different totals for identical
+    # historical queries. For a single day, accumulate complete scans until
+    # the union reaches the largest declared total and stops growing.
+    if start < end and len(announcements) != total:
+        return split_history()
+    if start == end:
+        unique = {
+            (row.get("secCode"), row.get("announcementId")): row
+            for row in announcements
+        }
+        largest_total = total
+        largest_total_observations = 1
+        stable_scans = 0
+        for attempt in range(1, 40):
+            if (
+                attempt >= 8
+                and largest_total_observations >= 2
+                and stable_scans >= 2
+                and len(unique) == largest_total
+            ):
+                break
+            time.sleep(0.2)
+            observed_total, observed_rows = fetch_pages((20, 10, 30)[(attempt - 1) % 3])
+            if observed_total >= 3000:
+                raise RuntimeError(f"巨潮公告单日结果可能截断: keyword={keyword} date={start}")
+            if observed_total > largest_total:
+                largest_total = observed_total
+                largest_total_observations = 1
+            elif observed_total == largest_total:
+                largest_total_observations += 1
+            prior_count = len(unique)
+            unique.update(
+                ((row.get("secCode"), row.get("announcementId")), row)
+                for row in observed_rows
+            )
+            stable_scans = (
+                stable_scans + 1
+                if len(unique) == prior_count == largest_total
+                else 0
+            )
+        if (
+            len(unique) != largest_total
+            or largest_total_observations < 2
+            or stable_scans < 2
+        ):
+            raise RuntimeError(
+                f"巨潮公告分页不完整: keyword={keyword} range={start}~{end} "
+                f"expected={largest_total} actual={len(unique)}"
+            )
+        announcements = list(unique.values())
     if not announcements:
         return pd.DataFrame(
             columns=["代码", "简称", "公告标题", "公告时间", "公告链接"]
@@ -1113,10 +1204,18 @@ def _load_cninfo_issue(refresh: bool = False, today: date | None = None) -> tupl
 
             end = today or date.today()
             start = end - timedelta(days=900)
-            issue = ak.bond_cov_issue_cninfo(
-                start_date=start.strftime("%Y%m%d"),
-                end_date=end.strftime("%Y%m%d"),
-            )
+            for attempt in range(1, 4):
+                meta["attempts"] = attempt
+                try:
+                    issue = ak.bond_cov_issue_cninfo(
+                        start_date=start.strftime("%Y%m%d"),
+                        end_date=end.strftime("%Y%m%d"),
+                    )
+                    break
+                except Exception:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.5 * attempt)
             issue = issue if isinstance(issue, pd.DataFrame) else pd.DataFrame()
             meta["poll_status"] = "success"
             if not issue.empty:

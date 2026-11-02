@@ -25,6 +25,7 @@ from quant.application.left_side_ranking import (
     DEFAULT_LEFT_SIDE_RANKING_CONFIG,
     LeftSideRankingConfig,
     load_left_side_ranking_scores,
+    load_left_side_v5_shadow_scores,
 )
 from quant.features.canonical_factor_names import (
     find_forbidden_aliases_in_payload,
@@ -602,6 +603,7 @@ class SelectorRankingBatch:
         self._identities: dict[Path, _FileIdentity] = {}
         self._right: tuple[dict[str, tuple[float, float]], dict[str, Any]] | None = None
         self._left: tuple[dict[str, tuple[float, float]], dict[str, Any]] | None = None
+        self._shadow: tuple[dict[str, dict[str, Any]], dict[str, Any]] | None = None
 
     def _check_inputs(self) -> None:
         if self._context_provider() != self._publication:
@@ -669,6 +671,19 @@ class SelectorRankingBatch:
                 _ranking_input_identities((paths.score_output, paths.score_manifest)),
             )
         return self._left
+
+    def _shadow_scores(
+        self, signal_date: str
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        assert self._left_config is not None
+        if self._shadow is None:
+            paths = self._left_config.paths
+            self._shadow = self._load(
+                lambda: load_left_side_v5_shadow_scores(signal_date, config=self._left_config),
+                _ranking_input_identities((paths.score_output, paths.score_manifest)),
+            )
+        return self._shadow
+
 
 def apply_selector_ranking_source(
     rows: list[dict[str, Any]],
@@ -784,9 +799,18 @@ def apply_selector_ranking_source(
                     f"{unconsumed[:20]}"
                 )
         left_artifact_sha = str(left_manifest.get("artifact_sha256") or "")
+        try:
+            left_shadow_scores, _left_shadow_manifest = (
+                load_left_side_v5_shadow_scores(signal_date, config=active_left)
+                if ranking_batch is None
+                else ranking_batch._shadow_scores(signal_date)
+            )
+        except RuntimeError:
+            left_shadow_scores = {}
     else:
         left_scores = {}
         left_artifact_sha = ""
+        left_shadow_scores = {}
 
     if left_policy_excluded_symbols:
         rows = [
@@ -813,6 +837,11 @@ def apply_selector_ranking_source(
             artifact_sha = left_artifact_sha
             normalization = active_left.score_normalization
             threshold_mode = "none_rank_only"
+            shadow_values = left_shadow_scores.get(symbol)
+            if shadow_values:
+                row.update(shadow_values)
+                row["shadow_v5_lifecycle"] = "shadow"
+                row["shadow_v5_production_action"] = "observe_only"
         else:
             row["ranking_source"] = "unified_ranker_not_applicable"
             continue

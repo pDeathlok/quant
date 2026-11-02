@@ -15,7 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from quant.strategies.custom.chan_model import (
+    CHAN_MODEL_LOGIC_VERSION,
     add_chan_model_strategy_columns,
+    resolve_chan_signal_date,
     select_chan_model_candidates,
     summarize_chan_model_strategy,
 )
@@ -37,17 +39,24 @@ def build_strategy_outputs(
     strategy_frame.to_parquet(output_dir / "chan_model_strategy_scored.parquet", index=False)
     strategy_frame.to_csv(output_dir / "chan_model_strategy_scored.csv", index=False)
 
-    candidates = select_chan_model_candidates(strategy_frame, trade_date=trade_date, top_n=top_n)
+    refresh_manifest_path = scored_path.parent / "live_refresh_manifest.json"
+    refresh_manifest = json.loads(refresh_manifest_path.read_text()) if refresh_manifest_path.exists() else {}
+    resolved_date = resolve_chan_signal_date(
+        scored, trade_date,
+        refresh_manifest.get("processed_through") if refresh_manifest.get("status") == "success" else None,
+    )
+    candidates = select_chan_model_candidates(strategy_frame, trade_date=resolved_date, top_n=top_n)
     candidates.to_csv(output_dir / "chan_model_latest_candidates.csv", index=False)
     summary = summarize_chan_model_strategy(strategy_frame)
     summary.to_csv(output_dir / "chan_model_strategy_summary.csv", index=False)
 
     resolved_trade_date = (
-        pd.to_datetime(candidates["date"].iloc[0]).strftime("%Y-%m-%d")
-        if not candidates.empty
+        resolved_date.strftime("%Y-%m-%d")
+        if pd.notna(resolved_date)
         else None
     )
     manifest = {
+        "logic_version": CHAN_MODEL_LOGIC_VERSION,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "scored_path": str(scored_path),
         "trade_date": resolved_trade_date,

@@ -13,6 +13,10 @@ from typing import Callable
 import pandas as pd
 
 from quant.data.atomic_io import atomic_write_csv, atomic_write_json, atomic_write_parquet
+from quant.data.daily_basic_valuation import (
+    REFERENCE_COLUMNS, resolved_feature_mask, supplement_pe_ttm,
+    supplement_pe_ttm_from_income,
+)
 from quant.data.tushare_fetcher import TushareDataFetcher, validate_daily_basic_frame
 from quant.routine.data_refresh import RequestLimiter, _is_retryable_error
 from quant.routine.paths import PROJECT_ROOT
@@ -52,6 +56,61 @@ DAILY_BASIC_FEATURE_COVERAGE: dict[str, float] = {
     "total_mv": 0.98,
     "circ_mv": 0.98,
 }
+
+# The historical daily endpoint retroactively exposes BJ price bars
+# before daily_basic used those identifiers. Do not turn that legacy source
+# disagreement into an unrepairable daily_basic refresh failure.
+LEGACY_BJ_IDENTIFIER_END = "20221231"
+DAILY_BASIC_DIRTY_DATES_PATH = PROJECT_ROOT / "data/routine/daily_basic_dirty_dates.json"
+
+
+def _dirty_dates_path(output_dir: Path) -> Path:
+    return (
+        DAILY_BASIC_DIRTY_DATES_PATH
+        if output_dir.resolve() == DAILY_BASIC_DIR.resolve()
+        else output_dir.parent / "daily_basic_dirty_dates.json"
+    )
+
+
+def _required_basic_symbols(symbols: set[str], trade_date: str) -> set[str]:
+    if trade_date <= LEGACY_BJ_IDENTIFIER_END:
+        return {
+            code for code in symbols
+            if not code.endswith(".BJ")
+        }
+    return symbols
+
+
+def pending_daily_basic_change_dates(
+    path: Path = DAILY_BASIC_DIRTY_DATES_PATH,
+) -> list[str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("dates"), list):
+        raise ValueError(f"invalid daily_basic dirty-date ledger: {path}")
+    dates = payload["dates"]
+    if any(not isinstance(date, str) or len(date) != 8 or not date.isdigit() for date in dates):
+        raise ValueError(f"invalid daily_basic dirty-date ledger: {path}")
+    return sorted(set(dates))
+
+
+def record_daily_basic_change_dates(
+    dates: list[str], path: Path = DAILY_BASIC_DIRTY_DATES_PATH,
+) -> list[str]:
+    pending = sorted(set(pending_daily_basic_change_dates(path)) | set(dates))
+    if pending:
+        atomic_write_json({"dates": pending}, path)
+    return pending
+
+
+def acknowledge_daily_basic_change_dates(
+    dates: list[str], path: Path = DAILY_BASIC_DIRTY_DATES_PATH,
+) -> list[str]:
+    remaining = sorted(set(pending_daily_basic_change_dates(path)) - set(dates))
+    atomic_write_json({"dates": remaining}, path)
+    return remaining
 
 DELAYED_DAILY_BASIC_COLUMNS: frozenset[str] = frozenset(
     {"turnover_rate_f", "dv_ratio", "dv_ttm", "free_share"}
@@ -481,7 +540,7 @@ def fetch_one_trade_date(
         and repair_marker.get("requires_source_refresh") is True
     )
     previous_frame: pd.DataFrame | None = None
-    if (repair_requested or force_source_refresh) and output_path.exists():
+    if output_path.exists():
         try:
             previous_frame = pd.read_parquet(output_path)
         except Exception:
@@ -494,6 +553,12 @@ def fetch_one_trade_date(
         output_path.exists()
         and not force_source_refresh
         and not _requires_source_refresh(output_path)
+        and not (
+            previous_frame is not None
+            and set(REFERENCE_COLUMNS).issubset(previous_frame.columns)
+            and (output_dir.parent / "income.parquet").is_file()
+            and (~resolved_feature_mask(previous_frame, "pe_ttm")).any()
+        )
     ):
         try:
             local = validate_daily_basic_frame(
@@ -508,7 +573,9 @@ def fetch_one_trade_date(
             pass
         else:
             local_symbols = set(local["ts_code"].dropna().astype(str))
-            unresolved_symbols = set(expected_symbols or ()) - local_symbols
+            unresolved_symbols = _required_basic_symbols(
+                set(expected_symbols or ()), trade_date
+            ) - local_symbols
             if not unresolved_symbols:
                 return {
                     "trade_date": trade_date,
@@ -521,6 +588,7 @@ def fetch_one_trade_date(
                         round(len(local) / expected_rows, 6) if expected_rows else None
                     ),
                     "feature_coverage": local.attrs.get("feature_coverage", {}),
+                    "resolved_feature_coverage": local.attrs.get("resolved_feature_coverage", {}),
                     "path": str(output_path),
                     "attempts": 0,
                     "repair_requested": False,
@@ -551,6 +619,31 @@ def fetch_one_trade_date(
                     trade_date,
                     daily_dir,
                 )
+                if (
+                    "pe_ttm" in df and "total_mv" in df
+                    and (~resolved_feature_mask(df, "pe_ttm")).any()
+                ):
+                    try:
+                        df, valuation_evidence = supplement_pe_ttm(
+                            df, trade_date, cache_dir.parent / "eastmoney_valuation",
+                        )
+                        derived_features["pe_ttm"] = valuation_evidence
+                    except Exception as exc:
+                        # Retain the original gate and retry policy on source errors.
+                        print(f"[daily_basic] valuation verification failed: {exc}", flush=True)
+                if "pe_ttm" in df and "total_mv" in df:
+                    df, income_evidence = supplement_pe_ttm_from_income(
+                        df, trade_date, output_dir.parent / "income.parquet",
+                    )
+                    if income_evidence["filled_rows"] or income_evidence["confirmed_loss_rows"]:
+                        evidence = derived_features.setdefault("pe_ttm", {
+                            "source": "tushare_income_ttm", "trade_date": trade_date,
+                            "filled_rows": 0, "confirmed_loss_rows": 0,
+                        })
+                        for key in ("filled_rows", "confirmed_loss_rows"):
+                            evidence[key] += income_evidence[key]
+                        evidence["unresolved_rows"] = income_evidence["unresolved_rows"]
+                        evidence["income_derivation"] = income_evidence
                 if deadline is None and availability_retry_failures > 0 and attempt == maximum_attempts:
                     df, delayed_features = _derive_delayed_daily_basic_features(
                         df,
@@ -565,7 +658,9 @@ def fetch_one_trade_date(
                     required_feature_coverage=DAILY_BASIC_FEATURE_COVERAGE,
                 )
                 actual_symbols = set(df["ts_code"].dropna().astype(str))
-                unresolved_symbols = set(expected_symbols or ()) - actual_symbols
+                unresolved_symbols = _required_basic_symbols(
+                    set(expected_symbols or ()), trade_date
+                ) - actual_symbols
                 if unresolved_symbols:
                     raise ValueError(
                         "Tushare daily_basic missing expected market symbols for "
@@ -601,7 +696,7 @@ def fetch_one_trade_date(
                 provenance_path.unlink(missing_ok=True)
             source_changed_rows = 0
             source_changed_columns: list[str] = []
-            if (repair_requested or force_source_refresh) and not estimated_features:
+            if previous_frame is not None and not estimated_features:
                 source_changed_rows, source_changed_columns = _repair_diff(
                     previous_frame,
                     df,
@@ -612,6 +707,7 @@ def fetch_one_trade_date(
                 "source": (
                     "tushare_with_estimated_fallback"
                     if estimated_features
+                    else "tushare_with_verified_valuation" if "pe_ttm" in derived_features
                     else "tushare"
                 ),
                 "status": "success",
@@ -622,6 +718,7 @@ def fetch_one_trade_date(
                     round(len(df) / expected_rows, 6) if expected_rows else None
                 ),
                 "feature_coverage": df.attrs.get("feature_coverage", {}),
+                "resolved_feature_coverage": df.attrs.get("resolved_feature_coverage", {}),
                 "derived_features": df.attrs.get("derived_features", {}),
                 "path": str(output_path),
                 "attempts": attempt,
@@ -719,7 +816,7 @@ def refresh_daily_basic(
         end_date,
     )
     expected_rows_by_date = {
-        trade_date: len(symbols)
+        trade_date: len(_required_basic_symbols(symbols, trade_date))
         for trade_date, symbols in expected_symbols_by_date.items()
     }
     trade_dates = sorted(expected_symbols_by_date)
@@ -796,6 +893,9 @@ def refresh_daily_basic(
         for audit in audits
         if int(audit.get("source_changed_rows") or 0) > 0
     )
+    pending_downstream_dates = record_daily_basic_change_dates(
+        source_changed_dates, path=_dirty_dates_path(output_dir)
+    )
     newly_flagged_dates = sorted(
         str(audit["trade_date"])
         for audit in audits
@@ -807,7 +907,7 @@ def refresh_daily_basic(
     deadline = tushare_retry_deadline(max(trade_dates), market_now())
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "source_policy": "tushare_only_daily_basic",
+        "source_policy": "tushare_primary_with_verified_eastmoney_valuation",
         "start_date": start_date,
         "end_date": end_date,
         "daily_dir": str(daily_dir),
@@ -827,7 +927,7 @@ def refresh_daily_basic(
         "source_recheck_dates": sorted(source_recheck_dates),
         "source_changed_dates": source_changed_dates,
         "downstream_refresh_dates": sorted(
-            set(repaired_dates) | set(source_changed_dates)
+            set(repaired_dates) | set(pending_downstream_dates)
         ),
         "newly_flagged_dates": newly_flagged_dates,
         "pending_repair_dates": pending_repair_dates,
@@ -856,8 +956,14 @@ def refresh_daily_basic(
         "actual_rows": latest_audit.get("rows"),
         "coverage_rate": latest_audit.get("coverage_rate"),
         "feature_coverage": latest_audit.get("feature_coverage", {}),
+        "resolved_feature_coverage": latest_audit.get("resolved_feature_coverage", {}),
         "source": latest_audit.get("source"),
-        "deterministic_derived_features": latest_audit.get("derived_features", {}),
+        "deterministic_derived_features": {
+            column: evidence
+            for column, evidence in latest_audit.get("derived_features", {}).items()
+            if column != "pe_ttm"
+        },
+        "valuation_verification": latest_audit.get("derived_features", {}).get("pe_ttm"),
     }
     manifest_path = audit_dir / "manifest.json"
     atomic_write_json(manifest, manifest_path)

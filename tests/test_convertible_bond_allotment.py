@@ -739,3 +739,216 @@ def test_convertible_bond_allotment_extracts_issue_dates_from_issuing_text():
     assert parsed["allot_name"] == "南芯配债"
     assert parsed["bond_code"] == "118070"
     assert parsed["bond_name"] == "南芯转债"
+
+
+@pytest.mark.parametrize("declared_total", [3000, 1435, 2])
+def test_cninfo_capped_history_preserves_real_registration(monkeypatch, declared_total):
+    import json
+    import quant.routine.convertible_bond_allotment as module
+    cases = json.loads((Path(__file__).parent / "fixtures/convertible_bond_announcement_cases.json").read_text())
+    case = next(x for x in cases["timeline_cases"] if x["id"] == "aoshikang_registration_before_extension_2026")
+    start, end = date(2026, 1, 1), date(2026, 9, 19)
+    def response(session, *, payload, keyword, page):
+        first, last = [date.fromisoformat(x) for x in payload["seDate"].split("~")]
+        capped = first == start and last == end
+        events = [x for x in case["announcements"] if first <= date.fromisoformat(x["announce_time"][:10]) <= last]
+        if capped:
+            events = events[-1:]
+        return {"totalAnnouncement": declared_total if capped else len(events), "announcements": [{"secCode": case["stock_code"], "secName": case["stock_name"], "announcementTitle": x["title"], "announcementTime": int(pd.Timestamp(x["announce_time"], tz="Asia/Shanghai").timestamp() * 1000), "announcementId": x["url"].split("/")[-1].split(".")[0], "orgId": "9900033854"} for x in events] if page == 1 else []}
+    monkeypatch.setattr(module, "_cninfo_disclosure_page", response)
+    frame = module._poll_cninfo_pipeline_announcements(keyword="可转换公司债券", start=start, end=end, session=object())
+    result = module._pipeline_from_announcements(frame).iloc[0]
+    assert result["stage"] == "registered"
+    assert result["announce_date"] == "2026-04-02"
+
+
+def test_cninfo_single_day_saturation_fails_closed(monkeypatch):
+    import quant.routine.convertible_bond_allotment as module
+    monkeypatch.setattr(module, "_cninfo_disclosure_page", lambda *a, **kw: {"totalAnnouncement": 3000, "announcements": []})
+    with pytest.raises(RuntimeError, match="截断"):
+        module._poll_cninfo_pipeline_announcements(keyword="可转债", start=date(2026, 9, 19), end=date(2026, 9, 19), session=object())
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_cninfo_single_day_incomplete_fails_closed(monkeypatch, duplicate):
+    import quant.routine.convertible_bond_allotment as module
+    event = {"secCode": "002913", "announcementId": "1225070385"}
+    monkeypatch.setattr(module, "_cninfo_disclosure_page", lambda *a, **kw: {
+        "totalAnnouncement": 2, "announcements": [event, event] if duplicate else [event],
+    })
+    with pytest.raises(RuntimeError, match="分页不完整"):
+        module._poll_cninfo_pipeline_announcements(
+            keyword="可转债", start=date(2026, 4, 2), end=date(2026, 4, 2), session=object(),
+        )
+
+
+def test_cninfo_single_day_rechecks_count_changed_during_pagination(monkeypatch):
+    import quant.routine.convertible_bond_allotment as module
+
+    rows = [
+        {
+            "secCode": "002913",
+            "secName": "测试股份",
+            "announcementTitle": "可转债公告",
+            "announcementId": str(index),
+            "announcementTime": 1791993600000,
+            "orgId": "9900033854",
+        }
+        for index in range(70)
+    ]
+    scans = 0
+
+    def response(session, *, payload, keyword, page):
+        nonlocal scans
+        if page == 1:
+            scans += 1
+        page_size = int(payload["pageSize"])
+        start = (page - 1) * page_size
+        return {
+            "totalAnnouncement": 67 if scans == 1 else 70,
+            "announcements": rows[start:start + page_size],
+        }
+
+    monkeypatch.setattr(module, "_cninfo_disclosure_page", response)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    frame = module._poll_cninfo_pipeline_announcements(
+        keyword="可转换公司债券",
+        start=date(2026, 10, 14),
+        end=date(2026, 10, 14),
+        session=object(),
+    )
+    assert scans >= 3
+    assert len(frame) == 70
+
+
+def test_cninfo_single_day_smaller_pages_recover_overlap(monkeypatch):
+    import quant.routine.convertible_bond_allotment as module
+
+    rows = [
+        {
+            "secCode": "002913",
+            "secName": "测试股份",
+            "announcementTitle": "可转债公告",
+            "announcementId": str(index),
+            "announcementTime": 1791993600000,
+            "orgId": "9900033854",
+        }
+        for index in range(54)
+    ]
+    sizes = []
+
+    def response(session, *, payload, keyword, page):
+        page_size = int(payload["pageSize"])
+        sizes.append(page_size)
+        start = (page - 1) * page_size
+        page_rows = rows[start:start + page_size]
+        if page_size == 30 and page == 2:
+            page_rows = [rows[29], *rows[31:54]]
+        return {"totalAnnouncement": 54, "announcements": page_rows}
+
+    monkeypatch.setattr(module, "_cninfo_disclosure_page", response)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    frame = module._poll_cninfo_pipeline_announcements(
+        keyword="可转换公司债券",
+        start=date(2026, 4, 1),
+        end=date(2026, 4, 1),
+        session=object(),
+    )
+    assert len(frame) == 54
+    assert 30 in sizes and 20 in sizes
+
+
+def test_cninfo_single_day_does_not_accept_stable_partial_shard(monkeypatch):
+    import quant.routine.convertible_bond_allotment as module
+
+    rows = [
+        {
+            "secCode": "002913",
+            "secName": "测试股份",
+            "announcementTitle": "可转债公告",
+            "announcementId": str(index),
+            "announcementTime": 1791993600000,
+            "orgId": "9900033854",
+        }
+        for index in range(68)
+    ]
+    scans = 0
+
+    def response(session, *, payload, keyword, page):
+        nonlocal scans
+        if page == 1:
+            scans += 1
+        page_size = int(payload["pageSize"])
+        visible = rows[:29] if scans <= 3 else rows
+        start = (page - 1) * page_size
+        return {
+            "totalAnnouncement": len(visible),
+            "announcements": visible[start:start + page_size],
+        }
+
+    monkeypatch.setattr(module, "_cninfo_disclosure_page", response)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    frame = module._poll_cninfo_pipeline_announcements(
+        keyword="可转换公司债券",
+        start=date(2026, 1, 5),
+        end=date(2026, 1, 5),
+        session=object(),
+    )
+    assert scans >= 8
+    assert len(frame) == 68
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_cninfo_issue_retries_transient_missing_records(monkeypatch, tmp_path, recovers):
+    import akshare as ak
+    import quant.routine.convertible_bond_allotment as module
+    attempts = []
+    def fetch(**kwargs):
+        attempts.append(kwargs)
+        if not recovers or len(attempts) < 3:
+            raise KeyError("records")
+        return pd.DataFrame([{"债券代码": "127999", "债券简称": "测试转债"}])
+    monkeypatch.setattr(ak, "bond_cov_issue_cninfo", fetch)
+    monkeypatch.setattr(module, "CB_CNINFO_ISSUE_PATH", tmp_path / "issue.parquet")
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    frame, meta = module._load_cninfo_issue(refresh=True, today=date(2026, 9, 20))
+    assert len(attempts) == 3
+    assert meta["poll_status"] == ("success" if recovers else "failed")
+    assert frame.empty is not recovers
+    assert (tmp_path / "issue.parquet").exists() is recovers
+
+
+
+@pytest.mark.parametrize("case_index", [0, 1])
+def test_real_issuance_details_exclude_underwriting_cap(case_index):
+    import json
+    import quant.routine.convertible_bond_allotment as module
+    case = json.loads((Path(__file__).parent / "fixtures/convertible_bond_announcement_cases.json").read_text())["issuance_detail_cases"][case_index]
+    assert module._extract_issue_size_yuan_from_text(case["text"].split("\n")[0]) is None
+    parsed = module._extract_issue_dates_from_text(case["text"])
+    for key, value in case["expected"].items():
+        assert parsed.get(key) == value, key
+
+
+def test_active_issuance_reparses_old_cache_and_overrides_stale_estimate(monkeypatch, tmp_path):
+    import quant.routine.convertible_bond_allotment as module
+    date_path = tmp_path / "dates.parquet"
+    size_path = tmp_path / "sizes.parquet"
+    pd.DataFrame([{"stock_code": "301149", "record_date": "2026-09-28", "allot_name": "为"}]).to_parquet(date_path)
+    pd.DataFrame([{"stock_code": "301149", "issue_size_yuan": 288000000.0}]).to_parquet(size_path)
+    monkeypatch.setattr(module, "CB_PIPELINE_ISSUE_DATE_PATH", date_path)
+    monkeypatch.setattr(module, "CB_PIPELINE_ISSUE_SIZE_PATH", size_path)
+    calls = []
+    def refreshed(record, today=None):
+        calls.append(record["stock_code"])
+        return {"stock_code": "301149", "record_date": "2026-09-28", "allot_name": "隆新配债", "issue_size_yuan": 960000000.0, "rights_per_share": 1.7173, "issue_date_source": "cninfo_issuing_pdf", "parser_version": 2}
+    monkeypatch.setattr(module, "_refresh_issue_dates_for_record", refreshed)
+    rows, _ = module._attach_pipeline_issue_dates([{"stock_code": "301149", "stage": "issuing"}], refresh=True, today=date(2026, 9, 26))
+    rows, _ = module._attach_pipeline_issue_sizes(rows)
+    rows[0]["total_share"] = 559000023
+    rows = module._attach_allotment_metrics(rows)
+    assert calls == ["301149"]
+    assert rows[0]["allot_name"] == "隆新配债"
+    assert rows[0]["issue_size_yuan"] == 960000000.0
+    assert rows[0]["rights_per_share"] == 1.7173
+    assert rows[0]["shares_for_one_lot"] == 583

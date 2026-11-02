@@ -47,6 +47,7 @@ from quant.features.market_sentiment import (
 from quant.ml.feature_coverage import validate_required_feature_coverage
 from quant.strategies.custom.chan_model import (
     add_chan_model_strategy_columns,
+    resolve_chan_signal_date,
     select_chan_model_candidates,
     summarize_chan_model_strategy,
 )
@@ -299,7 +300,9 @@ def _add_predictions(data: pd.DataFrame, models: dict[str, dict[str, Any]]) -> p
     return out
 
 
-def _write_strategy_outputs(scored: pd.DataFrame, output_dir: Path, top_n: int) -> dict[str, Any]:
+def _write_strategy_outputs(
+    scored: pd.DataFrame, output_dir: Path, top_n: int, trade_date: str | None = None,
+) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     strategy_frame = add_chan_model_strategy_columns(scored)
     atomic_write_parquet(
@@ -308,14 +311,15 @@ def _write_strategy_outputs(scored: pd.DataFrame, output_dir: Path, top_n: int) 
         index=False,
     )
     atomic_write_csv(strategy_frame, output_dir / "chan_model_strategy_scored.csv", index=False)
-    candidates = select_chan_model_candidates(strategy_frame, top_n=top_n)
+    resolved_date = resolve_chan_signal_date(strategy_frame, trade_date)
+    candidates = select_chan_model_candidates(strategy_frame, trade_date=resolved_date, top_n=top_n)
     atomic_write_csv(candidates, output_dir / "chan_model_latest_candidates.csv", index=False)
     summary = summarize_chan_model_strategy(strategy_frame)
     atomic_write_csv(summary, output_dir / "chan_model_strategy_summary.csv", index=False)
     return {
-        "latest_signal_date": pd.to_datetime(candidates["date"].iloc[0]).strftime("%Y-%m-%d") if not candidates.empty else None,
+        "latest_signal_date": resolved_date.strftime("%Y-%m-%d") if pd.notna(resolved_date) else None,
         "latest_candidates": int(len(candidates)),
-        "strategy_signal_dates": int(strategy_frame[strategy_frame["chan_model_signal"].eq(1)]["date"].nunique()),
+        "strategy_signal_dates": int(strategy_frame[strategy_frame["chan_model_setup_signal"].eq(1)]["date"].nunique()),
     }
 
 
@@ -448,7 +452,7 @@ def refresh_live_scores(args: argparse.Namespace) -> dict[str, Any]:
     combined = pd.concat([reference, historical, live_scored], ignore_index=True, sort=False)
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
     combined = combined.sort_values(["date", "symbol"]).reset_index(drop=True)
-    strategy_meta = _write_strategy_outputs(combined, args.output_dir, args.top_n)
+    strategy_meta = _write_strategy_outputs(combined, args.output_dir, args.top_n, args.end)
     atomic_write_parquet(combined, args.scored_path, index=False)
     atomic_write_csv(combined, args.scored_path.with_suffix(".csv"), index=False)
 

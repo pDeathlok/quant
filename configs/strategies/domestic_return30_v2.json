@@ -1,0 +1,40 @@
+{
+  "strategy_id": "domestic_return30_v2",
+  "status": "research_candidate",
+  "objective_max_drawdown": 0.3,
+  "retained_v1": "domestic_low_securities_vol16_v1",
+  "fixed_policy": "expert_nosec_blend_vol22",
+  "fixed_policy_selected_from_observed_history": true,
+  "annual_policy_separate": "routes_frozen.json",
+  "target_each_basket_max": 0.2,
+  "actual_tolerance": 0.23,
+  "frequency": 21,
+  "deadband": 0.03,
+  "target_archive": "reports/research/domestic_return30_v2_20261013/expert_targets.npz",
+  "report": "reports/research/domestic_return30_v2_20261013/report.md",
+  "live_trading_enabled": false,
+  "basket_core": {
+    "BYD": 0.2,
+    "broad": 0.2,
+    "gold": 0.2,
+    "bond": 0.2,
+    "securities": 0,
+    "dividend": 0.2
+  },
+  "broad_split": {
+    "510300.SH": 0.5,
+    "510500.SH": 0.5
+  },
+  "volatility_target": 0.22,
+  "volatility_lookback": 63,
+  "close_return_annualization": 252,
+  "cash_scale": "min(1, volatility_target/known_core_volatility)",
+  "near_optimal_alternative": {
+    "target_key": "nosec_blend_vol18",
+    "volatility_target": 0.18,
+    "metrics": "alternative_vol18_metrics.csv"
+  },
+  "target_key": "nosec_blend_vol22",
+  "fixed_candidate_net_cagr": 0.110177,
+  "fixed_candidate_max_drawdown": -0.267388
+}

@@ -1,0 +1,64 @@
+{
+  "completed_at": "2026-10-28T12:49:29.336977+08:00",
+  "before_count": 91,
+  "after_count": 98,
+  "new_symbols": 7,
+  "new_alerts": 7,
+  "verification": "PASS",
+  "items": [
+    {
+      "symbol": "600160.SH",
+      "name": "巨化股份",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "603379.SH",
+      "name": "三美股份",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "605020.SH",
+      "name": "永和股份",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "600989.SH",
+      "name": "宝丰能源",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "002648.SZ",
+      "name": "卫星化学",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "600426.SH",
+      "name": "华鲁恒升",
+      "new_symbol": false,
+      "new_alert": false
+    },
+    {
+      "symbol": "600309.SH",
+      "name": "万华化学",
+      "new_symbol": false,
+      "new_alert": false
+    },
+    {
+      "symbol": "600230.SH",
+      "name": "沧州大化",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "688353.SH",
+      "name": "华盛锂电",
+      "new_symbol": true,
+      "new_alert": true
+    }
+  ]
+}

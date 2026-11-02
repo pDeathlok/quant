@@ -29,6 +29,13 @@ class FactorCalculatorDefinition:
 
 
 _BASE_CALCULATORS: dict[str, dict[str, Any]] = {
+    "index_ma_state_research": {
+        "entrypoint": "quant.features.index_ma_state.compute_index_ma_state_features",
+        "dependencies": (), "factor_dependencies": (), "partition_axis": "dataset",
+        "executor": "serial", "default_workers": 1, "max_workers": 1,
+        "max_pending_multiplier": 1, "materialization": "on_demand",
+        "routine_node": "",
+    },
     "market_breadth_research": {
         "entrypoint": "quant.features.market_breadth.compute_market_breadth_features",
         "dependencies": (), "factor_dependencies": (), "partition_axis": "dataset",

@@ -1,0 +1,16 @@
+# Existing assets and chronological fold boundaries; no modification to old experiments.
+base_config: configs/kronos_byd_walk_forward.yaml
+output_dir: reports/research/kronos_next_day_prices_v1
+checkpoint_dir: models/research/kronos/checkpoints/next_day_prices_v1
+lookback: 90
+train_stride: 1
+epochs: 5
+patience: 2
+batch_size: 32
+backbone_lr: 0.00001
+head_lr: 0.0003
+weight_decay: 0.01
+loss: smooth_l1_log_return_pct
+loss_beta: 1.0
+price_weights: [1.0, 1.0, 1.0, 1.0]
+seed: 20260912

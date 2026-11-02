@@ -295,7 +295,7 @@ MySQL 快照执行相同的定期删除规则，但 InnoDB 删除行后通常先
 | `ROUTINE_TRADABILITY_BACKFILL_SLEEP` | `0.5` | 历史回填不同交易日之间的等待秒数 |
 | `ROUTINE_MARKET_REGIME_LOOKBACK_DAYS` | `252` | 市场状态读取正式行情的自然日窗口；必须至少 90 |
 | `TUSHARE_STOCK_BASIC_TTL_HOURS` | `24` | `stock_basic` 请求缓存最长有效时间；同一流水线内复用，避免重复请求 |
-| `ROUTINE_FINANCIAL_PERIODS` | `4` | 每日通过 Tushare VIP 重拉的最近报告期数 |
+| `ROUTINE_FINANCIAL_PERIODS` | `5` | 每日通过 Tushare VIP 分页重拉的最近报告期数，覆盖 TTM 所需上年同期 |
 | `ROUTINE_FINANCIAL_SLEEP` | `0.15` | 财务 VIP 请求之间的最小间隔秒数 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 内存或 CPU 紧张时降低 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | CPU 密集的特征计算默认使用多进程；调试时可改为 `threads` |
@@ -386,6 +386,18 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 3. 对应工作区步骤是否成功。
 4. 页面是否读取了带旧参数的快照；使用页面刷新按钮强制重建。
 5. 配债股和相似走势的 `generated_at` 是否为当天；两者首次打开会自动补刷过期缓存。
+
+### BYD 历史分钟训练数据
+
+日常更新通过 `python3 scripts/run_daily_web_refresh.py` 执行，BYD 显式刷新会先检查历史训练样本，再生成工作区；普通页面读取不会发起分钟行情下载。历史样本沿用依赖合同的 60 天 SLA，不代表当天实时特征。
+
+- 数据源顺序为 Tushare `stk_mins`、AkShare、BaoStock。Tushare 分钟权限及限频独立于日线接口；不能因为日线可用就假定分钟接口可用。
+- Tushare/AkShare 的原始分钟价格使用 Tushare `adj_factor` 统一前复权；AkShare 的近期历史覆盖不足时不能替代多年训练集。可选备用依赖为 `pip install '.[data-fallback]'`。
+- 来源变更或历史复权基准变化时重建完整分钟历史，禁止拼接不同来源或猜测缩放系数。校验交易日覆盖、每个交易日 48 根完整 K 线、日线开盘锚点和价格范围，并记录跨频率差异。分钟聚合 OHLC 不要求与日线全部相等。
+- 只有完整校验及刷新前后日线参考一致性检查通过，才原子替换逻辑路径 `data/cache/byd_002594_5min_training_qfq.parquet`。该文件随工作区纳入同一个发布版本，消费者和新鲜度证据读取同一版本的文件；供应商失败不会将旧文件标记为已更新。新建训练历史默认从 2020 年开始，覆盖模型的 2022—2023 年训练期及特征预热。
+- 下载在隔离子进程中执行，默认总时限 900 秒；超时或所有来源失败会让 BYD 刷新失败，并阻止全量发布，不放宽新鲜度门禁。检查结果中的 `provider_attempts`、`watermark` 和 `cross_frequency_audit` 定位问题。
+
+历史 BaoStock 专用研究脚本仍保留用于复现实验，不是例行更新入口。相似走势历史参考库维持每周五收盘后刷新；超过合同 TTL 时可在完整收盘输入已就绪的其他交易日补建，不能使用过期参考库继续发布。跨日任务只允许依据本轮已校验、封存的目标日期补建，实际来源日期必须一致，不能把昨日输入标为今日数据；未封存的请求仍要求当天收盘数据。
 
 ## 验证与回归
 

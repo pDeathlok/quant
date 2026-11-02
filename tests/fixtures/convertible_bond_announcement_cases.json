@@ -361,6 +361,87 @@
         "announce_date": "2026-06-10",
         "url": "http://example.test/300005/generic"
       }
+    },
+    {
+      "id": "hangya_20260912_registration_after_published_committee",
+      "stock_code": "688510",
+      "stock_name": "航亚科技",
+      "announcements": [
+        {
+          "title": "无锡航亚科技股份有限公司关于向不特定对象发行可转换公司债券申请获得上海证券交易所上市审核委员会审核通过的公告",
+          "announce_time": "2026-08-13 00:00:00",
+          "url": "https://static.cninfo.com.cn/finalpage/2026-08-13/1225470132.PDF"
+        },
+        {
+          "title": "无锡航亚科技股份有限公司关于向不特定对象发行可转换公司债券申请获得中国证券监督管理委员会同意注册批复的公告",
+          "announce_time": "2026-09-12 00:00:00",
+          "url": "https://static.cninfo.com.cn/finalpage/2026-09-12/1225559536.PDF"
+        }
+      ],
+      "expected": {
+        "stage": "registered",
+        "status": "同意注册",
+        "announce_date": "2026-09-12",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-09-12/1225559536.PDF"
+      }
+    },
+    {
+      "id": "aoshikang_registration_before_extension_2026",
+      "stock_code": "002913",
+      "stock_name": "奥士康",
+      "announcements": [
+        {
+          "title": "关于公司向不特定对象发行可转换公司债券申请获得中国证券监督管理委员会同意注册批复的公告",
+          "announce_time": "2026-04-02 00:00:00",
+          "url": "https://static.cninfo.com.cn/finalpage/2026-04-02/1225070385.PDF"
+        },
+        {
+          "title": "关于延长公司向不特定对象发行可转换公司债券股东会决议有效期及相关授权有效期的公告",
+          "announce_time": "2026-07-18 00:00:00",
+          "url": "https://static.cninfo.com.cn/finalpage/2026-07-18/1225429928.PDF"
+        }
+      ],
+      "expected": {
+        "stage": "registered",
+        "status": "同意注册",
+        "announce_date": "2026-04-02",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-02/1225070385.PDF"
+      }
+    }
+  ],
+  "issuance_detail_cases": [
+    {
+      "id": "longhua_20260924_issue_not_underwriting_cap",
+      "stock_code": "301149",
+      "title": "向不特定对象发行可转换公司债券发行公告",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-09-24/1225580001.PDF",
+      "text": "本次发行总额的30%，即原则上最大包销金额为28,800.00万元。\n本次发行总额为人民币96,000.00万元（含本数）可转债。\n本次发行的可转债简称为“隆新转债”，债券代码为“123288”。\n股权登记日2026年9月28日。每股配售1.7173元面值可转债。配售代码为“381149”，配售简称为“隆新配债”。",
+      "expected": {
+        "issue_size_yuan": 960000000.0,
+        "rights_per_share": 1.7173,
+        "bond_code": "123288",
+        "bond_name": "隆新转债",
+        "allot_code": "381149",
+        "allot_name": "隆新配债",
+        "record_date": "2026-09-28"
+      }
+    },
+    {
+      "id": "layermat_20260924_final_issue_over_draft",
+      "stock_code": "688150",
+      "title": "陕西莱特光电材料股份有限公司向不特定对象发行可转换公司债券发行公告",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-09-24/1225580208.PDF",
+      "text": "本次发行总额的30%，即原则上最大包销金额为15,743.37万元。\n本次拟发行可转债总额为人民币52,477.90万元。\n可转债代码118077，可转债简称莱特转债 可转债扩位简称莱特转债 原股东配售代码726150 原股东配售简称莱特配债 转债申购代码718150 转债申购简称莱特发债\n股权登记日2026年9月28日，原股东优先配售日与网上申购日同为2026年9月29日。每股配售1.313元面值可转债。",
+      "expected": {
+        "issue_size_yuan": 524779000.0,
+        "rights_per_share": 1.313,
+        "bond_code": "118077",
+        "bond_name": "莱特转债",
+        "allot_code": "726150",
+        "allot_name": "莱特配债",
+        "record_date": "2026-09-28",
+        "pay_date": "2026-09-29"
+      }
     }
   ]
 }

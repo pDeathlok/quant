@@ -7,6 +7,8 @@ description: 对沪深北交易所 A 股普通股上市公司进行证据驱动�
 
 把输出当作可复核的研究底稿，不把流畅叙述当作证据。先建立数据时点和口径，再形成投资逻辑，最后计算情景价值。
 
+默认个股研究同时应用“政策与需求 → 五条原则筛选 → 卡脖子/涨价/超预期营收验证 → 利润与现金流 → 估值 → 条件式择时与仓位研究”的链条。政策只是需求入口，技术只服务参与和退出条件，不替代独立估值；详见 [policy-demand-stock-selection.md](references/policy-demand-stock-selection.md)。
+
 ## 核心约束
 
 1. 对当前价格、公告、规则、宏观数据、管理层、股本和估值倍数联网核验；不得凭记忆声称“最新”。
@@ -28,6 +30,7 @@ description: 对沪深北交易所 A 股普通股上市公司进行证据驱动�
 按任务模式加载：
 
 - **所有模式的历史检查**：识别唯一证券代码和本次截止时点后，先查询同标的历史基线。命中时，无论最终任务模式为何，都额外读取 [review-and-learning.md](references/review-and-learning.md) 与 [report-template.md](references/report-template.md)，并加载基线的 `record.json` 和 `report.md`；未命中才标记首次建档。
+- **完整覆盖/政策主线候选池/成长逻辑验证**：读取 [policy-demand-stock-selection.md](references/policy-demand-stock-selection.md)。默认个股覆盖用它检验目标公司；用户要求从政策、国产替代、涨价或上游工具寻找公司时，用它建立候选池。复盘或事件更新只检验受影响环节；纯质量评分和纯反向估值不强行扩展选股任务。
 - **需要外部金融数据的所有模式**：读取 [miaoxiang-mcp.md](references/miaoxiang-mcp.md)，先检查 `mx-ds-mcp` 运行时工具是否实际可用，再执行该任务模式的最小调用计划。工具可用却没有实际调用时不得完成报告；纯本地材料、严格历史时点但返回无法通过可得时点门、或 MCP 不可用时可以跳过，但必须记录原因和降级路径。
 - **完整覆盖/同行/历史研究**：读取 [source-policy.md](references/source-policy.md)、[research-workflow.md](references/research-workflow.md)、[valuation-and-scenarios.md](references/valuation-and-scenarios.md)、[technical-price-volume.md](references/technical-price-volume.md)、[review-and-learning.md](references/review-and-learning.md) 和 [report-template.md](references/report-template.md)。
 - **财报/事件投资影响更新**：读取 [source-policy.md](references/source-policy.md) 与 [review-and-learning.md](references/review-and-learning.md)，再读取 [research-workflow.md](references/research-workflow.md) 中与新事实及财务口径相关的章节；先交付不超过 8 条的“新事实摘要”，每条包含事实、报告期、`available_at` 和来源。只有用户要求预测、估值或投资影响时才读取 [valuation-and-scenarios.md](references/valuation-and-scenarios.md) 与 [report-template.md](references/report-template.md)；要求市场反应或量价确认时另读 [technical-price-volume.md](references/technical-price-volume.md)。
@@ -39,6 +42,7 @@ description: 对沪深北交易所 A 股普通股上市公司进行证据驱动�
 
 ## 选择任务模式
 
+- **政策主线候选池**：先确认政策版本、实际需求和付款方，再定位产业链环节，按五条原则与三个验证维度列出候选、待验证及排除理由。候选身份只表示值得研究，不等于投资倾向或买入建议，不要求对初筛全体强行给目标价；对形成逐股投资判断的对象执行历史、MCP、三情景及归档契约。逐股形成筛选判断前仍须查询历史基线，未完成查询的名称只能标为待研究线索。
 - **完整覆盖（默认）**：用户只说“分析某股”时，完成业务、行业、财务质量、治理、估值、三情景、紧凑量价辅助、催化剂与风险；若该股已有基线，则同时执行同标的再分析要求，不能重新从零叙述。
 - **同标的再分析**：只要历史查询命中，即使用户仍只说“分析某股”，也以前一期为基线，先回答“上次怎么看”，再给“这次什么事实变了、哪些判断不变、模型/估值是否调整、下一步如何验证”。用户未明确提供新事件时，触发类型使用定期复盘或其他适用类型，不得伪装成首次覆盖。
 - **财报/事件更新**：先读取严格早于本次截止时点的最近历史记录，以前一期结论为基线，明确“新事实 → 旧判断检验 → 认知变化 → 预测变化 → 估值变化”；不得只复述公告，也不得悄悄覆盖旧记录。
@@ -174,6 +178,8 @@ PYTHONPATH=src python -m quant.research.a_share_skill_data \
 
 ### 5. 构建投资逻辑
 
+完整覆盖先按 [policy-demand-stock-selection.md](references/policy-demand-stock-selection.md) 检验政策需求、细分龙头与研发转化、景气和价格位置、订单兑现、上游工具价值及技术可复现性；把卡脖子、涨价、超预期营收分别标为支持/反对/待验证/不适用，再接入下面的经营模型。三项不是必须同时成立的硬筛选条件，也不得用综合分掩盖证据缺口。
+
 先写中性情景的经营模型，再下结论。至少形成 2–4 个论点支柱，每个支柱包含：
 
 1. 可验证的驱动和支持证据。
@@ -219,6 +225,7 @@ PYTHONPATH=src python -m quant.research.a_share_skill_data \
 5. 业务、行业、财务与会计质量、治理和资本配置。
 6. 预测、估值桥接、敏感性和反向估值。
 7. 量价技术辅助、与基本面是否一致及观察锚。
+   使用政策需求框架时，将候选原则、三维验证和预期差桥放入投资逻辑及财务段；择时与仓位研究独立放入量价段，执行 [policy-demand-stock-selection.md](references/policy-demand-stock-selection.md) 的输出契约。
 8. 催化剂、风险、监测清单。
 9. 来源、数据缺口、方法局限和免责声明。
 

@@ -2738,6 +2738,60 @@ th {
   max-height: 440px;
 }
 
+.similar-watch-panel > .panel-head {
+  flex-wrap: wrap;
+}
+
+.similar-watch-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.watchlist-alert-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.watchlist-alert-filter input {
+  appearance: none;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--muted);
+  cursor: pointer;
+}
+
+.watchlist-alert-filter input::before {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s;
+}
+
+.watchlist-alert-filter input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.watchlist-alert-filter input:checked::before {
+  transform: translateX(16px);
+}
+
+.watchlist-alert-filter input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
 .similar-signal-summary {
   display: grid;
   gap: 12px;
@@ -6013,3 +6067,37 @@ tbody tr.selected-row:hover td {
     font-size: 20px;
   }
 }
+
+/* Frozen transition-right strategy workspace. */
+.transition-toolbar { align-items: center; gap: 22px; }
+.transition-controls,.transition-account-controls { display:flex; gap:12px; align-items:end; flex-wrap:wrap; }
+.transition-controls label,.transition-account-controls label { display:grid; gap:7px; font-size:12px; color:var(--muted,#667085); }
+.transition-controls select,.transition-account-controls input { min-height:40px; padding:8px 12px; border:1px solid #dce3eb; border-radius:9px; background:#fff; color:#172b3a; }
+.transition-metrics { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:16px; padding:12px 0; }
+.transition-metrics span { display:block; font-size:12px; color:#687888; margin-bottom:7px; }
+.transition-metrics strong { display:block; font-size:19px; color:#183c48; overflow-wrap:anywhere; }
+.transition-badge { padding:7px 12px; border-radius:20px; background:#fff2dc; color:#81551a; font-size:12px; }
+.transition-badge.ready { background:#e9f4ef; color:#24654e; }
+.transition-order-grid { display:grid; grid-template-columns:1.2fr 1fr; gap:18px; }
+.transition-order-grid .panel { margin:0; }
+.transition-position { padding:15px 0; border-bottom:1px solid #edf0f4; }
+.transition-position:last-child { border-bottom:0; }
+.transition-position p { margin:8px 0; line-height:1.65; }
+.transition-action { display:inline-block; font-size:11px; padding:4px 7px; border-radius:5px; margin-right:6px; white-space:nowrap; background:#edf1f6; color:#526378; }
+.transition-action.sell { background:#fcece8; color:#a24030; }
+.transition-action.buy { background:#e4f3ee; color:#24664f; }
+.transition-action.check { background:#fff2dc; color:#81551a; }
+.transition-decision { font-size:19px; font-weight:600; color:#20596a; }
+.transition-note { padding:10px 13px; background:#f3f6fa; border-radius:8px; line-height:1.7; color:#526378; }
+.transition-table-scroll { overflow-x:auto; max-width:100%; }
+.transition-table { width:100%; min-width:730px; border-collapse:collapse; font-size:13px; }
+.transition-table th { text-align:left; color:#66788a; font-size:12px; font-weight:500; padding:13px 10px; border-bottom:1px solid #dfe6ed; white-space:nowrap; }
+.transition-table td { padding:14px 10px; border-bottom:1px solid #edf0f4; line-height:1.6; vertical-align:top; }
+.transition-table small { color:#788697; }
+.transition-table input { width:100%; min-width:115px; max-width:190px; box-sizing:border-box; padding:8px; border:1px solid #dce3eb; border-radius:6px; }
+.transition-account-controls { margin:12px 0; }
+.transition-rules summary { cursor:pointer; font-weight:600; color:#233e50; }
+.transition-rules li { margin:9px 0; line-height:1.8; }
+.transition-empty { padding:15px 0; color:#6c7e8e; line-height:1.8; }
+@media(max-width:1050px) { .transition-metrics { grid-template-columns:repeat(3,minmax(0,1fr)); } .transition-toolbar { flex-wrap:wrap; } }
+@media(max-width:650px) { .transition-order-grid { grid-template-columns:1fr; } .transition-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } .transition-controls { width:100%; } .transition-controls label { width:100%; } .transition-controls select { width:100%; } .transition-controls button,.transition-account-controls button { flex:1; min-width:130px; } }

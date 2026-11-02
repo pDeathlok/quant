@@ -169,6 +169,11 @@ def test_default_scope_closure_contains_only_required_production_branches() -> N
     assert "feature.selector_live" not in similar
 
 
+def test_similar_reference_contract_tracks_refresh_policy() -> None:
+    node = DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes["feature.similar_reference"]
+    assert "src/quant/routine/vector_refresh_policy.py" in node.contract_sources
+
+
 def test_right_side_shadow_is_a_separate_four_layer_research_closure() -> None:
     registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
     shadow = registry.required_node_ids("rightSideShadow")
@@ -338,7 +343,6 @@ def test_production_data_sources_register_their_primary_implementations() -> Non
         "data.cb_daily": "src/quant/routine/convertible_bond_grid_plan.py",
         "data.cb_reference": "src/quant/routine/convertible_bond_grid_plan.py",
         "data.cb_allotment_events": "src/quant/routine/convertible_bond_allotment.py",
-        "data.byd_intraday_training": "src/quant/application/workspaces/byd.py",
         "data.similar_watchlist": "src/quant/webapp/services.py",
     }
     production_source_ids = {
@@ -641,3 +645,11 @@ def test_plan_propagates_stale_exact_partition_and_expired_ttl() -> None:
     assert ttl_plan["data.ttl"].action == "refresh"
     assert ttl_plan["feature.live"].action == "refresh"
     assert ttl_plan["product.live"].action == "refresh"
+
+
+def test_transition_workspace_replaces_byd_training_in_active_closure():
+    r=DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    assert r.scope_roots["byd"] == ("product.transition",)
+    assert r.nodes["product.byd"].lifecycle == Lifecycle.RETIRED
+    assert r.nodes["data.byd_intraday_training"].lifecycle == Lifecycle.RETIRED
+    assert "src/quant/application/workspaces/transition.py" in r.nodes["product.transition"].contract_sources

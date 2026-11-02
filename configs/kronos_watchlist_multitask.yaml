@@ -1,0 +1,32 @@
+base_config: configs/kronos_byd_walk_forward.yaml
+watchlist: data/research/similar_patterns/watchlist.json
+output_dir: reports/research/kronos_watchlist_multitask_v1
+lookback: 90
+data_end: '2026-09-11'
+encode_batch_size: 64
+batch_size: 1024
+epochs: 6
+patience: 2
+learning_rate: 0.001
+auxiliary_weight: 0.3
+seeds: [20260912, 20260913]
+variants: [A, B, C, D, E, F]
+folds:
+  - name: test_2024
+    train_start: '2015-01-01'
+    train_end: '2022-12-31'
+    validation_year: 2023
+    test_start: '2024-01-01'
+    test_end: '2024-12-31'
+  - name: test_2025
+    train_start: '2016-01-01'
+    train_end: '2023-12-31'
+    validation_year: 2024
+    test_start: '2025-01-01'
+    test_end: '2025-12-31'
+  - name: test_2026
+    train_start: '2017-01-01'
+    train_end: '2024-12-31'
+    validation_year: 2025
+    test_start: '2026-01-01'
+    test_end: '2026-09-11'

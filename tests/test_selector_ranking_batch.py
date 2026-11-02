@@ -15,6 +15,7 @@ from quant.application import left_side_ranking
 from quant.application import selector_ranking as ranking
 from quant.application.left_side_ranking import (
     DEFAULT_LEFT_SIDE_RANKING_CONFIG,
+    LEFT_SIDE_V5_SHADOW_SCORE_FIELDS,
 )
 from quant.features.left_side_factor_contract import (
     LEFT_SIDE_FACTOR_CONTRACT_SHA256,
@@ -48,6 +49,7 @@ def _write_left(config, score=0.7):
             "date": DATE,
             config.score_field: score,
             config.normalized_score_field: score * 100,
+            **dict(zip(LEFT_SIDE_V5_SHADOW_SCORE_FIELDS, (0.8, 81.0, 82.0, True, 83.0, "v5"))),
         }
         for symbol in ("both", "left")
     ]).to_parquet(config.paths.score_output, index=False)
@@ -58,6 +60,7 @@ def _write_left(config, score=0.7):
         "output_sha256": hashlib.sha256(config.paths.score_output.read_bytes()).hexdigest(),
         "artifact_sha256": "left-artifact",
         "policy_excluded_candidate_symbols": ["left-excluded"],
+        "shadow_v5": {"status": "success"},
     }))
 
 
@@ -92,6 +95,7 @@ def _spy_loaders(monkeypatch):
     for name in (
         "load_right_side_ranking_scores",
         "load_left_side_ranking_scores",
+        "load_left_side_v5_shadow_scores",
     ):
         spy = Mock(wraps=getattr(ranking, name))
         monkeypatch.setattr(ranking, name, spy)
@@ -124,9 +128,12 @@ def test_fourteen_pools_match_standalone_with_one_load_per_input(inputs, monkeyp
             first_left_hash_calls = left_hash_spy.call_count
         assert hash_spy.call_count == first_hash_calls
         assert left_hash_spy.call_count == first_left_hash_calls
-    assert [spy.call_count for spy in spies] == [1, 1]
+    assert [spy.call_count for spy in spies] == [1, 1, 1]
     assert [row["symbol"] for row in result] == ["both", "right", "left", "unranked"]
     assert result[0]["selector_score"] == 90.0
+    assert "shadow_v5_absolute_score" not in result[0]
+    assert result[2]["shadow_v5_absolute_score"] == 83.0
+    assert result[2]["shadow_v5_production_action"] == "observe_only"
 
 
 @pytest.mark.parametrize("side", ["right", "left", "neither", "empty"])
@@ -142,8 +149,8 @@ def test_loads_only_actually_needed_sides(inputs, monkeypatch, side):
     for _ in range(3):
         ranking.apply_selector_ranking_source(deepcopy(rows), DATE, ranking_batch=batch)
     assert [spy.call_count for spy in spies] == {
-        "right": [1, 0], "left": [0, 1],
-        "neither": [0, 0], "empty": [0, 0],
+        "right": [1, 0, 0], "left": [0, 1, 1],
+        "neither": [0, 0, 0], "empty": [0, 0, 0],
     }[side]
 
 
@@ -283,7 +290,7 @@ def test_new_batch_revalidates_even_unchanged_files(inputs, monkeypatch):
             _rows(("right", ["B2"]), ("left", ["B1"])), DATE,
             ranking_batch=ranking.SelectorRankingBatch(DATE),
         )
-    assert [spy.call_count for spy in spies] == [2, 2]
+    assert [spy.call_count for spy in spies] == [2, 2, 2]
 
 
 @pytest.mark.parametrize("change", ["generation", "writable", "exit"])
@@ -313,6 +320,20 @@ def test_batch_still_checks_coverage_for_every_pool(inputs, side):
             _rows((side, [strategy])), DATE, ranking_batch=batch,
             require_all_ranked_candidates=True,
         )
+
+
+def test_shadow_failure_is_optional_and_retried_not_cached(inputs, monkeypatch):
+    loader = ranking.load_left_side_v5_shadow_scores
+    spy = Mock(side_effect=[RuntimeError("temporary shadow failure"), loader(DATE, config=inputs[1])])
+    monkeypatch.setattr(ranking, "load_left_side_v5_shadow_scores", spy)
+    batch = ranking.SelectorRankingBatch(DATE)
+    first = ranking.apply_selector_ranking_source(_rows(("left", ["B1"])), DATE, ranking_batch=batch)
+    second = ranking.apply_selector_ranking_source(_rows(("left", ["B1"])), DATE, ranking_batch=batch)
+    third = ranking.apply_selector_ranking_source(_rows(("left", ["B1"])), DATE, ranking_batch=batch)
+    assert "shadow_v5_absolute_score" not in first[0]
+    assert second == third
+    assert second[0]["shadow_v5_absolute_score"] == 83.0
+    assert spy.call_count == 2
 
 
 def test_input_change_during_first_load_is_not_cached(inputs, monkeypatch):
@@ -347,3 +368,19 @@ def test_first_load_checksum_validation_is_not_bypassed(inputs, side):
         ranking.apply_selector_ranking_source(deepcopy(rows), DATE, ranking_batch=batch)
     path.write_bytes(original)
     assert ranking.apply_selector_ranking_source(rows, DATE, ranking_batch=batch)
+
+
+def test_shadow_optional_failure_cannot_hide_source_change(inputs, monkeypatch):
+    _, left = inputs
+    loader = ranking.load_left_side_v5_shadow_scores
+
+    def changing_shadow(*args, **kwargs):
+        result = loader(*args, **kwargs)
+        left.paths.score_manifest.write_text(left.paths.score_manifest.read_text() + " ")
+        return result
+
+    monkeypatch.setattr(ranking, "load_left_side_v5_shadow_scores", changing_shadow)
+    with pytest.raises(RuntimeError, match="inputs changed"):
+        ranking.apply_selector_ranking_source(
+            _rows(("left", ["B1"])), DATE, ranking_batch=ranking.SelectorRankingBatch(DATE)
+        )

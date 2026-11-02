@@ -105,14 +105,18 @@ def _normalize_keys(frame: pd.DataFrame, *, require_symbol: bool) -> pd.DataFram
         ).dt.strftime("%Y%m%d")
     if "trade_date" not in out.columns:
         raise ValueError("active market value input misses trade_date/date")
+    compact = out["trade_date"].astype(str).str.replace("-", "", regex=False)
     parsed = pd.to_datetime(
-        out["trade_date"].astype(str).str.replace("-", "", regex=False),
+        compact,
         format="%Y%m%d",
         errors="coerce",
     )
     if parsed.isna().any():
         raise ValueError("active market value input has invalid trade_date values")
-    out["trade_date"] = parsed.dt.strftime("%Y%m%d")
+    # Preserve the already canonical compact key.  ``dt.strftime`` on a
+    # million-row full-market frame is needlessly expensive on macOS because
+    # it repeatedly consults timezone state for every scalar timestamp.
+    out["trade_date"] = compact
     out["date"] = parsed.dt.normalize()
     keys = ["trade_date"]
     if require_symbol:
@@ -163,19 +167,20 @@ def compute_active_share_ratio(
     if not 0.0 <= decay < 1.0:
         raise ValueError("active share decay must be in [0, 1)")
     turnover = pd.to_numeric(turnover_rate_pct, errors="coerce") / 100.0
-    result = pd.Series(np.nan, index=turnover.index, dtype=float)
+    values = turnover.to_numpy(dtype=float, copy=False)
+    result = np.full(len(values), np.nan, dtype=float)
     state = np.nan
-    for index, raw_value in turnover.items():
+    for position, raw_value in enumerate(values):
         if not np.isfinite(raw_value):
             continue
-        current = float(np.clip(raw_value, 0.0, 1.0))
+        current = float(min(1.0, max(0.0, raw_value)))
         state = (
             current
             if not np.isfinite(state)
             else current + decay * (1.0 - current) * state
         )
-        result.loc[index] = float(np.clip(state, 0.0, 1.0))
-    return result
+        result[position] = float(min(1.0, max(0.0, state)))
+    return pd.Series(result, index=turnover.index, dtype=float)
 
 
 def compute_stock_active_market_value_features(
@@ -195,9 +200,26 @@ def compute_stock_active_market_value_features(
         raise ValueError(f"stock active market value input misses columns: {missing}")
     frame["turnover_rate"] = _numeric(frame, "turnover_rate")
     frame["circ_mv"] = _numeric(frame, "circ_mv")
-    frame["stock_active_share_ratio_13d_proxy"] = frame.groupby(
-        "ts_code", sort=False
-    )["turnover_rate"].transform(compute_active_share_ratio)
+    turnover = frame["turnover_rate"].to_numpy(dtype=float, copy=False) / 100.0
+    symbol_codes = pd.factorize(frame["ts_code"], sort=False)[0]
+    active_share = np.full(len(frame), np.nan, dtype=float)
+    previous_code = -1
+    state = np.nan
+    for position, raw_value in enumerate(turnover):
+        current_code = int(symbol_codes[position])
+        if current_code != previous_code:
+            previous_code = current_code
+            state = np.nan
+        if not np.isfinite(raw_value):
+            continue
+        current = float(min(1.0, max(0.0, raw_value)))
+        state = (
+            current
+            if not np.isfinite(state)
+            else current + ACTIVE_SHARE_DECAY * (1.0 - current) * state
+        )
+        active_share[position] = float(min(1.0, max(0.0, state)))
+    frame["stock_active_share_ratio_13d_proxy"] = active_share
     frame["stock_active_mv_proxy_cny"] = (
         frame["circ_mv"]
         * 10_000.0
@@ -227,11 +249,28 @@ def compute_market_active_market_value_features(
     daily_basic: pd.DataFrame,
     *,
     market_daily: pd.DataFrame | None = None,
+    stock_features: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Aggregate stock proxies into whole-market date-level features."""
 
     basic = _normalize_keys(daily_basic, require_symbol=True)
-    stock = compute_stock_active_market_value_features(basic)
+    stock = (
+        compute_stock_active_market_value_features(basic)
+        if stock_features is None
+        else stock_features.copy()
+    )
+    required_stock = {
+        "ts_code",
+        "trade_date",
+        *STOCK_ACTIVE_MARKET_VALUE_FEATURE_COLUMNS,
+    }
+    missing_stock = sorted(required_stock - set(stock.columns))
+    if missing_stock:
+        raise ValueError(
+            f"precomputed stock active market value misses columns: {missing_stock}"
+        )
+    if stock.duplicated(["ts_code", "trade_date"]).any():
+        raise ValueError("precomputed stock active market value has duplicate keys")
     stock_source = stock.merge(
         basic[["ts_code", "trade_date", "circ_mv"]],
         on=["ts_code", "trade_date"],

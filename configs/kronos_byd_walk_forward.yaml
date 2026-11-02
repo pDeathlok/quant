@@ -1,0 +1,63 @@
+experiment:
+  name: kronos_byd_walk_forward
+  symbol: "002594"
+  data_path: data/stocks_daily/002594.parquet
+  output_dir: reports/research/kronos_byd_walk_forward
+  checkpoint_dir: models/research/kronos/checkpoints/byd_walk_forward
+  lookback: 90
+  horizon: 10
+  transaction_cost: 0.002
+
+model:
+  source_dir: models/research/kronos/source
+  source_revision: 67b630e67f6a18c9e9be918d9b4337c960db1e9a
+  tokenizer_path: models/research/kronos/pretrained/Kronos-Tokenizer-base
+  predictor_path: models/research/kronos/pretrained/Kronos-small
+  tokenizer_sha256: 59d85f6af76a2c3b8240ea06cb21db4213b4eeca053f246b23e29cf832fc6bee
+  predictor_sha256: b082dfcbd8e8c142a725c8bbb99781802f38fec81210e13479effb32b3c3e020
+  max_context: 512
+  device: auto
+
+training:
+  epochs: 2
+  batch_size: 16
+  train_stride: 5
+  validation_stride: 10
+  learning_rate: 0.000001
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  clip_grad_norm: 3.0
+  early_stopping_patience: 1
+  seed: 20260831
+
+inference:
+  evaluation_stride: 10
+  batch_size: 4
+  temperature: 0.6
+  top_k: 0
+  top_p: 0.9
+  sample_count: 3
+
+folds:
+  - name: test_2024
+    train_start: 2015-01-01
+    train_end: 2022-12-31
+    validation_start: 2023-01-01
+    validation_end: 2023-12-31
+    test_start: 2024-01-01
+    test_end: 2024-12-31
+  - name: test_2025
+    train_start: 2016-01-01
+    train_end: 2023-12-31
+    validation_start: 2024-01-01
+    validation_end: 2024-12-31
+    test_start: 2025-01-01
+    test_end: 2025-12-31
+  - name: test_2026_ytd
+    train_start: 2017-01-01
+    train_end: 2024-12-31
+    validation_start: 2025-01-01
+    validation_end: 2025-12-31
+    test_start: 2026-01-01
+    test_end: 2026-05-26

@@ -50,6 +50,8 @@ def test_selector_score_presentation_normalizes_and_ranks_all_three_scores() -> 
             "symbol": "000002.SZ",
             "ranking_source": "left_side_unified",
             "ranking_score_normalized": 70.0,
+            "shadow_v5_absolute_score": 86.5,
+            "shadow_v5_trade_gate_open": True,
             "opportunity_score": 80.0,
             "holding_score": 60.0,
         },
@@ -67,6 +69,8 @@ def test_selector_score_presentation_normalizes_and_ranks_all_three_scores() -> 
     assert result[0]["model_score_rank"] == 1
     assert result[0]["model_score_rank_count"] == 2
     assert result[1]["model_score_rank"] == 2
+    assert result[1]["model_score_shadow_v5"] == 86.5
+    assert result[1]["model_score_shadow_v5_rank"] == 1
     assert result[2]["model_score_normalized"] is None
     assert result[2]["model_score_rank"] is None
     assert [row["buy_score_rank"] for row in result] == [3, 1, 2]
@@ -192,12 +196,14 @@ def test_selector_score_probability_bands_match_active_artifacts(monkeypatch, tm
     assert {item["key"] for item in payload["calibrations"]} == {
         "model_right",
         "model_left",
+        "model_left_v5_shadow",
         "buy",
         "hold",
     }
     by_key = {item["key"]: item for item in payload["calibrations"]}
     assert len(by_key["model_right"]["bands"]) == 20
     assert len(by_key["model_left"]["bands"]) == 20
+    assert len(by_key["model_left_v5_shadow"]["bands"]) == 20
     assert len(by_key["buy"]["bands"]) == 17
     assert len(by_key["hold"]["bands"]) == 17
     for calibration in by_key.values():
@@ -218,6 +224,14 @@ def test_selector_score_probability_bands_match_active_artifacts(monkeypatch, tm
 def test_materialize_left_side_ranked_candidates_adds_missing_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    metrics = {
+        "trades": 2980,
+        "avg_return_pct": -0.6,
+        "win_rate": 0.419,
+        "max_drawdown_pct": None,
+        "profit_factor": 0.81,
+    }
+    monkeypatch.setattr(services, "_left_side_ranked_metrics", lambda: metrics)
     monkeypatch.setattr(services, "_family_profiles_for_date", lambda *args: {})
     monkeypatch.setattr(services, "_fill_stock_profile", lambda stock, *args: stock)
     stocks = {
@@ -277,6 +291,10 @@ def test_materialize_left_side_ranked_candidates_adds_missing_groups(
     } == {"SUPER_B1", "LOW_PULLBACK"}
     assert stocks["000002.SZ"]["name"] == "测试股票"
     assert stocks["000002.SZ"]["close"] == 12.34
+    assert all(
+        signal["metrics"] == metrics
+        for signal in stocks["000002.SZ"]["signals"]
+    )
 
 
 def test_selector_stock_row_scores_current_snapshot_when_plan_date_is_stale(
@@ -344,6 +362,62 @@ def test_selector_snapshot_rejects_stale_market_values() -> None:
             },
             "2026-09-03",
         )
+
+
+def test_display_selector_payload_backfills_cached_left_side_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = {
+        "trades": 2980,
+        "avg_return_pct": -0.6,
+        "win_rate": 0.419,
+        "max_drawdown_pct": None,
+        "profit_factor": 0.81,
+    }
+    monkeypatch.setattr(services, "_left_side_ranked_metrics", lambda: metrics)
+    monkeypatch.setattr(services, "_row_display_quality_gate", lambda _row: True)
+    monkeypatch.setattr(
+        services,
+        "apply_selector_ranking_source",
+        lambda rows, *_args, **_kwargs: rows,
+    )
+    monkeypatch.setattr(services, "_diversify_default_rows", lambda rows, _limit: rows)
+    payload = {
+        "signal_date": "2026-08-28",
+        "total_stock_count": 1,
+        "stocks": [
+            {
+                "symbol": "000001.SZ",
+                "ranking_source": "left_side_unified",
+                "ranking_score_normalized": 90.0,
+                "matched_count": 1,
+                "matched_group_sides": {"B1": "left"},
+                "best_avg_return_pct": None,
+                "best_profit_factor": 0.0,
+                "selector_score": 60.0,
+                "opportunity_score": 60.0,
+                "holding_score": 55.0,
+                "buy_score_source": "historical_return_model",
+                "hold_score_source": "historical_return_model",
+                "signals": [
+                    {
+                        "strategy_family": "B1",
+                        "strategy_group": "B1",
+                        "operation_key": "rank_only_top_n",
+                        "metrics": None,
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = services._display_selector_payload(payload, limit=10, side="left")
+    row = result["stocks"][0]
+
+    assert row["best_avg_return_pct"] == -0.6
+    assert row["best_profit_factor"] == 0.81
+    assert row["signals"][0]["metrics"] == metrics
+    assert row["historical_metrics_source"] == "left_side_unified_fold_c_top20"
 
 
 def test_operation_plan_crud_persists_tomorrow_and_long_term(monkeypatch, tmp_path) -> None:
@@ -449,6 +523,7 @@ def _stub_successful_global_refresh(
     left_side_ranker=None,
 ):
     from quant.routine import pipeline
+    from quant.routine import historical_integrity
     from quant.routine import left_side_unified_production
     from quant.routine import right_side_unified_production
 
@@ -481,6 +556,11 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(services, "run_cache_cleanup", lambda project_root: {"status": "success"})
     monkeypatch.setattr(pipeline, "_incremental_daily_start", lambda: "20260723")
     monkeypatch.setattr(pipeline, "refresh_data", source_success)
+    monkeypatch.setattr(
+        historical_integrity,
+        "audit_with_tushare",
+        lambda target_date: {"status": "success", "target_trade_date": target_date, "failure_count": 0},
+    )
     monkeypatch.setattr(pipeline, "refresh_daily_basic_data", daily_basic_success)
     monkeypatch.setattr(pipeline, "refresh_reference_inputs", success)
     monkeypatch.setattr(pipeline, "refresh_factor_registry_snapshot", success)
@@ -581,7 +661,7 @@ def _stub_successful_global_refresh(
     )
     monkeypatch.setattr(
         services,
-        "get_byd_daily_strategy",
+        "_refresh_transition_workspace",
         byd_daily_plan
         or (lambda *args, **kwargs: {"planned_t": {"signal_date": "2026-07-23"}, "alerts": []}),
     )
@@ -660,6 +740,20 @@ def test_global_refresh_stub_never_calls_real_long_factor_builder(monkeypatch, t
     services._run_latest_refresh_job("short")
 
     assert calls == []
+
+
+def test_financial_inputs_are_acquired_before_daily_basic_derivation(monkeypatch):
+    from quant.routine import pipeline
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    calls = []
+    monkeypatch.setattr(pipeline, "refresh_reference_inputs", lambda **kwargs:
+                        calls.append("reference") or {"status": "success"})
+    monkeypatch.setattr(pipeline, "refresh_daily_basic_data", lambda **kwargs:
+                        calls.append("daily_basic") or {"status": "success", "latest_trade_date": "20260723"})
+    services._run_latest_refresh_job("all")
+    assert status["status"] == "success"
+    assert calls == ["reference", "daily_basic"]
 
 
 def test_failed_postflight_does_not_publish_staged_workspaces(monkeypatch, tmp_path):
@@ -953,6 +1047,26 @@ def test_full_refresh_executes_every_active_composition_owner(monkeypatch):
     assert not audit["full_production_closure"]
 
 
+def test_full_refresh_rejects_historical_source_gap_before_features(monkeypatch):
+    from quant.routine import historical_integrity
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    monkeypatch.setattr(
+        historical_integrity,
+        "audit_with_tushare",
+        lambda target_date: {
+            "status": "failed", "target_trade_date": target_date,
+            "failure_count": 1,
+            "failures": [{"dataset": "daily", "reason": "missing_traded_price", "trade_date": "20261015"}],
+        },
+    )
+
+    services._run_latest_refresh_job("all", run_id="historical-gap")
+
+    assert status["status"] == "failed"
+    assert "历史底层数据完整性门禁失败" in str(status.get("error"))
+
+
 @pytest.mark.parametrize("scope,late_failure,missing_operation", [
     ("short", False, False), ("all", False, False), ("all", True, False),
     ("short", False, True), ("all", False, True),
@@ -1009,7 +1123,7 @@ def test_core_refresh_passes_one_scheduler_store_and_explicit_stage_inputs(monke
     lifetime = []
     consumed = []
     names = ["get_convertible_bond_grid_plan", "get_convertible_bond_allotments",
-             "get_byd_daily_strategy", "get_chan_model_strategy_plan",
+             "_refresh_transition_workspace", "get_chan_model_strategy_plan",
              "_refresh_long_stock_pool_variants", "_run_similar_pattern_analysis_isolated",
              "_ensure_selector_long_factor_snapshot", "get_stock_selector_payload",
              "_write_strategy_pool_snapshots"]
@@ -1713,6 +1827,17 @@ def test_failed_run_retry_identity_ignores_yesterday_dirty_plan_when_stable() ->
     current["node_state_fingerprints"]["data.market_daily"] = "market-v1"
     current["node_contract_hashes"] = {"feature.strategy_signals": "contract-v2"}
     assert services._retry_preflight_identity_stable(prior, current) is False
+
+
+def test_historical_market_backfill_invalidates_feature_inputs() -> None:
+    basic, market, combined = services._historical_input_repair_dates({
+        "refresh_daily_basic": {"downstream_refresh_dates": ["20200601"]},
+        "refresh_data": {"historical_backfill_changed_dates": ["20131114", "20200601"]},
+    })
+
+    assert basic == ["20200601"]
+    assert market == ["20131114", "20200601"]
+    assert combined == ["20131114", "20200601"]
 
 
 def test_terminal_refresh_writes_immutable_manifest_with_step_timings(
@@ -3125,7 +3250,7 @@ def test_tail_resume_runs_pending_steps_via_executor(monkeypatch) -> None:
             "records": [],
         },
     )
-    monkeypatch.setattr(services, "get_byd_daily_strategy", lambda *args, **kwargs: {"planned_t": {"signal_date": "2026-07-20"}, "alerts": []})
+    monkeypatch.setattr(services, "_refresh_transition_workspace", lambda *args, **kwargs: {"planned_t": {"signal_date": "2026-07-20"}, "alerts": []})
     monkeypatch.setattr(services, "_run_similar_pattern_analysis_isolated", lambda: {"generated_at": "2026-07-20T20:00:00", "results": []})
     monkeypatch.setattr(
         services,
@@ -3266,7 +3391,7 @@ def test_similar_pattern_refresh_updates_vector_caches(monkeypatch, tmp_path) ->
     assert payload["cache"]["reference_library_policy"] == "weekly"
     assert payload["cache"]["reference_library_refreshed"] is True
     assert payload["cache"]["reference_library_reason"] == "forced"
-    assert payload["cache"]["reference_library_minimum_refresh_age_days"] == 5
+    assert payload["cache"]["reference_library_minimum_refresh_age_days"] == 0
     assert payload["cache"]["target_vectors"] == "live_from_latest_daily_data"
 
 
@@ -3327,7 +3452,6 @@ def test_similar_pattern_refresh_reuses_current_weekly_library_but_analyzes_live
         "waiting_for_friday_close",
         "waiting_for_friday_trade_close",
         "friday_close_window_already_refreshed",
-        "minimum_refresh_age_not_reached",
     }
     assert payload["cache"]["reused"] == 1
 
@@ -3353,6 +3477,54 @@ def test_similar_pattern_refresh_rejects_missing_watchlist_targets(monkeypatch, 
 
     with pytest.raises(RuntimeError, match="missing=1/1"):
         services.refresh_similar_pattern_analysis()
+
+
+def test_similar_pattern_expired_unavailable_library_cannot_be_scored(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: pd.DataFrame())
+    monkeypatch.setattr(services, "_latest_similar_pattern_target_date", lambda symbols: "2026-09-14")
+    monkeypatch.setattr(
+        services, "_similar_pattern_vector_cache_refresh_decision",
+        lambda **kwargs: {"due": False, "status": "unavailable", "reason": "waiting_for_current_trade_close"},
+    )
+    def unexpected(*args, **kwargs):
+        pytest.fail("Expired reference library must not be built or scored with stale inputs")
+    monkeypatch.setattr(services, "build_vector_caches_parallel", unexpected)
+    monkeypatch.setattr(services, "analyze_targets_by_threshold", unexpected)
+    with pytest.raises(RuntimeError, match="Historical reference library unavailable"):
+        services._refresh_similar_pattern_analysis_once(["002594.SZ"])
+
+
+def test_similar_pattern_refresh_uses_dependency_contract_expiry(monkeypatch, tmp_path) -> None:
+    from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    from quant.routine import vector_refresh_policy
+
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(vector_refresh_policy, "vector_cache_refresh_decision", lambda path, **kwargs: kwargs)
+    decision = services._similar_pattern_vector_cache_refresh_decision()
+    assert decision["maximum_refresh_age_days"] == DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[
+        "feature.similar_reference"
+    ].freshness.max_age_days
+
+
+def test_similar_pattern_repair_date_comes_only_from_pinned_snapshot(monkeypatch, tmp_path):
+    from quant.data import market_snapshot
+    from quant.routine import vector_refresh_policy
+
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_VECTOR_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(vector_refresh_policy, "vector_cache_refresh_decision", lambda path, **kwargs: kwargs)
+    monkeypatch.setattr(market_snapshot, "current_market_snapshot", lambda: None)
+    assert services._similar_pattern_vector_cache_refresh_decision()["expected_trade_date"] is None
+
+    class Snapshot:
+        def latest_date(self, dataset):
+            assert dataset == "daily"
+            return pd.Timestamp("2026-09-15")
+
+    monkeypatch.setattr(market_snapshot, "current_market_snapshot", Snapshot)
+    assert services._similar_pattern_vector_cache_refresh_decision()["expected_trade_date"] == "2026-09-15"
+    monkeypatch.setattr(Snapshot, "latest_date", lambda self, dataset: None)
+    with pytest.raises(RuntimeError, match="no verified daily date"):
+        services._similar_pattern_vector_cache_refresh_decision()
 
 
 def test_similar_pattern_refresh_coalesces_concurrent_requests(monkeypatch) -> None:
@@ -3454,10 +3626,10 @@ def test_similar_pattern_weekly_library_becomes_due_on_friday_after_close(
     assert decision["due"] is True
     assert decision["reason"] == "friday_close_window"
     assert decision["refresh_age_days"] == 5
-    assert decision["minimum_refresh_age_days"] == 5
+    assert decision["minimum_refresh_age_days"] == 0
 
 
-def test_similar_pattern_weekly_library_waits_until_minimum_age_on_friday(
+def test_similar_pattern_weekly_library_refreshes_after_midweek_rebuild(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -3475,8 +3647,8 @@ def test_similar_pattern_weekly_library_waits_until_minimum_age_on_friday(
         source_trade_date="2026-07-24",
     )
 
-    assert decision["due"] is False
-    assert decision["reason"] == "minimum_refresh_age_not_reached"
+    assert decision["due"] is True
+    assert decision["reason"] == "friday_close_window"
     assert decision["refresh_age_days"] < 5
 
 
@@ -3511,7 +3683,7 @@ def test_similar_pattern_weekly_library_does_not_rebuild_twice_in_friday_window(
     state_dir.mkdir(parents=True)
     np.savez(state_dir / "000001_SZ.npz", vectors=np.zeros((1, 1), dtype=np.float32))
     (state_dir / services.SIMILAR_PATTERN_VECTOR_CACHE_METADATA).write_text(
-        json.dumps({"refreshed_at": "2026-07-24T15:05:00", "cached_files": 1}),
+        json.dumps({"refreshed_at": "2026-07-24T15:05:00", "source_trade_date": "2026-07-24", "cached_files": 1}),
         encoding="utf-8",
     )
 
@@ -3577,7 +3749,7 @@ def test_similar_pattern_missing_cache_repairs_on_non_friday_before_minimum_age(
     assert decision["reason"] == "cache_missing"
     assert decision["repair_required"] is True
     assert decision["cached_files"] == 0
-    assert decision["refresh_age_days"] < decision["minimum_refresh_age_days"]
+    assert decision["refresh_age_days"] < 1
 
 
 def test_similar_pattern_cache_repair_does_not_wait_for_minimum_refresh_age(
@@ -3607,7 +3779,7 @@ def test_similar_pattern_cache_repair_does_not_wait_for_minimum_refresh_age(
     assert decision["due"] is True
     assert decision["reason"] == "cache_file_count_changed"
     assert decision["repair_required"] is True
-    assert decision["refresh_age_days"] < decision["minimum_refresh_age_days"]
+    assert decision["refresh_age_days"] < 2
 
 
 def test_similar_pattern_weekly_library_does_not_advance_watermark_on_build_errors(

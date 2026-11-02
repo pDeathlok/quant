@@ -83,10 +83,18 @@ def main() -> None:
                     .head(top_n)
                 )
                 net = selected["terminal_return"] - ROUND_TRIP_COST
+                gross_profit = float(net[net.gt(0.0)].sum())
+                gross_loss = float(-net[net.lt(0.0)].sum())
                 metrics[model] = {
                     "trades": len(selected),
                     "average_net_return": float(net.mean()),
+                    "median_net_return": float(net.median()),
                     "win_rate": float(net.gt(0.0).mean()),
+                    "profit_factor": (
+                        gross_profit / gross_loss
+                        if gross_loss > 0.0
+                        else float("inf")
+                    ),
                 }
             baseline = metrics["independent_left_members"]
             candidate = metrics["unified_left_long_task_deep"]
@@ -102,6 +110,10 @@ def main() -> None:
                     ),
                     "baseline_win_rate": baseline["win_rate"],
                     "candidate_win_rate": candidate["win_rate"],
+                    "baseline_profit_factor": baseline["profit_factor"],
+                    "candidate_profit_factor": candidate["profit_factor"],
+                    "baseline_median_net_return": baseline["median_net_return"],
+                    "candidate_median_net_return": candidate["median_net_return"],
                     "trades": candidate["trades"],
                 }
             )
