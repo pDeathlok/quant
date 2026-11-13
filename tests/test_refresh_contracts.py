@@ -69,3 +69,11 @@ def test_right_side_shadow_has_an_independent_refresh_view() -> None:
         "right_side_shadow_score",
         "right_side_shadow_product",
     ]
+
+
+def test_registered_step_without_display_metadata_can_be_queued(monkeypatch) -> None:
+    monkeypatch.setitem(REFRESH_SCOPE_STEPS, "all", ["refresh_data", "future_step"])
+    steps = build_progress_steps("all")
+    assert steps[1]["key"] == steps[1]["label"] == "future_step"
+    assert steps[1]["status"] == "pending"
+    assert steps[1]["percent"] == 0

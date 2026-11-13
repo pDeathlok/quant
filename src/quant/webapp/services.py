@@ -33,8 +33,8 @@ import yaml
 
 from quant.application.refresh_contracts import (
     REFRESH_SCOPE_LABELS,
-    REFRESH_STEP_DEFINITIONS,
     build_progress_steps as _progress_steps,
+    refresh_step_definition,
     normalize_refresh_scope as _normalize_refresh_scope,
 )
 from quant.application.selector_ranking import (
@@ -9007,8 +9007,8 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
     for step_key, _, _ in pending_steps:
         _set_refresh_progress(
             step_key=step_key,
-            message=f"检测到断点，正在续跑 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
-            percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
+            message=f"检测到断点，正在续跑 {refresh_step_definition(step_key)['label']}",
+            percent=refresh_step_definition(step_key)["percent"],
             complete_previous=False,
         )
 
@@ -9080,7 +9080,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                     step_key=step_key,
                     step_status="success",
                     message=f"{failure_message.removesuffix('失败')}完成",
-                    percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
+                    percent=refresh_step_definition(step_key)["percent"],
                     complete_previous=False,
                 )
 
@@ -9909,7 +9909,7 @@ def _run_latest_refresh_job_in_generation(
                 for step_key, operation, failure_message, success_message in pending_early_jobs:
                     _set_refresh_progress(
                         step_key=step_key,
-                        message=f"共享数据已就绪，后台提前执行 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
+                        message=f"共享数据已就绪，后台提前执行 {refresh_step_definition(step_key)['label']}",
                         percent=35,
                         complete_previous=False,
                     )
@@ -10398,10 +10398,15 @@ def _run_latest_refresh_job_in_generation(
                 )
             )
 
+        portfolio_node = "score.application_portfolio"
+        if portfolio_node in DEFAULT_DAILY_DEPENDENCY_REGISTRY.required_node_ids(refresh_scope):
+            selected_output_nodes.append(portfolio_node)
+
         operation_steps = {
             "refresh_chan_model_scores": "chan_model_strategy",
             "run_right_side_unified": "right_side_unified_features",
             "run_left_side_unified": "left_side_unified_features",
+            "run_application_portfolio": "application_portfolio",
         }
 
         def output_dag_progress(
@@ -10456,6 +10461,15 @@ def _run_latest_refresh_job_in_generation(
             "operations": sorted(output_dag["operations"]),
         }
         node_results = output_dag["node_results"]
+        if portfolio_node in selected_output_nodes:
+            results["application_portfolio"] = dict(node_results[portfolio_node])
+            _set_refresh_progress(
+                step_key="application_portfolio",
+                step_status="success",
+                message="组合策略排名刷新完成",
+                percent=80,
+                complete_previous=False,
+            )
         chan_payload = dict(node_results["score.chan"])
         results["refresh_chan_model_scores"] = chan_payload
         _set_refresh_progress(

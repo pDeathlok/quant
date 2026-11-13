@@ -51,7 +51,13 @@ REFRESH_STEP_DEFINITIONS = {
     "left_side_unified_features": {"label": "构建左侧生产统一因子", "percent": 73},
     "left_side_unified_score": {"label": "计算左侧生产统一排序", "percent": 77},
     "left_side_unified_adapter": {"label": "校验左侧 selector 排序适配", "percent": 79},
+    "application_portfolio": {"label": "刷新组合策略排名", "percent": 80},
 }
+
+
+def refresh_step_definition(key: str) -> dict[str, Any]:
+    # Presentation metadata must not prevent a registered step from running.
+    return REFRESH_STEP_DEFINITIONS.get(key, {"label": key, "percent": 0})
 
 
 def normalize_refresh_scope(scope: str | None = None) -> str:
@@ -79,9 +85,9 @@ def build_progress_steps(scope: str | None = None) -> list[dict[str, Any]]:
     return [
         {
             "key": key,
-            "label": REFRESH_STEP_DEFINITIONS[key]["label"],
+            "label": refresh_step_definition(key)["label"],
             "status": "pending",
-            "percent": REFRESH_STEP_DEFINITIONS[key]["percent"],
+            "percent": refresh_step_definition(key)["percent"],
             "started_at": None,
             "finished_at": None,
             "elapsed_seconds": None,
