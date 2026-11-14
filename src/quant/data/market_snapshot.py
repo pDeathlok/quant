@@ -52,6 +52,8 @@ def _date_blocks(frame: pd.DataFrame) -> list[dict]:
     frame = frame.sort_values(["trade_date", "ts_code"], kind="stable").reset_index(drop=True)
     columns = sorted(frame.columns)
     table = pa.Table.from_pandas(frame[columns], preserve_index=False).replace_schema_metadata(None)
+    # Reuse boundary values instead of boxing a Series twice per monthly block.
+    dates = frame["trade_date"].to_numpy()
     blocks = []
     for month, indices in frame.groupby(frame["trade_date"].str[:6], sort=True).indices.items():
         start, length = int(indices[0]), len(indices)
@@ -62,8 +64,8 @@ def _date_blocks(frame: pd.DataFrame) -> list[dict]:
         with pa.ipc.new_stream(sink, block.schema) as writer:
             writer.write_table(block)
         blocks.append({
-            "partition": month, "min_date": frame["trade_date"].iloc[start],
-            "max_date": frame["trade_date"].iloc[start + length - 1], "rows": length,
+            "partition": month, "min_date": dates[start],
+            "max_date": dates[start + length - 1], "rows": length,
             "sha256": hashlib.sha256(sink.getvalue()).hexdigest(),
         })
     return blocks

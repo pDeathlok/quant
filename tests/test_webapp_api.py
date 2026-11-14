@@ -30,6 +30,7 @@ def isolate_long_factor_publication(monkeypatch, tmp_path):
     monkeypatch.setenv("MARKET_DATA_BACKEND", "file")
     monkeypatch.delenv("MARKET_DATA_SQL_URL", raising=False)
     monkeypatch.setattr(services, "LONG_FACTOR_SNAPSHOT_DIR", tmp_path / "long_factors")
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_ANALYSIS_PATH", tmp_path / "similar.json")
     from quant.infrastructure.publication import PublicationStore
 
     publication_root = tmp_path / "publication"
@@ -555,6 +556,8 @@ def _stub_successful_global_refresh(
         refresh_chan_model_scores or success,
     )
     monkeypatch.setattr(services, "_clear_selector_caches", lambda: None)
+    monkeypatch.setattr(services, "_similar_pattern_watchlist_profiles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: pd.DataFrame())
     monkeypatch.setattr(
         services,
         "_ensure_selector_long_factor_snapshot",
@@ -615,7 +618,7 @@ def _stub_successful_global_refresh(
     monkeypatch.setattr(
         services,
         "_run_similar_pattern_analysis_isolated",
-        lambda: {
+        lambda **kwargs: {
             "generated_at": "2026-07-23T18:00:00",
             "target_date": "2026-07-23",
             "results": [],
@@ -1119,6 +1122,168 @@ def test_global_refresh_starts_independent_workspaces_before_feature_build(
         == "2026-07-23"
     )
     assert status["result"]["byd_daily_plan"]["status"] == "success"
+
+
+def test_similar_vectors_start_before_selectors_and_badges_wait_for_snapshots(monkeypatch):
+    status = _stub_successful_global_refresh(monkeypatch)
+    started = threading.Event()
+    snapshot_written = threading.Event()
+    calls = []
+
+    def vectors(*, include_strategy_hits):
+        assert include_strategy_hits is False
+        calls.append("vectors")
+        started.set()
+        return {"target_date": "2026-07-23", "results": [], "cache": {}}
+
+    def selector(**kwargs):
+        assert started.wait(3)
+        return {"signal_date": "2026-07-23", "stocks": []}
+
+    def snapshots(*args, **kwargs):
+        snapshot_written.set()
+        return []
+
+    def badges(payload, *, read_only):
+        assert read_only is True
+        assert snapshot_written.is_set()
+        calls.append("badges")
+        return payload
+
+    monkeypatch.setattr(services, "_run_similar_pattern_analysis_isolated", vectors)
+    monkeypatch.setattr(services, "get_stock_selector_payload", selector)
+    monkeypatch.setattr(services, "_write_strategy_pool_snapshots", snapshots)
+    monkeypatch.setattr(services, "_attach_watchlist_strategy_hits", badges)
+    services._run_latest_refresh_job("all", run_id="early-vector-late-badges")
+    assert status["status"] == "success", status.get("error")
+    assert calls == ["vectors", "badges"]
+    assert status["result"]["similar_patterns"]["strategy_hits_pending"] is False
+
+
+def test_readonly_watchlist_badges_never_recompute_missing_or_old_snapshots(monkeypatch):
+    calls = []
+    monkeypatch.setattr(services, "_read_selector_snapshot", lambda *args: None)
+    monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: {
+        "signal_date": "2026-07-22", "candidates": [{"symbol": "002594.SZ"}],
+    })
+    monkeypatch.setattr(services, "_read_long_stock_pool_snapshot", lambda *args, **kwargs: {
+        "signal_date": "2026-07-22", "stocks": [{"ts_code": "002594.SZ"}],
+    })
+    for name in ("get_stock_selector_payload", "get_chan_model_strategy_plan", "get_long_stock_pool"):
+        monkeypatch.setattr(services, name, lambda *args, _name=name, **kwargs: calls.append(_name))
+    hits = services._collect_watchlist_strategy_hits(
+        ["002594.SZ"], signal_date="2026-07-23", read_only=True,
+    )
+    assert hits == {"002594.SZ": []}
+    assert calls == []
+
+
+@pytest.mark.parametrize("finalize", [False, True])
+def test_early_vector_analysis_does_not_read_downstream_watchlist_scores(monkeypatch, tmp_path, finalize):
+    monkeypatch.setattr(services, "SIMILAR_PATTERN_ANALYSIS_PATH", tmp_path / "vectors.json")
+    monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: pd.DataFrame())
+    monkeypatch.setattr(services, "_latest_similar_pattern_target_date", lambda symbols: "2026-07-23")
+    monkeypatch.setattr(services, "_similar_pattern_vector_cache_refresh_decision", lambda **kwargs: {
+        "due": False, "metadata": {}, "cached_files": 0, "reason": "not_due",
+        "minimum_refresh_age_days": 7,
+    })
+    monkeypatch.setattr(services, "analyze_targets_by_threshold", lambda *args, **kwargs: {})
+    monkeypatch.setattr(services, "_read_similar_pattern_validation", lambda: {})
+    monkeypatch.setattr(services, "load_market_regime", lambda path: {})
+    monkeypatch.setattr(services, "_read_similar_pattern_watchlist_state", lambda: {"symbols": []})
+    monkeypatch.setattr(services, "_watchlist_buy_hold_scores",
+                        lambda *args: pytest.fail("downstream score accessed before features"))
+    monkeypatch.setattr(services, "_attach_watchlist_strategy_hits",
+                        lambda *args, **kwargs: pytest.fail("badge accessed before snapshots"))
+    if finalize:
+        def fail_finalization(payload):
+            raise RuntimeError("scores unavailable")
+
+        monkeypatch.setattr(services, "_finalize_similar_pattern_payload", fail_finalization)
+        with pytest.raises(RuntimeError, match="scores unavailable"):
+            services._refresh_similar_pattern_analysis_once([])
+        assert not (tmp_path / "vectors.json").exists()
+        return
+    payload = services._refresh_similar_pattern_analysis_once([], include_strategy_hits=False)
+    assert payload["target_date"] == "2026-07-23"
+    assert payload["watchlist"] == []
+
+
+def test_failed_similar_finalization_remains_pending_for_retry(monkeypatch):
+    status = _stub_successful_global_refresh(monkeypatch)
+
+    def fail_finalization(payload):
+        raise RuntimeError("scores unavailable")
+
+    monkeypatch.setattr(services, "_finalize_similar_pattern_payload", fail_finalization)
+    services._run_latest_refresh_job("all", run_id="incomplete-similar-scores")
+    assert status["status"] == "failed"
+    assert "scores unavailable" in status["error"]
+    assert status["result"]["similar_patterns"]["status"] != "success"
+    assert status["result"]["similar_patterns"]["strategy_hits_pending"] is True
+    similar_step = next(step for step in status["steps"] if step["key"] == "similar_patterns")
+    assert similar_step["status"] == "failed"
+
+
+@pytest.mark.parametrize("bad_field", [None, "score_date", "holding_score", "feature_quality", "symbol",
+                                        "quality_status", "quality_date"])
+def test_similar_finalization_requires_current_complete_scores(monkeypatch, bad_field):
+    profile = {"symbol": "000001.SZ", "score_date": "2026-07-23", "opportunity_score": 50,
+               "holding_score": 60, "feature_quality": {"status": "complete", "date": "2026-07-23"}}
+    if bad_field == "quality_status":
+        profile["feature_quality"]["status"] = "failed"
+    elif bad_field == "quality_date":
+        profile["feature_quality"]["date"] = "2026-07-22"
+    elif bad_field:
+        profile[bad_field] = None
+    monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: pd.DataFrame())
+    monkeypatch.setattr(services, "_similar_pattern_watchlist_profiles", lambda *args, **kwargs: [profile])
+    calls = []
+    monkeypatch.setattr(services, "_attach_watchlist_strategy_hits",
+                        lambda payload, **kwargs: calls.append(kwargs) or payload)
+    payload = {"target_date": "2026-07-23", "results": [{"target": {"symbol": "000001.SZ"}}]}
+    if bad_field:
+        with pytest.raises(RuntimeError):
+            services._finalize_similar_pattern_payload(payload)
+        assert calls == []
+    else:
+        final = services._finalize_similar_pattern_payload(payload)
+        assert final["watchlist"] == [profile]
+        assert final["watchlist_score_dates"] == ["2026-07-23"]
+        assert calls == [{"read_only": True}]
+
+
+def test_cached_similar_get_does_not_mix_newer_strategy_badges(monkeypatch):
+    cached = {"target_date": "2026-07-22", "watchlist": [],
+              "results": [{"target": {"symbol": "000001.SZ"}}]}
+    monkeypatch.setattr(services, "_read_similar_pattern_analysis_cache", lambda: cached)
+    monkeypatch.setattr(services, "_upgrade_cached_similar_pattern_probability_policy", lambda value: value)
+    monkeypatch.setattr(services, "_read_similar_pattern_watchlist_symbols", lambda: ["000001.SZ"])
+    monkeypatch.setattr(services, "_stock_basic_for_similar_patterns", lambda: pd.DataFrame())
+    monkeypatch.setattr(services, "_similar_pattern_watchlist_profiles", lambda *args, **kwargs: [{"symbol": "000001.SZ"}])
+    monkeypatch.setattr(services, "_read_selector_snapshot", lambda *args: {
+        "signal_date": "2026-07-23", "stocks": [{"symbol": "000001.SZ"}],
+    })
+    monkeypatch.setattr(services, "_display_selector_payload", lambda payload, **kwargs: payload)
+    monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(services, "_read_long_stock_pool_snapshot", lambda *args, **kwargs: None)
+    calls = []
+    for name in ("get_stock_selector_payload", "get_chan_model_strategy_plan", "get_long_stock_pool"):
+        monkeypatch.setattr(services, name, lambda *args, _name=name, **kwargs: calls.append(_name))
+    result = services.get_similar_pattern_analysis()
+    assert result["results"][0]["strategy_hits"] == []
+    assert calls == []
+
+
+def test_short_refresh_does_not_compute_unrelated_chan_scores(monkeypatch):
+    calls = []
+    status = _stub_successful_global_refresh(
+        monkeypatch, refresh_chan_model_scores=lambda **kwargs: calls.append("chan"),
+    )
+    services._run_latest_refresh_job("short", run_id="short-no-chan")
+    assert status["status"] == "success", status.get("error")
+    assert calls == []
+    assert "refresh_chan_model_scores" not in status["result"]["output_dag"]["operations"]
 
 
 def test_allotment_quality_accepts_negative_j_values() -> None:
@@ -3258,7 +3423,7 @@ def test_similar_pattern_refresh_updates_vector_caches(monkeypatch, tmp_path) ->
     monkeypatch.setattr(services, "_activate_similar_pattern_vector_cache_config", lambda: {})
     monkeypatch.setattr(services, "analyze_targets_by_threshold", lambda *args, **kwargs: {})
 
-    payload = services.refresh_similar_pattern_analysis(force_vector_cache=True)
+    payload = services.refresh_similar_pattern_analysis(force_vector_cache=True, include_strategy_hits=False)
 
     assert calls["cache"] == 1
     assert payload["cache"]["rebuilt"] == 1
@@ -3317,9 +3482,9 @@ def test_similar_pattern_refresh_reuses_current_weekly_library_but_analyzes_live
         "_similar_pattern_result_payload",
         lambda *args, **kwargs: {"target": {"symbol": "002594.SZ"}},
     )
-    monkeypatch.setattr(services, "_attach_watchlist_strategy_hits", lambda payload: payload)
+    monkeypatch.setattr(services, "_attach_watchlist_strategy_hits", lambda payload, **kwargs: payload)
 
-    payload = services.refresh_similar_pattern_analysis()
+    payload = services.refresh_similar_pattern_analysis(include_strategy_hits=False)
 
     assert calls == {"cache": 0, "analysis": 1}
     assert payload["cache"]["reference_library_refreshed"] is False
@@ -3375,7 +3540,7 @@ def test_similar_pattern_refresh_coalesces_concurrent_requests(monkeypatch) -> N
                 second_request_started.set()
         return ["002594.SZ"]
 
-    def fake_refresh_once(symbols, progress_callback=None, *, force_vector_cache=False):
+    def fake_refresh_once(symbols, progress_callback=None, *, force_vector_cache=False, include_strategy_hits=True):
         nonlocal compute_count
         compute_count += 1
         computation_started.set()
@@ -3790,6 +3955,26 @@ def test_watchlist_strategy_hits_merge_only_strategy_workspaces(monkeypatch) -> 
     assert [item["strategy_key"] for item in hits["002788.SZ"]] == ["long"]
     assert hits["002920.SZ"] == []
     assert hits["002594.SZ"][0]["detail"] == "B1 / 强K"
+
+
+def test_readonly_badges_use_persisted_scores_without_running_rankers(monkeypatch):
+    monkeypatch.setattr(services, "_read_selector_snapshot", lambda *args: {
+        "signal_date": "2026-07-23", "stocks": [{
+            "symbol": "000001.SZ", "matched_families": ["B1"],
+            "selector_score": 80.0, "matched_count": 1, "best_profit_factor": 2.0,
+            "opportunity_score": 70.0, "holding_score": 60.0,
+        }],
+    })
+    monkeypatch.setattr(services, "_row_display_quality_gate", lambda row: True)
+    monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(services, "_read_long_stock_pool_snapshot", lambda *args, **kwargs: None)
+    for name in ("_apply_historical_score_normalization", "apply_selector_ranking_source"):
+        monkeypatch.setattr(services, name, lambda *args, _name=name, **kwargs: pytest.fail(_name))
+    hits = services._collect_watchlist_strategy_hits(
+        ["000001.SZ"], signal_date="2026-07-23", read_only=True,
+    )
+    assert [hit["strategy_key"] for hit in hits["000001.SZ"]] == ["short"]
+    assert hits["000001.SZ"][0]["signal_date"] == "2026-07-23"
 
 
 def test_attach_watchlist_strategy_hits_adds_badges_to_each_result(monkeypatch) -> None:
@@ -4415,7 +4600,7 @@ def test_similar_pattern_cache_filters_results_removed_from_watchlist(monkeypatc
     monkeypatch.setattr(
         services,
         "_attach_watchlist_strategy_hits",
-        lambda payload: payload,
+        lambda payload, **kwargs: payload,
     )
 
     payload = services.get_similar_pattern_analysis()

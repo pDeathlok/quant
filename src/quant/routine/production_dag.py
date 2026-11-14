@@ -21,7 +21,9 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from quant.application.daily_dependencies import (
     DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+    DependencyRegistry,
 )
+from quant.routine.operation_registry import OperationRegistry
 from quant.routine.dag_executor import DailyDagExecutor, ResourceBudget
 from quant.routine.checkpoint_store import CheckpointStore
 from quant.routine.default_operations import DEFAULT_DAILY_OPERATION_REGISTRY, build_default_operation_registry
@@ -42,6 +44,26 @@ def production_dag_mode(scope: str) -> str:
     if mode == "enabled":
         raise ValueError("Full identity-audited DAG cutover is not implemented; use core")
     return mode
+
+
+def production_output_node_ids(
+    scope: str, *, completed_operation_ids: Iterable[str] = (),
+    dependencies: DependencyRegistry = DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+    operations: OperationRegistry = DEFAULT_DAILY_OPERATION_REGISTRY,
+) -> tuple[str, ...]:
+    """Schedule registered executable outputs, not a second model allowlist.
+
+    Source/workspace callbacks retain their composition owners. Completed
+    operations are excluded as a unit, including every node they produce.
+    """
+    required = dependencies.required_node_ids(scope)
+    operations.validate_against_dependencies(dependencies, node_ids=required)
+    completed = set(completed_operation_ids)
+    return tuple(
+        node_id for node_id in required
+        if operations.definitions[dependencies.nodes[node_id].operation_id].production_ready
+        and dependencies.nodes[node_id].operation_id not in completed
+    )
 
 
 @contextmanager

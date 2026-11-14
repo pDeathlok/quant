@@ -1,11 +1,80 @@
+import hashlib
 import json
 import threading
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from quant.data import market_snapshot as snapshots
+
+
+def _reference_date_blocks(frame):
+    """Pre-optimization block encoding, including scalar boundary lookups."""
+    import pyarrow as pa
+
+    frame = frame.sort_values(["trade_date", "ts_code"], kind="stable").reset_index(drop=True)
+    table = pa.Table.from_pandas(
+        frame[sorted(frame.columns)], preserve_index=False,
+    ).replace_schema_metadata(None)
+    blocks = []
+    for month, indices in frame.groupby(frame["trade_date"].str[:6], sort=True).indices.items():
+        start, length = int(indices[0]), len(indices)
+        block = table.take(pa.array(indices, type=pa.int64()))
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, block.schema) as writer:
+            writer.write_table(block)
+        blocks.append({
+            "partition": month, "min_date": frame["trade_date"].iloc[start],
+            "max_date": frame["trade_date"].iloc[start + length - 1], "rows": length,
+            "sha256": hashlib.sha256(sink.getvalue()).hexdigest(),
+        })
+    return blocks
+
+
+@pytest.mark.parametrize("dtype", ["object", "string[python]", "string[pyarrow]"])
+@pytest.mark.parametrize("shape", ["empty", "single", "mixed", "reordered"])
+def test_date_block_boundaries_preserve_reference_fingerprints(dtype, shape):
+    frame = pd.DataFrame({
+        "ts_code": ["000002.SZ", "000001.SZ", "000001.SZ", "000002.SZ", "000001.SZ"],
+        "trade_date": pd.Series(["20260302", "20251231", "20260130", "20260102", "20260130"], dtype=dtype),
+        "value": [Decimal("1.000000000000000001"), None, Decimal("2.5"), Decimal("-3"), Decimal("2.6")],
+        "close": [1.000000000000001, float("nan"), 3.0, 4.0, 5.0],
+        "name": ["long value" * 100, None, "short", "", "duplicate identity"],
+    })
+    if shape in {"empty", "single"}:
+        frame = frame.iloc[:int(shape == "single")].copy()
+    elif shape == "reordered":
+        frame = frame.iloc[[3, 1, 2, 4, 0]][list(reversed(frame.columns))].copy()
+    frame.index = pd.Index([17] * len(frame), name="source_row")
+    original = frame.copy(deep=True)
+    expected = _reference_date_blocks(frame)
+
+    actual = snapshots._date_blocks(frame)
+
+    assert actual == expected
+    assert json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def test_date_block_boundary_lookup_does_not_repeat_per_month(monkeypatch):
+    frame = pd.DataFrame({
+        "ts_code": ["000001.SZ"] * 36,
+        "trade_date": pd.date_range("2023-01-01", periods=36, freq="MS").strftime("%Y%m%d"),
+        "close": range(36),
+    })
+    original = pd.DataFrame.__getitem__
+    lookups = []
+
+    def counted(self, key):
+        if isinstance(key, str) and key == "trade_date":
+            lookups.append(key)
+        return original(self, key)
+
+    monkeypatch.setattr(pd.DataFrame, "__getitem__", counted)
+    assert len(snapshots._date_blocks(frame)) == 36
+    assert len(lookups) <= 5
 
 
 def test_date_normalization_parses_distinct_values_once(monkeypatch):

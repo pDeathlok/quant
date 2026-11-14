@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import ast
+from html.parser import HTMLParser
+from pathlib import Path
+import re
+
+import pytest
+
+from quant.application.daily_dependencies import DEFAULT_DAILY_DEPENDENCY_REGISTRY
+from quant.application.page_refresh_coverage import (
+    PAGE_REFRESH_CONTRACTS,
+    LONG_VARIANT_EXPOSURE,
+    SHORT_STRATEGY_MEMBERS,
+    page_refresh_coverage_report,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_every_frontend_tab_has_explicit_refresh_policy() -> None:
+    source = (ROOT / "web/app.js").read_text()
+    tabs = source.split("const WORKSPACE_TABS = [", 1)[1].split("]", 1)[0]
+    assert set(re.findall(r'key: "([^"]+)"', tabs)) == {
+        page.tab for page in PAGE_REFRESH_CONTRACTS
+    }
+    registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    all_nodes = set(registry.required_node_ids("all"))
+    for page in PAGE_REFRESH_CONTRACTS:
+        if page.policy == "user_crud":
+            assert page.tab in {"plans", "reviews"}
+            assert not page.products
+            continue
+        assert set(page.products) <= all_nodes
+        assert set(page.products) <= set(registry.required_node_ids(page.tab))
+        assert all(registry.nodes[node].final_gate for node in page.products)
+
+
+def test_short_strategy_groups_and_members_match_service_contract() -> None:
+    tree = ast.parse((ROOT / "src/quant/webapp/services.py").read_text())
+    groups = next(ast.literal_eval(node.value) for node in tree.body
+                  if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "STRATEGY_GROUPS"
+                          for target in node.targets))
+    assert {item["key"]: tuple(item["members"]) for item in groups} == SHORT_STRATEGY_MEMBERS
+
+
+def test_cb_substrategy_inventory_matches_builder() -> None:
+    from quant.routine.convertible_bond_grid_plan import convertible_bond_grid_strategy_configs
+
+    contract = next(page for page in PAGE_REFRESH_CONTRACTS if page.tab == "cb")
+    assert contract.strategies == tuple(config.name for config, _ in convertible_bond_grid_strategy_configs())
+
+
+def test_chan_substrategy_inventory_matches_builder() -> None:
+    from quant.strategies.custom.chan_model import CHAN_MODEL_RULES
+
+    contract = next(page for page in PAGE_REFRESH_CONTRACTS if page.tab == "chan")
+    assert contract.strategies == tuple(rule.id for rule in CHAN_MODEL_RULES)
+
+
+def test_long_visible_buttons_do_not_include_historical_catalog_variants() -> None:
+    class Buttons(HTMLParser):
+        variants: list[str]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.variants = []
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            attributes = dict(attrs)
+            if tag == "button" and "data-long-variant" in attributes:
+                assert "disabled" not in attributes and "hidden" not in attributes
+                self.variants.append(attributes["data-long-variant"])
+
+    parser = Buttons()
+    parser.feed((ROOT / "web/index.html").read_text())
+    assert set(parser.variants) == set(LONG_VARIANT_EXPOSURE["visible_buttons"])
+    assert len(parser.variants) == 4  # Desktop and mobile controls.
+    page = next(page for page in PAGE_REFRESH_CONTRACTS if page.tab == "long")
+    assert set(page.strategies) == set(LONG_VARIANT_EXPOSURE["visible_buttons"]) | set(
+        LONG_VARIANT_EXPOSURE["daily_compatibility_outputs"],
+    )
+    assert set(page.strategies).isdisjoint(LONG_VARIANT_EXPOSURE["catalog_only_not_daily"])
+
+
+def test_long_variants_all_have_required_evidence() -> None:
+    registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    for tab in ("long",):
+        page = next(page for page in PAGE_REFRESH_CONTRACTS if page.tab == tab)
+        evidence = registry.nodes[page.products[0]].freshness.evidence
+        variants = {spec.expected_value for spec in evidence if spec.adapter == "result_variant"}
+        if tab == "long":
+            assert any(spec.locator == "long_stock_pool.blood_chip" and spec.required for spec in evidence)
+            variants.add("blood_chip")
+        assert variants == set(page.strategies)
+        assert all(spec.required for spec in evidence)

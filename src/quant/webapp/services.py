@@ -397,7 +397,7 @@ _REFRESH_JOB_THREADS: dict[str, threading.Thread] = {}
 REFRESH_HEARTBEAT_SECONDS = 30.0
 _SIMILAR_PATTERN_REFRESH_GUARD = threading.Lock()
 _SIMILAR_PATTERN_REFRESH_INFLIGHT: tuple[
-    tuple[tuple[str, ...], bool],
+    tuple[tuple[str, ...], bool, bool],
     Future[dict[str, Any]],
 ] | None = None
 _REFRESH_STATUS: dict[str, Any] = {
@@ -4344,12 +4344,20 @@ def refresh_similar_pattern_watchlist_scores() -> dict[str, Any]:
     }
 
 
-def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[str, Any]]]:
+def _collect_watchlist_strategy_hits(
+    symbols: list[str], *, signal_date: str | None = None, read_only: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
     """Collect current cross-workspace hits for watchlist symbols from existing strategy payloads."""
     targets = {str(symbol).upper() for symbol in symbols}
     hits: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in targets}
+    if not targets:
+        return hits
+
+    expected_date = signal_date
 
     def append_hit(symbol: str, key: str, label: str, detail: str, signal_date: Any = None) -> None:
+        if expected_date and str(signal_date or "") != expected_date:
+            return
         normalized = _canonical_watch_symbol(symbol)
         if normalized not in targets:
             return
@@ -4364,7 +4372,7 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
 
     try:
         view = current_publication()
-        latest_signal_date = (
+        latest_signal_date = signal_date or (
             _latest_selector_snapshot_date(None, True)
             if view and view.generation and not view.writable
             else _latest_candidate_signal_date()
@@ -4374,7 +4382,7 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
             None,
             True,
         )
-        if short_payload is None:
+        if short_payload is None and not read_only:
             short_payload = get_stock_selector_payload(
                 signal_date=latest_signal_date,
                 include_extended=True,
@@ -4383,7 +4391,9 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
         # Keep cross-workspace badges aligned with the short-strategy surface:
         # raw snapshot rows that fail the OOT quality gate or fall outside the
         # displayed shortlist must not be presented as visible strategy hits.
-        short_payload = _display_selector_payload(short_payload)
+        short_payload = _display_selector_payload(
+            short_payload or {"stocks": []}, persisted_scores_only=read_only,
+        )
         for item in short_payload.get("stocks") or []:
             families = " / ".join(str(value) for value in (item.get("matched_families") or [])[:4])
             append_hit(
@@ -4397,7 +4407,11 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
         pass
 
     try:
-        chan_payload = get_chan_model_strategy_plan(top_n=20)
+        chan_payload = (
+            _read_workspace_snapshot("chan_model_strategy", snapshot_date=signal_date,
+                                     params={"top_n": 20}, allow_sql=False) or {}
+            if read_only else get_chan_model_strategy_plan(top_n=20)
+        )
         for item in chan_payload.get("candidates") or []:
             append_hit(
                 str(item.get("symbol") or ""),
@@ -4410,7 +4424,10 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
         pass
 
     try:
-        long_payload = get_long_stock_pool(variant="tea")
+        long_payload = (
+            _read_long_stock_pool_snapshot("tea", signal_date, allow_sql=False) or {}
+            if read_only else get_long_stock_pool(variant="tea")
+        )
         for item in long_payload.get("stocks") or []:
             append_hit(
                 str(item.get("ts_code") or ""),
@@ -4425,14 +4442,17 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
     return hits
 
 
-def _attach_watchlist_strategy_hits(payload: dict[str, Any]) -> dict[str, Any]:
+def _attach_watchlist_strategy_hits(payload: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     """Attach strategy badges without changing the similar-pattern forecast itself."""
     symbols = [
         str(item.get("target", {}).get("symbol") or "").upper()
         for item in payload.get("results") or []
         if item.get("target", {}).get("symbol")
     ]
-    strategy_hits = _collect_watchlist_strategy_hits(symbols)
+    strategy_hits = {} if read_only and not payload.get("target_date") else (
+        _collect_watchlist_strategy_hits(symbols, signal_date=payload.get("target_date"), read_only=True)
+        if read_only else _collect_watchlist_strategy_hits(symbols)
+    )
     for item in payload.get("results") or []:
         symbol = str(item.get("target", {}).get("symbol") or "").upper()
         item["strategy_hits"] = strategy_hits.get(symbol, [])
@@ -4440,11 +4460,37 @@ def _attach_watchlist_strategy_hits(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _finalize_similar_pattern_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Join scores only after their feature producers and page snapshots finish."""
+    profiles = _similar_pattern_watchlist_profiles(_stock_basic_for_similar_patterns(), include_scores=True)
+    expected_symbols = {item["target"]["symbol"] for item in payload.get("results") or []}
+    if {item["symbol"] for item in profiles} != expected_symbols:
+        raise RuntimeError("自选池在计算期间发生变化，拒绝发布不完整评分")
+    target_date = payload.get("target_date")
+    invalid = [item["symbol"] for item in profiles if (
+        _safe_float(item.get("opportunity_score")) is None
+        or _safe_float(item.get("holding_score")) is None
+        or item.get("score_date") != target_date
+        or not isinstance(item.get("feature_quality"), Mapping)
+        or item["feature_quality"].get("status") != "complete"
+        or item["feature_quality"].get("date") != target_date
+    )]
+    if invalid:
+        raise RuntimeError(f"自选池当日评分或特征质量缺失: {invalid[:8]}")
+    enriched = {
+        **payload, "watchlist": profiles,
+        "watchlist_score_dates": sorted({item["score_date"] for item in profiles}),
+        "watchlist_scores_generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return _attach_watchlist_strategy_hits(enriched, read_only=True)
+
+
 def _refresh_similar_pattern_analysis_once(
     symbols: list[str],
     progress_callback=None,
     *,
     force_vector_cache: bool = False,
+    include_strategy_hits: bool = True,
 ) -> dict[str, Any]:
     basic = _stock_basic_for_similar_patterns()
     source_trade_date = _latest_similar_pattern_target_date(symbols)
@@ -4531,7 +4577,7 @@ def _refresh_similar_pattern_analysis_once(
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "target_date": source_trade_date,
-        "watchlist": _similar_pattern_watchlist_profiles(basic),
+        "watchlist": _similar_pattern_watchlist_profiles(basic, include_scores=False),
         "config": {
             "candidate_start_date": SIMILAR_PATTERN_CONFIG.candidate_start_date,
             "candidate_step_days": SIMILAR_PATTERN_CONFIG.candidate_step_days,
@@ -4589,7 +4635,8 @@ def _refresh_similar_pattern_analysis_once(
             "target_vectors": "live_from_latest_daily_data",
         },
     }
-    payload = _attach_watchlist_strategy_hits(payload)
+    if include_strategy_hits:
+        payload = _finalize_similar_pattern_payload(payload)
     atomic_write_json(payload, SIMILAR_PATTERN_ANALYSIS_PATH)
     return payload
 
@@ -4598,13 +4645,14 @@ def refresh_similar_pattern_analysis(
     progress_callback=None,
     *,
     force_vector_cache: bool = False,
+    include_strategy_hits: bool = True,
 ) -> dict[str, Any]:
     """Run one analysis per watchlist revision and share it with concurrent callers."""
     assert_publication_writable()
     global _SIMILAR_PATTERN_REFRESH_INFLIGHT
 
     requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
-    requested_key = (requested_symbols, bool(force_vector_cache))
+    requested_key = (requested_symbols, bool(force_vector_cache), include_strategy_hits)
 
     while True:
         with _SIMILAR_PATTERN_REFRESH_GUARD:
@@ -4624,6 +4672,7 @@ def refresh_similar_pattern_analysis(
                     list(requested_symbols),
                     progress_callback=progress_callback,
                     force_vector_cache=force_vector_cache,
+                    include_strategy_hits=include_strategy_hits,
                 )
             except BaseException as exc:
                 future.set_exception(exc)
@@ -4656,10 +4705,11 @@ def refresh_similar_pattern_analysis(
         except Exception:
             pass
         requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
-        requested_key = (requested_symbols, bool(force_vector_cache))
+        requested_key = (requested_symbols, bool(force_vector_cache), include_strategy_hits)
 
 
-def _similar_patterns_worker(result_queue: mp.Queue, publication=None, worker_limit=None, market_environment=None) -> None:
+def _similar_patterns_worker(result_queue: mp.Queue, publication=None, worker_limit=None, market_environment=None,
+                             include_strategy_hits: bool = True) -> None:
     def emit_progress(message: str) -> None:
         result_queue.put({"type": "progress", "message": message})
 
@@ -4675,7 +4725,9 @@ def _similar_patterns_worker(result_queue: mp.Queue, publication=None, worker_li
     os.environ.update(overrides)
     try:
         with publication_context(publication) if publication else nullcontext():
-            payload = refresh_similar_pattern_analysis(progress_callback=emit_progress)
+            payload = refresh_similar_pattern_analysis(
+                progress_callback=emit_progress, include_strategy_hits=include_strategy_hits,
+            )
     except Exception as exc:
         result_queue.put(
             {
@@ -4712,7 +4764,8 @@ def _drain_similar_pattern_worker_queue(result_queue: mp.Queue) -> dict[str, Any
         final_result = dict(message)
 
 
-def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTERNS_TIMEOUT_SECONDS) -> dict[str, Any]:
+def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTERNS_TIMEOUT_SECONDS,
+                                         *, include_strategy_hits: bool = True) -> dict[str, Any]:
     from quant.data.market_snapshot import pinned_market_environment
     from quant.routine.resource_scheduler import current_resource_grant
 
@@ -4722,7 +4775,7 @@ def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTER
     proc = ctx.Process(
         target=_similar_patterns_worker,
         args=(result_queue, current_publication(), grant.granted_workers if grant else None,
-              pinned_market_environment()),
+              pinned_market_environment(), include_strategy_hits),
         daemon=False,
     )
     proc.start()
@@ -4788,7 +4841,7 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
                 for symbol in watchlist_symbols
                 if symbol in result_by_symbol
             ]
-            cached = _attach_watchlist_strategy_hits(cached)
+            cached = _attach_watchlist_strategy_hits(cached, read_only=True)
             persisted_profiles = _similar_pattern_watchlist_profiles(
                 _stock_basic_for_similar_patterns(),
                 include_scores=False,
@@ -5442,6 +5495,8 @@ def _display_selector_payload(
     payload: dict[str, Any],
     limit: int = DEFAULT_SELECTOR_LIMIT,
     side: str = "all",
+    *,
+    persisted_scores_only: bool = False,
 ) -> dict[str, Any]:
     normalized_side = str(side or "all").strip().lower()
     if normalized_side not in {"all", "left", "right"}:
@@ -5449,7 +5504,7 @@ def _display_selector_payload(
     rows = [dict(row) for row in payload.get("stocks") or []]
     complete_total = int(payload.get("total_stock_count") or len(rows))
     display_rows = [row for row in rows if _row_display_quality_gate(row)]
-    if any(
+    if not persisted_scores_only and any(
         row.get("buy_score_source") != "historical_return_model"
         or row.get("hold_score_source") != "historical_return_model"
         for row in display_rows
@@ -5464,10 +5519,11 @@ def _display_selector_payload(
             else original
             for original, rescored in zip(display_rows, rescored_rows)
         ]
-    display_rows = apply_selector_ranking_source(
-        display_rows,
-        str(payload.get("signal_date") or "") or None,
-    )
+    if not persisted_scores_only:
+        display_rows = apply_selector_ranking_source(
+            display_rows,
+            str(payload.get("signal_date") or "") or None,
+        )
     all_actionable_total = len(display_rows)
     if normalized_side != "all":
         display_rows = [
@@ -9828,6 +9884,12 @@ def _run_latest_refresh_job_in_generation(
                     "BYD 做T日线计划刷新失败",
                     "BYD 做T日线计划已提前刷新完成",
                 ),
+                (
+                    "similar_patterns",
+                    lambda: _run_similar_pattern_analysis_isolated(include_strategy_hits=False),
+                    "相似走势决策台刷新失败",
+                    "相似走势计算完成，等待当日评分与策略标签",
+                ),
             ]
 
             def run_early_workspace(
@@ -9835,12 +9897,20 @@ def _run_latest_refresh_job_in_generation(
                 operation,
                 success_message: str,
             ) -> Any:
+                claim = (
+                    ResourceClaim(
+                        cpu_slots=min(4, scheduler.budget.cpu_slots), io_slots=1, memory_mb=1024,
+                        db_connections=min(4, scheduler.budget.db_connections), requested_workers=4, max_workers=4,
+                    ) if step_key == "similar_patterns"
+                    else ResourceClaim(io_slots=1, memory_mb=512, db_connections=1)
+                )
                 payload = run_with_resources(
-                    ResourceClaim(io_slots=1, memory_mb=512, db_connections=1),
+                    claim,
                     composed, {
                         "convertible_bond_plan": "build_convertible_bond_grid_workspace",
                         "convertible_bond_allotment": "build_convertible_bond_allotment_workspace",
                         "byd_daily_plan": "build_byd_daily_workspace",
+                        "similar_patterns": "refresh_similar_pattern_analysis",
                     }[step_key], operation,
                 )
                 if step_key == "convertible_bond_plan":
@@ -9858,6 +9928,12 @@ def _run_latest_refresh_job_in_generation(
                         raise RuntimeError(
                             "BYD 日线计划日期未更新到目标交易日: "
                             f"expected={early_trade_date} actual={actual_date}"
+                        )
+                elif step_key == "similar_patterns":
+                    if payload.get("target_date") != early_signal_date:
+                        raise RuntimeError(
+                            "相似走势目标日期未更新到目标交易日: "
+                            f"expected={early_signal_date} actual={payload.get('target_date')}"
                         )
                 with early_workspace_results_lock:
                     if step_key == "convertible_bond_plan":
@@ -9877,6 +9953,13 @@ def _run_latest_refresh_job_in_generation(
                             "records": len(payload.get("records") or []),
                             "quality": payload.get("quality"),
                         }
+                    elif step_key == "similar_patterns":
+                        results[step_key] = {
+                            "status": "pending", "target_date": payload.get("target_date"),
+                            "generated_at": payload.get("generated_at"),
+                            "targets": len(payload.get("results") or []),
+                            "strategy_hits_pending": True,
+                        }
                     else:
                         planned_t = payload.get("planned_t") or {}
                         results[step_key] = {
@@ -9886,7 +9969,7 @@ def _run_latest_refresh_job_in_generation(
                         }
                 _set_refresh_progress(
                     step_key=step_key,
-                    step_status="success",
+                    step_status="running" if step_key == "similar_patterns" else "success",
                     message=success_message,
                     percent=40,
                     complete_previous=False,
@@ -9897,7 +9980,8 @@ def _run_latest_refresh_job_in_generation(
                 item
                 for item in early_jobs
                 if (
-                    (results.get(item[0]) or {}).get("status") != "success"
+                    item[0] == "similar_patterns"
+                    or (results.get(item[0]) or {}).get("status") != "success"
                     or item[0] in planned_refresh_ui_steps
                 )
             ]
@@ -10286,6 +10370,9 @@ def _run_latest_refresh_job_in_generation(
                 "resource_usage": feature_stage["resource_usage"],
                 "elapsed_seconds": feature_stage["elapsed_seconds"],
                 "operations": sorted(feature_stage["operations"]),
+                "operation_metrics": {
+                    key: dict(value.metrics) for key, value in feature_stage["operations"].items()
+                },
             }
             if not signal_ready:
                 results["signal_cache"] = dict(
@@ -10380,34 +10467,22 @@ def _run_latest_refresh_job_in_generation(
             DEFAULT_DAILY_OPERATION_REGISTRY,
         )
 
-        selected_output_nodes = ["feature.chan_live", "score.chan"]
-        if right_side_enabled:
-            selected_output_nodes.extend(
-                (
-                    "feature.right_side_unified",
-                    "score.right_side_unified",
-                    "product.right_side_unified_adapter",
-                )
-            )
-        if left_side_enabled:
-            selected_output_nodes.extend(
-                (
-                    "feature.left_side_unified",
-                    "score.left_side_unified",
-                    "product.left_side_unified_adapter",
-                )
-            )
+        from quant.routine.production_dag import production_output_node_ids
 
-        portfolio_node = "score.application_portfolio"
-        if portfolio_node in DEFAULT_DAILY_DEPENDENCY_REGISTRY.required_node_ids(refresh_scope):
-            selected_output_nodes.append(portfolio_node)
-
-        operation_steps = {
-            "refresh_chan_model_scores": "chan_model_strategy",
-            "run_right_side_unified": "right_side_unified_features",
-            "run_left_side_unified": "left_side_unified_features",
-            "run_application_portfolio": "application_portfolio",
-        }
+        selected_output_nodes = production_output_node_ids(
+            refresh_scope,
+            completed_operation_ids=(
+                "refresh_strategy_signal_cache", "refresh_active_project_features",
+            ),
+        )
+        operation_steps = {}
+        for node_id in sorted(
+            selected_output_nodes,
+            key=lambda key: DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[key].ui_order,
+        ):
+            node = DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[node_id]
+            if node.ui_step:
+                operation_steps.setdefault(node.operation_id, node.ui_step)
 
         def output_dag_progress(
             operation_id: str,
@@ -10459,10 +10534,17 @@ def _run_latest_refresh_job_in_generation(
             "resource_usage": output_dag["resource_usage"],
             "elapsed_seconds": output_dag["elapsed_seconds"],
             "operations": sorted(output_dag["operations"]),
+            "operation_metrics": {
+                key: dict(value.metrics) for key, value in output_dag["operations"].items()
+            },
         }
         node_results = output_dag["node_results"]
-        if portfolio_node in selected_output_nodes:
-            results["application_portfolio"] = dict(node_results[portfolio_node])
+        for node_id in selected_output_nodes:
+            node = DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[node_id]
+            for alias in node.result_aliases:
+                results[alias] = dict(node_results[node_id])
+        portfolio_node = "score.application_portfolio"
+        if portfolio_node in node_results:
             _set_refresh_progress(
                 step_key="application_portfolio",
                 step_status="success",
@@ -10470,15 +10552,15 @@ def _run_latest_refresh_job_in_generation(
                 percent=80,
                 complete_previous=False,
             )
-        chan_payload = dict(node_results["score.chan"])
-        results["refresh_chan_model_scores"] = chan_payload
-        _set_refresh_progress(
-            step_key="chan_model_strategy",
-            step_status="success",
-            message="缠论实时评分刷新完成",
-            percent=72,
-            complete_previous=False,
-        )
+        if "score.chan" in node_results:
+            results["refresh_chan_model_scores"] = dict(node_results["score.chan"])
+            _set_refresh_progress(
+                step_key="chan_model_strategy",
+                step_status="success",
+                message="缠论实时评分刷新完成",
+                percent=72,
+                complete_previous=False,
+            )
 
         if right_side_enabled:
             right_payload = dict(node_results["score.right_side_unified"])
@@ -10672,12 +10754,7 @@ def _run_latest_refresh_job_in_generation(
             percent=92,
             complete_previous=False,
         )
-        _set_refresh_progress(
-            step_key="similar_patterns",
-            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
-            percent=92,
-            complete_previous=False,
-        )
+        similar_payload = None
         with ThreadPoolExecutor(
             max_workers=3,
             thread_name_prefix="quant-late-workspace",
@@ -10698,16 +10775,6 @@ def _run_latest_refresh_job_in_generation(
                 ): (
                     "long_stock_pool",
                     "长线策略与带血筹计划生成失败",
-                ),
-                executor.submit(
-                    run_with_resources, ResourceClaim(
-                        cpu_slots=min(4, scheduler.budget.cpu_slots), io_slots=1, memory_mb=1024,
-                        db_connections=min(4, scheduler.budget.db_connections), requested_workers=4, max_workers=4,
-                    ),
-                    composed, "refresh_similar_pattern_analysis", _run_similar_pattern_analysis_isolated,
-                ): (
-                    "similar_patterns",
-                    "相似走势决策台刷新失败",
                 ),
             }
             futures.update(early_workspace_futures)
@@ -10749,8 +10816,10 @@ def _run_latest_refresh_job_in_generation(
                             "event_polled_through"
                         ),
                         "records": len(payload.get("records") or []),
+                        "quality": payload.get("quality"),
                     }
                 elif result_key == "similar_patterns":
+                    similar_payload = payload
                     if str(payload.get("target_date") or "") != expected_signal_date:
                         raise RuntimeError(
                             "相似走势目标日期未更新到目标交易日: "
@@ -10758,7 +10827,8 @@ def _run_latest_refresh_job_in_generation(
                             f"actual={payload.get('target_date')}"
                         )
                     results[result_key] = {
-                        "status": "success",
+                        "status": "pending",
+                        "strategy_hits_pending": True,
                         "generated_at": payload.get("generated_at"),
                         "target_date": payload.get("target_date"),
                         "reference_library_refreshed_at": (
@@ -10790,7 +10860,10 @@ def _run_latest_refresh_job_in_generation(
 
         if strict_core:
             save_core_source_manifest(PROJECT_ROOT, sealed_input)
-        _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
+        _set_refresh_progress(
+            step_key="snapshot", message="正在写入策略股票池快照",
+            percent=98, complete_previous=False,
+        )
         snapshot_timings = {}
         written_pools = composed(
             "write_strategy_pool_snapshots", _write_strategy_pool_snapshots,
@@ -10803,6 +10876,28 @@ def _run_latest_refresh_job_in_generation(
             "timings": snapshot_timings,
             "long_stock_pools": results["long_stock_pool"]["variants"],
         }
+        if similar_payload is not None:
+            # Only enrich after the strategy products and snapshots are current;
+            # the expensive vector computation never calls another workspace.
+            workspace_failure_step = "similar_patterns"
+            enrichment_started = monotonic()
+            final_similar = _finalize_similar_pattern_payload(similar_payload)
+            atomic_write_json(final_similar, SIMILAR_PATTERN_ANALYSIS_PATH)
+            results["similar_patterns"].update(
+                status="success",
+                strategy_hits_pending=False,
+                watchlist_score_dates=final_similar["watchlist_score_dates"],
+                scored_count=len(final_similar["watchlist"]),
+            )
+            results.setdefault("finalization_timings", {})["watchlist_scores_and_badges_seconds"] = round(
+                monotonic() - enrichment_started, 3,
+            )
+            _set_refresh_progress(
+                step_key="similar_patterns", step_status="success",
+                message="相似走势、当日自选评分与策略标签已完成",
+                percent=98, complete_previous=False,
+            )
+            workspace_failure_step = None
         _run_post_snapshot_cache_cleanup(results)
         publish_dependency_gate(
             results,
@@ -10830,6 +10925,7 @@ def _run_latest_refresh_job_in_generation(
             status="failed",
             step_key=workspace_failure_step or _REFRESH_STATUS.get("current_step"),
             message="刷新任务失败",
+            complete_previous=False,
             result=results if "results" in locals() else None,
             error=f"{exc}\n{traceback.format_exc(limit=5)}",
         )

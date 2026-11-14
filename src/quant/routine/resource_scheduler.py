@@ -8,13 +8,13 @@ thread pools, BLAS threads and remote processes cannot be bounded by this API.
 
 from __future__ import annotations
 
-from collections import deque
+from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, wait
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import os
 import threading
-from typing import Callable, Iterable, Iterator, Mapping, TypeVar
+from typing import Callable, Iterable, Iterator, Mapping, TypeVar, cast
 
 from quant.infrastructure.publication import ContextThreadPoolExecutor
 from quant.routine.operation_contracts import ResourceClaim
@@ -226,29 +226,63 @@ class ResourceGrant:
         claim: ResourceClaim,
         max_pending: int | None = None,
     ) -> list[R]:
-        """Ordered child work with bounded input consumption and outstanding jobs."""
+        """Refill on completion while preserving input order and bounded jobs."""
         limit = self.granted_workers if max_pending is None else max_pending
         if not 1 <= limit <= 2 * self.granted_workers:
             raise ValueError("max_pending must be within [1, 2 * granted_workers]")
 
-        def run(item: T) -> R:
-            with self.reserve(claim) as child:
-                return function(item, child)
+        stopped = threading.Event()
+        failure_lock = threading.Lock()
+        failures: list[BaseException] = []
 
-        results: list[R] = []
-        pending = deque()
+        def run(item: T) -> R:
+            try:
+                if stopped.is_set():
+                    raise CancelledError()
+                with self.reserve(claim) as child:
+                    if stopped.is_set():
+                        raise CancelledError()
+                    return function(item, child)
+            except BaseException as exc:
+                # Stop queued workers before the coordinator observes the future.
+                with failure_lock:
+                    if not stopped.is_set():
+                        failures.append(exc)
+                        stopped.set()
+                raise
+
+        results: list[R | None] = []
+        pending: dict[Future[R], int] = {}
         with ContextThreadPoolExecutor(max_workers=self.granted_workers) as executor:
-            iterator = iter(items)
-            while True:
-                if len(pending) >= limit:
-                    results.append(pending.popleft().result())
-                try:
-                    item = next(iterator)
-                except StopIteration:
-                    break
-                pending.append(executor.submit(run, item))
-            results.extend(future.result() for future in pending)
-        return results
+            try:
+                iterator = iter(items)
+                exhausted = False
+                while pending or not exhausted:
+                    while not exhausted and len(pending) < limit:
+                        if failures:
+                            raise failures[0]
+                        try:
+                            item = next(iterator)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        if failures:
+                            raise failures[0]
+                        pending[executor.submit(run, item)] = len(results)
+                        results.append(None)
+                    if not pending:
+                        break
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    if failures:
+                        raise failures[0]
+                    for future in done:
+                        results[pending.pop(future)] = future.result()
+            except BaseException:
+                stopped.set()
+                for future in pending:
+                    future.cancel()
+                raise  # The executor joins running workers before releasing the parent.
+        return cast(list[R], results)
 
     def close(self) -> None:
         with self._condition:

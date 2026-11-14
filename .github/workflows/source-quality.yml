@@ -98,3 +98,11 @@ jobs:
       - name: Check BYD source fallback with its supported strategy runtime
         if: matrix.python == '3.13'
         run: python -m pytest -q tests/test_byd_workspace.py
+      - name: Check refresh coverage, scheduling and finalization
+        if: matrix.python == '3.13'
+        run: >-
+          python -m pytest -q
+          tests/test_daily_dependencies.py tests/test_daily_dependency_runtime.py
+          tests/test_page_refresh_coverage.py tests/test_refresh_workspace_coverage.py
+          tests/test_refresh_output_selection.py tests/test_resource_scheduler.py
+          tests/test_daily_dag_executor.py tests/test_webapp_api.py

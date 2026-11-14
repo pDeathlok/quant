@@ -510,6 +510,7 @@ class DailyDagExecutor:
 
         pending = set(definitions)
         running: dict[Future[OperationResult], str] = {}
+        operation_started: dict[str, float] = {}
         grants: dict[str, ResourceGrant] = {}
         completed: dict[str, OperationResult] = {}
         started_at = time.monotonic()
@@ -566,6 +567,7 @@ class DailyDagExecutor:
                         continue
                     context = replace(context, resource_grant=grant)
                     pending.remove(operation_id)
+                    operation_started[operation_id] = time.monotonic()
                     try:
                         future = executor.submit(self._run_with_grant, definition, context)
                     except BaseException:
@@ -606,6 +608,10 @@ class DailyDagExecutor:
                             error_category="executor",
                             error=str(exc),
                         )
+                    result = replace(result, metrics={
+                        **result.metrics,
+                        "execution_seconds": round(time.monotonic() - operation_started[operation_id], 3),
+                    })
                     completed[operation_id] = result
                     self._emit(
                         operation_id,

@@ -115,7 +115,7 @@ class DependencyEdge:
 
 @dataclass(frozen=True)
 class EvidenceSpec:
-    """One runtime freshness probe, tried in declaration order."""
+    """One runtime freshness probe; every required probe must be valid."""
 
     adapter: str
     locator: str
@@ -311,7 +311,7 @@ class DependencyRegistry:
         self.topological_order()
 
     def topological_order(self, node_ids: Iterable[str] | None = None) -> tuple[str, ...]:
-        selected = set(node_ids or self.nodes)
+        selected = set(self.nodes if node_ids is None else node_ids)
         visiting: set[str] = set()
         visited: set[str] = set()
         ordered: list[str] = []
@@ -1881,7 +1881,13 @@ def build_default_daily_dependency_registry(
             "product.long_pools", Layer.PRODUCT, "webapp.services.long",
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
             (_edge("feature.long_snapshot"),),
-            _exact(_result("long_stock_pool.variants.0", "signal_date")), _daily_incremental(),
+            _exact(
+                *(EvidenceSpec(
+                    "result_variant", "long_stock_pool.variants", "signal_date",
+                    predicate_field="variant", expected_value=variant,
+                ) for variant in ("tea", "tea_safe", "v44")),
+                _result("long_stock_pool.blood_chip", "signal_date"),
+            ), _daily_incremental(),
             "refresh_long_stock_pool_variants", result_aliases=("long_stock_pool",),
             publication_outputs=("data/long_stock_pool_snapshots", "data/blood_chip_long_snapshots"),
             contract_sources=(

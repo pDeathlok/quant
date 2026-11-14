@@ -29,6 +29,7 @@ from quant.application.daily_dependencies import (
     classify_feature_usage,
     state_is_current,
 )
+from quant.application.page_refresh_coverage import page_refresh_coverage_report
 from quant.data.atomic_io import atomic_write_json
 from quant.features.factor_registry import (
     FACTOR_REGISTRY,
@@ -452,8 +453,19 @@ def _evidence_value(
             return None
         value = manifest["signal_date"]
         return _parse_date(value), _parse_datetime(value), manifest["data_sha256"]
-    if adapter in {"result", "top_list_poll"}:
+    if adapter in {"result", "result_variant", "top_list_poll"}:
         payload = _lookup(results, locator)
+        if adapter == "result_variant":
+            if not isinstance(payload, (list, tuple)) or not predicate_field:
+                return None
+            matches = [
+                item for item in payload
+                if isinstance(item, Mapping)
+                and _lookup(item, predicate_field) == expected_value
+            ]
+            if len(matches) != 1:
+                return None
+            payload = matches[0]
         if not isinstance(payload, Mapping):
             return None
         if adapter == "top_list_poll":
@@ -640,13 +652,16 @@ def collect_node_states(
                 evidence.predicate_field,
                 evidence.expected_value,
             )
-            if item is None:
+            # A fingerprint alone cannot satisfy a declared date probe.
+            if item is None or (evidence.date_field and item[0] is None):
                 required_missing = required_missing or evidence.required
             else:
                 observed.append(item)
         if required_missing or not observed:
             continue
         dates = [item[0] for item in observed if item[0] is not None]
+        if node.freshness.mode == FreshnessMode.EXACT_TRADE_DATE and len(set(dates)) > 1:
+            continue
         checked = [item[1] for item in observed if item[1] is not None]
         fingerprints = sorted(item[2] for item in observed if item[2])
         watermark = min(dates) if dates else None
@@ -897,7 +912,8 @@ def _postflight_result_backed_nodes(
     for node_id in active_node_ids:
         node = registry.nodes[node_id]
         if node.outputs or not any(
-            evidence.adapter == "result" for evidence in node.freshness.evidence
+            evidence.adapter in {"result", "result_variant"}
+            for evidence in node.freshness.evidence
         ):
             continue
         current, _ = state_is_current(
@@ -1327,6 +1343,9 @@ def publish_daily_dependency_snapshot(
         },
         "freshness_audit": freshness_audit,
         "registry": registry.as_dict(),
+        "page_refresh_coverage": page_refresh_coverage_report(
+            registry, scope, target.isoformat(),
+        ),
     }
     commit_baseline = bool(
         phase == "postflight"
@@ -1381,6 +1400,7 @@ def publish_daily_dependency_snapshot(
         "refresh_nodes": payload["refresh_nodes"],
         "freshness_audit": freshness_audit,
         "path": str(output_path),
+        "page_refresh_coverage": payload["page_refresh_coverage"],
         "committed_path": str(scope_state_path),
         "dated_path": str(dated_path),
     }

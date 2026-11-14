@@ -122,6 +122,8 @@ def test_independent_operations_run_in_parallel(tmp_path: Path) -> None:
     assert result["status"] == "success"
     assert len(thread_ids) == 2
     assert result["resource_usage"]["max_cpu_slots"] == 2
+    for operation in result["operations"].values():
+        assert 0 <= operation.metrics["execution_seconds"] <= result["elapsed_seconds"]
 
 
 def test_resource_budget_prevents_oversubscription(tmp_path: Path) -> None:
