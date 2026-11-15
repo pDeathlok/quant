@@ -1,0 +1,12 @@
+{
+  "release_id": "application_portfolio_v1",
+  "mode": "research_candidate",
+  "manifest": "models/candidates/application_portfolio_v1/manifest.json",
+  "manifest_sha256": "0d65cba1d2c68d9059abeb74336c91d4cf14279d3b48b30a9261411c710e4582",
+  "weights": {
+    "score_three_way": 0.25,
+    "score_return_path": 0.25,
+    "weighted_low_volatility": 0.5
+  },
+  "verification": "reports/research/dual_objective_portfolio_v1/release_verification.json"
+}

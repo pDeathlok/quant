@@ -131,15 +131,18 @@ def refresh_stock_basic(
     }
 
 
-def refresh_index_daily(fetcher: TushareDataFetcher, raw_dir: Path, end_date: str) -> dict[str, Any]:
-    path = raw_dir / f"index_{INDEX_CODE}.parquet"
+def refresh_index_daily(fetcher: TushareDataFetcher, raw_dir: Path, end_date: str, *, index_code: str = INDEX_CODE) -> dict[str, Any]:
+    path = raw_dir / f"index_{index_code}.parquet"
     existing = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+    if not existing.empty and existing["trade_date"].astype(str).eq(end_date).any():
+        return {"status":"success","latest_trade_date":end_date,"path":str(path),
+                "new_rows":0,"total_rows":len(existing),"data_missing":False,"checkpoint_reused":True}
     if not existing.empty and "trade_date" in existing.columns:
         latest = pd.to_datetime(existing["trade_date"].astype(str), format="%Y%m%d", errors="coerce").max()
         start = (latest - pd.Timedelta(days=10)).strftime("%Y%m%d") if pd.notna(latest) else "20100101"
     else:
         start = "20100101"
-    fresh = fetcher.pro.index_daily(ts_code=INDEX_CODE, start_date=start, end_date=end_date)
+    fresh = fetcher.pro.index_daily(ts_code=index_code, start_date=start, end_date=end_date)
     if fresh is None:
         fresh = pd.DataFrame()
     combined = _merge_frame(
@@ -166,6 +169,25 @@ def refresh_index_daily(fetcher: TushareDataFetcher, raw_dir: Path, end_date: st
             f"latest available is {latest_text or 'none'}"
         )
     return result
+
+
+def refresh_model_indices(fetcher: TushareDataFetcher, raw_dir: Path, end_date: str, *,
+                          required_indices: Iterable[str] = ()) -> dict[str, Any]:
+    """One source owner for CSI300 and any additional configured model indices."""
+    codes=list(dict.fromkeys([INDEX_CODE,*required_indices]))
+    results={}
+    for code in codes:
+        if not isinstance(code,str) or not code.replace('.','').isalnum():
+            raise ValueError('Invalid configured index code')
+        results[code]=refresh_index_daily(fetcher,raw_dir,end_date,index_code=code)
+    primary=dict(results[INDEX_CODE])
+    complete=all(r.get('status')=='success' for r in results.values())
+    primary['rank_indices']={'status':'success' if complete else 'partial',
+        'latest_trade_date':end_date if complete else None,'indices':results}
+    if not complete:
+        primary['status']='partial'
+        primary.setdefault('error','Required ranking index history is incomplete')
+    return primary
 
 
 def _request_frame_with_retries(
@@ -330,6 +352,7 @@ def refresh_long_factor_daily_sources(
     trade_date: str,
     *,
     datasets: Iterable[str] | None = None,
+    rank_flow_context: bool = False,
 ) -> dict[str, Any]:
     """Refresh only the long-factor datasets requested by active consumers."""
 
@@ -352,7 +375,7 @@ def refresh_long_factor_daily_sources(
         "holder_trade_recent": "stk_holdertrade",
     }
     required_methods = [method_by_dataset[dataset] for dataset in selected]
-    if set(selected) & {"margin_detail", "moneyflow", "top_list"}:
+    if 'top_list' in selected or (not rank_flow_context and set(selected) & {"margin_detail", "moneyflow"}):
         required_methods.append("trade_cal")
     missing_methods = [
         method for method in required_methods if not callable(getattr(fetcher.pro, method, None))
@@ -386,13 +409,31 @@ def refresh_long_factor_daily_sources(
                 context_lookback_calendar_days=incremental.context_lookback_calendar_days,
                 poll_overlap_calendar_days=incremental.poll_overlap_calendar_days,
             )
-        else:
+        elif rank_flow_context:
+            # These published flows enter the ranker strictly before its signal
+            # date. Repair the rolling context, not just today's last file.
+            calendar_path=raw_dir/f'index_{INDEX_CODE}.parquet'
+            if calendar_path.exists():
+                calendar=pd.read_parquet(calendar_path,columns=['trade_date']).trade_date.astype(str)
+                local_dates=sorted(set(calendar.loc[calendar.lt(trade_date)]))[-60:]
+            else:
+                local_dates=sorted(p.stem for p in (raw_dir/'daily_basic').glob('*.parquet')
+                                   if p.stem.isdigit() and p.stem<trade_date)[-60:]
+            if len(local_dates) < 60:
+                raise RuntimeError('A prior trading calendar is required for ranking flows')
             dataset_result = backfill_trade_date_partitions(
-                fetcher.pro, dataset, trade_date, trade_date, raw_dir, audit_dir,
-                policy=policy,
+                fetcher.pro, dataset, local_dates[0], local_dates[-1], raw_dir, audit_dir,
+                policy=policy, trade_dates=local_dates,
             )
             if dataset_result.get("status") == "success":
                 dataset_result["polled_through"] = trade_date
+                dataset_result["observation_through"] = local_dates[-1]
+        else:
+            dataset_result = backfill_trade_date_partitions(
+                fetcher.pro, dataset, trade_date, trade_date, raw_dir, audit_dir, policy=policy,
+            )
+            if dataset_result.get('status') == 'success':
+                dataset_result['polled_through'] = trade_date
         datasets[dataset] = dataset_result
     if "holder_trade_recent" in selected:
         datasets["holder_trade_recent"] = refresh_holder_trade_recent(
@@ -429,6 +470,8 @@ def refresh_reference_data(
     force_financials: bool = False,
     include_long_factor_sources: bool = True,
     long_factor_datasets: Iterable[str] | None = None,
+    rank_flow_context: bool = False,
+    required_indices: Iterable[str] = (),
     include_stock_basic: bool = True,
     include_index: bool = True,
     include_tradability: bool = True,
@@ -456,7 +499,8 @@ def refresh_reference_data(
             "reason": "not required for this refresh scope",
         }
     if include_index:
-        operations.append(("index_000300", lambda: refresh_index_daily(fetcher, raw_dir, end_date)))
+        operations.append(("index_000300", lambda: refresh_model_indices(
+            fetcher, raw_dir, end_date, required_indices=required_indices)))
     else:
         steps["index_000300"] = {
             "status": "skipped",
@@ -505,6 +549,7 @@ def refresh_reference_data(
                 audit_dir,
                 end_date,
                 datasets=selected_long_datasets,
+                rank_flow_context=rank_flow_context,
             )
         except Exception as exc:
             steps["long_factor_sources"] = {"status": "failed", "error": str(exc)}

@@ -33,8 +33,8 @@ import yaml
 
 from quant.application.refresh_contracts import (
     REFRESH_SCOPE_LABELS,
-    REFRESH_STEP_DEFINITIONS,
     build_progress_steps as _progress_steps,
+    refresh_step_definition,
     normalize_refresh_scope as _normalize_refresh_scope,
 )
 from quant.application.selector_ranking import (
@@ -42,6 +42,14 @@ from quant.application.selector_ranking import (
     SelectorRankingBatch,
     SelectorRankingSource,
     apply_selector_ranking_source,
+)
+from quant.application.short_risk_filter import (
+    FILTER_LABEL,
+    FILTER_VERSION,
+    LOOKBACK_SESSIONS,
+    SHOCK_DROP_PCT,
+    SHOCK_VOLUME_MULTIPLE,
+    unreclaimed_selloff_symbols,
 )
 from quant.application.left_side_ranking import (
     DEFAULT_LEFT_SIDE_RANKING_CONFIG,
@@ -403,7 +411,7 @@ _REFRESH_JOB_THREADS: dict[str, threading.Thread] = {}
 REFRESH_HEARTBEAT_SECONDS = 30.0
 _SIMILAR_PATTERN_REFRESH_GUARD = threading.Lock()
 _SIMILAR_PATTERN_REFRESH_INFLIGHT: tuple[
-    tuple[tuple[str, ...], bool],
+    tuple[tuple[str, ...], bool, bool],
     Future[dict[str, Any]],
 ] | None = None
 _REFRESH_STATUS: dict[str, Any] = {
@@ -1144,7 +1152,13 @@ def _load_project_env() -> None:
 
 def get_transition_daily_strategy(strategy: str = "return", refresh: bool = False) -> dict[str, Any]:
     from quant.application.workspaces.transition import workspace
-    return workspace(PROJECT_ROOT, strategy, refresh)
+    view = current_publication()
+    return workspace(
+        PROJECT_ROOT,
+        strategy,
+        refresh,
+        publication_generation=getattr(view, "generation", None),
+    )
 
 
 def save_transition_account(strategy: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -1155,13 +1169,27 @@ def save_transition_account(strategy: str, body: dict[str, Any]) -> dict[str, An
 
 def _refresh_transition_workspace() -> dict[str, Any]:
     payload = get_transition_daily_strategy("return", refresh=True)
-    if payload.get("status") == "blocked":
-        raise ValueError("过渡期右侧数据未就绪：" + "；".join(payload.get("issues", [])))
+    variants = []
     for variant in ("return", "win"):
         item = payload if variant == "return" else get_transition_daily_strategy(variant)
+        if item.get("status") not in {"ready", "needs_account"} or not item.get("signal_date"):
+            raise ValueError(f"多状态右侧 {variant} 数据未就绪：" + "；".join(item.get("issues", [])))
+        if item["signal_date"] != payload.get("signal_date"):
+            raise ValueError(f"多状态右侧变体日期不一致：{variant}={item['signal_date']}")
         _write_workspace_snapshot("transition_daily_plan", item["signal_date"], item,
                                   params={"strategy": variant}, write_sql=False)
-    return payload
+        variants.append({"variant": variant, "status": "success", "signal_date": item["signal_date"]})
+    return {**payload, "variants": variants}
+
+
+def _transition_refresh_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "success",
+        "signal_date": (payload.get("planned_t") or {}).get("signal_date"),
+        "variants": payload.get("variants") or [],
+        "alerts": len(payload.get("alerts") or []),
+        "intraday_training_refresh": payload.get("intraday_training_refresh"),
+    }
 
 
 def get_byd_daily_strategy(
@@ -4450,12 +4478,20 @@ def refresh_similar_pattern_watchlist_scores() -> dict[str, Any]:
     }
 
 
-def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[str, Any]]]:
+def _collect_watchlist_strategy_hits(
+    symbols: list[str], *, signal_date: str | None = None, read_only: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
     """Collect current cross-workspace hits for watchlist symbols from existing strategy payloads."""
     targets = {str(symbol).upper() for symbol in symbols}
     hits: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in targets}
+    if not targets:
+        return hits
+
+    expected_date = signal_date
 
     def append_hit(symbol: str, key: str, label: str, detail: str, signal_date: Any = None) -> None:
+        if expected_date and str(signal_date or "") != expected_date:
+            return
         normalized = _canonical_watch_symbol(symbol)
         if normalized not in targets:
             return
@@ -4470,7 +4506,7 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
 
     try:
         view = current_publication()
-        latest_signal_date = (
+        latest_signal_date = signal_date or (
             _latest_selector_snapshot_date(None, True)
             if view and view.generation and not view.writable
             else _latest_candidate_signal_date()
@@ -4480,7 +4516,7 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
             None,
             True,
         )
-        if short_payload is None:
+        if short_payload is None and not read_only:
             short_payload = get_stock_selector_payload(
                 signal_date=latest_signal_date,
                 include_extended=True,
@@ -4489,7 +4525,7 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
         # Keep cross-workspace badges aligned with the short-strategy surface:
         # raw snapshot rows that fail the OOT quality gate or fall outside the
         # displayed shortlist must not be presented as visible strategy hits.
-        short_payload = _display_selector_payload(short_payload)
+        short_payload = _display_selector_payload(short_payload or {"stocks": []})
         for item in short_payload.get("stocks") or []:
             families = " / ".join(str(value) for value in (item.get("matched_families") or [])[:4])
             append_hit(
@@ -4503,7 +4539,11 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
         pass
 
     try:
-        chan_payload = get_chan_model_strategy_plan(top_n=20)
+        chan_payload = (
+            _read_workspace_snapshot("chan_model_strategy", snapshot_date=signal_date,
+                                     params={"top_n": 20}, allow_sql=False) or {}
+            if read_only else get_chan_model_strategy_plan(top_n=20)
+        )
         for item in chan_payload.get("candidates") or []:
             append_hit(
                 str(item.get("symbol") or ""),
@@ -4516,7 +4556,10 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
         pass
 
     try:
-        long_payload = get_long_stock_pool(variant="tea")
+        long_payload = (
+            _read_long_stock_pool_snapshot("tea", signal_date, allow_sql=False) or {}
+            if read_only else get_long_stock_pool(variant="tea")
+        )
         for item in long_payload.get("stocks") or []:
             append_hit(
                 str(item.get("ts_code") or ""),
@@ -4531,14 +4574,17 @@ def _collect_watchlist_strategy_hits(symbols: list[str]) -> dict[str, list[dict[
     return hits
 
 
-def _attach_watchlist_strategy_hits(payload: dict[str, Any]) -> dict[str, Any]:
+def _attach_watchlist_strategy_hits(payload: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     """Attach strategy badges without changing the similar-pattern forecast itself."""
     symbols = [
         str(item.get("target", {}).get("symbol") or "").upper()
         for item in payload.get("results") or []
         if item.get("target", {}).get("symbol")
     ]
-    strategy_hits = _collect_watchlist_strategy_hits(symbols)
+    strategy_hits = {} if read_only and not payload.get("target_date") else (
+        _collect_watchlist_strategy_hits(symbols, signal_date=payload.get("target_date"), read_only=True)
+        if read_only else _collect_watchlist_strategy_hits(symbols)
+    )
     for item in payload.get("results") or []:
         symbol = str(item.get("target", {}).get("symbol") or "").upper()
         item["strategy_hits"] = strategy_hits.get(symbol, [])
@@ -4546,11 +4592,37 @@ def _attach_watchlist_strategy_hits(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _finalize_similar_pattern_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Join scores only after their feature producers and page snapshots finish."""
+    profiles = _similar_pattern_watchlist_profiles(_stock_basic_for_similar_patterns(), include_scores=True)
+    expected_symbols = {item["target"]["symbol"] for item in payload.get("results") or []}
+    if {item["symbol"] for item in profiles} != expected_symbols:
+        raise RuntimeError("自选池在计算期间发生变化，拒绝发布不完整评分")
+    target_date = payload.get("target_date")
+    invalid = [item["symbol"] for item in profiles if (
+        _safe_float(item.get("opportunity_score")) is None
+        or _safe_float(item.get("holding_score")) is None
+        or item.get("score_date") != target_date
+        or not isinstance(item.get("feature_quality"), Mapping)
+        or item["feature_quality"].get("status") != "complete"
+        or item["feature_quality"].get("date") != target_date
+    )]
+    if invalid:
+        raise RuntimeError(f"自选池当日评分或特征质量缺失: {invalid[:8]}")
+    enriched = {
+        **payload, "watchlist": profiles,
+        "watchlist_score_dates": sorted({item["score_date"] for item in profiles}),
+        "watchlist_scores_generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return _attach_watchlist_strategy_hits(enriched, read_only=True)
+
+
 def _refresh_similar_pattern_analysis_once(
     symbols: list[str],
     progress_callback=None,
     *,
     force_vector_cache: bool = False,
+    include_strategy_hits: bool = True,
 ) -> dict[str, Any]:
     basic = _stock_basic_for_similar_patterns()
     source_trade_date = _latest_similar_pattern_target_date(symbols)
@@ -4642,7 +4714,7 @@ def _refresh_similar_pattern_analysis_once(
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "target_date": source_trade_date,
-        "watchlist": _similar_pattern_watchlist_profiles(basic),
+        "watchlist": _similar_pattern_watchlist_profiles(basic, include_scores=False),
         "config": {
             "candidate_start_date": SIMILAR_PATTERN_CONFIG.candidate_start_date,
             "candidate_step_days": SIMILAR_PATTERN_CONFIG.candidate_step_days,
@@ -4700,7 +4772,8 @@ def _refresh_similar_pattern_analysis_once(
             "target_vectors": "live_from_latest_daily_data",
         },
     }
-    payload = _attach_watchlist_strategy_hits(payload)
+    if include_strategy_hits:
+        payload = _finalize_similar_pattern_payload(payload)
     atomic_write_json(payload, SIMILAR_PATTERN_ANALYSIS_PATH)
     return payload
 
@@ -4709,13 +4782,14 @@ def refresh_similar_pattern_analysis(
     progress_callback=None,
     *,
     force_vector_cache: bool = False,
+    include_strategy_hits: bool = True,
 ) -> dict[str, Any]:
     """Run one analysis per watchlist revision and share it with concurrent callers."""
     assert_publication_writable()
     global _SIMILAR_PATTERN_REFRESH_INFLIGHT
 
     requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
-    requested_key = (requested_symbols, bool(force_vector_cache))
+    requested_key = (requested_symbols, bool(force_vector_cache), include_strategy_hits)
 
     while True:
         with _SIMILAR_PATTERN_REFRESH_GUARD:
@@ -4735,6 +4809,7 @@ def refresh_similar_pattern_analysis(
                     list(requested_symbols),
                     progress_callback=progress_callback,
                     force_vector_cache=force_vector_cache,
+                    include_strategy_hits=include_strategy_hits,
                 )
             except BaseException as exc:
                 future.set_exception(exc)
@@ -4767,10 +4842,11 @@ def refresh_similar_pattern_analysis(
         except Exception:
             pass
         requested_symbols = tuple(_read_similar_pattern_watchlist_symbols())
-        requested_key = (requested_symbols, bool(force_vector_cache))
+        requested_key = (requested_symbols, bool(force_vector_cache), include_strategy_hits)
 
 
-def _similar_patterns_worker(result_queue: mp.Queue, publication=None, worker_limit=None, market_environment=None) -> None:
+def _similar_patterns_worker(result_queue: mp.Queue, publication=None, worker_limit=None, market_environment=None,
+                             include_strategy_hits: bool = True) -> None:
     def emit_progress(message: str) -> None:
         result_queue.put({"type": "progress", "message": message})
 
@@ -4786,7 +4862,9 @@ def _similar_patterns_worker(result_queue: mp.Queue, publication=None, worker_li
     os.environ.update(overrides)
     try:
         with publication_context(publication) if publication else nullcontext():
-            payload = refresh_similar_pattern_analysis(progress_callback=emit_progress)
+            payload = refresh_similar_pattern_analysis(
+                progress_callback=emit_progress, include_strategy_hits=include_strategy_hits,
+            )
     except Exception as exc:
         result_queue.put(
             {
@@ -4823,7 +4901,8 @@ def _drain_similar_pattern_worker_queue(result_queue: mp.Queue) -> dict[str, Any
         final_result = dict(message)
 
 
-def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTERNS_TIMEOUT_SECONDS) -> dict[str, Any]:
+def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTERNS_TIMEOUT_SECONDS,
+                                         *, include_strategy_hits: bool = True) -> dict[str, Any]:
     from quant.data.market_snapshot import pinned_market_environment
     from quant.routine.resource_scheduler import current_resource_grant
 
@@ -4833,7 +4912,7 @@ def _run_similar_pattern_analysis_isolated(timeout_seconds: int = SIMILAR_PATTER
     proc = ctx.Process(
         target=_similar_patterns_worker,
         args=(result_queue, current_publication(), grant.granted_workers if grant else None,
-              pinned_market_environment()),
+              pinned_market_environment(), include_strategy_hits),
         daemon=False,
     )
     proc.start()
@@ -4899,7 +4978,7 @@ def get_similar_pattern_analysis(refresh: bool = False) -> dict[str, Any]:
                 for symbol in watchlist_symbols
                 if symbol in result_by_symbol
             ]
-            cached = _attach_watchlist_strategy_hits(cached)
+            cached = _attach_watchlist_strategy_hits(cached, read_only=True)
             persisted_profiles = _similar_pattern_watchlist_profiles(
                 _stock_basic_for_similar_patterns(),
                 include_scores=False,
@@ -5451,6 +5530,7 @@ def _filtered_selector_payload(
         str(payload.get("signal_date") or "") or None,
         **({"ranking_batch": ranking_batch} if ranking_batch is not None else {}),
     )
+    _annotate_selector_rank_release(rows)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -5458,6 +5538,9 @@ def _filtered_selector_payload(
     )
     filtered = dict(payload)
     filtered["stocks"] = rows
+    if payload.get('application_portfolio'):
+        from quant.application.portfolio_application import project_portfolio
+        filtered['application_portfolio'] = project_portfolio(payload['application_portfolio'], symbols={row['symbol'] for row in rows}, limit=0)
     filtered["snapshot_scope"] = {"strategies": sorted(selected)}
     filtered["generated_at"] = datetime.now().isoformat(timespec="seconds")
     return filtered
@@ -5549,6 +5632,76 @@ def _selector_row_side(row: dict[str, Any]) -> str | None:
     return None
 
 
+def _annotate_selector_rank_release(rows: list[dict[str, Any]]) -> None:
+    """Persist display metadata immediately after current-model score validation."""
+    for row in rows:
+        if row.get("ranking_source") == "left_side_unified":
+            row["ranking_model_engine"] = DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine
+            row["ranking_model_release_id"] = DEFAULT_LEFT_SIDE_RANKING_CONFIG.release_id
+        else:
+            row["ranking_model_engine"] = row.get("ranking_source")
+            row["ranking_model_release_id"] = None
+
+
+def _validate_published_selector_ranks(rows: list[dict[str, Any]], signal_date: str) -> None:
+    """Committed pages consume embedded ranks, never a mutable latest cache."""
+    for row in rows:
+        source = row.get("ranking_source")
+        if source == "unified_ranker_not_applicable":
+            continue
+        raw = _safe_float(row.get("ranking_score"))
+        normalized = _safe_float(row.get("ranking_score_normalized"))
+        if (source not in {"left_side_unified", "right_side_unified"}
+                or row.get("ranking_score_date") != signal_date
+                or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("ranking_model_artifact_sha256") or ""))
+                or raw is None or normalized is None
+                or not np.isfinite([raw, normalized]).all()
+                or not 0 <= raw <= 1 or not 0 <= normalized <= 100):
+            raise RuntimeError("Invalid published selector ranking identity or score")
+
+
+def _bind_selector_probability_bands(payload: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Omit old-model probability labels when presenting a different ranker."""
+    allowed = {
+        key: {row.get("ranking_model_artifact_sha256") for row in rows if row.get("ranking_source") == source}
+        for key, source in [("model_left", "left_side_unified"),
+                            ("model_left_ranknet_v6", "left_side_unified"),
+                            ("model_right", "right_side_unified")]
+    }
+    calibrations = payload.get("calibrations") or []
+    matching_left = any(c.get("key") == "model_left" and (c.get("source") or {}).get("artifact_sha256") in allowed["model_left"]
+                        for c in calibrations)
+    shadow_applies = matching_left and any(row.get("shadow_v5_lifecycle") == "shadow" for row in rows)
+    retained = [c for c in calibrations
+                if (c.get("key") not in allowed or (c.get("source") or {}).get("artifact_sha256") in allowed[c["key"]])
+                and (c.get("key") != "model_left_v5_shadow" or shadow_applies)]
+    return {**payload, "available": bool(payload.get("available") and retained), "calibrations": retained}
+
+
+def _selector_short_risk_filter(payload: dict[str, Any]) -> dict[str, Any]:
+    saved = payload.get("short_risk_filter") or {}
+    if saved.get("version") == FILTER_VERSION:
+        return saved
+
+    signal_date = payload.get("signal_date")
+    symbols = {str(row["symbol"]) for row in payload.get("stocks") or [] if row.get("symbol")}
+    excluded: set[str] = set()
+    if signal_date and symbols:
+        target = pd.Timestamp(signal_date)
+        # Historical snapshot views can be served without an active SQL connection.
+        # The store still honors a pinned market snapshot during production builds.
+        config = MarketDataStoreConfig.from_env(root=DAILY_DIR.parent)
+        store = MarketDataStore(replace(config, backend="parquet"))
+        daily = store.read_market_range(
+            DAILY_DIR.name,
+            start_date=(target - pd.Timedelta(days=45)).date().isoformat(),
+            end_date=target.date().isoformat(),
+            columns=["ts_code", "trade_date", "close", "low", "pre_close", "pct_chg", "volume"],
+        )
+        excluded = unreclaimed_selloff_symbols(daily, symbols, target.date().isoformat())
+    return {"version": FILTER_VERSION, "excluded_symbols": sorted(excluded)}
+
+
 def _display_selector_payload(
     payload: dict[str, Any],
     limit: int = DEFAULT_SELECTOR_LIMIT,
@@ -5559,8 +5712,15 @@ def _display_selector_payload(
         raise ValueError(f"unknown selector side: {side}")
     rows = [dict(row) for row in payload.get("stocks") or []]
     complete_total = int(payload.get("total_stock_count") or len(rows))
-    display_rows = [row for row in rows if _row_display_quality_gate(row)]
-    if any(
+    short_risk_filter = _selector_short_risk_filter(payload)
+    excluded_symbols = set(short_risk_filter["excluded_symbols"])
+    display_rows = [
+        row for row in rows
+        if row.get("symbol") not in excluded_symbols and _row_display_quality_gate(row)
+    ]
+    publication = current_publication()
+    committed = publication is not None and publication.generation is not None and not publication.writable
+    if not committed and any(
         row.get("buy_score_source") != "historical_return_model"
         or row.get("hold_score_source") != "historical_return_model"
         for row in display_rows
@@ -5575,11 +5735,15 @@ def _display_selector_payload(
             else original
             for original, rescored in zip(display_rows, rescored_rows)
         ]
-    display_rows = apply_selector_ranking_source(
-        display_rows,
-        str(payload.get("signal_date") or "") or None,
-    )
-    _apply_left_side_ranked_metrics(display_rows)
+    if committed:
+        _validate_published_selector_ranks(display_rows, str(payload.get("signal_date") or ""))
+    else:
+        display_rows = apply_selector_ranking_source(
+            display_rows,
+            str(payload.get("signal_date") or "") or None,
+        )
+        _annotate_selector_rank_release(display_rows)
+        _apply_left_side_ranked_metrics(display_rows)
     all_actionable_total = len(display_rows)
     if normalized_side != "all":
         display_rows = [
@@ -5597,6 +5761,22 @@ def _display_selector_payload(
     display = display_rows[:limit] if limit > 0 else display_rows
     out = dict(payload)
     out["stocks"] = display
+    out["short_risk_filter"] = short_risk_filter
+    out["notes"] = [
+        *(payload.get("notes") or []),
+        f"短线风险过滤（全部、左侧、右侧）：{FILTER_LABEL}。"
+        f"信号日前 {LOOKBACK_SESSIONS} 个交易日内跌幅至少 {SHOCK_DROP_PCT:g}%，"
+        f"成交量至少为下跌日前 {LOOKBACK_SESSIONS} 日均量的 {SHOCK_VOLUME_MULTIPLE:g} 倍，"
+        "且信号日收盘仍低于该日最低价。",
+    ]
+    if payload.get('application_portfolio'):
+        from quant.application.portfolio_application import project_portfolio
+        portfolio_symbols = {row["symbol"] for row in rows if row.get("symbol")} - excluded_symbols
+        out['application_portfolio'] = project_portfolio(
+            payload['application_portfolio'],
+            side=normalized_side,
+            symbols=portfolio_symbols if excluded_symbols else None,
+        )
     out["total_stock_count"] = total
     out["all_actionable_stock_count"] = all_actionable_total
     out["complete_stock_count"] = complete_total
@@ -5620,13 +5800,13 @@ def _display_selector_payload(
             "hold": "hold_score_normalized",
         },
         "targets": {
-            "model": "T+5 好路径排序（冲高且控制回撤）",
+            "model": "当日候选相对排序分（不是收益率或胜率）",
             "model_left_v5_shadow": "T+5 净收益为正的绝对市场状态与个股混合分（影子）",
             "buy": "T+5 最大冲高收益",
             "hold": "T+5 收盘收益",
         },
     }
-    out["score_probability_bands"] = _selector_score_probability_bands()
+    out["score_probability_bands"] = _bind_selector_probability_bands(_selector_score_probability_bands(), display_rows)
     return out
 
 
@@ -7355,10 +7535,8 @@ def _selector_production_snapshot_rows(
             "dated": True,
         },
         {
-            "path": PROJECT_ROOT
-            / "data/features/left_side_unified/latest_features.parquet",
-            "manifest": PROJECT_ROOT
-            / "data/features/left_side_unified/feature_manifest.json",
+            "path": DEFAULT_LEFT_SIDE_RANKING_CONFIG.paths.feature_output,
+            "manifest": DEFAULT_LEFT_SIDE_RANKING_CONFIG.paths.feature_manifest,
             "calculators": frozenset({"left_side_rule"}),
             "dated": True,
         },
@@ -7408,13 +7586,25 @@ def _selector_production_snapshot_rows(
                     raise RuntimeError("manifest date or checksum mismatch")
                 available = set(pq.ParquetFile(path).schema.names)
                 symbol_column = "symbol" if "symbol" in available else "ts_code"
-                missing = set(required) - available
+                compatibility = (
+                    metadata.get("selector_compatibility_features", {})
+                    if "left_side_rule" in calculators
+                    and DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion"
+                    else {}
+                )
+                if "left_side_rule" in calculators and DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion":
+                    if not set(required).issubset(compatibility):
+                        raise RuntimeError("missing legacy selector feature mapping")
+                source_columns = [compatibility.get(column, column) for column in required]
+                missing = set(source_columns) - available
                 if missing:
                     raise RuntimeError(f"missing columns: {sorted(missing)}")
                 frame = pd.read_parquet(
-                    path, columns=[symbol_column, "date", *required],
+                    path, columns=[symbol_column, "date", *source_columns],
                     filters=[("date", "==", target)],
                 )
+                if compatibility:
+                    frame = frame.rename(columns={compatibility[c]: c for c in required})
             symbol_column = "symbol" if "symbol" in available else "ts_code"
             if frame[symbol_column].duplicated().any():
                 raise RuntimeError("duplicate symbols in exact-date cross-section")
@@ -8129,6 +8319,9 @@ def _score_interpretation(opportunity_score: float, holding_score: float) -> dic
 
 
 def _row_display_quality_gate(row: dict[str, Any]) -> bool:
+    if row.get("ranking_source") == "left_side_unified" and row.get("ranking_model_engine") == "rank_fusion":
+        # The versioned ranker's cash gate already determines admission.
+        return True
     return any(_signal_quality_gate(signal) for signal in row.get("signals") or [])
 
 
@@ -8641,7 +8834,7 @@ def _left_side_ranked_signal(strategy_group: str) -> dict[str, Any]:
             "metrics": dict(metrics) if metrics is not None else None,
             "metrics_text": _metrics_text(metrics),
             "action_level": "观察",
-            "playbook_source": "左侧统一排序 · Fold C Top20",
+            "playbook_source": ("左侧统一排序 · RankNet 融合" if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion" else "左侧统一排序 · Fold C Top20"),
             "strength_score": 0.0,
         }
     )
@@ -8649,8 +8842,10 @@ def _left_side_ranked_signal(strategy_group: str) -> dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def _left_side_ranked_metrics() -> dict[str, Any] | None:
-    """Load the production Top20's strict OOT metrics for left-side rows."""
+    """Load legacy Top20 metrics only for the model they describe."""
 
+    if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion":
+        return None
     try:
         frame = pd.read_csv(LEFT_SIDE_ENTRY_TOPN_METRICS)
     except (FileNotFoundError, OSError, pd.errors.ParserError):
@@ -9279,7 +9474,7 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
             ),
             "配债股数据刷新失败",
         ),
-        ("byd_daily_plan", lambda: _refresh_transition_workspace(), "过渡期右侧次日计划刷新失败"),
+        ("byd_daily_plan", lambda: _refresh_transition_workspace(), "多状态右侧次日计划刷新失败"),
         ("similar_patterns", lambda: _run_similar_pattern_analysis_isolated(), "相似走势决策台刷新失败"),
     ]
     pending_steps = [item for item in pending_steps if step_map.get(item[0]) != "success"]
@@ -9287,8 +9482,8 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
     for step_key, _, _ in pending_steps:
         _set_refresh_progress(
             step_key=step_key,
-            message=f"检测到断点，正在续跑 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
-            percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
+            message=f"检测到断点，正在续跑 {refresh_step_definition(step_key)['label']}",
+            percent=refresh_step_definition(step_key)["percent"],
             complete_previous=False,
         )
 
@@ -9350,18 +9545,12 @@ def _resume_tail_refresh_from_cached_selector(scope: str, resume_status: dict[st
                         "targets": len(payload.get("results") or []),
                     }
                 else:
-                    planned_t = payload.get("planned_t") or {}
-                    results[step_key] = {
-                        "status": "success",
-                        "signal_date": planned_t.get("signal_date"),
-                        "alerts": len(payload.get("alerts") or []),
-                        "intraday_training_refresh": payload.get("intraday_training_refresh"),
-                    }
+                    results[step_key] = _transition_refresh_summary(payload)
                 _set_refresh_progress(
                     step_key=step_key,
                     step_status="success",
                     message=f"{failure_message.removesuffix('失败')}完成",
-                    percent=REFRESH_STEP_DEFINITIONS[step_key]["percent"],
+                    percent=refresh_step_definition(step_key)["percent"],
                     complete_previous=False,
                 )
 
@@ -9458,7 +9647,10 @@ def _publication_store() -> PublicationStore:
         path for node in DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes.values()
         for path in node.publication_outputs
     }
-    outputs.update(("web/data/dashboard.json", "data/contracts/daily_dependencies", "data/cache/routine_source_manifests"))
+    from quant.routine.short_etf_flow import SNAPSHOT_DIRECTORY
+
+    outputs.update(("web/data/dashboard.json", "data/contracts/daily_dependencies",
+                    "data/cache/routine_source_manifests", SNAPSHOT_DIRECTORY))
     return PublicationStore(PROJECT_ROOT, tuple(sorted(outputs)))
 
 
@@ -9963,6 +10155,10 @@ def _run_latest_refresh_job_in_generation(
             expected_trade_date,
             format="%Y%m%d",
         ).date().isoformat()
+        if refresh_scope in {"all", "short"}:
+            from quant.routine.short_etf_flow import refresh_short_etf_flow
+
+            results["short_etf_flow"] = refresh_short_etf_flow(expected_trade_date)
         with _REFRESH_LOCK:
             if _owned_refresh_context_active_unlocked():
                 _REFRESH_STATUS["trade_date"] = expected_trade_date
@@ -10139,8 +10335,14 @@ def _run_latest_refresh_job_in_generation(
                 (
                     "byd_daily_plan",
                     lambda: _refresh_transition_workspace(),
-                    "过渡期右侧次日计划刷新失败",
-                    "过渡期右侧次日计划已提前刷新完成",
+                    "多状态右侧次日计划刷新失败",
+                    "多状态右侧次日计划已提前刷新完成",
+                ),
+                (
+                    "similar_patterns",
+                    lambda: _run_similar_pattern_analysis_isolated(include_strategy_hits=False),
+                    "相似走势决策台刷新失败",
+                    "相似走势计算完成，等待其他工作区汇总策略标签",
                 ),
             ]
 
@@ -10149,12 +10351,20 @@ def _run_latest_refresh_job_in_generation(
                 operation,
                 success_message: str,
             ) -> Any:
+                claim = (
+                    ResourceClaim(
+                        cpu_slots=min(4, scheduler.budget.cpu_slots), io_slots=1, memory_mb=1024,
+                        db_connections=min(4, scheduler.budget.db_connections), requested_workers=4, max_workers=4,
+                    ) if step_key == "similar_patterns"
+                    else ResourceClaim(io_slots=1, memory_mb=512, db_connections=1)
+                )
                 payload = run_with_resources(
-                    ResourceClaim(io_slots=1, memory_mb=512, db_connections=1),
+                    claim,
                     composed, {
                         "convertible_bond_plan": "build_convertible_bond_grid_workspace",
                         "convertible_bond_allotment": "build_convertible_bond_allotment_workspace",
                         "byd_daily_plan": "build_transition_daily_workspace",
+                        "similar_patterns": "refresh_similar_pattern_analysis",
                     }[step_key], operation,
                 )
                 if step_key == "convertible_bond_plan":
@@ -10170,8 +10380,14 @@ def _run_latest_refresh_job_in_generation(
                     ).replace("-", "")
                     if actual_date != early_trade_date:
                         raise RuntimeError(
-                            "过渡期右侧计划日期未更新到目标交易日: "
+                            "多状态右侧计划日期未更新到目标交易日: "
                             f"expected={early_trade_date} actual={actual_date}"
+                        )
+                elif step_key == "similar_patterns":
+                    if payload.get("target_date") != early_signal_date:
+                        raise RuntimeError(
+                            "相似走势目标日期未更新到目标交易日: "
+                            f"expected={early_signal_date} actual={payload.get('target_date')}"
                         )
                 with early_workspace_results_lock:
                     if step_key == "convertible_bond_plan":
@@ -10191,17 +10407,18 @@ def _run_latest_refresh_job_in_generation(
                             "records": len(payload.get("records") or []),
                             "quality": payload.get("quality"),
                         }
-                    else:
-                        planned_t = payload.get("planned_t") or {}
+                    elif step_key == "similar_patterns":
                         results[step_key] = {
-                            "status": "success",
-                            "signal_date": planned_t.get("signal_date"),
-                            "alerts": len(payload.get("alerts") or []),
-                            "intraday_training_refresh": payload.get("intraday_training_refresh"),
+                            "status": "pending", "target_date": payload.get("target_date"),
+                            "generated_at": payload.get("generated_at"),
+                            "targets": len(payload.get("results") or []),
+                            "strategy_hits_pending": True,
                         }
+                    else:
+                        results[step_key] = _transition_refresh_summary(payload)
                 _set_refresh_progress(
                     step_key=step_key,
-                    step_status="success",
+                    step_status="running" if step_key == "similar_patterns" else "success",
                     message=success_message,
                     percent=40,
                     complete_previous=False,
@@ -10212,7 +10429,8 @@ def _run_latest_refresh_job_in_generation(
                 item
                 for item in early_jobs
                 if (
-                    (results.get(item[0]) or {}).get("status") != "success"
+                    item[0] == "similar_patterns"
+                    or (results.get(item[0]) or {}).get("status") != "success"
                     or item[0] in planned_refresh_ui_steps
                 )
             ]
@@ -10224,7 +10442,7 @@ def _run_latest_refresh_job_in_generation(
                 for step_key, operation, failure_message, success_message in pending_early_jobs:
                     _set_refresh_progress(
                         step_key=step_key,
-                        message=f"共享数据已就绪，后台提前执行 {REFRESH_STEP_DEFINITIONS[step_key]['label']}",
+                        message=f"共享数据已就绪，后台提前执行 {refresh_step_definition(step_key)['label']}",
                         percent=35,
                         complete_previous=False,
                     )
@@ -10337,25 +10555,20 @@ def _run_latest_refresh_job_in_generation(
                     complete_previous=False,
                 )
             elif refresh_scope == "byd":
-                _set_refresh_progress(step_key="byd_daily_plan", message="正在刷新 过渡期右侧次日计划", percent=92)
+                _set_refresh_progress(step_key="byd_daily_plan", message="正在刷新 多状态右侧次日计划", percent=92)
                 payload = _refresh_transition_workspace()
                 planned_t = payload.get("planned_t") or {}
                 actual_date = str(planned_t.get("signal_date") or "").replace("-", "")
                 if actual_date != trade_date:
                     raise RuntimeError(
-                        "过渡期右侧计划日期未更新到目标交易日: "
+                        "多状态右侧计划日期未更新到目标交易日: "
                         f"expected={trade_date} actual={actual_date}"
                     )
-                results["byd_daily_plan"] = {
-                    "status": "success",
-                    "signal_date": planned_t.get("signal_date"),
-                    "alerts": len(payload.get("alerts") or []),
-                    "intraday_training_refresh": payload.get("intraday_training_refresh"),
-                }
+                results["byd_daily_plan"] = _transition_refresh_summary(payload)
                 _set_refresh_progress(
                     step_key="byd_daily_plan",
                     step_status="success",
-                    message="过渡期右侧次日计划刷新完成",
+                    message="多状态右侧次日计划刷新完成",
                     percent=98,
                     complete_previous=False,
                 )
@@ -10609,6 +10822,9 @@ def _run_latest_refresh_job_in_generation(
                 "resource_usage": feature_stage["resource_usage"],
                 "elapsed_seconds": feature_stage["elapsed_seconds"],
                 "operations": sorted(feature_stage["operations"]),
+                "operation_metrics": {
+                    key: dict(value.metrics) for key, value in feature_stage["operations"].items()
+                },
             }
             if not signal_ready:
                 results["signal_cache"] = dict(
@@ -10703,29 +10919,22 @@ def _run_latest_refresh_job_in_generation(
             DEFAULT_DAILY_OPERATION_REGISTRY,
         )
 
-        selected_output_nodes = ["feature.chan_live", "score.chan"]
-        if right_side_enabled:
-            selected_output_nodes.extend(
-                (
-                    "feature.right_side_unified",
-                    "score.right_side_unified",
-                    "product.right_side_unified_adapter",
-                )
-            )
-        if left_side_enabled:
-            selected_output_nodes.extend(
-                (
-                    "feature.left_side_unified",
-                    "score.left_side_unified",
-                    "product.left_side_unified_adapter",
-                )
-            )
+        from quant.routine.production_dag import production_output_node_ids
 
-        operation_steps = {
-            "refresh_chan_model_scores": "chan_model_strategy",
-            "run_right_side_unified": "right_side_unified_features",
-            "run_left_side_unified": "left_side_unified_features",
-        }
+        selected_output_nodes = production_output_node_ids(
+            refresh_scope,
+            completed_operation_ids=(
+                "refresh_strategy_signal_cache", "refresh_active_project_features",
+            ),
+        )
+        operation_steps = {}
+        for node_id in sorted(
+            selected_output_nodes,
+            key=lambda key: DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[key].ui_order,
+        ):
+            node = DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[node_id]
+            if node.ui_step:
+                operation_steps.setdefault(node.operation_id, node.ui_step)
 
         def output_dag_progress(
             operation_id: str,
@@ -10761,6 +10970,7 @@ def _run_latest_refresh_job_in_generation(
             node_ids=selected_output_nodes,
             input_snapshots=production_stage_inputs(
                 PROJECT_ROOT, selected_output_nodes, completed_snapshots=stage_snapshots,
+                target_trade_date=expected_signal_date,
             ) if strict_core else None,
         )
         if output_dag["status"] != "success":
@@ -10777,17 +10987,33 @@ def _run_latest_refresh_job_in_generation(
             "resource_usage": output_dag["resource_usage"],
             "elapsed_seconds": output_dag["elapsed_seconds"],
             "operations": sorted(output_dag["operations"]),
+            "operation_metrics": {
+                key: dict(value.metrics) for key, value in output_dag["operations"].items()
+            },
         }
         node_results = output_dag["node_results"]
-        chan_payload = dict(node_results["score.chan"])
-        results["refresh_chan_model_scores"] = chan_payload
-        _set_refresh_progress(
-            step_key="chan_model_strategy",
-            step_status="success",
-            message="缠论实时评分刷新完成",
-            percent=72,
-            complete_previous=False,
-        )
+        for node_id in selected_output_nodes:
+            node = DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[node_id]
+            for alias in node.result_aliases:
+                results[alias] = dict(node_results[node_id])
+        portfolio_node = "score.application_portfolio"
+        if portfolio_node in node_results:
+            _set_refresh_progress(
+                step_key="application_portfolio",
+                step_status="success",
+                message="组合策略排名刷新完成",
+                percent=80,
+                complete_previous=False,
+            )
+        if "score.chan" in node_results:
+            results["refresh_chan_model_scores"] = dict(node_results["score.chan"])
+            _set_refresh_progress(
+                step_key="chan_model_strategy",
+                step_status="success",
+                message="缠论实时评分刷新完成",
+                percent=72,
+                complete_previous=False,
+            )
 
         if right_side_enabled:
             right_payload = dict(node_results["score.right_side_unified"])
@@ -10981,12 +11207,7 @@ def _run_latest_refresh_job_in_generation(
             percent=92,
             complete_previous=False,
         )
-        _set_refresh_progress(
-            step_key="similar_patterns",
-            message="正在并行计算长线、缠论与相似走势，并汇合提前启动的工作区",
-            percent=92,
-            complete_previous=False,
-        )
+        similar_payload = None
         with ThreadPoolExecutor(
             max_workers=3,
             thread_name_prefix="quant-late-workspace",
@@ -11007,16 +11228,6 @@ def _run_latest_refresh_job_in_generation(
                 ): (
                     "long_stock_pool",
                     "长线策略与带血筹计划生成失败",
-                ),
-                executor.submit(
-                    run_with_resources, ResourceClaim(
-                        cpu_slots=min(4, scheduler.budget.cpu_slots), io_slots=1, memory_mb=1024,
-                        db_connections=min(4, scheduler.budget.db_connections), requested_workers=4, max_workers=4,
-                    ),
-                    composed, "refresh_similar_pattern_analysis", _run_similar_pattern_analysis_isolated,
-                ): (
-                    "similar_patterns",
-                    "相似走势决策台刷新失败",
                 ),
             }
             futures.update(early_workspace_futures)
@@ -11058,8 +11269,10 @@ def _run_latest_refresh_job_in_generation(
                             "event_polled_through"
                         ),
                         "records": len(payload.get("records") or []),
+                        "quality": payload.get("quality"),
                     }
                 elif result_key == "similar_patterns":
+                    similar_payload = payload
                     if str(payload.get("target_date") or "") != expected_signal_date:
                         raise RuntimeError(
                             "相似走势目标日期未更新到目标交易日: "
@@ -11067,7 +11280,8 @@ def _run_latest_refresh_job_in_generation(
                             f"actual={payload.get('target_date')}"
                         )
                     results[result_key] = {
-                        "status": "success",
+                        "status": "pending",
+                        "strategy_hits_pending": True,
                         "generated_at": payload.get("generated_at"),
                         "target_date": payload.get("target_date"),
                         "reference_library_refreshed_at": (
@@ -11076,13 +11290,7 @@ def _run_latest_refresh_job_in_generation(
                         "targets": len(payload.get("results") or []),
                     }
                 else:
-                    planned_t = payload.get("planned_t") or {}
-                    results[result_key] = {
-                        "status": "success",
-                        "signal_date": planned_t.get("signal_date"),
-                        "alerts": len(payload.get("alerts") or []),
-                        "intraday_training_refresh": payload.get("intraday_training_refresh"),
-                    }
+                    results[result_key] = _transition_refresh_summary(payload)
                 if future not in early_workspace_futures:
                     _set_refresh_progress(
                         step_key=result_key,
@@ -11100,7 +11308,10 @@ def _run_latest_refresh_job_in_generation(
 
         if strict_core:
             save_core_source_manifest(PROJECT_ROOT, sealed_input)
-        _set_refresh_progress(step_key="snapshot", message="正在写入策略股票池快照", percent=98)
+        _set_refresh_progress(
+            step_key="snapshot", message="正在写入策略股票池快照",
+            percent=98, complete_previous=False,
+        )
         snapshot_timings = {}
         written_pools = composed(
             "write_strategy_pool_snapshots", _write_strategy_pool_snapshots,
@@ -11113,6 +11324,28 @@ def _run_latest_refresh_job_in_generation(
             "timings": snapshot_timings,
             "long_stock_pools": results["long_stock_pool"]["variants"],
         }
+        if similar_payload is not None:
+            # Only enrich after the strategy products and snapshots are current;
+            # the expensive vector computation never calls another workspace.
+            workspace_failure_step = "similar_patterns"
+            enrichment_started = monotonic()
+            final_similar = _finalize_similar_pattern_payload(similar_payload)
+            atomic_write_json(final_similar, SIMILAR_PATTERN_ANALYSIS_PATH)
+            results["similar_patterns"].update(
+                status="success",
+                strategy_hits_pending=False,
+                watchlist_score_dates=final_similar["watchlist_score_dates"],
+                scored_count=len(final_similar["watchlist"]),
+            )
+            results.setdefault("finalization_timings", {})["watchlist_scores_and_badges_seconds"] = round(
+                monotonic() - enrichment_started, 3,
+            )
+            _set_refresh_progress(
+                step_key="similar_patterns", step_status="success",
+                message="相似走势、当日自选评分与策略标签已完成",
+                percent=98, complete_previous=False,
+            )
+            workspace_failure_step = None
         _run_post_snapshot_cache_cleanup(results)
         publish_dependency_gate(
             results,
@@ -11140,6 +11373,7 @@ def _run_latest_refresh_job_in_generation(
             status="failed",
             step_key=workspace_failure_step or _REFRESH_STATUS.get("current_step"),
             message="刷新任务失败",
+            complete_previous=False,
             result=results if "results" in locals() else None,
             error=f"{exc}\n{traceback.format_exc(limit=5)}",
         )
@@ -11439,6 +11673,7 @@ def get_stock_selector_payload(
             full_snapshot and effective_include_extended
         ),
     )
+    _annotate_selector_rank_release(rows)
     rows = sorted(
         rows,
         key=lambda item: (item["selector_score"], item["matched_count"], item["best_profit_factor"]),
@@ -11473,12 +11708,16 @@ def get_stock_selector_payload(
             "B1 已合并模型分和规则信号；B2/B3 当前使用全市场规则候选缓存，不再受 B1 模型候选池限制。",
             "买入分使用同一模型版本下跨日期可比的 0-100 固定历史参考标尺；它是未来 5 日最大冲高收益预测的鲁棒映射，不是胜率，也不是直接经验分位。",
             "持有分使用同一模型版本下跨日期可比的固定历史参考标尺，以未来 5 日收盘收益为主、冲高能力为辅助；分数用于历史排序，不等同于收益承诺。",
-            f"前端默认先过滤为可操作候选，再展示保守预期收益分 Top{DEFAULT_SELECTOR_LIMIT}；MySQL 快照仍保存完整规则全集，便于后续复盘和重新训练。",
+            f"前端默认先过滤为可操作候选，再展示统一模型排序分 Top{DEFAULT_SELECTOR_LIMIT}；MySQL 快照仍保存完整规则全集，便于后续复盘和重新训练。",
             "SB1 和超级B1 本质偏盘中/尾盘战法，正式交易前仍需要分钟级数据确认买点。",
             "异动地量、黄金碗等策略已完成模型版买点评估；当前选股器对所有策略使用同一套筛选、排序、快照和复盘口径。",
         ],
     }
+    from quant.application.portfolio_application import attach_portfolio
+    payload = attach_portfolio(payload, resolve_path=publication_path,
+                               require_full_coverage=bool(full_snapshot and effective_include_extended))
     if full_snapshot:
+        payload["short_risk_filter"] = _selector_short_risk_filter(payload)
         _write_selector_snapshot(payload, strategies, effective_include_extended)
     out = payload if full_snapshot else _display_selector_payload(payload, side=side)
     out["cache"] = {"hit": False, "backend": "generated"}

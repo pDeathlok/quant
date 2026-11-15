@@ -57,9 +57,11 @@ def test_short_plan_collapses_shared_model_and_selector_operations(tmp_path) -> 
         "product.selector_core",
         "product.selector_extended",
     }
-    assert "refresh_active_project_features" in operations[
+    assert "refresh_active_project_features" not in operations[
         "run_left_side_unified"
     ]["depends_on"]
+    assert "refresh_active_project_features" in operations['run_right_side_unified']['depends_on']
+    assert 'refresh_long_research_external' in operations['run_left_side_unified']['depends_on']
     assert operations["refresh_strategy_signal_cache"]["cache_mode"] == (
         "append_state"
     )

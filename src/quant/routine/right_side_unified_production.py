@@ -44,7 +44,7 @@ from quant.features.right_side_factor_contract import (
     factor_contract_sha256,
 )
 from quant.features.variable_library import DAILY_BASIC_PROJECT_FACTOR_COLUMNS
-from quant.infrastructure.publication import publication_path
+from quant.infrastructure.publication import logical_publication_path, publication_path
 from quant.research.right_side_unified import load_signal_universe
 from quant.research.right_side_unified_features import (
     RULE_FEATURE_COLUMNS,
@@ -52,6 +52,7 @@ from quant.research.right_side_unified_features import (
     rule_feature_columns_sha256,
 )
 from quant.routine.paths import PROJECT_ROOT
+from quant.routine.short_etf_rank import market_context_identity, model_identity, rank_with_etf
 from quant.routine.project_feature_cache import (
     load_exact_date_project_feature_cache,
 )
@@ -366,8 +367,20 @@ def _production_input_snapshot(
             for name, path in required_files.items()
         },
     }
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    identity = {
+        "target_date": payload["target_date"],
+        "inputs": {
+            name: {**entry, "path": str(logical_publication_path(required_files[name]))}
+            for name, entry in payload["inputs"].items()
+        },
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest(), payload
+
+
+def _score_input_fingerprint(feature_fingerprint: str | None, signal_date: str, project_root: Path) -> str:
+    inputs = (feature_fingerprint, model_identity(project_root), market_context_identity(signal_date, project_root))
+    return hashlib.sha256(json.dumps(inputs).encode()).hexdigest()
 
 
 def validate_production_ranking_artifact(
@@ -658,12 +671,17 @@ def score_right_side_unified_production(
         *RIGHT_SIDE_SHADOW_IDENTITY_COLUMNS,
     ]
     scored = frame[output_columns].copy()
-    scored["ranking_score"] = probabilities
+    artifact_sha = _sha256(config.paths.artifact)
+    adjusted, etf_rank = rank_with_etf(
+        "right", frame, probabilities, target.date().isoformat(), artifact_sha, project_root=project_root,
+    )
+    scored["ranking_score_base"] = probabilities
+    scored["ranking_score"] = adjusted
     scored[NORMALIZED_RANKING_SCORE_FIELD] = _normalize_ranking_scores(
-        probabilities,
+        adjusted,
         bundle["score_normalization"],
     )
-    scored["model_artifact_sha256"] = _sha256(config.paths.artifact)
+    scored["model_artifact_sha256"] = artifact_sha
     atomic_write_parquet(scored, config.paths.score_output, index=False)
     score_manifest = {
         "status": "success",
@@ -680,6 +698,10 @@ def score_right_side_unified_production(
         "source_input_fingerprint": feature_manifest.get(
             "source_input_fingerprint"
         ),
+        "score_input_fingerprint": _score_input_fingerprint(
+            feature_manifest.get("source_input_fingerprint"), target.date().isoformat(), project_root,
+        ),
+        "etf_rank": etf_rank,
         "candidate_count": int(len(scored)),
         "policy_excluded_candidate_count": len(policy_excluded),
         "policy_excluded_candidate_symbols": policy_excluded,
@@ -738,7 +760,6 @@ def run_right_side_unified_production(
         if not 1 <= factor_workers <= 32:
             raise ValueError("right-side production factor_workers must be in [1, 32]")
         config = replace(config, factor_workers=factor_workers)
-    validate_production_ranking_artifact(config, project_root=project_root)
     target = pd.to_datetime(target_date, errors="raise").normalize()
     project_feature_path, project_feature_manifest_path = _project_feature_paths(
         project_root, project_feature_path, project_feature_manifest_path,
@@ -750,16 +771,26 @@ def run_right_side_unified_production(
         project_feature_path=project_feature_path,
         project_feature_manifest_path=project_feature_manifest_path,
     )
+    feature_checkpoint_reused = False
     try:
         feature_manifest = _load_json(config.paths.feature_manifest)
-        score_manifest = _load_json(config.paths.score_manifest)
-        if (
+        feature_checkpoint_reused = (
             feature_manifest.get("status") == "success"
             and feature_manifest.get("target_date") == target.date().isoformat()
             and feature_manifest.get("source_input_fingerprint") == input_fingerprint
             and feature_manifest.get("output_sha256")
             == _sha256(config.paths.feature_output)
+        )
+        score_manifest = _load_json(config.paths.score_manifest)
+        if (
+            feature_checkpoint_reused
             and score_manifest.get("source_input_fingerprint") == input_fingerprint
+            and (
+                score_manifest.get("score_input_fingerprint") == _score_input_fingerprint(
+                    input_fingerprint, target.date().isoformat(), project_root,
+                )
+                or (score_manifest.get("score_input_fingerprint") is None and model_identity(project_root) is None)
+            )
         ):
             scores, validated_manifest = load_right_side_ranking_scores(
                 target.date().isoformat(),
@@ -779,19 +810,20 @@ def run_right_side_unified_production(
             }
     except (FileNotFoundError, OSError, RuntimeError, ValueError):
         pass
-    feature_manifest = build_right_side_unified_production_features(
-        target.date().isoformat(),
-        config=config,
-        project_root=project_root,
-        project_feature_path=project_feature_path,
-        project_feature_manifest_path=project_feature_manifest_path,
-    )
-    feature_manifest = {
-        **feature_manifest,
-        "source_input_fingerprint": input_fingerprint,
-        "source_inputs": input_snapshot,
-    }
-    atomic_write_json(feature_manifest, config.paths.feature_manifest)
+    if not feature_checkpoint_reused:
+        feature_manifest = build_right_side_unified_production_features(
+            target.date().isoformat(),
+            config=config,
+            project_root=project_root,
+            project_feature_path=project_feature_path,
+            project_feature_manifest_path=project_feature_manifest_path,
+        )
+        feature_manifest = {
+            **feature_manifest,
+            "source_input_fingerprint": input_fingerprint,
+            "source_inputs": input_snapshot,
+        }
+        atomic_write_json(feature_manifest, config.paths.feature_manifest)
     score_manifest = score_right_side_unified_production(
         target.date().isoformat(),
         config=config,
@@ -804,6 +836,7 @@ def run_right_side_unified_production(
     return {
         **score_manifest,
         "checkpoint_reused": False,
+        "feature_checkpoint_reused": feature_checkpoint_reused,
         "refresh_reason": "new_target_or_changed_inputs",
         "selector_adapter": adapter,
     }

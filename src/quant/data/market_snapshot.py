@@ -52,6 +52,8 @@ def _date_blocks(frame: pd.DataFrame) -> list[dict]:
     frame = frame.sort_values(["trade_date", "ts_code"], kind="stable").reset_index(drop=True)
     columns = sorted(frame.columns)
     table = pa.Table.from_pandas(frame[columns], preserve_index=False).replace_schema_metadata(None)
+    # Reuse boundary values instead of boxing a Series twice per monthly block.
+    dates = frame["trade_date"].to_numpy()
     blocks = []
     for month, indices in frame.groupby(frame["trade_date"].str[:6], sort=True).indices.items():
         start, length = int(indices[0]), len(indices)
@@ -62,8 +64,8 @@ def _date_blocks(frame: pd.DataFrame) -> list[dict]:
         with pa.ipc.new_stream(sink, block.schema) as writer:
             writer.write_table(block)
         blocks.append({
-            "partition": month, "min_date": frame["trade_date"].iloc[start],
-            "max_date": frame["trade_date"].iloc[start + length - 1], "rows": length,
+            "partition": month, "min_date": dates[start],
+            "max_date": dates[start + length - 1], "rows": length,
             "sha256": hashlib.sha256(sink.getvalue()).hexdigest(),
         })
     return blocks
@@ -87,17 +89,21 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def _canonical_dates(values: pd.Series) -> pd.Series:
-    # Daily partitions repeat one date across thousands of symbols.
+def _canonical_dates(values: pd.Series, *, cache: dict[str, object] | None = None) -> pd.Series:
+    # A SQL export repeats the same trading dates for thousands of stocks.
+    # The caller owns this cache for one export; no stale cross-run state.
     raw = values.astype(str)
-    unique = pd.Series(raw.unique())
-    normalized = pd.to_datetime(unique, format="mixed", errors="raise").dt.strftime("%Y%m%d")
-    return raw.map(dict(zip(unique, normalized)))
+    cache = {} if cache is None else cache
+    missing = [value for value in raw.unique() if value not in cache]
+    if missing:
+        normalized = pd.to_datetime(pd.Series(missing), format="mixed", errors="raise").dt.strftime("%Y%m%d")
+        cache.update(zip(missing, normalized))
+    return raw.map(cache)
 
 
 _DIGESTS: OrderedDict[tuple, str] = OrderedDict()
 _DIGEST_LOCK = threading.Lock()
-_DIGEST_CACHE_SIZE = 16384
+_DIGEST_CACHE_SIZE = 32768
 
 
 @contextmanager
@@ -192,6 +198,14 @@ def _cached_reader(manifest_path: Path, expected_fingerprint: str) -> SnapshotRe
         raise MarketSnapshotError("Pinned canonical manifest is unavailable or invalid") from exc
 
 
+def release_market_snapshot_reader(manifest_path: Path) -> None:
+    """Release a temporary export after its owner has joined all consumers."""
+    path = Path(manifest_path).absolute()
+    with _READER_LOCK:
+        for key in [key for key in _READERS if key[0] == path]:
+            del _READERS[key]
+
+
 def pinned_market_environment() -> dict[str, str]:
     pin = _PIN.get()
     if pin is not None:
@@ -259,11 +273,22 @@ def read_pinned_parquet(path: Path | str, **kwargs) -> pd.DataFrame:
     if reader is None:
         return pd.read_parquet(path, **kwargs)
     path = Path(path).absolute()
-    for entry in reader.manifest["datasets"].values():
-        for chunk in entry["files"]:
-            if reader.root / chunk["path"] == path:
-                return _read_verified_parquet(reader._chunk_path(chunk), chunk["sha256"], **kwargs)
-    raise MarketSnapshotError("Parquet path is not declared in the pinned market snapshot")
+    # The manifest is immutable for this reader. Index declarations once instead
+    # of walking every file for every read; file bytes are still verified below.
+    declared = getattr(reader, "_declared_file_index", None)
+    if declared is None:
+        with _READER_LOCK:
+            declared = getattr(reader, "_declared_file_index", None)
+            if declared is None:
+                declared = {}
+                for entry in reader.manifest["datasets"].values():
+                    for chunk in entry["files"]:
+                        declared.setdefault(reader.root / chunk["path"], chunk)
+                reader._declared_file_index = declared
+    chunk = declared.get(path)
+    if chunk is None:
+        raise MarketSnapshotError("Parquet path is not declared in the pinned market snapshot")
+    return _read_verified_parquet(reader._chunk_path(chunk), chunk["sha256"], **kwargs)
 
 
 class SnapshotReader:
@@ -459,9 +484,12 @@ def _capture_supplemental_dataset(
     dataset: str, source: Path, staging: Path, start_date, symbols, workers: int,
 ) -> tuple[dict, dict]:
     started = monotonic()
-    if not source.is_dir() or source.is_symlink():
+    if not (source.is_dir() or source.is_file()) or source.is_symlink():
         raise MarketSnapshotError(f"Declared file source missing or unsafe: {dataset}")
-    paths = sorted(source.glob("*.parquet"))
+    single_file = source.is_file()
+    pattern = f"tushare_{dataset}_*.parquet" if dataset in {"moneyflow", "margin_detail", "top_list"} else "*.parquet"
+    paths = [source] if single_file else sorted(source.glob(pattern))
+    ignored_files = 0 if single_file else len(list(source.glob("*.parquet"))) - len(paths)
     if any(path.is_symlink() for path in paths):
         raise MarketSnapshotError("Symlink supplemental source")
     destination = staging / dataset
@@ -488,11 +516,12 @@ def _capture_supplemental_dataset(
         captured_at = monotonic()
         # Check the whole source set again, including files copied early in the run.
         unchanged = all(digest == before[path] for path, digest in zip(paths, executor.map(_digest, paths)))
-        if (source.is_symlink() or paths != sorted(source.glob("*.parquet"))
+        current_paths = [source] if single_file and source.is_file() else sorted(source.glob(pattern))
+        if (source.is_symlink() or paths != current_paths
                 or any(path.is_symlink() for path in paths) or not unchanged):
             raise MarketSnapshotError(f"Declared file source changed during export: {dataset}")
     return entry, {
-        "files": len(paths), "workers": workers, **counts,
+        "files": len(paths), "ignored_other_dataset_files": ignored_files, "workers": workers, **counts,
         "initial_hash_seconds": round(hashed_at - started, 3),
         "capture_seconds": round(captured_at - hashed_at, 3),
         "final_check_seconds": round(monotonic() - captured_at, 3),
@@ -530,11 +559,12 @@ def export_market_snapshot(store, directory: Path, *, datasets=("daily",), start
     manifest = {"schema": 1, "status": "sealed", "datasets": {}}
     metrics = {"supplemental": {}}
     canonical_started = monotonic()
+    date_cache: dict[str, object] = {}
 
     def save(dataset, frame, filename=None, *, symbol=None):
         if not {"ts_code", "trade_date"} <= set(frame.columns):
             raise MarketSnapshotError(f"Canonical source schema missing: {dataset}")
-        dates = _canonical_dates(frame["trade_date"])
+        dates = _canonical_dates(frame["trade_date"], cache=date_cache)
         if dates.isna().any() or frame["ts_code"].isna().any():
             raise MarketSnapshotError(f"Canonical source has missing row identities: {dataset}")
         frame = frame.copy()

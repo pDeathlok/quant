@@ -519,7 +519,14 @@ def test_score_snapshot_rejects_legacy_probability_aliases(tmp_path: Path) -> No
         load_right_side_ranking_scores("2026-08-12", config=config)
 
 
-def test_registry_source_switch_is_explicit_and_legacy_is_rollback_default() -> None:
+@pytest.mark.parametrize("portfolio_enabled", [False, True])
+def test_registry_source_switch_is_explicit_and_legacy_is_rollback_default(monkeypatch, portfolio_enabled) -> None:
+    from quant.application import portfolio_application
+
+    monkeypatch.setattr(portfolio_application, "load_portfolio_config", lambda: {
+        "enabled": portfolio_enabled, "rankings": "portfolio/rankings.parquet",
+        "inputs": "portfolio/inputs.parquet", "manifest": "portfolio/manifest.json",
+    })
     default = build_default_daily_dependency_registry(
         SelectorRankingSource.LEGACY_Z_SKILL
     )
@@ -534,7 +541,9 @@ def test_registry_source_switch_is_explicit_and_legacy_is_rollback_default() -> 
     assert "score.right_side_unified" in promoted_inputs
     assert "score.z_skill" not in promoted_inputs
     assert "score.left_side_unified" in promoted_inputs
-    assert "score.right_side_unified" not in set(default.required_node_ids("short"))
+    # An enabled portfolio still needs both constituent rankers, even if the
+    # selector itself rolls back to legacy ranking.
+    assert ("score.right_side_unified" in set(default.required_node_ids("short"))) is portfolio_enabled
     assert "score.right_side_unified" in set(promoted.required_node_ids("short"))
     assert default.required_node_ids("rightSideRankingCandidate")[-1] == (
         "product.right_side_unified_adapter"

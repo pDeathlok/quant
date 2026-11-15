@@ -24,9 +24,14 @@ def test_repository_left_side_release_is_canonical_and_promoted_after_gate() -> 
 
     assert config.enabled is True
     assert config.strategy_keys == LEFT_SIDE_SIGNALS
-    assert config.paths.artifact.name == "ranking.joblib"
-    assert "left_side_unified_canonical_v4_group4" in str(config.paths.artifact)
+    assert config.engine == 'rank_fusion'
+    assert config.paths.artifact.name == 'manifest.json'
+    assert 'left_side_ranknet_v6' in str(config.paths.artifact)
     assert config.score_normalization == "daily_cross_section_percentile_v1"
+    from quant.ml.rank_fusion import RankFusion
+    assert len(RankFusion.load(config.paths.artifact_manifest).required_features) == 152
+    rollback = load_left_side_ranking_config(config_path='configs/releases/left_side_unified_v4_rollback.yaml')
+    assert rollback.engine == 'legacy' and rollback.paths.artifact.is_file()
 
 
 def test_left_side_release_rejects_contract_drift(tmp_path: Path) -> None:

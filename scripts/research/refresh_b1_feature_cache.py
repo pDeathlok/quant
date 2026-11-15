@@ -931,6 +931,7 @@ def main() -> None:
             required_features,
             target_date=actual_source_latest,
             context="B1 live active-candidate feature refresh",
+            daily_basic_dir=args.daily_basic_dir,
         )
     updated_at = datetime.now().isoformat(timespec="seconds")
     active_manifest = {

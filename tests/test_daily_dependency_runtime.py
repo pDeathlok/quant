@@ -43,6 +43,88 @@ class _ImportanceModel:
     feature_importances_ = (0.8, 0.0, 0.2)
 
 
+def _page_registry(node_id: str) -> DependencyRegistry:
+    node = replace(DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes[node_id], inputs=())
+    return DependencyRegistry((node,), {"demo": (node_id,)})
+
+
+def _long_results() -> dict:
+    return {"long_stock_pool": {
+        "variants": [{"variant": key, "signal_date": "2026-11-13"}
+                     for key in ("tea", "tea_safe", "v44")],
+        "blood_chip": {"signal_date": "2026-11-13", "candidates": 0},
+    }}
+
+
+@pytest.mark.parametrize("key", ("tea", "tea_safe", "v44", "blood_chip"))
+@pytest.mark.parametrize("fault", ("absent", "undated", "invalid", "stale", "future", "failed"))
+def test_long_gate_requires_every_variant_date(tmp_path: Path, key: str, fault: str) -> None:
+    results = _long_results()
+    payload = results["long_stock_pool"]
+    item = (payload["blood_chip"] if key == "blood_chip" else
+            next(row for row in payload["variants"] if row["variant"] == key))
+    if fault == "absent":
+        if key == "blood_chip":
+            del payload[key]
+        else:
+            payload["variants"].remove(item)
+    elif fault == "failed":
+        item["status"] = "failed"
+    else:
+        item["signal_date"] = {
+            "undated": None, "invalid": "not-a-date", "stale": "2026-11-12",
+            "future": "2026-11-16",
+        }[fault]
+    registry = _page_registry("product.long_pools")
+    states = runtime.collect_node_states(registry, tmp_path, results)
+    assert runtime.audit_required_freshness(
+        registry, "demo", date(2026, 11, 13), states,
+    )["status"] == "failed"
+
+
+def test_long_variant_identity_not_list_order_and_empty_candidates_are_valid(tmp_path: Path) -> None:
+    registry = _page_registry("product.long_pools")
+    results = _long_results()
+    results["long_stock_pool"]["variants"].reverse()
+    states = runtime.collect_node_states(registry, tmp_path, results)
+    assert states["product.long_pools"].watermark == date(2026, 11, 13)
+    assert runtime._postflight_result_backed_nodes(
+        registry, states, registry.nodes, date(2026, 11, 13),
+    ) == {"product.long_pools"}
+    results["long_stock_pool"]["variants"].append(
+        {"variant": "tea", "signal_date": "2026-11-13"},
+    )
+    assert runtime.collect_node_states(registry, tmp_path, results) == {}
+
+
+@pytest.mark.parametrize("variant", ("return", "win"))
+@pytest.mark.parametrize("fault", ("absent", "undated", "stale", "future", "blocked", "duplicate"))
+def test_transition_gate_requires_both_variants(tmp_path: Path, variant: str, fault: str) -> None:
+    registry = _page_registry("product.transition")
+    variants = [{"variant": key, "status": "success", "signal_date": "2026-11-13"}
+                for key in ("return", "win")]
+    results = {"byd_daily_plan": {"signal_date": "2026-11-13", "variants": variants}}
+    states = runtime.collect_node_states(registry, tmp_path, results)
+    assert states["product.transition"].watermark == date(2026, 11, 13)
+    item = next(row for row in variants if row["variant"] == variant)
+    if fault == "absent":
+        variants.remove(item)
+    elif fault == "duplicate":
+        variants.append(dict(item))
+    elif fault == "blocked":
+        item["status"] = "blocked"
+    else:
+        item["signal_date"] = {"undated": None, "stale": "2026-11-12", "future": "2026-11-16"}[fault]
+    assert runtime.collect_node_states(registry, tmp_path, results) == {}
+
+
+def test_transition_summary_without_variants_is_not_completion(tmp_path: Path) -> None:
+    registry = _page_registry("product.transition")
+    assert runtime.collect_node_states(
+        registry, tmp_path, {"byd_daily_plan": {"signal_date": "2026-11-13"}},
+    ) == {}
+
+
 def test_right_side_shadow_catalog_matches_complete_model_input_contract() -> None:
     features = tuple(RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS)
     contract = ModelContract(
@@ -126,6 +208,36 @@ def _complete_snapshot_cycle(
         registry=registry,
     )
     return preflight, postflight
+
+
+@pytest.mark.parametrize("optional_status", ("success", "degraded", "not_observed"))
+def test_optional_etf_report_does_not_block_strict_postflight(
+    tmp_path: Path, optional_status: str,
+) -> None:
+    node = replace(
+        DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes["product.short_snapshot"],
+        inputs=(), contract_sources=(),
+    )
+    registry = DependencyRegistry((node,), {"short": (node.node_id,)})
+    results = {"selector_extended": {"status": "success", "signal_date": "2026-11-13"}}
+    if optional_status != "not_observed":
+        results["short_etf_flow"] = {
+            "status": optional_status,
+            "signal_date": "2026-11-13",
+            "source_dates": {"fd_share": "2026-11-11"},
+        }
+    _, summary = _complete_snapshot_cycle(
+        tmp_path, date(2026, 11, 13), registry, results, scope="short",
+    )
+    assert summary["status"] == "success"
+    assert summary["baseline_committed"] is True
+    assert summary["refresh_node_ids"] == []
+    report = summary["page_refresh_coverage"]
+    assert report["optional_dependencies"]["short_etf_flow"]["status"] == optional_status
+    stored = json.loads(Path(summary["path"]).read_text())
+    assert stored["page_refresh_coverage"]["optional_dependencies"] == json.loads(
+        json.dumps(report["optional_dependencies"]),
+    )
 
 
 def test_freshness_audit_aggregates_exact_and_poll_failures() -> None:

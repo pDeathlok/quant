@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>策略工作台</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg?v=20260617" />
-    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1-20261101-transition-right-v3-20261102-watchlist-alert-filter-v1" />
+    <link rel="stylesheet" href="./styles.css?v=20260720-allotment-divider-v10-20260722-long-recommendation-v1-watchlist-scores-v1-watchlist-alerts-v5-20260730-allotment-xueqiu-v1-20260730-grid-shrink-v2-20260730-mobile-toolbar-v1-20260802-long-good-price-v5-metrics-20260803-price-score-forecast-years-v1-price-band-sort-v1-20260810-blood-chip-long-v2-survival-mobile-20260810-blood-chip-xueqiu-v1-20260812-operation-plans-v1-watchlist-alert-hit-lines-v3-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v2-ranknet-20261101-transition-right-v3-20261102-watchlist-alert-filter-v1-multi-regime-v1-short-etf-flow-v1-review-v2-chan-guide-v1-portfolio-20261112-futures-20261115-retained-v3" />
     <link rel="modulepreload" href="/core/api-client.js" />
     <link rel="modulepreload" href="/core/formatters.js" />
   </head>
@@ -21,7 +21,7 @@
         </div>
         <div class="sidebar-brief">
             <span>工作区</span>
-          <p>顶部 Tab 切换短线、缠论、长线、可转债、配债股、过渡期右侧、自选池与操作计划。左侧区域跟随当前工作区显示对应策略选择。</p>
+          <p>顶部 Tab 切换短线、缠论、长线、可转债、配债股、多状态右侧、自选池、操作计划、股指战法与复盘。左侧区域跟随当前工作区显示对应策略选择。</p>
         </div>
         <div class="global-refresh-card">
           <span>全局更新</span>
@@ -53,7 +53,22 @@
           <div id="cbStrategyCards" class="cb-strategy-cards"></div>
           <button id="cbRefreshButton" class="secondary-button" type="button">刷新计划</button>
         </div>
+        <div id="futuresSidebar" class="side-section hidden">
+          <span>股指研究</span>
+          <p class="if-sidebar-note">保留两种QVIX策略<br>固定偏收益 · 重选偏稳定<br>50万元 · 最多一手</p>
+          <p class="if-sidebar-note">数据截至 2026-11-06<br>研究结论更新于 2026-11-15</p>
+          <p class="if-sidebar-note">开仓区为最新收盘后试算。<br>按50万元空仓账户核验，不连接真实账户。</p>
+        </div>
       </aside>
+
+      <main id="futuresPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区"></nav>
+        <section class="toolbar">
+          <div><p class="eyebrow">Index Futures Strategy</p><h2>股指战法</h2><p class="subline">两种保留策略 · 近期表现 · 开仓检查</p></div>
+          <span class="if-status">研究候选 · 待前瞻验证</span>
+        </section>
+        <div id="indexFuturesContent" aria-live="polite"><p class="panel">正在载入股指研究结果…</p></div>
+      </main>
 
       <main id="shortPage" class="main page-view">
         <nav class="workspace-tabs" aria-label="策略工作区">
@@ -74,8 +89,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>过渡期右侧</strong>
-            <span>趋势候选 / 次日执行</span>
+            <strong>多状态右侧</strong>
+            <span>市场阶段 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -117,11 +132,35 @@
           </div>
         </section>
 
+        <section class="panel short-etf-panel" aria-labelledby="shortEtfTitle">
+          <div class="panel-head">
+            <h3 id="shortEtfTitle">宽基 ETF 资金</h3>
+            <span id="shortEtfStatus" role="status">等待载入</span>
+          </div>
+          <div id="shortEtfContent" class="table-wrap" hidden>
+            <table>
+              <thead>
+                <tr><th>指数篮子</th><th>近 5 日净申购</th><th>近 20 日净申购</th><th>成交放量</th><th title="两个交易日前的成分 ETF 中，份额和净值在可用时点齐备的比例">份额覆盖</th></tr>
+              </thead>
+              <tbody id="shortEtfRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="applicationPortfolioPanel" class="panel application-portfolio-panel" aria-labelledby="applicationPortfolioTitle" hidden>
+          <div class="panel-head">
+            <h3 id="applicationPortfolioTitle">默认组合 · 独立资金队列</h3>
+            <span id="applicationPortfolioStatus"></span>
+          </div>
+          <p id="applicationPortfolioNote" class="application-portfolio-note"></p>
+          <div id="applicationPortfolioSleeves" class="application-portfolio-sleeves"></div>
+        </section>
+
         <section class="split">
           <div class="panel">
             <div class="panel-head stock-pool-head">
               <div class="stock-pool-heading">
-                <h3>股票池</h3>
+                <h3 id="shortStockPoolTitle">股票池</h3>
                 <div id="shortSideFilter" class="short-side-filter" role="group" aria-label="按短线模型侧筛选">
                   <button class="active" type="button" data-short-side="all" aria-pressed="true">全部</button>
                   <button type="button" data-short-side="left" aria-pressed="false" title="只看左侧统一模型候选">左侧</button>
@@ -151,7 +190,7 @@
                     <th>历史均值</th>
                     <th>PF</th>
                     <th>日期</th>
-                    <th>雪球</th>
+                    <th>雪球 / 复盘</th>
                   </tr>
                 </thead>
                 <tbody id="stockRows"></tbody>
@@ -214,8 +253,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>过渡期右侧</strong>
-            <span>趋势候选 / 次日执行</span>
+            <strong>多状态右侧</strong>
+            <span>市场阶段 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -238,6 +277,74 @@
 
         <section id="chanMetrics" class="chan-performance"></section>
 
+        <section class="panel chan-guide" aria-labelledby="chanGuideTitle">
+          <div class="chan-guide-intro">
+            <div><p class="eyebrow">读懂信号</p><h3 id="chanGuideTitle">三买：突破后，回踩站稳，再确认</h3></div>
+            <p>“三买”是第三类买点，不是第三次买入。本页使用日线分型、笔和中枢的量化近似来识别。</p>
+          </div>
+          <div class="chan-buy3-steps" aria-label="本项目三买确认步骤">
+            <div><b>01 · 向上离开</b><span>上涨笔高点超过中枢上沿</span></div>
+            <div><b>02 · 回踩站稳</b><span>回踩低点守住中枢上沿附近</span></div>
+            <div><b>03 · 再次突破</b><span>收盘首次突破回踩笔高点，趋势达标</span></div>
+          </div>
+          <details id="chanGuideDetails">
+            <summary>展开图解、具体指标与模型筛选规则</summary>
+            <div class="chan-guide-grid">
+              <article>
+                <h4>先认清“笔”和“中枢”</h4>
+                <p><b>分型</b>是局部高点或低点；交替的顶、底分型连接成<b>笔</b>，本项目最小笔间隔为 4 根日 K。最近 7 笔中，连续 3 笔的重叠价格区间构成候选中枢，取最近有效的一组。</p>
+                <p><b>中枢下沿</b>＝三笔低点的最大值；<b>中枢上沿</b>＝三笔高点的最小值。宽度＝上沿 ÷ 下沿 − 1，需在 1.5%～22% 之间。</p>
+                <svg class="chan-buy3-diagram" viewBox="0 0 480 180" role="img" aria-label="三买示意：价格离开中枢后，回踩不回中枢，再向上突破回踩笔高点；非真实行情">
+                  <rect x="25" y="104" width="420" height="42" fill="currentColor" opacity="0.07" />
+                  <path d="M25 104H445 M25 146H445" fill="none" stroke="currentColor" opacity="0.35" stroke-dasharray="5 5" />
+                  <polyline points="30,140 70,108 100,143 135,105 165,135 235,48 310,86 390,25" fill="none" stroke="currentColor" stroke-width="3" />
+                  <path d="M235 48H425" fill="none" stroke="currentColor" opacity="0.35" stroke-dasharray="4 5" />
+                  <circle cx="310" cy="86" r="5" fill="currentColor" />
+                  <text x="34" y="131">中枢</text><text x="201" y="32">向上离开</text><text x="282" y="72">回踩站稳</text><text x="354" y="17">再次突破</text><text x="351" y="99">中枢上沿</text><text x="25" y="170">结构示意 · 非真实行情</text>
+                </svg>
+              </article>
+              <article>
+                <h4>本项目怎样确认三买？</h4>
+                <ol>
+                  <li>最近完成的一笔为下跌笔；此前上涨笔的高点 <b>＞ 中枢上沿 × 1.002</b>。</li>
+                  <li>回踩下跌笔的低点 <b>＞ 中枢上沿 × 0.99</b>。代码允许 1% 容差；理论三买要求回试低点不跌破中枢上沿。</li>
+                  <li>当日收盘 <b>＞ 回踩下跌笔高点 × 1.002</b>，且上一日收盘不高于该触发价，只在首次突破时确认。</li>
+                  <li>收盘 ＞ MA20，MA20 ＞ 3 个交易日前的 MA20；有 MA60 数据时，还要求 MA20 ＞ MA60。MA20 / MA60 分别是 20 / 60 日平均收盘价。</li>
+                </ol>
+                <p>进入买入信号还需满足成交量与交易条件：成交量大于 0；有 20 日均量时，当日量须超过其 45%；剔除 ST、带 * 或“退”字的股票。</p>
+              </article>
+              <article>
+                <h4>一买、二买，和三买有什么区别？</h4>
+                <p><b>一买观察：</b>本项目检查下跌创新低但 MACD 力度减弱，并出现反弹，只记录为观察信号。MACD 是用于比较趋势动能的指标。</p>
+                <p><b>二买确认：</b>后一次下跌低点比前一次高出 0.5% 以上，收盘站回 MA5 / MA10，并首次突破最近下跌笔高点的 1.002 倍，同时满足趋势条件。</p>
+                <p><b>三买确认：</b>重点看已经向上离开中枢后，回踩能否站稳，再由向上突破确认。主策略与扩容策略都要求三买，高置信池可以接纳非三买信号。</p>
+              </article>
+              <article>
+                <h4>候选怎样入选？</h4>
+                <dl class="chan-rule-list">
+                  <dt>主策略</dt><dd>三买确认 ＋ 好交易模型分达到训练样本第 80 百分位门槛（历史前 20%）。</dd>
+                  <dt>扩容策略</dt><dd>三买确认 ＋ 缠论分 ≥ 95 ＋ 模型分达到训练样本第 50 百分位门槛。</dd>
+                  <dt>高置信池</dt><dd>模型分达到训练样本第 90 百分位门槛；不强制三买，需复核结构。</dd>
+                </dl>
+                <p>Top20 / Top50 / Top10 表示历史分布的分位门槛，不是当天选 20 / 50 / 10 只股票，也不是 80% / 50% / 90% 的胜率。</p>
+              </article>
+              <article>
+                <h4>排名分、模型分、缠论分怎么看？</h4>
+                <p><b>模型分：</b>“好交易”的预测概率，训练目标为 T+1 开盘买入后，10 日收益 ≥ 2%，且 5 日收益 ＞ −2%。大收益概率对应 10 日收益 ≥ 3%；10 日预测胜率对应收益 ＞ 0。</p>
+                <p><b>缠论分：</b>结构评分＝78 基础分 ＋ 三买加 8 分 ＋ 趋势加 4 或 8 分 ＋ 中枢宽度奖励 ＋ 笔振幅奖励。它可能超过 100，不是胜率。宽度奖励＝10 × [1 − min(宽度, 20%) ÷ 20%]；笔振幅低于 18% 加 6 分，否则加 2 分。</p>
+                <p><b>排名分：</b>好交易概率分位 × 45 ＋ 大收益概率分位 × 25 ＋ 胜率分位 × 15 ＋ 缠论分（截到 0～100）× 0.15 − 正跳空百分点 × 1.5。概率分位按本次评分数据集计算，开盘未知时暂不扣跳空分。</p>
+              </article>
+              <article>
+                <h4>有候选后，什么时候可执行？</h4>
+                <p><b>T</b> 是信号日，<b>T+1</b> 是下一交易日。跳空＝（T+1 开盘 ÷ T 日收盘 − 1）× 100%。开盘未知时显示“待开盘核验”。</p>
+                <ul><li>跳空 ≤ 3%：满足本策略的开盘执行条件。</li><li>3% ＜ 跳空 ≤ 6%：降仓观察。</li><li>跳空 ＞ 6%：放弃。</li></ul>
+                <p>页面仓位为策略基础参考（主策略 25%、扩容 15%、高置信池 20%）。收盘入选和次日可执行分别判断；模型概率与历史样本统计均不是收益保证。</p>
+              </article>
+            </div>
+            <p class="chan-guide-source">数值条件依据本项目当前日线结构与模型筛选规则。概念参考：<a href="https://czsc.readthedocs.io/en/v0.9.5/_static/%E7%BC%A0%E4%B8%AD%E8%AF%B4%E7%A6%85%E6%8A%80%E6%9C%AF%E5%8E%9F%E7%90%86.html" target="_blank" rel="noopener noreferrer">CZSC 整理的《缠中说禅技术原理》↗</a></p>
+          </details>
+        </section>
+
         <section class="split chan-split">
           <div class="panel">
             <div class="panel-head">
@@ -248,11 +355,11 @@
               <table class="chan-table">
                 <thead>
                   <tr>
-                    <th>股票</th>
+                    <th>股票 / 雪球</th>
                     <th>规则</th>
-                    <th>排名分</th>
-                    <th>模型分</th>
-                    <th>缠论分</th>
+                    <th title="综合概率分位、结构分和开盘跳空的排序分，不是胜率">排名分</th>
+                    <th title="好交易预测概率；详见上方指标说明">模型分</th>
+                    <th title="结构评分，可能超过100，不是百分比">缠论分</th>
                     <th>T+1跳空</th>
                     <th>仓位</th>
                   </tr>
@@ -305,8 +412,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>过渡期右侧</strong>
-            <span>趋势候选 / 次日执行</span>
+            <strong>多状态右侧</strong>
+            <span>市场阶段 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -574,8 +681,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>过渡期右侧</strong>
-            <span>趋势候选 / 次日执行</span>
+            <strong>多状态右侧</strong>
+            <span>市场阶段 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -658,8 +765,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>过渡期右侧</strong>
-            <span>趋势候选 / 次日执行</span>
+            <strong>多状态右侧</strong>
+            <span>市场阶段 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -788,8 +895,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab active" type="button" data-page="byd">
-            <strong>过渡期右侧</strong>
-            <span>趋势候选 / 次日执行</span>
+            <strong>多状态右侧</strong>
+            <span>市场阶段 / 次日执行</span>
           </button>
           <button class="page-tab" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -798,14 +905,18 @@
         </nav>
 
         <section class="toolbar transition-toolbar">
-          <div><p class="eyebrow">Transition · Right-side strategy</p><h2>过渡期右侧 · 次日操作台</h2><p id="transitionSubline" class="subline">核对收盘数据、账户与下一交易日，再执行计划。</p></div>
-          <div class="transition-controls"><label>策略版本<select id="transitionStrategy"><option value="return">收益型 · 趋势跟踪</option><option value="win">胜率型 · 半仓退出</option></select></label><button id="transitionReload" type="button">重算计划</button><button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页行情</button></div>
+          <div><p class="eyebrow">Market regimes · Right-side strategy</p><h2>多状态右侧 · 次日操作台</h2><p id="transitionSubline" class="subline">核对收盘数据、账户与下一交易日，再执行计划。</p></div>
+          <div class="transition-controls"><label>过渡期策略账户<select id="transitionStrategy"><option value="return">收益型 · 趋势跟踪</option><option value="win">胜率型 · 半仓退出</option></select></label><button id="transitionReload" type="button">重算计划</button><button id="bydRefreshLatestButton" type="button" data-refresh-scope="byd">更新本页行情</button></div>
         </section>
         <section class="panel transition-summary"><div class="panel-head"><h3>次日执行状态</h3><span id="transitionStatus" role="status">正在核对</span></div><div id="transitionOverview" class="transition-metrics"></div><div id="transitionIssues" role="status"></div></section>
+        <section class="panel">
+          <div class="panel-head"><h3>各市场阶段的策略</h3><span id="transitionCurrentStrategy">正在识别市场阶段</span></div>
+          <ul id="transitionStrategyStates" class="transition-strategy-states"><li>正在加载五阶段策略说明…</li></ul>
+        </section>
         <section class="transition-order-grid"><article class="panel"><div class="panel-head"><h3>01 · 次日卖出 / 持有</h3><span>卖出成交后才释放资金和槽位</span></div><div id="transitionSellHold"></div></article><article class="panel"><div class="panel-head"><h3>02 · 次日条件买入</h3><span>收盘执行 · 空槽留现金</span></div><div id="transitionBuySummary"></div></article></section>
         <section class="panel"><div class="panel-head"><h3>实际账户与持仓</h3><span>两套策略分别保存；不会自动记录成交或下单</span></div><form id="transitionAccountForm"><div class="transition-account-controls"><label>可用现金（元）<input id="transitionCash" type="number" min="0" step="0.01" required /></label><button id="transitionAddHolding" type="button">添加实际持仓</button><button type="submit" id="transitionSaveAccount">保存账户并重算</button><button type="button" id="transitionRestoreAccount">重新读取已保存记录</button></div><div class="transition-table-scroll"><table class="transition-table"><thead><tr><th>股票代码</th><th>实际入场日</th><th>当前股数</th><th>实际每股成本</th><th>编辑</th></tr></thead><tbody id="transitionHoldingInputs"></tbody></table></div><p id="transitionAccountStatus" class="subline" role="status">请确认现金与实际持仓后保存，才能启用买入清单。</p></form></section>
         <section class="panel"><div class="panel-head"><h3>买入备选队列</h3><span>按20日波动升序 · 最多10只备选，最多5仓</span></div><div id="transitionBuys" class="transition-table-scroll"></div></section>
-        <details class="panel transition-rules" open><summary>明确的次日买卖逻辑</summary><div id="transitionExecutionRules"></div><p class="subline">固定研究候选：收益型采用6%最高收盘回撤跟踪退出；胜率型采用收盘涨3% / 跌5%触发。触发后的下一交易日收盘尝试成交，实际盈亏可能超过阈值。价格退出以入场日参考收盘为基准，实际成本仅作账户记录。上述阈值用于收盘判断，不是次日委托价。市场标签变化不强制清仓。</p></details>
+        <details class="panel transition-rules" open><summary>当前阶段与持仓规则</summary><div id="transitionExecutionRules"></div><p class="subline">持仓退出以入场日参考收盘为基准。实际成本用于账户记录。</p></details>
         <details class="panel transition-rules"><summary>七个指数如何判定市场状态</summary><div id="transitionIndices" class="transition-table-scroll"></div><p class="subline">每条均线至少4个指数站上即记为多数站上；牛市、熊市、回调、反弹之外的组合记为过渡阶段。数据不完整时暂停新买入。</p></details>
       </main>
 
@@ -828,8 +939,8 @@
             <span>发行流程 / 关键日期</span>
           </button>
           <button class="page-tab" type="button" data-page="byd">
-            <strong>过渡期右侧</strong>
-            <span>趋势候选 / 次日执行</span>
+            <strong>多状态右侧</strong>
+            <span>市场阶段 / 次日执行</span>
           </button>
           <button class="page-tab active" type="button" data-page="similar">
             <strong>自选池</strong>
@@ -959,6 +1070,43 @@
         </section>
       </main>
 
+      <main id="reviewsPage" class="main page-view">
+        <nav class="workspace-tabs" aria-label="策略工作区"></nav>
+        <section class="toolbar">
+          <div>
+            <p class="eyebrow">Review Notebook</p>
+            <h2>复盘</h2>
+            <p class="subline">先看当时的日期、策略和评分，再记下后续观察。完整加入信息可展开查看。</p>
+          </div>
+          <span id="reviewsMeta" class="subline" role="status"></span>
+        </section>
+        <details class="panel review-manual">
+          <summary>手动添加股票</summary>
+          <form id="reviewForm" class="review-form">
+            <label>股票代码<input name="symbol" required maxlength="20" placeholder="如 000001.SZ" /></label>
+            <label>股票名称<input name="name" maxlength="100" placeholder="选填" /></label>
+            <label>依据日期<input name="signal_date" type="date" /></label>
+            <label class="review-form-wide">加入时的信息<textarea name="information" rows="3" maxlength="20000" placeholder="策略、得分及其他加入依据"></textarea></label>
+            <label class="review-form-wide">备注<textarea name="note" rows="2" maxlength="20000" placeholder="后续观察与复盘结论，可随时修改"></textarea></label>
+            <button type="submit">加入复盘</button>
+          </form>
+        </details>
+        <section class="review-filters" aria-label="复盘记录筛选">
+          <label class="review-search">搜索记录<input id="reviewSearch" type="search" placeholder="股票名称 / 代码 / 策略 / 备注" /></label>
+          <label>来源<select id="reviewSourceFilter"><option value="">全部来源</option></select></label>
+          <label>排序<select id="reviewSort"><option value="newest">最近加入</option><option value="oldest">最早加入</option><option value="signal">依据日期从新到旧</option></select></label>
+          <span id="reviewDraftCount" role="status"></span>
+        </section>
+        <section class="panel review-panel">
+          <div class="table-wrap">
+            <table class="review-table">
+              <thead><tr><th>股票</th><th>雪球链接</th><th>加入时的信息</th><th>备注</th></tr></thead>
+              <tbody id="reviewRows"><tr><td colspan="4" class="empty-cell">正在加载复盘记录…</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+
       <main id="plansPage" class="main page-view">
         <nav class="workspace-tabs" aria-label="策略工作区"></nav>
 
@@ -981,7 +1129,7 @@
             <div class="panel-head">
               <div>
                 <h3 id="operationPlanFormTitle">新增计划</h3>
-                <span>执行条件尽量写得具体、可验证</span>
+                <span>填写时自动保存草稿，切回本页可继续编辑</span>
               </div>
               <button id="operationPlanReset" class="inline-secondary" type="button">清空</button>
             </div>
@@ -1052,6 +1200,7 @@
 
     <div id="watchlistContextMenu" class="watchlist-context-menu" role="menu" hidden>
       <button type="button" role="menuitem" data-watchlist-context-add>加入自选池</button>
+      <button type="button" role="menuitem" data-review-context-add>加入复盘</button>
       <button type="button" role="menuitem" data-watchlist-context-pin hidden>置顶</button>
       <button type="button" role="menuitem" data-watchlist-context-alert hidden>设置提醒</button>
       <button type="button" role="menuitem" class="watchlist-context-danger" data-watchlist-context-delete hidden>删除自选</button>
@@ -1110,6 +1259,6 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v1-20261101-transition-right-v3-20261102-watchlist-alert-filter-v1"></script>
+    <script type="module" src="./app.js?v=20260720-watchlist-reorder-v5-20260722-long-recommendation-v1-watchlist-scores-v1-similar-background-refresh-v2-watchlist-alerts-v4-default-similar-v1-20260729-watchlist-async-add-v1-20260730-watchlist-fast-delete-v1-20260730-allotment-refresh-quality-v1-20260730-allotment-xueqiu-v1-20260730-xueqiu-bj920-v2-20260730-button-performance-v2-modular-core-v1-20260731-allotment-watchlist-note-v1-20260802-data-quality-v1-20260802-long-good-price-v5-metrics-20260803-watchlist-auto-refresh-v2-20260803-price-score-forecast-years-v1-long-judgement-v2-price-band-sort-v1-20260803-refresh-status-v1-long-valuation-sort-v1-20260809-allotment-cache-contract-v1-20260810-blood-chip-long-v2-survival-scale-in-rate-fix-20260810-blood-chip-xueqiu-v1-20260811-short-xueqiu-v1-20260812-operation-plans-v3-next-day-default-watchlist-alert-hit-lines-v2-long-value-alerts-v1-operation-plan-checklist-v1-20260827-short-side-badges-v1-score-normalization-v1-short-side-filter-v1-fine-score-bands-v2-ranknet-20261101-transition-right-v3-20261102-watchlist-alert-filter-v1-multi-regime-v2-short-etf-flow-v1-operation-plan-draft-v1-review-v2-chan-guide-v1-portfolio-20261112-futures-20261115-retained-v3"></script>
   </body>
 </html>

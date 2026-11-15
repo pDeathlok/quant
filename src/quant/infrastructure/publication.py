@@ -75,6 +75,16 @@ def publication_path(path: Path) -> Path:
     return view.resolve(path) if view is not None else path
 
 
+def logical_publication_path(path: Path) -> Path:
+    """Return a stable cache identity for a path in the current generation."""
+    view = current_publication()
+    if view is not None and view.generation:
+        tree = view.directory / view.generation / "tree"
+        if path.is_relative_to(tree):
+            return view.root / path.relative_to(tree)
+    return path
+
+
 def publication_write_path(path: Path) -> Path:
     resolved = publication_path(path)
     view = current_publication()

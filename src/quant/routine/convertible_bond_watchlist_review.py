@@ -56,6 +56,14 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _read_json_object_with_sha256(path: Path) -> tuple[dict[str, Any], str]:
+    data = path.read_bytes()
+    payload = json.loads(data)
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON 根节点必须是对象: {path}")
+    return payload, hashlib.sha256(data).hexdigest()
+
+
 def _sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -396,8 +404,6 @@ def generate_watchlist_review_plan(
     watchlist_path = Path(watchlist_path)
     snapshot_path = Path(snapshot_path)
     output_path = Path(output_path)
-    watchlist_payload = _read_json_object(watchlist_path)
-
     if refresh:
         if workspace_loader is None:
             raise ValueError(
@@ -453,10 +459,13 @@ def generate_watchlist_review_plan(
         "records_with_expired_dates": len(allotment_payload.get("records") or []),
         "result_consistency": consistency,
     }
+    watchlist_payload, watchlist_sha256 = _read_json_object_with_sha256(
+        watchlist_path
+    )
     plan = build_watchlist_review_plan(
         records=list(allotment_payload.get("records") or []),
         watchlist_payload=watchlist_payload,
-        watchlist_sha256=_sha256_path(watchlist_path),
+        watchlist_sha256=watchlist_sha256,
         asof=asof,
         source=source,
     )
@@ -613,11 +622,9 @@ def apply_watchlist_review_plan(
     current_date = today or _now_shanghai().date()
     if plan.get("asof") != current_date.isoformat():
         raise ValueError("计划不是当日生成，请重新运行 plan 后再确认")
-    current_sha256 = _sha256_path(watchlist_path)
+    watchlist, current_sha256 = _read_json_object_with_sha256(watchlist_path)
     if current_sha256 != plan.get("watchlist_sha256"):
         raise ValueError("自选池在生成计划后已变更，请重新运行 plan")
-
-    watchlist = _read_json_object(watchlist_path)
     raw_symbols = watchlist.get("symbols", [])
     if not isinstance(raw_symbols, list):
         raise ValueError("自选池 symbols 必须是列表")

@@ -12,6 +12,7 @@ from quant.features.active_market_value import (
 from quant.features.candlestick_context import (
     CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS,
 )
+from quant.features.index_ma_state import INDEX_MA_STATE_FEATURE_COLUMNS
 from quant.features.market_breadth import (
     MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS,
 )
@@ -190,6 +191,7 @@ def test_registry_governance_separates_canonical_alias_and_lifecycle() -> None:
         + len(ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS)
         + len(MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS)
         + len(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS)
+        + len(INDEX_MA_STATE_FEATURE_COLUMNS)
     )
     assert role_counts.to_dict() == {
         "feature": 583 + len(LEFT_SIDE_RULE_FEATURE_COLUMNS),
@@ -198,6 +200,7 @@ def test_registry_governance_separates_canonical_alias_and_lifecycle() -> None:
             len(ACTIVE_MARKET_VALUE_RESEARCH_FEATURE_COLUMNS)
             + len(MARKET_BREADTH_RESEARCH_FEATURE_COLUMNS)
             + len(CANDLE_CONTEXT_RESEARCH_FEATURE_COLUMNS)
+            + len(INDEX_MA_STATE_FEATURE_COLUMNS)
         ),
     }
     assert FACTOR_ALIAS_TARGETS == {}

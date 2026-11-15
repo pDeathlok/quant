@@ -12,7 +12,7 @@ REFRESH_SCOPE_LABELS = {
     "long": "长线策略",
     "cb": "可转债策略",
     "cbAllotment": "配债股",
-    "byd": "过渡期右侧",
+    "byd": "多状态右侧",
     "similar": "自选池",
     "rightSideShadow": "右侧统一模型影子",
     "rightSideRankingCandidate": "右侧统一模型生产候选验收",
@@ -39,7 +39,7 @@ REFRESH_STEP_DEFINITIONS = {
     "long_stock_pool": {"label": "刷新长线因子截面、页面股票池与带血筹每日计划", "percent": 92},
     "convertible_bond_plan": {"label": "刷新可转债策略计划", "percent": 94},
     "convertible_bond_allotment": {"label": "刷新配债股数据", "percent": 96},
-    "byd_daily_plan": {"label": "刷新过渡期右侧次日计划", "percent": 97},
+    "byd_daily_plan": {"label": "刷新多状态右侧次日计划", "percent": 97},
     "similar_patterns": {"label": "刷新自选池相似走势", "percent": 97},
     "snapshot": {"label": "写入策略股票池快照", "percent": 98},
     "right_side_shadow_features": {"label": "构建右侧影子 canonical 因子", "percent": 80},
@@ -51,7 +51,13 @@ REFRESH_STEP_DEFINITIONS = {
     "left_side_unified_features": {"label": "构建左侧生产统一因子", "percent": 73},
     "left_side_unified_score": {"label": "计算左侧生产统一排序", "percent": 77},
     "left_side_unified_adapter": {"label": "校验左侧 selector 排序适配", "percent": 79},
+    "application_portfolio": {"label": "刷新组合策略排名", "percent": 80},
 }
+
+
+def refresh_step_definition(key: str) -> dict[str, Any]:
+    # Presentation metadata must not prevent a registered step from running.
+    return REFRESH_STEP_DEFINITIONS.get(key, {"label": key, "percent": 0})
 
 
 def normalize_refresh_scope(scope: str | None = None) -> str:
@@ -80,9 +86,9 @@ def build_progress_steps(scope: str | None = None) -> list[dict[str, Any]]:
     return [
         {
             "key": key,
-            "label": REFRESH_STEP_DEFINITIONS[key]["label"],
+            "label": refresh_step_definition(key)["label"],
             "status": "pending",
-            "percent": REFRESH_STEP_DEFINITIONS[key]["percent"],
+            "percent": refresh_step_definition(key)["percent"],
             "started_at": None,
             "finished_at": None,
             "elapsed_seconds": None,

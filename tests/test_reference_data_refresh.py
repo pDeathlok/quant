@@ -52,6 +52,40 @@ def test_old_single_page_financial_checkpoint_is_not_reused(tmp_path):
     assert _financial_checkpoint_current(path, "20261030")
 
 
+def test_rank_flow_refresh_repairs_prior_context_and_reuses_calendar(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from quant.routine import reference_data_refresh as module
+    basic=tmp_path/'daily_basic';basic.mkdir()
+    dates=pd.bdate_range('2026-01-01',periods=61)
+    for date in dates:
+        (basic/f'{date:%Y%m%d}.parquet').touch()
+    calls=[]
+    def backfill(pro,dataset,start,end,raw,audit,**kwargs):
+        calls.append((dataset,start,end,kwargs['trade_dates']))
+        return {'status':'success'}
+    monkeypatch.setattr(module,'backfill_trade_date_partitions',backfill)
+    pro=SimpleNamespace(moneyflow=lambda:None,margin_detail=lambda:None)
+    result=module.refresh_long_factor_daily_sources(SimpleNamespace(pro=pro),tmp_path,tmp_path/'audit',
+        dates[-1].strftime('%Y%m%d'),datasets=('moneyflow','margin_detail'),rank_flow_context=True)
+    assert result['status']=='success' and len(calls)==2
+    assert all(len(call[3])==60 and call[2]==dates[-2].strftime('%Y%m%d') for call in calls)
+    assert all(row['polled_through']==dates[-1].strftime('%Y%m%d') for row in result['datasets'].values())
+
+
+def test_configured_indices_share_owner_and_skip_complete_dates(tmp_path):
+    from types import SimpleNamespace
+    from quant.routine.reference_data_refresh import refresh_model_indices
+    calls=[]
+    def fetch(**kwargs):
+        calls.append(kwargs['ts_code'])
+        return pd.DataFrame({'ts_code':[kwargs['ts_code']], 'trade_date':['20261110'], 'close':[100.]})
+    fetcher=SimpleNamespace(pro=SimpleNamespace(index_daily=fetch))
+    for _ in range(2):
+        result=refresh_model_indices(fetcher,tmp_path,'20261110',required_indices=('000300.SH','000001.SH','000001.SH'))
+        assert result['status']=='success'
+    assert calls==['000300.SH','000001.SH']
+
+
 class FakePro:
     def trade_cal(self, **kwargs) -> pd.DataFrame:
         return pd.DataFrame({"cal_date": [kwargs["start_date"]], "is_open": ["1"]})

@@ -68,6 +68,10 @@ class LeftSideRankingConfig:
     score_normalization: str
     factor_workers: int
     paths: LeftSideRankingPaths
+    engine: str = "legacy"
+    factor_contract_sha256: str = LEFT_SIDE_FACTOR_CONTRACT_SHA256
+    score_schema_version: str = LEFT_SIDE_SCORE_SCHEMA_VERSION
+    required_indices: tuple[str, ...] = ()
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, Any]:
@@ -100,6 +104,9 @@ def load_left_side_ranking_config(
     selector = _mapping(payload.get("selector"), field="selector")
     model = _mapping(payload.get("model"), field="model")
     paths = _mapping(payload.get("paths"), field="paths")
+    engine = str(model.get("engine", "legacy"))
+    if engine not in {"legacy", "rank_fusion"}:
+        raise ValueError(f"Unsupported left ranking engine: {engine}")
     expected = {
         "artifact_schema_version": LEFT_SIDE_ARTIFACT_SCHEMA_VERSION,
         "feature_schema_version": LEFT_SIDE_FEATURE_SCHEMA_VERSION,
@@ -114,8 +121,20 @@ def load_left_side_ranking_config(
         for key, expected_value in expected.items()
         if model.get(key) != expected_value
     }
-    if drift:
+    if drift and engine == "legacy":
         raise ValueError(f"left-side ranking model contract drifted: {drift}")
+    if engine == "rank_fusion":
+        from quant.ml.rank_fusion import RankFusion
+        from quant.features.active_market_value import KEY_INDEX_SPECS
+        fusion = RankFusion.load(_safe_path(project_root, model.get("artifact_manifest")))
+        digest = hashlib.sha256(json.dumps(list(fusion.required_features)).encode()).hexdigest()
+        if model.get("factor_contract_sha256") != digest or release.get("id") != fusion.release_id:
+            raise ValueError("Rank fusion configuration does not match release contract")
+        if model.get("score_schema_version") != "left-side-rank-fusion-score-v1":
+            raise ValueError("Unsupported rank fusion score contract")
+        if (model.get('feature_schema_version') != 'rank-feature-runtime-v1'
+                or tuple(model.get('required_indices', ())) != tuple(spec.ts_code for spec in KEY_INDEX_SPECS)):
+            raise ValueError('Rank feature runtime/index source contract mismatch')
     strategy_keys = tuple(str(value) for value in (selector.get("strategy_keys") or ()))
     if strategy_keys != LEFT_SIDE_SIGNALS:
         raise ValueError("left-side ranking strategy order drifted")
@@ -138,6 +157,10 @@ def load_left_side_ranking_config(
         normalized_score_field=str(selector.get("normalized_score_field") or ""),
         score_normalization=str(selector.get("normalization") or ""),
         factor_workers=factor_workers,
+        engine=engine,
+        required_indices=tuple(model.get('required_indices', ())),
+        factor_contract_sha256=str(model.get("factor_contract_sha256")),
+        score_schema_version=str(model.get("score_schema_version")),
         paths=LeftSideRankingPaths(
             artifact=_safe_path(project_root, model.get("artifact")),
             artifact_manifest=_safe_path(project_root, model.get("artifact_manifest")),
@@ -180,12 +203,14 @@ def _load_left_side_ranking_frame(
     if not isinstance(manifest, dict):
         raise RuntimeError("left-side score manifest must be a mapping")
     target = pd.Timestamp(signal_date).date().isoformat()
-    if manifest.get("schema_version") != LEFT_SIDE_SCORE_SCHEMA_VERSION:
+    if manifest.get("schema_version") != config.score_schema_version:
         raise RuntimeError("left-side score schema mismatch")
     if manifest.get("target_date") != target:
         raise RuntimeError("left-side score manifest is stale")
-    if manifest.get("factor_contract_sha256") != LEFT_SIDE_FACTOR_CONTRACT_SHA256:
+    if manifest.get("factor_contract_sha256") != config.factor_contract_sha256:
         raise RuntimeError("left-side score factor contract mismatch")
+    if config.engine == "rank_fusion" and manifest.get("artifact_sha256") != _sha256(config.paths.artifact):
+        raise RuntimeError("left-side scores belong to a different model release")
     if find_forbidden_aliases_in_payload(manifest):
         raise RuntimeError("left-side score manifest contains forbidden aliases")
     if manifest.get("output_sha256") != _sha256(config.paths.score_output):

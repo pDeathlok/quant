@@ -1,0 +1,60 @@
+release:
+  id: left-ranknet-v6-20261111
+  lifecycle: production
+  consumer: quant.webapp.services.selector
+  dependency_nodes:
+  - feature.left_side_unified
+  - score.left_side_unified
+  - product.left_side_unified_adapter
+  - score.selector
+selector:
+  enabled: true
+  failure_policy: fail_closed
+  score_field: ranking_score
+  normalized_score_field: ranking_score_normalized
+  production_threshold_mode: none_rank_only
+  selection_policy: downstream_top_n_ordering
+  normalization: daily_cross_section_percentile_v1
+  factor_workers: 4
+  overlap_policy: right_side_precedence
+  strategy_keys:
+  - B1
+  - SB1
+  - SUPER_B1
+  - LOW_PULLBACK
+model:
+  engine: rank_fusion
+  artifact: models/production/left_side_ranknet_v6/manifest.json
+  artifact_manifest: models/production/left_side_ranknet_v6/manifest.json
+  artifact_schema_version: rank-fusion-v1
+  feature_schema_version: rank-feature-runtime-v1
+  score_schema_version: left-side-rank-fusion-score-v1
+  factor_contract_sha256: 81809fcbbaea225617fe4236885ea3433d263d2dfd628cb455b582c13109d79e
+  required_indices:
+  - 000001.SH
+  - 399001.SZ
+  - 399006.SZ
+  - 000688.SH
+  - 000016.SH
+  - 000300.SH
+  - 000905.SH
+  - 000852.SH
+  - 899050.BJ
+paths:
+  project_feature_cache: data/features/b1/active_candidate_project_features.parquet
+  project_feature_manifest: data/features/b1/active_candidate_project_features_manifest.json
+  signal_cache: data/features/z_skill_daily_candidates.parquet
+  b1_gate_cache: data/features/b1/b1_gate_candidates.parquet
+  family_signal_cache: data/features/b1/b1_family_rule_candidates.parquet
+  market_data_root: data/raw
+  feature_output: data/features/left_side_ranknet_v6/latest_features.parquet
+  feature_manifest: data/features/left_side_ranknet_v6/feature_manifest.json
+  score_output: data/features/left_side_ranknet_v6/latest_scores.parquet
+  score_manifest: data/features/left_side_ranknet_v6/score_manifest.json
+  ranking_decision: reports/research/left_ranknet_rollout/decision.json
+promotion:
+  user_authorized: true
+  rollback_config: configs/releases/left_side_unified_v4_rollback.yaml
+  parity_report: models/production/left_side_ranknet_v6/parity.json
+  preserve_rollback_artifacts:
+  - models/production/left_side_unified_canonical_v4_group4/ranking.joblib

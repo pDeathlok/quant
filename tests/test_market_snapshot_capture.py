@@ -1,11 +1,80 @@
+import hashlib
 import json
 import threading
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from quant.data import market_snapshot as snapshots
+
+
+def _reference_date_blocks(frame):
+    """Pre-optimization block encoding, including scalar boundary lookups."""
+    import pyarrow as pa
+
+    frame = frame.sort_values(["trade_date", "ts_code"], kind="stable").reset_index(drop=True)
+    table = pa.Table.from_pandas(
+        frame[sorted(frame.columns)], preserve_index=False,
+    ).replace_schema_metadata(None)
+    blocks = []
+    for month, indices in frame.groupby(frame["trade_date"].str[:6], sort=True).indices.items():
+        start, length = int(indices[0]), len(indices)
+        block = table.take(pa.array(indices, type=pa.int64()))
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, block.schema) as writer:
+            writer.write_table(block)
+        blocks.append({
+            "partition": month, "min_date": frame["trade_date"].iloc[start],
+            "max_date": frame["trade_date"].iloc[start + length - 1], "rows": length,
+            "sha256": hashlib.sha256(sink.getvalue()).hexdigest(),
+        })
+    return blocks
+
+
+@pytest.mark.parametrize("dtype", ["object", "string[python]", "string[pyarrow]"])
+@pytest.mark.parametrize("shape", ["empty", "single", "mixed", "reordered"])
+def test_date_block_boundaries_preserve_reference_fingerprints(dtype, shape):
+    frame = pd.DataFrame({
+        "ts_code": ["000002.SZ", "000001.SZ", "000001.SZ", "000002.SZ", "000001.SZ"],
+        "trade_date": pd.Series(["20260302", "20251231", "20260130", "20260102", "20260130"], dtype=dtype),
+        "value": [Decimal("1.000000000000000001"), None, Decimal("2.5"), Decimal("-3"), Decimal("2.6")],
+        "close": [1.000000000000001, float("nan"), 3.0, 4.0, 5.0],
+        "name": ["long value" * 100, None, "short", "", "duplicate identity"],
+    })
+    if shape in {"empty", "single"}:
+        frame = frame.iloc[:int(shape == "single")].copy()
+    elif shape == "reordered":
+        frame = frame.iloc[[3, 1, 2, 4, 0]][list(reversed(frame.columns))].copy()
+    frame.index = pd.Index([17] * len(frame), name="source_row")
+    original = frame.copy(deep=True)
+    expected = _reference_date_blocks(frame)
+
+    actual = snapshots._date_blocks(frame)
+
+    assert actual == expected
+    assert json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def test_date_block_boundary_lookup_does_not_repeat_per_month(monkeypatch):
+    frame = pd.DataFrame({
+        "ts_code": ["000001.SZ"] * 36,
+        "trade_date": pd.date_range("2023-01-01", periods=36, freq="MS").strftime("%Y%m%d"),
+        "close": range(36),
+    })
+    original = pd.DataFrame.__getitem__
+    lookups = []
+
+    def counted(self, key):
+        if isinstance(key, str) and key == "trade_date":
+            lookups.append(key)
+        return original(self, key)
+
+    monkeypatch.setattr(pd.DataFrame, "__getitem__", counted)
+    assert len(snapshots._date_blocks(frame)) == 36
+    assert len(lookups) <= 5
 
 
 def test_date_normalization_parses_distinct_values_once(monkeypatch):
@@ -22,6 +91,45 @@ def test_date_normalization_parses_distinct_values_once(monkeypatch):
     assert calls == [2]
     assert actual.tolist() == ["20260908", "20260907"] * 1000
     assert actual.index.equals(values.index)
+
+
+def test_date_normalization_reuses_dates_across_stock_batches(monkeypatch):
+    original=pd.to_datetime
+    calls=[]
+    def tracked(values, **kwargs):
+        calls.append(len(values))
+        return original(values, **kwargs)
+    monkeypatch.setattr(pd,'to_datetime',tracked)
+    cache={}
+    first=pd.Series(['20261110','20261111','20261110'],index=[5,7,9])
+    second=pd.Series(['20261111','20261112'],index=[11,13])
+    pd.testing.assert_series_equal(snapshots._canonical_dates(first,cache=cache),first)
+    pd.testing.assert_series_equal(snapshots._canonical_dates(second,cache=cache),second)
+    assert calls==[2,1]
+    with pytest.raises(ValueError):
+        snapshots._canonical_dates(pd.Series(['20260230']),cache=cache)
+
+
+def test_source_capture_ignores_files_from_a_different_dataset(source,tmp_path):
+    directory,frame=source
+    (directory/'sample.parquet').rename(directory/'tushare_moneyflow_20260908.parquet')
+    frame.assign(turnover_rate=999).to_parquet(directory/'tushare_top_list_20260908.parquet',index=False)
+    store=SimpleNamespace(config=SimpleNamespace(backend='file',root=tmp_path))
+    sealed=snapshots.export_market_snapshot(store,tmp_path/'sealed',datasets=('moneyflow',),
+        supplemental_sources={'moneyflow':directory})
+    manifest=json.loads(sealed.manifest_path.read_text())
+    assert [c['path'] for c in manifest['datasets']['moneyflow']['files']]==['moneyflow/tushare_moneyflow_20260908.parquet']
+    assert sealed.metrics['supplemental']['moneyflow']['ignored_other_dataset_files']==1
+    pd.testing.assert_frame_equal(snapshots.SnapshotReader(sealed.manifest_path).read('moneyflow'),frame)
+
+
+def test_finished_temporary_snapshot_reader_can_be_released(source,tmp_path):
+    directory,_=source
+    sealed=capture(directory,tmp_path/'sealed')
+    with snapshots.pinned_market_snapshot(sealed.manifest_path):
+        assert snapshots.current_market_snapshot() is not None
+    snapshots.release_market_snapshot_reader(sealed.manifest_path)
+    assert not any(key[0]==sealed.manifest_path for key in snapshots._READERS)
 
 
 @pytest.mark.parametrize("date", ["20260230", "not-a-date", "20261301"])
@@ -63,6 +171,62 @@ def test_canonical_files_are_copied_without_decoding_value_columns(source, tmp_p
     assert copied.stat().st_ino != (directory / "sample.parquet").stat().st_ino
     pd.testing.assert_frame_equal(snapshots.SnapshotReader(sealed.manifest_path).available("daily_basic"), expected)
     assert sealed.metrics["supplemental"]["daily_basic"]["copied"] == 1
+
+
+def test_single_index_file_is_sealed_and_survives_source_replacement(source, tmp_path):
+    directory, expected = source
+    path = directory / 'sample.parquet'
+    sealed = capture(path, tmp_path / 'sealed-index')
+    expected.assign(turnover_rate=999).to_parquet(path, index=False)
+    with snapshots.pinned_market_snapshot(sealed.manifest_path):
+        pinned = snapshots.pinned_dataset_path('daily_basic') / path.name
+        pd.testing.assert_frame_equal(snapshots.read_pinned_parquet(pinned), expected)
+        with pytest.raises(snapshots.MarketSnapshotError, match='not declared'):
+            snapshots.read_pinned_parquet(path)
+
+
+def test_pinned_file_lookup_reuses_index_and_preserves_column_selection(source, tmp_path):
+    directory, expected = source
+    sealed = capture(directory, tmp_path / 'sealed')
+
+    class CountedFiles(list):
+        visits = 0
+
+        def __iter__(self):
+            self.visits += 1
+            return super().__iter__()
+
+    with snapshots.pinned_market_snapshot(sealed.manifest_path):
+        reader = snapshots.current_market_snapshot()
+        path = snapshots.pinned_dataset_path('daily_basic') / 'sample.parquet'
+        files = CountedFiles(reader.manifest['datasets']['daily_basic']['files'])
+        reader.manifest['datasets']['daily_basic']['files'] = files
+        pd.testing.assert_frame_equal(snapshots.read_pinned_parquet(path), expected)
+        pd.testing.assert_frame_equal(
+            snapshots.read_pinned_parquet(path, columns=['turnover_rate']),
+            expected[['turnover_rate']],
+        )
+        with pytest.raises(snapshots.MarketSnapshotError, match='not declared'):
+            snapshots.read_pinned_parquet(directory / 'sample.parquet')
+        assert files.visits == 1
+
+
+@pytest.mark.parametrize('mutation', ['overwrite', 'delete', 'symlink'])
+def test_cached_pinned_lookup_still_verifies_file_on_every_read(source, tmp_path, mutation):
+    directory, expected = source
+    sealed = capture(directory, tmp_path / 'sealed')
+    with snapshots.pinned_market_snapshot(sealed.manifest_path):
+        path = snapshots.pinned_dataset_path('daily_basic') / 'sample.parquet'
+        pd.testing.assert_frame_equal(snapshots.read_pinned_parquet(path), expected)
+        if mutation == 'overwrite':
+            expected.assign(turnover_rate=999).to_parquet(path, index=False)
+        elif mutation == 'delete':
+            path.unlink()
+        else:
+            path.unlink()
+            path.symlink_to(directory / 'sample.parquet')
+        with pytest.raises(snapshots.MarketSnapshotError):
+            snapshots.read_pinned_parquet(path)
 
 
 @pytest.mark.parametrize("variant", ["date", "timestamp", "numeric", "index", "filtered"])

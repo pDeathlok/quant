@@ -1,4 +1,4 @@
-"""Frozen transition-right workspace: actual holdings and next-close instructions."""
+"""Market-stage strategy routing and next-close plans for actual holdings."""
 from __future__ import annotations
 import json,os,re,fcntl,hashlib,threading,inspect
 from datetime import datetime,date,timedelta
@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from quant.core.paths import PROJECT_ROOT
 from quant.data.atomic_io import atomic_write_json,atomic_write_parquet
 from quant.data.source_merge import normalize_tushare_daily,normalize_ts_code
 from quant.features.variable_library import build_continuous_ohlc
@@ -13,9 +14,34 @@ from quant.data.amount_units import resolve_amount_kcny
 
 POLICIES={'return':dict(label='收益型',fraction=1.,trail=.06,tp=0.,sl=0.),'win':dict(label='胜率型',fraction=.5,trail=0.,tp=.03,sl=.05)}
 INDICES={'000001.SH':'上证指数','399001.SZ':'深证成指','399006.SZ':'创业板指','000016.SH':'上证50','000300.SH':'沪深300','000905.SH':'中证500','000852.SH':'中证1000'}
-RULES=['仅市场均线处于过渡阶段时产生新买入信号，不要求连续三日确认。','创业板/科创板；至少250根行情、股价≥3元、20日成交额中位数≥5000万元、信号日涨幅<9.5%。','EMA144>EMA169、收盘>EMA144、3日涨幅>0、距MA20在-2%至8%；按20日波动从低到高排序。','收盘确认后，下一交易日收盘尝试成交；先卖后买，最多5仓，空槽留现金，不加仓、不按排名强制换股。','收益型：每仓预算为权益20%，最高收盘回撤6%触发退出；胜率型：每仓10%，收盘涨3%/跌5%触发退出。','最长持有入场后20个交易日；触发价格退出后下一交易日收盘卖，市场状态变化不强制卖。','成交需满足T+1、实际交易价格、整手和成交容量；止盈止损为收盘触发条件，不是保证成交价。']
+MARKET_STRATEGIES = json.loads(
+    (PROJECT_ROOT / "web" / "market-strategy-states.json").read_text(encoding="utf-8")
+)
+UNAVAILABLE_STRATEGY = {
+    'label': '数据待更新', 'name': '等待行情核对', 'mode': 'blocked',
+    'decision': '市场阶段未确认，暂停新买入。',
+}
+ENTRY_RULES = [
+    '创业板/科创板；至少250根行情、股价≥3元、20日成交额中位数≥5000万元、信号日涨幅<9.5%。',
+    'EMA144>EMA169、收盘>EMA144、3日涨幅>0、距MA20在-2%至8%；按20日波动从低到高排序。',
+    '信号日确认市场阶段，无需连续三日。次日收盘尝试成交；先卖后买，最多5仓，空槽留现金，不加仓、不按排名强制换股。',
+    '收益型每仓预算为权益20%，胜率型每仓10%。',
+]
+HOLDING_RULES = [
+    '已有持仓沿用所属策略的退出规则。收益型在最高收盘回撤6%时触发退出；胜率型在收盘涨3%或跌5%时触发退出。',
+    '最长持有入场后20个交易日；价格退出在触发后的下一交易日收盘尝试成交。市场阶段切换时继续按持仓规则处理。',
+    '成交需满足T+1、实际交易价格、整手和成交容量；止盈止损阈值用于收盘判断。',
+]
 _LOCK=threading.RLock()
 _DATA_LOCK=threading.RLock()
+
+
+def market_strategy_state(state):
+    current = MARKET_STRATEGIES.get(state, UNAVAILABLE_STRATEGY)
+    return {
+        'market_strategy': current,
+        'strategy_states': [{'state': key, **profile} for key, profile in MARKET_STRATEGIES.items()],
+    }
 
 def today():return datetime.now(ZoneInfo('Asia/Shanghai'))
 def iso(x):return pd.Timestamp(x).date().isoformat()
@@ -84,6 +110,11 @@ def market_state(indices,asof):
 
 def build_plan(policy,account,summary,history,market,calendar,signal_date,trade_date,issues=None):
  cfg=POLICIES[policy];issues=list(issues or [])+market.get('issues',[]);calendar=pd.DatetimeIndex(calendar).sort_values().unique();asof=pd.Timestamp(signal_date);target=pd.Timestamp(trade_date) if trade_date else None
+ strategy_state=market_strategy_state(market['state'])
+ profile=strategy_state['market_strategy']
+ entry_enabled=profile['mode']=='conditional_entry'
+ target_fraction=cfg['fraction'] if entry_enabled else 0.
+ rules=[profile['decision'],*(ENTRY_RULES if entry_enabled else []),*HOLDING_RULES]
  rows={r['symbol']:r for r in summary};history=history.copy();history['date']=pd.to_datetime(history.date) if len(history) else pd.Series(dtype='datetime64[ns]')
  sells=[];holds=[];held=set();value=0.;cash=account['cash']
  for pos in account['positions']:
@@ -117,24 +148,24 @@ def build_plan(policy,account,summary,history,market,calendar,signal_date,trade_
    if not item.get('trigger_date'):item['reason']='已到入场后第20个交易日，执行时间退出'
    sells.append(item)
   else:holds.append(item)
- equity=cash+value;budget=equity*cfg['fraction']/5
- can_buy=market['state']=='transition' and not issues and bool(trade_date) and account.get('confirmed',False)
- candidates=sorted([r for r in summary if r.get('eligible') and r['date']==signal_date],key=lambda r:(r['vol20'],r['symbol']))[:10]
+ equity=cash+value;budget=equity*target_fraction/5
+ can_buy=entry_enabled and not issues and bool(trade_date) and account.get('confirmed',False)
+ candidates=sorted([r for r in summary if r.get('eligible') and r['date']==signal_date],key=lambda r:(r['vol20'],r['symbol']))[:10] if entry_enabled else []
  selling={p['symbol'] for p in sells}
- buy=[];reserved=0.;projected_slots=max(0,5-len(account['positions']));cap_cash=cash;remaining=max(0,equity*cfg['fraction']-value)
+ buy=[];reserved=0.;projected_slots=max(0,5-len(account['positions']));cap_cash=cash;remaining=max(0,equity*target_fraction-value)
  for rank,row in enumerate(candidates,1):
   symbol=row['symbol'];price=row['close']*1.0005;limit=min(budget,max(0,cap_cash-reserved),max(0,remaining-reserved),row['amount']*.01)
   qty=int(max(0,limit-5)/(price*1.00031)//100)*100;minimum=200 if symbol.startswith('688') else 100
   is_held=symbol in held;available=can_buy and not is_held and projected_slots>0 and qty>=minimum
   after_sell=can_buy and bool(sells) and (not is_held or symbol in selling) and min(budget,row['amount']*.01)>price*minimum+5
-  reason='现持仓若先全部卖出，可按队列重新评估独立新买单；入场日期需重置' if is_held and symbol in selling and after_sell else ('已持仓，不重复买入' if is_held else ('市场非过渡阶段，不开新仓' if market['state']!='transition' else ('资料待确认，暂停买入' if not can_buy else ('空槽或可用现金不足，仅备选' if not available else '符合冻结规则，列入次日条件买入队列'))))
+  reason='现持仓若先全部卖出，可按队列重新评估独立新买单；入场日期需重置' if is_held and symbol in selling and after_sell else ('已持仓，不重复买入' if is_held else ('资料待确认，暂停买入' if not can_buy else ('空槽或可用现金不足，仅备选' if not available else '符合冻结规则，列入次日条件买入队列')))
   if after_sell and not available and not is_held:reason='先完成卖出、核实到账现金和空槽，再按队列评估，不能预支卖出款'
   buy.append({**row,'rank':rank,'action':'BUY' if available else ('AFTER_SELL' if after_sell else 'WATCH'),'reason':reason,'budget':budget,'estimated_quantity':qty if available else 0,'execution':'次日收盘按当时价格、可用现金和成交额1%上限重新计算；涨停/停牌不买'})
   if available:projected_slots-=1;reserved+=qty*price+max(5,qty*price*.0003)+qty*price*.00001
  # Do not budget unfilled sell proceeds or free slots before actual sales.
  if sells:issues.append('买入数量按当前现金和空槽估算；卖出实际成交后才可释放资金/槽位，并继续按备选顺序评估')
- status='blocked' if market['state']=='unavailable' or not trade_date or any(i for i in issues if not i.startswith('买入数量')) else ('ready' if account.get('confirmed') else 'needs_account')
- return clean(dict(schema_version='transition_workspace_v1',generated_at=today().isoformat(),strategy=policy,label=cfg['label'],signal_date=signal_date,trade_date=trade_date,status=status,account=account,market=market,equity=equity,target_fraction=cfg['fraction'],per_stock_budget=budget,sells=sells,holds=holds,buys=buy,can_open_new=can_buy,issues=issues,rules=RULES,execution_time='下一交易日收盘',planned_t={'signal_date':signal_date},snapshot_kind='实际持仓的次日条件计划；不会自动记账或下单'))
+ status='blocked' if profile['mode']=='blocked' or not trade_date or any(i for i in issues if not i.startswith('买入数量')) else ('ready' if account.get('confirmed') else 'needs_account')
+ return clean(dict(schema_version='transition_workspace_v1',generated_at=today().isoformat(),strategy=policy,label=cfg['label'],signal_date=signal_date,trade_date=trade_date,status=status,account=account,market=market,equity=equity,target_fraction=target_fraction,per_stock_budget=budget,sells=sells,holds=holds,buys=buy,can_open_new=can_buy,issues=issues,rules=rules,execution_time='下一交易日收盘',planned_t={'signal_date':signal_date},snapshot_kind='实际持仓的次日条件计划；不会自动记账或下单',**strategy_state))
 
 def verified_calendar(root):
  from quant.data.tushare_fetcher import TushareDataFetcher
@@ -169,18 +200,16 @@ def _canonical_daily(store,symbols,end):
  if not parts:raise ValueError('本地日线源没有可用的策略行情')
  return pd.concat(parts,ignore_index=True).drop_duplicates(['ts_code','trade_date'],keep='last')
 
-def load_inputs(root,refresh=False):
+def load_inputs(root,refresh=False,*,publication_generation=None):
  from quant.data.market_data_store import MarketDataStore,MarketDataStoreConfig
  from quant.data.tushare_fetcher import TushareDataFetcher
- from quant.infrastructure.publication import current_publication
  root=Path(root);cal,signal,target=verified_calendar(root);store=MarketDataStore(MarketDataStoreConfig.from_env(root=root/'data/raw'));cache=root/'data/cache/transition_workspace';cache.mkdir(parents=True,exist_ok=True)
  latest=store.latest_dataset_trade_date('daily')
  if latest is None or pd.Timestamp(latest)<pd.Timestamp(signal):raise ValueError(f'策略行情未更新到{signal}；请更新行情后再生成买卖计划')
  revision=store.dataset_revision('daily');files=[]
  if store.config.backend not in {'mysql','sql'}:files=[(str(p),p.stat().st_mtime_ns,p.stat().st_size) for p in sorted((store.config.root/'daily_partitioned').glob('year_month=*/data.parquet'))]
- view=current_publication();generation=getattr(view,'generation',None)
  contract=_SOURCE_CONTRACT
- key=hashlib.sha256(json.dumps([signal,revision,files,generation,contract],default=str).encode()).hexdigest()[:20]
+ key=hashlib.sha256(json.dumps([signal,revision,files,publication_generation,contract],default=str).encode()).hexdigest()[:20]
  summary_path=cache/f'{key}.json';history_path=cache/f'{key}.parquet'
  if summary_path.exists() and history_path.exists() and not refresh:
   data=json.loads(summary_path.read_text());return data['summary'],pd.read_parquet(history_path),data['market'],cal,signal,target
@@ -211,16 +240,16 @@ def load_inputs(root,refresh=False):
  atomic_write_parquet(history,history_path,index=False);atomic_write_json(clean(dict(summary=summaries,market=market,source_date=signal,revision=revision)),summary_path)
  return summaries,history,market,cal,signal,target
 
-def workspace(root,policy='return',refresh=False):
+def workspace(root,policy='return',refresh=False,*,publication_generation=None):
  account=get_account(root,policy)
  try:
   with _DATA_LOCK:
-   summary,history,market,cal,signal,target=load_inputs(root,refresh)
+   summary,history,market,cal,signal,target=load_inputs(root,refresh,publication_generation=publication_generation)
   return build_plan(policy,account,summary,history,market,cal,signal,target)
  except Exception as exc:
   # No historical snapshot or hardcoded research candidate is substituted
   # for a missing current source. Holdings remain intact.
-  return dict(schema_version='transition_workspace_v1',generated_at=today().isoformat(),strategy=policy,label=POLICIES[policy]['label'],status='blocked',signal_date=None,trade_date=None,account=account,market={'state':'unavailable','label':'数据待更新','indices':[],'counts':{}},sells=[],holds=[],buys=[],can_open_new=False,issues=[str(exc)],rules=RULES,planned_t={'signal_date':None})
+  return dict(schema_version='transition_workspace_v1',generated_at=today().isoformat(),strategy=policy,label=POLICIES[policy]['label'],status='blocked',signal_date=None,trade_date=None,account=account,market={'state':'unavailable','label':'数据待更新','indices':[],'counts':{}},sells=[],holds=[],buys=[],can_open_new=False,issues=[str(exc)],rules=[UNAVAILABLE_STRATEGY['decision'],*HOLDING_RULES],planned_t={'signal_date':None},**market_strategy_state('unavailable'))
 
 
 _SOURCE_CONTRACT=hashlib.sha256((inspect.getsource(symbol_features)+inspect.getsource(market_state)+inspect.getsource(load_inputs)+inspect.getsource(resolve_amount_kcny)).encode()).hexdigest()

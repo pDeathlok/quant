@@ -167,6 +167,8 @@ def _fetch_trade_date_partition(
     frame = method(trade_date=trade_date)
     if not isinstance(frame, pd.DataFrame):
         raise IncompletePartition(f"Tushare {dataset} {trade_date} returned no DataFrame")
+    if dataset in {"moneyflow", "margin_detail"} and frame.empty:
+        raise IncompletePartition(f"Tushare {dataset} {trade_date} returned an empty trading-day cross section")
     if dataset == "top_list" and frame.empty and not len(frame.columns):
         frame = pd.DataFrame(columns=sorted(spec["required"]))
     if len(frame) >= int(spec["limit"]):
@@ -221,7 +223,7 @@ def _partition_valid(path: Path, spec: dict[str, Any], trade_date: str) -> bool:
     if len(frame) >= int(spec["limit"]):
         return False
     if frame.empty:
-        return True
+        return spec["method"] not in {"moneyflow", "margin_detail"}
     if spec["method"] == "top_list":
         try:
             _top_list_numeric_values(frame)
@@ -343,6 +345,7 @@ def backfill_trade_date_partitions(
     pending_state_path: Path | None = None,
     max_dates: int | None = None,
     progress_every: int = 20,
+    trade_dates: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Backfill a cross-sectional daily source into one file per trade date."""
 
@@ -351,7 +354,9 @@ def backfill_trade_date_partitions(
     spec = TRADE_DATE_DATASETS[dataset]
     output_dir = raw_dir / str(spec["directory"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    dates = load_open_trade_dates(pro, start_date, end_date)
+    dates = load_open_trade_dates(pro, start_date, end_date) if trade_dates is None else sorted(set(_date_text(d) for d in trade_dates))
+    if any(d < _date_text(start_date) or d > _date_text(end_date) for d in dates):
+        raise ValueError("Supplied trade dates lie outside the requested range")
     forced = {_date_text(value) for value in force_dates}
     repoll_start = _date_text(repoll_from) if repoll_from is not None else None
     pending: list[str] = []

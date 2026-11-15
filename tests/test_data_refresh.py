@@ -334,6 +334,7 @@ def test_refresh_daily_data_batches_raw_market_by_trade_date(monkeypatch, tmp_pa
     )
 
     monkeypatch.setenv("MARKET_DATA_BACKEND", "parquet")
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(tmp_path))
     monkeypatch.setattr(data_refresh, "AUDIT_ROOT", tmp_path / "audit")
     monkeypatch.setattr(data_refresh, "TushareDataFetcher", DummyTushareFetcher)
     monkeypatch.setattr(data_refresh, "load_tushare_symbols", fake_load_symbols)

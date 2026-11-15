@@ -29,7 +29,7 @@ function harness(page = "long", { generationTransport = false } = {}) {
   const variant = element("variant");
   variant.dataset.longVariant = "tea";
   const context = vm.createContext({
-    URLSearchParams, Headers, AbortController, console,
+    URLSearchParams, Headers, AbortController, AbortSignal, console,
     fetch: (url, options) => new Promise((resolve, reject) => {
       requests.push({ url, options, resolve, reject });
     }),
@@ -214,6 +214,25 @@ test("transition strategy switch cannot be overwritten by old variant", async ()
   await old;
   assert.equal(h.snapshot(), snapshot);
   assert.equal(h.state.bydPayload.marker, "current variant");
+});
+
+test("transition shows all market strategies while the next-day plan is pending or fails", async () => {
+  const h = harness("byd");
+  const plan = h.run("loadTransitionPlan().catch(showError)");
+  h.run("renderMarketStrategyStates(currentTransitionPlan())");
+  assert.match(h.element("#transitionStrategyStates").innerHTML, /正在加载五阶段/);
+  assert.equal(h.requests[1].url, "./market-strategy-states.json");
+  const catalog = JSON.parse(readFileSync(path.join(root, "web/market-strategy-states.json"), "utf8"));
+  h.requests[1].resolve({ ok: true, json: async () => catalog });
+  await tick();
+  const cards = h.element("#transitionStrategyStates").innerHTML;
+  assert.equal((cards.match(/<li>/g) || []).length, 5);
+  assert.equal(h.state.bydLoading, true);
+  h.requests[0].reject(new Error("plan timeout"));
+  await plan;
+  h.run("renderMarketStrategyStates(currentTransitionPlan())");
+  assert.equal(h.element("#transitionStrategyStates").innerHTML, cards);
+  assert.equal(h.element("#transitionCurrentStrategy").textContent, "当前市场阶段待核对");
 });
 
 test("navigation invalidates a pending page even when the destination is cached", async () => {
@@ -679,4 +698,73 @@ test("generation: missing bootstrap header fails closed and a later load can ret
   respond(h.requests[2], { marker: "retried" }, "generation-2");
   await current;
   assert.equal(h.state.longPayload.marker, "retried");
+});
+
+test('score probability bands retain every bin and count boundaries exactly once', () => {
+  const h = harness('short');
+  h.run(`globalThis.calibration = { bands: Array.from({length: 20}, (_, i) => ({
+    label: String(i * 5) + '-' + String(i * 5 + 5), min_score: i * 5, max_score: i * 5 + 5,
+  })) };`);
+  const bands = h.run('currentProbabilityBands(calibration, [0, 5, 95, 100])');
+  assert.equal(bands.length, 20);
+  assert.equal(bands.reduce((sum, b) => sum + b.current_count, 0), 4);
+  assert.equal(bands[0].current_count, 1);
+  assert.equal(bands[1].current_count, 1);
+  assert.equal(bands[19].current_count, 2);
+  assert.equal(h.run('currentProbabilityBands(calibration, []).length'), 20);
+  assert.equal(h.run('currentProbabilityBands(calibration, [98]).length'), 20);
+});
+
+test('left RankNet probability card follows side switch and excludes missing scores', () => {
+  const h = harness('short');
+  h.state.payload = { stocks: [
+    {symbol: 'a', ranking_source: 'left_side_unified', model_score_normalized: 50},
+    {symbol: 'b', ranking_source: 'right_side_unified', model_score_normalized: 98},
+    {symbol: 'c', ranking_source: 'left_side_unified', model_score_normalized: null},
+    {symbol: 'd', ranking_source: 'left_side_unified'},
+  ]};
+  assert.equal(h.run('JSON.stringify(shortCalibrationScores({key: "model_left_ranknet_v6"}))'), '[50]');
+  h.run(`globalThis.calibrations = ['model_left', 'model_left_ranknet_v6', 'model_left_v5_shadow', 'model_right', 'buy', 'hold'].map(key => ({key}));`);
+  h.state.shortSideFilter = 'left';
+  assert.equal(h.run('visibleScoreCalibrations(calibrations).some(c => c.key === "model_right")'), false);
+  assert.equal(h.run('visibleScoreCalibrations(calibrations).some(c => c.key === "model_left_ranknet_v6")'), true);
+  h.state.shortSideFilter = 'right';
+  assert.equal(h.run('JSON.stringify(visibleScoreCalibrations(calibrations).map(c => c.key))'), '["model_right","buy","hold"]');
+});
+
+test('review search, source and date ordering preserve saved records and note drafts', () => {
+  const h = harness('reviews');
+  h.state.reviewRecords = [
+    { id: 'a', symbol: '000001.SZ', name: '平安银行', source: '短线策略', created_at: '2026-11-10', signal_date: '2026-11-09', information: 'B1', note: '' },
+    { id: 'b', symbol: '600000.SH', name: '浦发银行', source: '缠论策略', created_at: '2026-11-12', signal_date: '2026-11-08', information: '三买', note: '等待' },
+  ];
+  const original = JSON.stringify(h.state.reviewRecords);
+  assert.equal(h.run('filteredReviewRecords()[0].id'), 'b');
+  h.state.reviewSort = 'signal';
+  assert.equal(h.run('filteredReviewRecords()[0].id'), 'a');
+  h.state.reviewSource = '缠论策略';
+  h.state.reviewQuery = '600000.sh';
+  assert.equal(h.run('filteredReviewRecords()[0].id'), 'b');
+  h.state.reviewQuery = '量能草稿';
+  h.state.reviewNoteDrafts.set('b', '量能草稿');
+  assert.equal(h.run('filteredReviewRecords()[0].id'), 'b');
+  h.state.reviewSource = '短线策略';
+  assert.equal(h.run('filteredReviewRecords().length'), 0);
+  assert.equal(JSON.stringify(h.state.reviewRecords), original);
+  assert.equal(h.state.reviewNoteDrafts.get('b'), '量能草稿');
+});
+
+test('review summary supports old manual records and separates missing scores from zero', () => {
+  const h = harness('reviews');
+  const summary = h.run(`reviewEntrySummary({ information: '<img src=x onerror=alert(1)>', snapshot: {row: {
+    model_score_normalized: 0, buy_score_normalized: null, hold_score_normalized: ''
+  }}})`);
+  assert.ok(summary.includes('&lt;img'));
+  assert.ok(!summary.includes('<img'));
+  assert.ok(summary.includes('模型分'));
+  assert.ok(summary.includes('0.0'));
+  assert.ok(!summary.includes('买入分'));
+  assert.ok(!summary.includes('持有分'));
+  assert.ok(h.run('reviewEntrySummary({information: "旧的手动记录"})').includes('旧的手动记录'));
+  assert.ok(h.run('reviewScoreSummary({source: "缠论策略", snapshot: {row: {pred_good: 0.65}}})').includes('65.0%'));
 });

@@ -47,7 +47,10 @@ def test_build_progress_steps_returns_fresh_mutable_records() -> None:
 
 @pytest.mark.parametrize("scope", sorted(REFRESH_SCOPE_STEPS))
 def test_every_page_refresh_starts_from_shared_market_daily_data(scope: str) -> None:
-    assert REFRESH_SCOPE_STEPS[scope][0] == "refresh_data"
+    steps = build_progress_steps(scope)
+    assert [step["key"] for step in steps] == REFRESH_SCOPE_STEPS[scope]
+    assert steps[0]["key"] == "refresh_data"
+    assert all(step["label"] and 0 <= step["percent"] <= 100 for step in steps)
 
 
 def test_daily_refresh_orders_unified_short_factors_before_page_outputs() -> None:
@@ -69,3 +72,11 @@ def test_right_side_shadow_has_an_independent_refresh_view() -> None:
         "right_side_shadow_score",
         "right_side_shadow_product",
     ]
+
+
+def test_registered_step_without_display_metadata_can_be_queued(monkeypatch) -> None:
+    monkeypatch.setitem(REFRESH_SCOPE_STEPS, "all", ["refresh_data", "future_step"])
+    steps = build_progress_steps("all")
+    assert steps[1]["key"] == steps[1]["label"] == "future_step"
+    assert steps[1]["status"] == "pending"
+    assert steps[1]["percent"] == 0

@@ -78,6 +78,10 @@ def inputs(tmp_path, monkeypatch):
     left = replace(
         DEFAULT_LEFT_SIDE_RANKING_CONFIG,
         enabled=True,
+        # These fixtures exercise the still-supported v4 score/shadow schema.
+        engine='legacy',
+        factor_contract_sha256=LEFT_SIDE_FACTOR_CONTRACT_SHA256,
+        score_schema_version=LEFT_SIDE_SCORE_SCHEMA_VERSION,
         paths=replace(
             DEFAULT_LEFT_SIDE_RANKING_CONFIG.paths,
             score_output=tmp_path / "left/scores.parquet",

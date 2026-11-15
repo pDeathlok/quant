@@ -7,6 +7,8 @@ describes *what* must be current and how changes propagate; runtime adapters in
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from enum import Enum
@@ -115,7 +117,7 @@ class DependencyEdge:
 
 @dataclass(frozen=True)
 class EvidenceSpec:
-    """One runtime freshness probe, tried in declaration order."""
+    """One runtime freshness probe; every required probe must be valid."""
 
     adapter: str
     locator: str
@@ -311,7 +313,7 @@ class DependencyRegistry:
         self.topological_order()
 
     def topological_order(self, node_ids: Iterable[str] | None = None) -> tuple[str, ...]:
-        selected = set(node_ids or self.nodes)
+        selected = set(self.nodes if node_ids is None else node_ids)
         visiting: set[str] = set()
         visited: set[str] = set()
         ordered: list[str] = []
@@ -696,6 +698,13 @@ def build_default_daily_dependency_registry(
         else SelectorRankingSource(str(selector_ranking_source))
     )
     left_side_enabled = DEFAULT_LEFT_SIDE_RANKING_CONFIG.enabled
+    from quant.application.portfolio_application import load_portfolio_config
+    portfolio_config = load_portfolio_config()
+    portfolio_enabled = portfolio_config['enabled']
+    left_config = DEFAULT_LEFT_SIDE_RANKING_CONFIG
+    left_ranknet = left_config.engine == "rank_fusion"
+    left_paths = {key: getattr(left_config.paths, key).relative_to(Path(__file__).resolve().parents[3]).as_posix()
+                  for key in ["feature_output", "feature_manifest", "score_output", "score_manifest", "artifact", "artifact_manifest"]}
     two_unified_rankers_active = (
         configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED
         and left_side_enabled
@@ -768,7 +777,8 @@ def build_default_daily_dependency_registry(
         DependencyNode(
             "data.csi300_daily", Layer.DATA_SOURCE, "routine.reference_data_refresh",
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (),
-            _exact(_result("refresh_reference_inputs.steps.index_000300", "latest_trade_date")),
+            _exact(_result("refresh_reference_inputs.steps.index_000300", "latest_trade_date"),
+                   *((_result("refresh_reference_inputs.steps.index_000300.rank_indices", "latest_trade_date"),) if left_ranknet else ())),
             IncrementalPolicy("trade_date", ("ts_code", "trade_date"),
                               poll_overlap_calendar_days=10),
             "refresh_index_000300",
@@ -776,7 +786,8 @@ def build_default_daily_dependency_registry(
                 "src/quant/routine/reference_data_refresh.py",
                 "src/quant/data/tushare_fetcher.py",
             ),
-            outputs=("data/raw/index_000300.SH.parquet",),
+            outputs=tuple(f"data/raw/index_{code}.parquet" for code in
+                          dict.fromkeys(("000300.SH", *left_config.required_indices))),
             result_aliases=("refresh_reference_inputs.steps.index_000300",),
             ui_step="refresh_data", ui_order=12, final_gate=True,
         ),
@@ -955,6 +966,19 @@ def build_default_daily_dependency_registry(
             _exact(), _daily_incremental(keys=("trade_date", "ts_code")),
             "refresh_tradability_for_research", outputs=("data/raw/tradability/YYYYMMDD.parquet",),
             notes="No active production consumer; refreshed only by research/backtest jobs.",
+        ),
+        DependencyNode(
+            "data.rank_flows", Layer.DATA_SOURCE, "data.long_factor_backfill",
+            Lifecycle.PRODUCTION if left_ranknet else Lifecycle.RETIRED,
+            Cadence.EVENT_POLL_DAILY if left_ranknet else Cadence.ON_DEMAND, (),
+            _polled(_result("refresh_reference_inputs.steps.long_factor_sources.datasets.moneyflow", "polled_through"),
+                    _result("refresh_reference_inputs.steps.long_factor_sources.datasets.margin_detail", "polled_through")),
+            IncrementalPolicy(write_mode="upsert_target_partition", context_lookback_calendar_days=60),
+            "refresh_long_research_external",
+            outputs=("data/raw/margin_detail", "data/raw/moneyflow"),
+            contract_sources=("src/quant/routine/reference_data_refresh.py", "src/quant/data/long_factor_backfill.py"),
+            final_gate=True,
+            notes="Shared strictly previous-observation inputs for the deployed ranker.",
         ),
         DependencyNode(
             "data.long_research_external", Layer.DATA_SOURCE, "data.long_factor_backfill",
@@ -1299,7 +1323,7 @@ def build_default_daily_dependency_registry(
             "routine.right_side_unified_production",
             Lifecycle.PRODUCTION,
             Cadence.TRADE_DAILY,
-            (_edge("data.market_daily"), _edge("feature.strategy_signals")),
+            (_edge("data.market_daily"), _edge("feature.strategy_signals"), _edge("feature.project_daily")),
             _exact(
                 _file("data/features/right_side_unified/latest_features.parquet"),
                 _json(
@@ -1412,21 +1436,22 @@ def build_default_daily_dependency_registry(
             (
                 _edge("data.market_daily"),
                 _edge("feature.strategy_signals"),
-                _edge("feature.project_daily"),
+                *(() if left_ranknet else (_edge("feature.project_daily"),)),
+                *((_edge("data.daily_basic"), _edge("data.csi300_daily"), _edge("data.rank_flows"), _edge("data.top_list")) if left_ranknet else ()) ,
             ),
             _exact(
-                _file("data/features/left_side_unified/latest_features.parquet"),
+                _file(left_paths["feature_output"]),
                 _json(
-                    "data/features/left_side_unified/feature_manifest.json",
+                    left_paths["feature_manifest"],
                     "target_date",
                     predicate_field="candidate_coverage_status",
                     expected_value="complete",
                 ),
                 _json(
-                    "data/features/left_side_unified/feature_manifest.json",
+                    left_paths["feature_manifest"],
                     "target_date",
                     predicate_field="factor_contract_sha256",
-                    expected_value=LEFT_SIDE_FACTOR_CONTRACT_SHA256,
+                    expected_value=left_config.factor_contract_sha256,
                 ),
             ),
             _daily_incremental(calendar_days=550, keys=("date", "symbol")),
@@ -1440,8 +1465,8 @@ def build_default_daily_dependency_registry(
                 "src/quant/routine/left_side_unified_production.py",
             ),
             outputs=(
-                "data/features/left_side_unified/latest_features.parquet",
-                "data/features/left_side_unified/feature_manifest.json",
+                left_paths["feature_output"],
+                left_paths["feature_manifest"],
             ),
             result_aliases=("left_side_unified_features",),
             ui_step="left_side_unified_features",
@@ -1458,15 +1483,15 @@ def build_default_daily_dependency_registry(
             Cadence.TRADE_DAILY if left_side_enabled else Cadence.ON_DEMAND,
             (_edge("feature.left_side_unified", ColumnMode.MODEL_ARTIFACT),),
             _exact(
-                _file("data/features/left_side_unified/latest_scores.parquet"),
+                _file(left_paths["score_output"]),
                 _json(
-                    "data/features/left_side_unified/score_manifest.json",
+                    left_paths["score_manifest"],
                     "target_date",
                     predicate_field="schema_version",
-                    expected_value=LEFT_SIDE_SCORE_SCHEMA_VERSION,
+                    expected_value=left_config.score_schema_version,
                 ),
                 _json(
-                    "data/features/left_side_unified/score_manifest.json",
+                    left_paths["score_manifest"],
                     "target_date",
                     predicate_field="selector_adapter_status",
                     expected_value="ready",
@@ -1481,24 +1506,18 @@ def build_default_daily_dependency_registry(
                 "src/quant/routine/left_side_unified_production.py",
             ),
             outputs=(
-                "data/features/left_side_unified/latest_scores.parquet",
-                "data/features/left_side_unified/score_manifest.json",
+                left_paths["score_output"],
+                left_paths["score_manifest"],
             ),
             result_aliases=("left_side_unified_scores",),
             ui_step="left_side_unified_score",
             ui_order=44,
             artifact=ArtifactSpec(
-                (
-                    "models/production/left_side_unified_canonical_v4_group4/"
-                    "ranking.joblib",
-                ),
-                "bundle_features",
+                (left_paths["artifact"],),
+                "rank_fusion_manifest" if left_ranknet else "bundle_features",
                 "feature.left_side_unified",
-                manifest_path=(
-                    "models/production/left_side_unified_canonical_v4_group4/"
-                    "manifest.json"
-                ),
-                expected_schema=LEFT_SIDE_ARTIFACT_SCHEMA_VERSION,
+                manifest_path=left_paths["artifact_manifest"],
+                expected_schema="rank-fusion-v1" if left_ranknet else LEFT_SIDE_ARTIFACT_SCHEMA_VERSION,
             ),
             final_gate=True,
             notes="Ranking-only output with daily cross-sectional percentile normalization.",
@@ -1510,7 +1529,8 @@ def build_default_daily_dependency_registry(
              *((_edge("score.b1"),) if not left_side_enabled else ()),
              *((_edge("score.z_skill"),) if not two_unified_rankers_active else ()),
              *((_edge("score.right_side_unified"),) if configured_source == SelectorRankingSource.RIGHT_SIDE_UNIFIED else ()),
-             *((_edge("score.left_side_unified"),) if left_side_enabled else ())),
+             *((_edge("score.left_side_unified"),) if left_side_enabled else ()),
+             *((_edge("score.application_portfolio"),) if portfolio_enabled else ())),
             _exact(_result("selector_extended", "signal_date")),
             _daily_incremental(keys=("date", "symbol")), "build_selector_payload",
             contract_sources=(
@@ -1789,7 +1809,7 @@ def build_default_daily_dependency_registry(
             (_edge("score.left_side_unified"),),
             _exact(
                 _json(
-                    "data/features/left_side_unified/score_manifest.json",
+                    left_paths["score_manifest"],
                     "target_date",
                     predicate_field="selector_adapter_status",
                     expected_value="ready",
@@ -1803,7 +1823,7 @@ def build_default_daily_dependency_registry(
                 "src/quant/routine/left_side_unified_production.py",
                 "src/quant/webapp/services.py",
             ),
-            outputs=("data/features/left_side_unified/score_manifest.json",),
+            outputs=(left_paths["score_manifest"],),
             result_aliases=("left_side_unified_adapter",),
             ui_step="left_side_unified_adapter",
             ui_order=46,
@@ -1887,7 +1907,13 @@ def build_default_daily_dependency_registry(
             "product.long_pools", Layer.PRODUCT, "webapp.services.long",
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
             (_edge("feature.long_snapshot"),),
-            _exact(_result("long_stock_pool.variants.0", "signal_date")), _daily_incremental(),
+            _exact(
+                *(EvidenceSpec(
+                    "result_variant", "long_stock_pool.variants", "signal_date",
+                    predicate_field="variant", expected_value=variant,
+                ) for variant in ("tea", "tea_safe", "v44")),
+                _result("long_stock_pool.blood_chip", "signal_date"),
+            ), _daily_incremental(),
             "refresh_long_stock_pool_variants", result_aliases=("long_stock_pool",),
             publication_outputs=("data/long_stock_pool_snapshots", "data/blood_chip_long_snapshots"),
             contract_sources=(
@@ -1923,7 +1949,13 @@ def build_default_daily_dependency_registry(
         DependencyNode(
             "product.transition", Layer.PRODUCT, "application.workspaces.transition",
             Lifecycle.PRODUCTION, Cadence.TRADE_DAILY, (_edge("data.market_daily"), _edge("data.stock_basic"), _edge("data.csi300_daily")),
-            _exact(_result("byd_daily_plan", "signal_date")), _daily_incremental(lookback=250),
+            _exact(
+                _result("byd_daily_plan", "signal_date"),
+                *(EvidenceSpec(
+                    "result_variant", "byd_daily_plan.variants", "signal_date",
+                    predicate_field="variant", expected_value=variant,
+                ) for variant in ("return", "win")),
+            ), _daily_incremental(lookback=250),
             "build_transition_daily_workspace", result_aliases=("byd_daily_plan",),
             publication_outputs=("data/workspace_snapshots",),
             contract_sources=("src/quant/application/workspaces/transition.py", "src/quant/features/variable_library.py", "src/quant/data/source_merge.py", "src/quant/data/amount_units.py"),
@@ -1957,6 +1989,22 @@ def build_default_daily_dependency_registry(
             notes="Seven research-only v1/v2 artifacts have no production page consumer.",
         ),
     ]
+    if portfolio_enabled:
+        portfolio_outputs = tuple(portfolio_config[key] for key in ['rankings', 'inputs', 'manifest'])
+        nodes.append(DependencyNode(
+            'score.application_portfolio', Layer.MODEL_SCORE, 'quant.routine.application_portfolio_production',
+            Lifecycle.PRODUCTION, Cadence.TRADE_DAILY,
+            tuple(_edge(key) for key in ['score.left_side_unified', 'score.right_side_unified',
+                'data.market_daily', 'data.daily_basic', 'data.csi300_daily', 'data.rank_flows', 'data.top_list']),
+            _exact(_file(portfolio_config['rankings']),
+                   _json(portfolio_config['manifest'], 'target_date', predicate_field='status', expected_value='success')),
+            _daily_incremental(keys=('date', 'sleeve', 'symbol')), 'run_application_portfolio',
+            outputs=portfolio_outputs, publication_outputs=portfolio_outputs,
+            contract_sources=('configs/strategies/application_portfolio.json',
+                'src/quant/routine/application_portfolio_production.py', 'src/quant/ml/portfolio_policy.py'),
+            result_aliases=('application_portfolio',), ui_step='application_portfolio', ui_order=45,
+            final_gate=True,
+        ))
     scopes = {
         "all": (
             "product.short_snapshot", "product.chan", "product.long_pools",
@@ -1986,6 +2034,8 @@ def required_source_options(scope: str) -> dict[str, Any]:
     long_datasets: list[str] = []
     if "data.top_list" in active:
         long_datasets.append("top_list")
+    if "data.rank_flows" in active:
+        long_datasets.extend(("margin_detail", "moneyflow"))
     if "data.long_research_external" in active:
         long_datasets.extend(("margin_detail", "moneyflow", "holder_trade_recent"))
     return {

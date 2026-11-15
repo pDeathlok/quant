@@ -21,7 +21,9 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from quant.application.daily_dependencies import (
     DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+    DependencyRegistry,
 )
+from quant.routine.operation_registry import OperationRegistry
 from quant.routine.dag_executor import DailyDagExecutor, ResourceBudget
 from quant.routine.checkpoint_store import CheckpointStore
 from quant.routine.default_operations import DEFAULT_DAILY_OPERATION_REGISTRY, build_default_operation_registry
@@ -44,24 +46,50 @@ def production_dag_mode(scope: str) -> str:
     return mode
 
 
+def production_output_node_ids(
+    scope: str, *, completed_operation_ids: Iterable[str] = (),
+    dependencies: DependencyRegistry = DEFAULT_DAILY_DEPENDENCY_REGISTRY,
+    operations: OperationRegistry = DEFAULT_DAILY_OPERATION_REGISTRY,
+) -> tuple[str, ...]:
+    """Schedule registered executable outputs, not a second model allowlist.
+
+    Source/workspace callbacks retain their composition owners. Completed
+    operations are excluded as a unit, including every node they produce.
+    """
+    required = dependencies.required_node_ids(scope)
+    operations.validate_against_dependencies(dependencies, node_ids=required)
+    completed = set(completed_operation_ids)
+    return tuple(
+        node_id for node_id in required
+        if operations.definitions[dependencies.nodes[node_id].operation_id].production_ready
+        and dependencies.nodes[node_id].operation_id not in completed
+    )
+
+
 @contextmanager
 def sealed_core_market_inputs(project_root: Path) -> Iterator[InputSnapshot]:
     """Acquire only after source writes, retain bytes until all core workers finish."""
     from quant.data import MarketDataStore, MarketDataStoreConfig
-    from quant.data.market_snapshot import export_market_snapshot, pinned_market_snapshot
+    from quant.data.market_snapshot import export_market_snapshot, pinned_market_snapshot, release_market_snapshot_reader
     from quant.routine.checkpoint_store import canonical_fingerprint
     from quant.routine.operation_identity import dataset_manifest_changes
     from quant.infrastructure.publication import publication_path
 
     store = MarketDataStore(MarketDataStoreConfig.from_env(root=project_root / "data/raw"))
+    from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+    supplemental = {
+        "daily_basic": project_root / "data/raw/daily_basic",
+        "top_list": project_root / "data/raw/top_list",
+    }
+    if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion":
+        supplemental.update({kind: project_root / 'data/raw' / kind for kind in ('moneyflow', 'margin_detail')})
+        supplemental.update({f"index_{code.replace('.', '_')}": project_root / f'data/raw/index_{code}.parquet'
+                             for code in DEFAULT_LEFT_SIDE_RANKING_CONFIG.required_indices})
     with TemporaryDirectory(prefix="quant-core-market-") as directory:
         started = monotonic()
         sealed = export_market_snapshot(
-            store, Path(directory) / "sealed", datasets=("daily", "daily_basic", "top_list"),
-            supplemental_sources={
-                "daily_basic": project_root / "data/raw/daily_basic",
-                "top_list": project_root / "data/raw/top_list",
-            },
+            store, Path(directory) / "sealed", datasets=("daily", *supplemental),
+            supplemental_sources=supplemental,
         )
         manifest = json.loads(sealed.manifest_path.read_text())
         if (not isinstance(manifest, dict) or manifest.get("fingerprint") != sealed.fingerprint
@@ -97,11 +125,17 @@ def sealed_core_market_inputs(project_root: Path) -> Iterator[InputSnapshot]:
             },
             changes=NodeChanges(full_rebuild=True),
         )
-        with pinned_market_snapshot(sealed.manifest_path) as acquired:
-            if acquired.fingerprint != sealed.fingerprint:
-                raise ValueError("Pinned market fingerprint changed after export acquisition")
-            with pinned_market_inputs(snapshot):
-                yield snapshot
+        del previous, manifest  # Consumers use the verified pinned reader below.
+        try:
+            with pinned_market_snapshot(sealed.manifest_path) as acquired:
+                if acquired.fingerprint != sealed.fingerprint:
+                    raise ValueError("Pinned market fingerprint changed after export acquisition")
+                with pinned_market_inputs(snapshot):
+                    yield snapshot
+        finally:
+            # This owner has joined every consumer before leaving the pin.
+            # Do not retain the large reader for a soon-deleted temporary export.
+            release_market_snapshot_reader(sealed.manifest_path)
 
 
 CORE_SOURCE_MANIFEST = "data/cache/routine_source_manifests/core.json"
@@ -152,6 +186,7 @@ def production_stage_inputs(
     project_root: Path, node_ids: Iterable[str], *,
     changes: Mapping[str, NodeChanges] | None = None,
     completed_snapshots: Mapping[str, InputSnapshot] | None = None,
+    target_trade_date: str | None = None,
 ) -> dict[str, InputSnapshot]:
     """Resolve only external inputs; never disguise stage outputs as inputs."""
     selected = {
@@ -173,7 +208,7 @@ def production_stage_inputs(
     return {
         **core_input_snapshots(
             project_root, sorted(external - carried.keys()),
-            canonical_market=require_pinned_market(), changes=changes,
+            canonical_market=require_pinned_market(), changes=changes, target_trade_date=target_trade_date,
         ),
         **carried,
     }

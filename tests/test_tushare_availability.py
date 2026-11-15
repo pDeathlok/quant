@@ -189,7 +189,8 @@ def run_workflow(monkeypatch, tmp_path, clock, terminals, max_attempts=1):
         def get_status(self):
             return self.terminal
 
-        def start_refresh(self, scope):
+        def start_refresh(self, scope, *, trade_date=None):
+            assert trade_date == "2026-08-28"
             self.starts += 1
             self.terminal = terminals.pop(0)
             return {"status": "queued"}

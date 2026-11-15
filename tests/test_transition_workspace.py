@@ -1,5 +1,5 @@
 import numpy as np,pandas as pd,pytest
-from quant.application.workspaces.transition import build_plan,market_state,INDICES,save_account,get_account,symbol_features
+from quant.application.workspaces.transition import build_plan,market_state,INDICES,save_account,get_account,symbol_features,workspace
 from quant.research.multiregime_features import causal_features
 CAL=pd.bdate_range('2025-01-01',periods=100)
 def fixture(policy='return',prices=None,entry=10,signal=25,cash=900000,confirmed=True):
@@ -32,9 +32,31 @@ def test_win_stop_and_profit_have_separate_explicit_reasons():
  prices[25]=94
  p=build_plan(*fixture('win',prices));assert '止损' in p['sells'][0]['reason']
 
-def test_market_state_change_does_not_force_exit():
- args=list(fixture());args[4]['state']='bear';p=build_plan(*args)
- assert not p['sells'] and p['holds'][0]['action']=='HOLD' and not p['can_open_new']
+@pytest.mark.parametrize('state,mode', [
+ ('bull', 'research'), ('pullback', 'research'), ('transition', 'conditional_entry'),
+ ('rebound', 'research'), ('bear', 'cash'), ('unavailable', 'blocked'),
+])
+def test_market_state_routes_entry_without_replacing_holding_rules(state, mode):
+ args=list(fixture())
+ args[4]['state']=state
+ args[2].append({**args[2][0], 'symbol': '300002.SZ'})
+ plan=build_plan(*args)
+ assert plan['market_strategy']['mode']==mode
+ assert {profile['state'] for profile in plan['strategy_states']}=={'bull','bear','pullback','rebound','transition'}
+ assert not plan['sells'] and plan['holds'][0]['action']=='HOLD'
+ if mode=='conditional_entry':
+  assert plan['can_open_new'] and any(row['action']=='BUY' for row in plan['buys'])
+ else:
+  assert not plan['can_open_new'] and plan['buys']==[] and plan['per_stock_budget']==0
+
+def test_unavailable_data_keeps_the_market_strategy_catalog(tmp_path, monkeypatch):
+ def fail(*args):
+  raise ValueError('行情待更新')
+ monkeypatch.setattr('quant.application.workspaces.transition.load_inputs',fail)
+ plan=workspace(tmp_path)
+ assert plan['status']=='blocked'
+ assert plan['market_strategy']['mode']=='blocked'
+ assert len(plan['strategy_states'])==5
 
 def test_missing_holding_quote_blocks_buys_without_discarding_position():
  args=list(fixture());args[2][0]['date']=str(CAL[24].date());p=build_plan(*args)

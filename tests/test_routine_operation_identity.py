@@ -45,9 +45,16 @@ def test_runtime_contract_change_cannot_save_a_successful_checkpoint(tmp_path, m
     assert not list((tmp_path / "checkpoints").glob("*.json"))
 
 
-def test_all_five_core_operations_have_complete_declared_inputs_and_model_contracts():
-    assert len(CORE_OPERATION_INPUTS) == 5
-    for operation_id, inputs in CORE_OPERATION_INPUTS.items():
+def test_all_registered_core_operations_have_complete_declared_inputs_and_model_contracts():
+    active_core = {
+        key for key, definition in DEFAULT_DAILY_OPERATION_REGISTRY.definitions.items()
+        if definition.production_ready
+    }
+    assert {"refresh_strategy_signal_cache", "refresh_active_project_features",
+            "run_right_side_unified", "run_left_side_unified", "refresh_chan_model_scores"} <= active_core
+    assert active_core <= CORE_OPERATION_INPUTS.keys()
+    for operation_id in active_core:
+        inputs = CORE_OPERATION_INPUTS[operation_id]
         definition = DEFAULT_DAILY_OPERATION_REGISTRY.definitions[operation_id]
         assert definition.input_ids == inputs
         assert definition.cache.track_python_imports

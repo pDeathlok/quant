@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import os
+
 from dataclasses import replace
 import hashlib
 import json
@@ -27,22 +29,33 @@ from quant.routine.operation_registry import OperationRegistry
 
 
 CORE_OPERATION_INPUTS = {
+    "run_application_portfolio": (
+        "score.left_side_unified", "score.right_side_unified", "data.market_daily",
+        "source.market_daily_parquet", "data.daily_basic", "data.csi300_daily", "data.rank_flows", "data.top_list",
+    ),
     "refresh_strategy_signal_cache": ("data.market_daily", "source.market_daily_parquet"),
     "refresh_active_project_features": (
         "data.market_daily", "source.market_daily_parquet", "data.daily_basic", "feature.strategy_signals",
     ),
     "run_right_side_unified": (
         "data.market_daily", "source.market_daily_parquet",
-        "feature.strategy_signals", "feature.project_daily",
+        "feature.strategy_signals", "feature.project_daily", "source.short_etf_rank",
     ),
     "run_left_side_unified": (
         "data.market_daily", "source.market_daily_parquet", "data.daily_basic",
-        "feature.strategy_signals", "feature.project_daily",
+        "feature.strategy_signals", "feature.project_daily", "source.short_etf_rank",
     ),
     "refresh_chan_model_scores": (
         "data.market_daily", "source.market_daily_parquet", "data.daily_basic", "data.top_list",
     ),
 }
+
+from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion":
+    CORE_OPERATION_INPUTS["run_left_side_unified"] = (
+        "data.market_daily", "source.market_daily_parquet", "data.daily_basic",
+        "feature.strategy_signals", "data.csi300_daily", "data.rank_flows", "data.top_list", "source.short_etf_rank",
+    )
 
 # These are atomic ownership groups of existing executable routines, not
 # independently cacheable nodes. The web composition supplies the real callback.
@@ -71,6 +84,11 @@ COMPOSED_OPERATION_GROUPS = {
 }
 
 _IMPLEMENTATION_PATHS = {
+    "run_application_portfolio": (
+        "src/quant/routine/application_portfolio_production.py", "src/quant/routine/rank_feature_runtime.py",
+        "src/quant/ml/portfolio_policy.py", "src/quant/ml/application_portfolio.py",
+        "src/quant/ml/portfolio_neural_worker.py", "src/quant/application/portfolio_application.py",
+    ),
     "refresh_strategy_signal_cache": (
         "src/quant/research/strategy_signal_cache.py", "src/quant/research/b1_family_rules.py",
         "src/quant/research/z_skill_rules.py", "src/quant/research/rule_windows.py",
@@ -87,6 +105,8 @@ _IMPLEMENTATION_PATHS = {
     "run_left_side_unified": (
         "src/quant/routine/project_feature_cache.py", "src/quant/features/left_side_v5_shadow.py",
         "src/quant/features/candlestick_context.py",
+        "src/quant/routine/left_ranknet_production.py", "src/quant/routine/rank_feature_runtime.py",
+        "src/quant/features/rank_runtime.py", "src/quant/ml/rank_fusion.py",
     ),
     "refresh_chan_model_scores": (
         "scripts/research/refresh_chan_model_live_scores.py", "scripts/research/backtest_chan_daily.py",
@@ -114,6 +134,14 @@ def _core_model_contracts(operation_id: str) -> tuple[str, ...]:
     from quant.application.selector_ranking import DEFAULT_SELECTOR_RANKING_CONFIG
     from quant.routine.paths import PROJECT_ROOT
 
+    if operation_id == "run_application_portfolio":
+        from quant.application.portfolio_application import load_portfolio_config, CONFIG
+        config = load_portfolio_config(PROJECT_ROOT)
+        if not config['enabled']:
+            return (CONFIG,)
+        policy_path = PROJECT_ROOT / config['policy']
+        policy = json.loads(policy_path.read_text())
+        return (CONFIG, config['policy'], *(str((policy_path.parent / name).relative_to(PROJECT_ROOT)) for name in policy['files']))
     if operation_id == "run_right_side_unified":
         paths = DEFAULT_SELECTOR_RANKING_CONFIG.paths
         return tuple(path.relative_to(PROJECT_ROOT).as_posix() for path in (
@@ -121,9 +149,14 @@ def _core_model_contracts(operation_id: str) -> tuple[str, ...]:
         ))
     if operation_id == "run_left_side_unified":
         paths = DEFAULT_LEFT_SIDE_RANKING_CONFIG.paths
-        return tuple(path.relative_to(PROJECT_ROOT).as_posix() for path in (
+        components = ()
+        if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion":
+            manifest = json.loads(paths.artifact_manifest.read_text())
+            components = tuple(paths.artifact_manifest.parent / c["file"] for c in manifest["components"])
+        return tuple(dict.fromkeys(path.relative_to(PROJECT_ROOT).as_posix() for path in (
             paths.artifact, paths.artifact_manifest, paths.ranking_decision,
-        ))
+            *components,
+        )))
     if operation_id == "refresh_chan_model_scores":
         return tuple(f"models/research/chan_daily/{target}.joblib" for target in (
             "target_win10", "target_big10", "target_good",
@@ -132,6 +165,7 @@ def _core_model_contracts(operation_id: str) -> tuple[str, ...]:
 
 
 _RESOURCE_PROFILES: dict[str, ResourceClaim] = {
+    "run_application_portfolio": ResourceClaim(4, 2, 6144, None, 4, 4),
     "refresh_data": ResourceClaim(1, 1, 768, "tushare", 1, 1),
     "refresh_daily_basic": ResourceClaim(1, 1, 768, "tushare", 1, 1),
     "refresh_index_000300": ResourceClaim(1, 1, 512, "tushare", 1, 1),
@@ -142,7 +176,9 @@ _RESOURCE_PROFILES: dict[str, ResourceClaim] = {
     "refresh_strategy_signal_cache": ResourceClaim(8, 1, 2560, None, 8, 8),
     "refresh_active_project_features": ResourceClaim(6, 1, 2560, None, 6, 6),
     "run_right_side_unified": ResourceClaim(6, 1, 2048, None, 6, 6),
-    "run_left_side_unified": ResourceClaim(2, 1, 1024, None, 2, 2),
+    "run_left_side_unified": (ResourceClaim(4, min(2, max(1, int(os.getenv("ROUTINE_IO_SLOTS", "4")))), 6144, None, 4, 4)
+                              if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == "rank_fusion"
+                              else ResourceClaim(2, 1, 1024, None, 2, 2)),
     "refresh_chan_model_scores": ResourceClaim(4, 1, 2048, None, 4, 4),
     "build_selector_payload": ResourceClaim(1, 1, 1536, None, 1, 1),
     "refresh_long_factor_snapshot": ResourceClaim(4, 1, 2048, None, 4, 4),
@@ -161,6 +197,7 @@ _APPEND_STATE_OPERATIONS = {
 }
 
 _ENTRYPOINTS = {
+    "run_application_portfolio": "quant.routine.application_portfolio_production:run_operation",
     "refresh_strategy_signal_cache": (
         "quant.routine.operation_adapters:refresh_strategy_signals"
     ),
@@ -265,13 +302,19 @@ def build_default_operation_registry(
                 resources=_default_claim(operation_id),
                 cache=CachePolicy(
                     mode=mode,
+                    # These workers materialize the same full date-level rows
+                    # for every caller; short/all must not retrain them twice.
+                    scope_invariant=operation_id in CORE_OPERATION_INPUTS,
                     contract_version=_contract_version(operation_id, nodes),
                     output_paths=outputs,
                     contract_paths=contract_paths,
                     optional_contract_paths=(
-                        ((".env", "models/shadow/left_side_absolute_v5")
-                         if operation_id == "run_left_side_unified" else (".env",))
-                        if operation_id in CORE_OPERATION_INPUTS else ()
+                        (".env",) if operation_id in CORE_OPERATION_INPUTS else ()
+                    ) + (
+                        ("configs/strategies/short_etf_rank.json",)
+                        if operation_id in {"run_left_side_unified", "run_right_side_unified"} else ()
+                    ) + (
+                        ("models/shadow/left_side_absolute_v5",) if operation_id == "run_left_side_unified" else ()
                     ),
                     environment_keys=(
                         ("ROUTINE_PRODUCTION_FACTOR_SCHEMA", "PROJECT_FACTOR_COMPATIBILITY_MODE",

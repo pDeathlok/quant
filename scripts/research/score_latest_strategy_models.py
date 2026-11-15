@@ -383,7 +383,9 @@ def build_latest_dataset(
     return data
 
 
-def ensure_model_features(data: pd.DataFrame, models: dict) -> pd.DataFrame:
+def ensure_model_features(
+    data: pd.DataFrame, models: dict, *, daily_basic_dir: Path | None = None,
+) -> pd.DataFrame:
     out = data.copy()
     required_features = list(
         dict.fromkeys(
@@ -404,6 +406,7 @@ def ensure_model_features(data: pd.DataFrame, models: dict) -> pd.DataFrame:
         required_features,
         target_date=target_date,
         context="Z-skill latest scoring",
+        daily_basic_dir=daily_basic_dir,
     )
     for label_name in LABELS:
         col = f"pred_{label_name}"
@@ -476,7 +479,7 @@ def main() -> None:
         feature_coverage = _empty_feature_coverage(models, target_date_text)
         predicted = data.copy()
     else:
-        data = ensure_model_features(data, models)
+        data = ensure_model_features(data, models, daily_basic_dir=args.daily_dir.parent / "daily_basic")
         feature_coverage = dict(data.attrs["feature_coverage"])
         predicted = add_predictions(data, models, signals)
     playbook_path = args.output_dir / "latest_z_skill_model_operational_playbook.csv"

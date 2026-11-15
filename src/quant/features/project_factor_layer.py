@@ -355,6 +355,7 @@ def calculate_project_market_factors(
     symbol: str = "",
     *,
     shared_factors: pd.DataFrame | None = None,
+    legacy_factors: pd.DataFrame | None = None,
     factor_schema_version: str | None = None,
 ) -> pd.DataFrame:
     """Return model-ready keys plus every project OHLCV-derived factor."""
@@ -368,10 +369,10 @@ def calculate_project_market_factors(
         if schema == LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION
         else build_continuous_ohlc
     )
-    legacy = calculate_legacy_market_factors(
-        prepared,
-        factor_schema_version=schema,
-    )
+    legacy = (calculate_legacy_market_factors(prepared, factor_schema_version=schema)
+              if legacy_factors is None else legacy_factors.reset_index(drop=True))
+    if len(legacy) != len(prepared):
+        raise ValueError("Shared legacy factors do not match daily rows")
     shared = (
         calculate_project_extra_features(prepared, price_builder=price_builder)
         if shared_factors is None or schema == LEGACY_PRODUCTION_FACTOR_SCHEMA_VERSION

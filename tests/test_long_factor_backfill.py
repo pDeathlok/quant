@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from quant.data.long_factor_backfill import (
     RequestPolicy,
@@ -11,7 +12,46 @@ from quant.data.long_factor_backfill import (
     fetch_complete_date_range,
     fetch_complete_pages,
     merge_deduplicated,
+    TRADE_DATE_DATASETS,
 )
+
+
+@pytest.mark.parametrize('dataset', ['moneyflow', 'margin_detail'])
+def test_empty_trading_day_flow_cache_is_repaired_and_then_reused(tmp_path, dataset):
+    spec = TRADE_DATE_DATASETS[dataset]
+    day = '20260811'
+    raw, audit = tmp_path/'raw', tmp_path/'audit'
+    audit.mkdir()
+    folder = raw/spec['directory']; folder.mkdir(parents=True)
+    path = folder/f"{spec['prefix']}_{day}.parquet"
+    pd.DataFrame(columns=sorted(spec['required'])).to_parquet(path, index=False)
+    calls = []
+    def fetch(*, trade_date):
+        calls.append(trade_date)
+        row = {key: 1. for key in spec['required']}
+        row.update(ts_code='000001.SZ', trade_date=trade_date)
+        return pd.DataFrame([row])
+    pro = type('Pro', (), {})()
+    setattr(pro, spec['method'], fetch)
+    first = backfill_trade_date_partitions(pro, dataset, day, day, raw, audit,
+                                          trade_dates=[day], policy=RequestPolicy(sleep_seconds=0))
+    second = backfill_trade_date_partitions(pro, dataset, day, day, raw, audit,
+                                           trade_dates=[day], policy=RequestPolicy(sleep_seconds=0))
+    assert first['status'] == 'success' and first['requested'] == 1
+    assert second['requested'] == 0 and calls == [day]
+    assert len(pd.read_parquet(path)) == 1
+
+
+@pytest.mark.parametrize('dataset', ['moneyflow', 'margin_detail'])
+def test_empty_provider_flow_is_never_marked_complete(tmp_path, dataset):
+    spec = TRADE_DATE_DATASETS[dataset]
+    pro = type('Pro', (), {})()
+    setattr(pro, spec['method'], lambda **kwargs: pd.DataFrame(columns=sorted(spec['required'])))
+    audit = tmp_path/'audit'; audit.mkdir()
+    result = backfill_trade_date_partitions(pro, dataset, '20260811', '20260811', tmp_path/'raw', audit,
+                                           trade_dates=['20260811'], policy=RequestPolicy(retries=0, sleep_seconds=0))
+    assert result['status'] == 'failed' and result['success'] == 0
+    assert not list((tmp_path/'raw'/spec['directory']).glob('*.parquet'))
 
 
 class FakePro:

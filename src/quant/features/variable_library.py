@@ -399,7 +399,7 @@ def _align_resampled_kdj(df: pd.DataFrame, rule: str, prefix: str) -> pd.DataFra
     result = pd.DataFrame(index=df.index)
     for col in [f"{prefix}_k", f"{prefix}_d", f"{prefix}_j"]:
         result[col] = np.nan
-    if len(bars) < 10:
+    if bars.empty:
         return result
 
     kdj = KDJ().compute(bars)
@@ -407,6 +407,9 @@ def _align_resampled_kdj(df: pd.DataFrame, rule: str, prefix: str) -> pd.DataFra
     bars[f"{prefix}_k"] = kdj["K"]
     bars[f"{prefix}_d"] = kdj["D"]
     bars[f"{prefix}_j"] = kdj["J"]
+    # Readiness belongs to each historical row, not the eventual length of
+    # the input series. A later listing anniversary cannot unlock old values.
+    bars.loc[bars.index[:9], [f"{prefix}_k", f"{prefix}_d", f"{prefix}_j"]] = np.nan
     left = df[["date"]].dropna().sort_values("date")
     if left.empty:
         return result

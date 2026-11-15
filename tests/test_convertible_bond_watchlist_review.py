@@ -244,6 +244,47 @@ def test_refresh_plan_reuses_daily_update_then_builds_review_from_cache(
     assert output_path.is_file()
 
 
+def test_refresh_plan_uses_watchlist_changed_during_shared_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    output_path = tmp_path / "plan.json"
+    _write_json(watchlist_path, {"updated_at": "before", "symbols": [], "notes": {}})
+    record = _record("300002", "新增股份", "registered")
+
+    def workspace_loader(**kwargs):
+        _write_json(
+            watchlist_path,
+            {"updated_at": "during_refresh", "symbols": ["300002.SZ"], "notes": {}},
+        )
+        return {
+            "generated_at": "2026-08-26T09:00:00",
+            "event_poll_status": "success",
+            "event_polled_through": "2026-08-26",
+            "records": [record],
+        }
+
+    monkeypatch.setattr(
+        review_module,
+        "build_convertible_bond_allotment_payload",
+        lambda **kwargs: {"records": [dict(record)]},
+    )
+
+    plan = generate_watchlist_review_plan(
+        watchlist_path=watchlist_path,
+        output_path=output_path,
+        refresh=True,
+        today=ASOF,
+        workspace_loader=workspace_loader,
+    )
+
+    assert plan["counts"]["watchlist"] == 1
+    assert plan["watchlist_updated_at"] == "during_refresh"
+    assert plan["additions"] == []
+    assert plan["watchlist_sha256"] == _sha256_path(watchlist_path)
+
+
 def test_refresh_plan_rejects_daily_and_review_result_mismatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

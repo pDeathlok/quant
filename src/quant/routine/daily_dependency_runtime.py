@@ -30,6 +30,7 @@ from quant.application.daily_dependencies import (
     state_is_current,
 )
 from quant.data.atomic_io import atomic_write_json
+from quant.application.page_refresh_coverage import page_refresh_coverage_report
 from quant.features.factor_registry import (
     FACTOR_REGISTRY,
     LONG_PRODUCTION_FACTOR_COLUMNS,
@@ -169,8 +170,13 @@ def _manifest_hashes(project_root: Path, manifest_path: str | None) -> dict[str,
 def _extract_artifact(path: Path, extractor: str) -> dict[str, Any]:
     import joblib
 
-    artifact = joblib.load(path)
-    if extractor == "sklearn_feature_names":
+    artifact = _read_json(path) if extractor == "rank_fusion_manifest" else joblib.load(path)
+    if extractor == "rank_fusion_manifest":
+        from quant.ml.rank_fusion import RankFusion
+        fusion = RankFusion.load(path)
+        features = list(fusion.required_features)
+        effective = list(features)
+    elif extractor == "sklearn_feature_names":
         features = [str(value) for value in getattr(artifact, "feature_names_in_", ())]
         effective = [
             str(value)
@@ -452,8 +458,19 @@ def _evidence_value(
             return None
         value = manifest["signal_date"]
         return _parse_date(value), _parse_datetime(value), manifest["data_sha256"]
-    if adapter in {"result", "top_list_poll"}:
+    if adapter in {"result", "result_variant", "top_list_poll"}:
         payload = _lookup(results, locator)
+        if adapter == "result_variant":
+            if not isinstance(payload, (list, tuple)) or not predicate_field:
+                return None
+            matches = [
+                item for item in payload
+                if isinstance(item, Mapping)
+                and _lookup(item, predicate_field) == expected_value
+            ]
+            if len(matches) != 1:
+                return None
+            payload = matches[0]
         if not isinstance(payload, Mapping):
             return None
         if adapter == "top_list_poll":
@@ -647,13 +664,16 @@ def collect_node_states(
                 evidence.predicate_field,
                 evidence.expected_value,
             )
-            if item is None:
+            # A fingerprint alone cannot satisfy a declared date probe.
+            if item is None or (evidence.date_field and item[0] is None):
                 required_missing = required_missing or evidence.required
             else:
                 observed.append(item)
         if required_missing or not observed:
             continue
         dates = [item[0] for item in observed if item[0] is not None]
+        if node.freshness.mode == FreshnessMode.EXACT_TRADE_DATE and len(set(dates)) > 1:
+            continue
         checked = [item[1] for item in observed if item[1] is not None]
         fingerprints = sorted(item[2] for item in observed if item[2])
         watermark = min(dates) if dates else None
@@ -697,7 +717,8 @@ def _feature_catalogs(
         "feature.right_side_unified": tuple(
             RIGHT_SIDE_SHADOW_MODEL_INPUT_COLUMNS
         ),
-        "feature.left_side_unified": tuple(LEFT_SIDE_SCORING_INPUT_COLUMNS),
+        "feature.left_side_unified": (contracts["score.left_side_unified"].required_feature_union
+                                      if "score.left_side_unified" in contracts else tuple(LEFT_SIDE_SCORING_INPUT_COLUMNS)),
     }
 
 
@@ -744,6 +765,8 @@ def resolve_active_source_options(
     datasets: list[str] = []
     if "data.top_list" in active:
         datasets.append("top_list")
+    if "data.rank_flows" in active:
+        datasets.extend(("margin_detail", "moneyflow"))
     if "data.long_research_external" in active:
         datasets.extend(("margin_detail", "moneyflow", "holder_trade_recent"))
     return {
@@ -754,7 +777,7 @@ def resolve_active_source_options(
         "include_index": "data.csi300_daily" in active,
         "include_market_regime": "feature.market_regime" in active,
         "include_tradability": "data.tradability" in active,
-        "long_factor_datasets": tuple(datasets),
+        "long_factor_datasets": tuple(dict.fromkeys(datasets)),
         "include_financials": "data.financial_pit" in active,
         "include_analyst": "data.analyst_pit" in active,
         "active_source_nodes": tuple(
@@ -904,7 +927,8 @@ def _postflight_result_backed_nodes(
     for node_id in active_node_ids:
         node = registry.nodes[node_id]
         if node.outputs or not any(
-            evidence.adapter == "result" for evidence in node.freshness.evidence
+            evidence.adapter in {"result", "result_variant"}
+            for evidence in node.freshness.evidence
         ):
             continue
         current, _ = state_is_current(
@@ -1333,6 +1357,9 @@ def publish_daily_dependency_snapshot(
             ],
         },
         "freshness_audit": freshness_audit,
+        "page_refresh_coverage": page_refresh_coverage_report(
+            registry, scope, target.isoformat(), result_payload,
+        ),
         "registry": registry.as_dict(),
     }
     commit_baseline = bool(
@@ -1387,6 +1414,7 @@ def publish_daily_dependency_snapshot(
         "refresh_node_ids": payload["refresh_node_ids"],
         "refresh_nodes": payload["refresh_nodes"],
         "freshness_audit": freshness_audit,
+        "page_refresh_coverage": payload["page_refresh_coverage"],
         "path": str(output_path),
         "committed_path": str(scope_state_path),
         "dated_path": str(dated_path),
@@ -1395,7 +1423,7 @@ def publish_daily_dependency_snapshot(
 
 def _cli() -> int:
     parser = argparse.ArgumentParser(description="Daily dependency runtime helper")
-    parser.add_argument("--extractor", choices=("sklearn_feature_names", "bundle_features"))
+    parser.add_argument("--extractor", choices=("sklearn_feature_names", "bundle_features", "rank_fusion_manifest"))
     parser.add_argument("--extract-artifacts", nargs="*")
     args = parser.parse_args()
     if args.extract_artifacts is not None:

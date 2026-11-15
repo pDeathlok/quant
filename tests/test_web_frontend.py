@@ -57,14 +57,14 @@ def test_static_assets_use_cache_policy_gzip_and_module_preload() -> None:
     assert '<link rel="modulepreload" href="/core/formatters.js" />' in INDEX_HTML
 
 
-def test_workspace_tabs_use_one_eight_item_contract() -> None:
-    expected_keys = ["short", "chan", "long", "cb", "cbAllotment", "byd", "similar", "plans"]
+def test_workspace_tabs_use_one_ten_item_contract() -> None:
+    expected_keys = ["short", "chan", "long", "cb", "cbAllotment", "byd", "futures", "similar", "plans", "reviews"]
 
     assert "const WORKSPACE_TABS = [" in APP_JS
     assert all(f'key: "{key}"' in APP_JS for key in expected_keys)
     assert "ensureWorkspaceTabs" in APP_JS
     assert "ensureChanTabs" not in APP_JS
-    assert "grid-template-columns: repeat(8, minmax(0, 1fr));" in STYLES_CSS
+    assert "grid-template-columns: repeat(10, minmax(0, 1fr));" in STYLES_CSS
 
 
 def test_operation_plans_tab_supports_durable_crud_and_horizon_filters() -> None:
@@ -440,12 +440,12 @@ def test_short_selector_normalizes_ranks_sorts_and_explains_score_bands() -> Non
     assert "function currentProbabilityBands(calibration, scores)" in APP_JS
     assert "当前池 ${scores.length} 只" in APP_JS
     assert 'data-current-count="${band.current_count}"' in APP_JS
-    assert "仅显示当前股票池覆盖分档及相邻一档" in APP_JS
+    assert "显示完整历史分档，高亮当前股票池所在分档" in APP_JS
     assert 'id="scoreProbabilityBands"' in INDEX_HTML
     assert "score-probability-grid" in STYLES_CSS
     assert ".score-probability-card tr.current-score-band td" in STYLES_CSS
     assert "20260827-short-side-badges-v1-score-normalization-v1" in INDEX_HTML
-    assert "fine-score-bands-v1" in INDEX_HTML
+    assert "fine-score-bands-v2-ranknet" in INDEX_HTML
 
 
 def test_watchlist_rows_support_persistent_drag_order_and_pin_menu() -> None:
@@ -631,7 +631,9 @@ def test_transition_page_distinguishes_next_close_buy_sell_and_hold() -> None:
     assert 'id="transitionSellHold"' in INDEX_HTML
     assert 'id="transitionBuys"' in INDEX_HTML
     assert 'id="transitionExecutionRules"' in INDEX_HTML
-    assert "市场非过渡阶段，次日不开新仓" in APP_JS
+    assert 'id="transitionStrategyStates"' in INDEX_HTML
+    assert 'id="transitionCurrentStrategy"' in INDEX_HTML
+    assert 'p.market_strategy?.decision' in APP_JS
     assert "卖出成交后才释放资金和槽位" in INDEX_HTML
     assert "不会自动记录成交或下单" in INDEX_HTML
     assert "function renderTransitionPage()" in APP_JS

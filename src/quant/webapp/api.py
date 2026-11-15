@@ -6,12 +6,20 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from quant.webapp.review_records import (
+    add_review_record,
+    delete_review_record,
+    get_review_records,
+    update_review_note,
+)
+
 from quant.application.workspaces.convertible_bonds import (
     DEFAULT_CONVERTIBLE_BOND_GRID_LIMIT,
     DEFAULT_ALLOTMENT_INCLUDE_LISTED_DAYS,
     DEFAULT_ALLOTMENT_LIMIT,
     DEFAULT_ALLOTMENT_STAGE_SCOPE,
 )
+from quant.routine.short_etf_flow import read_short_etf_flow
 from quant.webapp.services import (
     add_similar_pattern_watch_symbol,
     get_byd_daily_strategy,
@@ -48,6 +56,51 @@ from quant.webapp.services import (
 
 router = APIRouter()
 SELECTOR_REPLAY_MIN_DATE = date(2020, 1, 1)
+
+
+class ReviewRecordRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=20)
+    name: str = Field(default="", max_length=100)
+    source: str = Field(default="手动记录", max_length=100)
+    signal_date: date | None = None
+    information: str = Field(default="", max_length=20_000)
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    note: str = Field(default="", max_length=20_000)
+
+
+class ReviewNoteRequest(BaseModel):
+    note: str = Field(max_length=20_000)
+
+    model_config = {"extra": "forbid"}
+
+
+@router.get("/review-records")
+def review_records() -> dict[str, Any]:
+    return get_review_records()
+
+
+@router.post("/review-records")
+def create_review_record(body: ReviewRecordRequest) -> dict[str, Any]:
+    try:
+        return add_review_record(body.model_dump(mode="json"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/review-records/{record_id}/note")
+def save_review_note(record_id: str, body: ReviewNoteRequest) -> dict[str, Any]:
+    try:
+        return update_review_note(record_id, body.note)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="复盘记录不存在") from exc
+
+
+@router.delete("/review-records/{record_id}")
+def remove_review_record(record_id: str) -> dict[str, bool]:
+    try:
+        return delete_review_record(record_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="复盘记录不存在") from exc
 
 
 class RefreshPlanRequest(BaseModel):
@@ -374,13 +427,18 @@ def stock_selector(
         if signal_date and date.fromisoformat(signal_date) < SELECTOR_REPLAY_MIN_DATE:
             raise HTTPException(status_code=400, detail="复盘查询暂从 2026-06-01 开始")
         selected = [item.strip() for item in strategies.split(",")] if strategies else None
-        return get_stock_selector_payload(
+        payload = get_stock_selector_payload(
             strategies=selected,
             signal_date=signal_date,
             include_extended=include_extended,
             use_cache=not refresh,
             side=normalized_side,
         )
+        actual_date = payload.get("signal_date")
+        requested_date = date.fromisoformat(signal_date).isoformat() if signal_date else actual_date
+        etf_flow = (read_short_etf_flow(actual_date) if requested_date == actual_date
+                    else {"status": "unavailable"})
+        return {**payload, "etf_flow": etf_flow}
     except HTTPException:
         raise
     except ValueError as exc:
@@ -538,3 +596,15 @@ def transition_account(strategy: Literal["return", "win"], body: TransitionAccou
         return save_transition_account(strategy, body.model_dump(mode="json"))
     except ValueError as exc:
         raise HTTPException(status_code=409 if "其他页面" in str(exc) else 400, detail=str(exc)) from exc
+
+
+@router.post("/index-futures/refresh")
+def refresh_index_futures() -> dict[str, Any]:
+    from quant.webapp.index_futures import start_refresh
+    return start_refresh()
+
+
+@router.get("/index-futures/refresh/status")
+def index_futures_refresh_status() -> dict[str, Any]:
+    from quant.webapp.index_futures import refresh_status
+    return refresh_status()

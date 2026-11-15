@@ -13,6 +13,27 @@ from quant.routine.production_dag import production_dag_mode, require_pinned_mar
 from quant.routine.resource_scheduler import ResourceBudget, ResourceScheduler, current_resource_grant
 
 
+def test_rank_source_groups_use_sealed_dataset_fingerprints(tmp_path):
+    from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+    from quant.routine.checkpoint_store import canonical_fingerprint
+
+    names = ['moneyflow', 'margin_detail', *[
+        f"index_{code.replace('.', '_')}" for code in DEFAULT_LEFT_SIDE_RANKING_CONFIG.required_indices
+    ]]
+    fingerprints = {name: canonical_fingerprint({'source': name}) for name in names}
+    sealed = InputSnapshot('sealed', payload={'dataset_fingerprints': fingerprints, 'sealed_datasets': tuple(names)})
+    snapshots = core_input_snapshots(tmp_path, ['data.rank_flows', 'data.csi300_daily'], canonical_market=sealed)
+    assert snapshots['data.rank_flows'].fingerprint == canonical_fingerprint({name: fingerprints[name] for name in names[:2]})
+    assert snapshots['data.csi300_daily'].fingerprint == canonical_fingerprint({name: fingerprints[name] for name in names[2:]})
+    changed = {**fingerprints, 'moneyflow': canonical_fingerprint({'revision': 2})}
+    second = core_input_snapshots(tmp_path, ['data.rank_flows', 'data.csi300_daily'],
+                                  canonical_market=InputSnapshot('changed', payload={'dataset_fingerprints': changed, 'sealed_datasets': tuple(names)}))
+    assert second['data.rank_flows'].fingerprint != snapshots['data.rank_flows'].fingerprint
+    assert second['data.csi300_daily'].fingerprint == snapshots['data.csi300_daily'].fingerprint
+    with pytest.raises(ValueError, match='Sealed source coverage missing'):
+        core_input_snapshots(tmp_path, ['data.rank_flows'], canonical_market=InputSnapshot('missing', payload={'dataset_fingerprints': {}}))
+
+
 def test_default_core_and_explicit_rollback(monkeypatch):
     monkeypatch.delenv("ROUTINE_DAG_EXECUTOR", raising=False)
     assert production_dag_mode("all") == production_dag_mode("short") == "core"
@@ -44,8 +65,10 @@ def test_sealed_export_lifetime_and_failure_cleanup(monkeypatch, tmp_path):
     content["fingerprint"] = fingerprint
 
     def export(store, directory, *, datasets, supplemental_sources):
-        assert tuple(datasets) == ("daily", "daily_basic", "top_list")
-        assert set(supplemental_sources) == {"daily_basic", "top_list"}
+        from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+        extra={'moneyflow','margin_detail',*[f"index_{code.replace('.', '_')}" for code in DEFAULT_LEFT_SIDE_RANKING_CONFIG.required_indices]}
+        assert set(datasets) == {'daily','daily_basic','top_list',*extra}
+        assert set(supplemental_sources) == {'daily_basic','top_list',*extra}
         directory.mkdir()
         events.append(directory)
         manifest = directory / "manifest.json"
@@ -63,8 +86,14 @@ def test_sealed_export_lifetime_and_failure_cleanup(monkeypatch, tmp_path):
             assert manifest.is_file()
             events.append("exited")
 
+    def release(manifest):
+        assert manifest.is_file()
+        assert events[-1] == "exited"
+        events.append("released")
+
     monkeypatch.setitem(sys.modules, "quant.data.market_snapshot", SimpleNamespace(
         export_market_snapshot=export, pinned_market_snapshot=pin,
+        release_market_snapshot_reader=release,
     ))
     with pytest.raises(RuntimeError, match="consumer failed"):
         with sealed_core_market_inputs(tmp_path) as snapshot:
@@ -72,7 +101,7 @@ def test_sealed_export_lifetime_and_failure_cleanup(monkeypatch, tmp_path):
             assert snapshot.changes.full_rebuild
             assert snapshot.payload["capture_metrics"] == {"canonical_export_seconds": 1.25}
             raise RuntimeError("consumer failed")
-    assert events[1:] == ["entered", "exited"]
+    assert events[1:] == ["entered", "exited", "released"]
     assert not events[0].exists()
     with pytest.raises(ValueError, match="pinned_market_inputs"):
         require_pinned_market()
@@ -177,6 +206,12 @@ def sealed_real_sources(tmp_path, monkeypatch):
     top = raw / "top_list"
     basic.mkdir(parents=True)
     top.mkdir()
+    from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+    for kind in ['moneyflow','margin_detail']:
+        (raw/kind).mkdir()
+        pd.DataFrame({'ts_code':['000001.SZ'],'trade_date':['20260904'],'value':[1.]}).to_parquet(raw/kind/f'tushare_{kind}_20260904.parquet',index=False)
+    for code in DEFAULT_LEFT_SIDE_RANKING_CONFIG.required_indices:
+        pd.DataFrame({'ts_code':[code],'trade_date':['20260904'],'close':[100.]}).to_parquet(raw/f'index_{code}.parquet',index=False)
     dates = pd.bdate_range("2026-08-03", periods=25)
     for number, date in enumerate(dates):
         pd.DataFrame({"ts_code": ["000001.SZ"], "trade_date": [date.strftime("%Y%m%d")],

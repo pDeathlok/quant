@@ -134,6 +134,17 @@ def test_registry_rejects_duplicate_missing_and_cyclic_dependencies() -> None:
         )
 
 
+@pytest.mark.parametrize("selected", ((), [], set(), iter(())))
+def test_topological_order_preserves_explicit_empty_selection(selected) -> None:
+    assert DEFAULT_DAILY_DEPENDENCY_REGISTRY.topological_order(selected) == ()
+
+
+def test_topological_order_defaults_to_all_nodes_only_for_none() -> None:
+    registry = DEFAULT_DAILY_DEPENDENCY_REGISTRY
+    assert set(registry.topological_order()) == set(registry.nodes)
+    assert registry.topological_order(("data.market_daily",)) == ("data.market_daily",)
+
+
 def test_default_scope_closure_contains_only_required_production_branches() -> None:
     short = set(DEFAULT_DAILY_DEPENDENCY_REGISTRY.required_node_ids("short"))
     assert {
@@ -340,6 +351,7 @@ def test_production_data_sources_register_their_primary_implementations() -> Non
         "data.financial_pit": "src/quant/routine/reference_data_refresh.py",
         "data.analyst_pit": "scripts/research/refresh_analyst_forecasts.py",
         "data.top_list": "src/quant/data/long_factor_backfill.py",
+        "data.rank_flows": "src/quant/data/long_factor_backfill.py",
         "data.cb_daily": "src/quant/routine/convertible_bond_grid_plan.py",
         "data.cb_reference": "src/quant/routine/convertible_bond_grid_plan.py",
         "data.cb_allotment_events": "src/quant/routine/convertible_bond_allotment.py",

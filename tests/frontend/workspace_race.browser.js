@@ -12,6 +12,7 @@ const files = new Map([
   ["/app.js", ["app.js", "text/javascript"]],
   ["/styles.css", ["styles.css", "text/css"]],
   ["/favicon.svg", ["favicon.svg", "image/svg+xml"]],
+  ["/core/index-futures.js", ["core/index-futures.js", "text/javascript"]],
   ["/core/api-client.js", ["core/api-client.js", "text/javascript"]],
   ["/core/formatters.js", ["core/formatters.js", "text/javascript"]],
 ]);

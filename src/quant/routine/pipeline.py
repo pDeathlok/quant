@@ -350,6 +350,11 @@ def refresh_reference_inputs(
         or bool(long_factor_datasets),
         "long_factor_datasets": long_factor_datasets,
     }
+    if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == 'rank_fusion':
+        reference_kwargs.update(
+            rank_flow_context=True,
+            required_indices=DEFAULT_LEFT_SIDE_RANKING_CONFIG.required_indices,
+        )
     if effective_include_analyst:
         # Eastmoney/AkShare and Tushare use independent upstreams and write to
         # different datasets. Run them concurrently, then merge only their

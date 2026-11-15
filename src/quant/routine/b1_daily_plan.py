@@ -191,6 +191,7 @@ def predict_models(
     *,
     model_dir: Path,
     model_names: tuple[str, ...],
+    daily_basic_dir: Path | None = None,
 ) -> pd.DataFrame:
     out = migrate_legacy_factor_columns(
         candidates,
@@ -252,6 +253,7 @@ def predict_models(
         required_features,
         target_date=target_date,
         context="B1 daily plan scoring",
+        daily_basic_dir=daily_basic_dir,
     )
 
     for model_name, _, model in loaded_models:
@@ -492,6 +494,7 @@ def build_daily_plan(
             latest,
             model_dir=model_dir,
             model_names=release.model_names,
+            daily_basic_dir=PROJECT_ROOT / "data/raw/daily_basic" if production_default else None,
         )
         feature_coverage = dict(latest.attrs["feature_coverage"])
 

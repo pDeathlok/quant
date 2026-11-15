@@ -261,12 +261,13 @@ def test_strict_adapter_passes_same_staged_paths_to_snapshot_and_builder(
             assert getattr(built_config.paths, field) == publication_path(getattr(config.paths, field))
 
 
-@pytest.mark.parametrize("changed", ["feature", "manifest", "source"])
+@pytest.mark.parametrize("changed", ["feature", "manifest", "source", "etf"])
 def test_same_date_checkpoint_invalidated_by_consumed_input_changes(
     monkeypatch, tmp_path, production_inputs, changed,
 ) -> None:
     config, feature, manifest = production_inputs
     calls = []
+    scores = []
     monkeypatch.setattr(production, "validate_production_ranking_artifact", lambda *a, **k: {})
 
     def build(target, **kwargs):
@@ -278,7 +279,11 @@ def test_same_date_checkpoint_invalidated_by_consumed_input_changes(
         }
 
     def score(*args, **kwargs):
+        scores.append(kwargs)
         payload = json.loads(config.paths.feature_manifest.read_text())
+        payload["score_input_fingerprint"] = production._score_input_fingerprint(
+            payload["source_input_fingerprint"], args[0], tmp_path,
+        )
         config.paths.score_manifest.write_text(json.dumps(payload))
         return payload
 
@@ -301,9 +306,15 @@ def test_same_date_checkpoint_invalidated_by_consumed_input_changes(
     elif changed == "manifest":
         payload = json.loads(manifest.read_text())
         manifest.write_text(json.dumps({**payload, "source_revision": 2}))
-    else:
+    elif changed == "source":
         (tmp_path / "src/quant/routine/project_feature_cache.py").write_text("changed reader contract")
+    else:
+        monkeypatch.setattr(production, "market_context_identity", lambda *a: "updated ETF inputs")
     assert run()["checkpoint_reused"] is False
+    assert len(scores) == 2
+    if changed == "etf":
+        assert len(calls) == 1
+        return
     assert len(calls) == 2
     assert calls[-1]["project_feature_path"] == feature
     assert calls[-1]["project_feature_manifest_path"] == manifest

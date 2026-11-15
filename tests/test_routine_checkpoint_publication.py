@@ -1,4 +1,5 @@
 from __future__ import annotations
+import pytest
 
 from quant.application.daily_dependencies import DependencyRegistry, Layer
 from quant.infrastructure.publication import (
@@ -11,6 +12,27 @@ from quant.routine.operation_adapters import result_from_payload
 from quant.routine.operation_contracts import CacheMode, CachePolicy, NodeChanges
 from quant.routine.operation_registry import OperationRegistry
 from tests.test_daily_dag_executor import _node, _operation
+
+
+@pytest.mark.parametrize('shared', [False, True])
+def test_scope_independent_workers_reuse_only_identical_date_inputs(tmp_path, shared):
+    node=_node('product.test','test',Layer.PRODUCT)
+    operation=_operation('test',(node.node_id,),cache=CachePolicy(
+        CacheMode.EXACT_DATE,'v1',('output',),scope_invariant=shared))
+    calls=[]
+    def build(context):
+        calls.append(context.scope)
+        (tmp_path/'output').write_text(context.target_trade_date)
+        return result_from_payload({'status':'success'},(node.node_id,),context)
+    executor=DailyDagExecutor(
+        DependencyRegistry((node,),{'short':(node.node_id,),'all':(node.node_id,)}),
+        OperationRegistry((operation,)),project_root=tmp_path,
+        checkpoint_store=CheckpointStore(tmp_path,tmp_path/'cache'),handlers={'test':build})
+    for scope in ['short','all']:
+        assert executor.execute(target_trade_date='2026-11-10',scope=scope)['status']=='success'
+    assert len(calls)==(1 if shared else 2)
+    assert executor.execute(target_trade_date='2026-11-11',scope='all')['status']=='success'
+    assert len(calls)==(2 if shared else 3)
 
 
 def test_dag_checkpoint_and_adapter_hash_staged_output_but_canonical_contract(tmp_path):

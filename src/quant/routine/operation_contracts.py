@@ -56,6 +56,7 @@ class CachePolicy:
     optional_contract_paths: tuple[str, ...] = ()
     environment_keys: tuple[str, ...] = ()
     track_python_imports: bool = False
+    scope_invariant: bool = False
 
     def __post_init__(self) -> None:
         if not self.contract_version.strip():

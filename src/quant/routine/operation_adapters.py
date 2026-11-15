@@ -230,14 +230,6 @@ def run_right_side_unified(context: OperationContext) -> OperationResult:
 
     if context.identity_required:
         from quant.application.selector_ranking import load_selector_ranking_config
-        from quant.data.atomic_io import atomic_write_json
-        from quant.routine.right_side_unified_production import (
-            _production_input_snapshot,
-            build_right_side_unified_production_features, score_right_side_unified_production,
-            validate_right_side_unified_selector_adapter,
-        )
-        import pandas as pd
-
         if context.project_root is None:
             raise ValueError("strict right-side adapter requires project_root")
         shared_feature_paths = {
@@ -249,12 +241,10 @@ def run_right_side_unified(context: OperationContext) -> OperationResult:
             field: publication_path(getattr(config.paths, field))
             for field in ("feature_output", "feature_manifest", "score_output", "score_manifest", "z_signal_cache", "family_signal_cache")
         }))
-        fingerprint, source = _production_input_snapshot(config, pd.Timestamp(context.target_trade_date), project_root=context.project_root, **shared_feature_paths)
-        feature = build_right_side_unified_production_features(context.target_trade_date, config=config, project_root=context.project_root, **shared_feature_paths)
-        atomic_write_json({**feature, "source_input_fingerprint": fingerprint, "source_inputs": source}, config.paths.feature_manifest)
-        score = score_right_side_unified_production(context.target_trade_date, config=config, project_root=context.project_root)
-        payload = {**score, "status": "success", "checkpoint_reused": False,
-                   "selector_adapter": validate_right_side_unified_selector_adapter(context.target_trade_date, config=config)}
+        payload = run_right_side_unified_production(
+            context.target_trade_date, config=config, project_root=context.project_root,
+            **shared_feature_paths,
+        )
     else:
         payload = run_right_side_unified_production(
             context.target_trade_date, factor_workers=context.granted_workers,
@@ -275,9 +265,6 @@ def run_left_side_unified(context: OperationContext) -> OperationResult:
 
     if context.identity_required:
         from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
-        from quant.routine.left_side_unified_production import (
-            build_left_side_production_features, score_left_side_production, validate_left_side_selector_adapter,
-        )
         config = DEFAULT_LEFT_SIDE_RANKING_CONFIG
         config = replace(config, factor_workers=context.granted_workers, paths=replace(config.paths, **{
             field: publication_path(getattr(config.paths, field)) for field in (
@@ -285,10 +272,7 @@ def run_left_side_unified(context: OperationContext) -> OperationResult:
                 "project_feature_manifest", "signal_cache", "b1_gate_cache", "family_signal_cache",
             )
         }))
-        feature = build_left_side_production_features(context.target_trade_date, config=config)
-        score = score_left_side_production(context.target_trade_date, config=config)
-        payload = {"status": "success", "checkpoint_reused": False, "feature": feature, "score": score,
-                   "adapter": validate_left_side_selector_adapter(context.target_trade_date, config=config)}
+        payload = run_left_side_production(context.target_trade_date, config=config)
     else:
         payload = run_left_side_production(context.target_trade_date, factor_workers=context.granted_workers)
     return _result(

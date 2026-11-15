@@ -1,6 +1,6 @@
 {
   "schema_version": "selector-score-probability-bands-v2",
-  "generated_at": "2026-09-01T06:48:10+08:00",
+  "generated_at": "2026-11-12T09:13:02+08:00",
   "method": "strict_out_of_sample_observed_frequency_by_display_score_band",
   "score_range": [
     0.0,
@@ -8,7 +8,8 @@
   ],
   "band_policy": {
     "model": "5_point_bins",
-    "buy_hold": "2_point_bins_from_40_to_70_with_aggregated_tails"
+    "buy_hold": "2_point_bins_from_40_to_70_with_aggregated_tails",
+    "model_right": "5_point_bins_below_95_then_1_point_bins"
   },
   "calibrations": [
     {
@@ -179,12 +180,44 @@
           "probability_pct": 31.41
         },
         {
-          "label": "95-100",
+          "label": "95-96",
           "min_score": 95.0,
+          "max_score": 96.0,
+          "sample_count": 3428,
+          "event_count": 1079,
+          "probability_pct": 31.48
+        },
+        {
+          "label": "96-97",
+          "min_score": 96.0,
+          "max_score": 97.0,
+          "sample_count": 3427,
+          "event_count": 1077,
+          "probability_pct": 31.43
+        },
+        {
+          "label": "97-98",
+          "min_score": 97.0,
+          "max_score": 98.0,
+          "sample_count": 3428,
+          "event_count": 1151,
+          "probability_pct": 33.58
+        },
+        {
+          "label": "98-99",
+          "min_score": 98.0,
+          "max_score": 99.0,
+          "sample_count": 3427,
+          "event_count": 1110,
+          "probability_pct": 32.39
+        },
+        {
+          "label": "99-100",
+          "min_score": 99.0,
           "max_score": 100.0,
-          "sample_count": 17138,
-          "event_count": 5910,
-          "probability_pct": 34.48
+          "sample_count": 3428,
+          "event_count": 1493,
+          "probability_pct": 43.55
         }
       ]
     },
@@ -846,6 +879,189 @@
           "sample_count": 723,
           "event_count": 341,
           "probability_pct": 47.16
+        }
+      ]
+    },
+    {
+      "key": "model_left_ranknet_v6",
+      "label": "左侧模型分（RankNet融合）",
+      "score_field": "model_score_normalized",
+      "target_label": "5日净收益为正概率",
+      "target_definition": "次日收盘尝试买入，持有 5 个交易日后净收益大于 0（扣除 20bp 成本）；涨停未成交的 20 次尝试按空仓零收益计入，排除 23 条未知或未成熟结果；与右侧好路径概率的事件定义不同",
+      "normalization": "rank_fusion_then_daily_cross_section_percentile_v1",
+      "evaluation_scope": "2026-01-05 至 2026-08-21 样本外历史（已用于研究评估），截至 2026-09-04 的成熟结果",
+      "evaluation_asof": "2026-09-04",
+      "cohort_count": 80776,
+      "excluded_count": 23,
+      "unfilled_count": 20,
+      "source": {
+        "artifact_path": "models/production/left_side_ranknet_v6/manifest.json",
+        "artifact_sha256": "1fdc360cf48588922966a3f5e0e7796bcf5e40360ed0cb84e5483c6dceaedf67",
+        "sample_path": "reports/research/left_ranknet_rollout/probability_samples.parquet",
+        "sample_sha256": "6c59343799c647aca1ff65e07100a1e995655ac72205ef89d16e5b1937f66c49",
+        "research_dataset_path": "reports/research/full_rank_comparison_v2/dataset_left.parquet",
+        "research_dataset_sha256": "a8cc4e42c3e558799f1d9cf901a18139405adb5a0b938c33e73ea4968b0f305e"
+      },
+      "bands": [
+        {
+          "label": "0-5",
+          "min_score": 0.0,
+          "max_score": 5.0,
+          "sample_count": 4103,
+          "event_count": 1723,
+          "probability_pct": 41.99
+        },
+        {
+          "label": "5-10",
+          "min_score": 5.0,
+          "max_score": 10.0,
+          "sample_count": 4029,
+          "event_count": 1692,
+          "probability_pct": 42.0
+        },
+        {
+          "label": "10-15",
+          "min_score": 10.0,
+          "max_score": 15.0,
+          "sample_count": 4035,
+          "event_count": 1714,
+          "probability_pct": 42.48
+        },
+        {
+          "label": "15-20",
+          "min_score": 15.0,
+          "max_score": 20.0,
+          "sample_count": 4019,
+          "event_count": 1729,
+          "probability_pct": 43.02
+        },
+        {
+          "label": "20-25",
+          "min_score": 20.0,
+          "max_score": 25.0,
+          "sample_count": 4020,
+          "event_count": 1715,
+          "probability_pct": 42.66
+        },
+        {
+          "label": "25-30",
+          "min_score": 25.0,
+          "max_score": 30.0,
+          "sample_count": 4040,
+          "event_count": 1728,
+          "probability_pct": 42.77
+        },
+        {
+          "label": "30-35",
+          "min_score": 30.0,
+          "max_score": 35.0,
+          "sample_count": 4027,
+          "event_count": 1685,
+          "probability_pct": 41.84
+        },
+        {
+          "label": "35-40",
+          "min_score": 35.0,
+          "max_score": 40.0,
+          "sample_count": 4032,
+          "event_count": 1694,
+          "probability_pct": 42.01
+        },
+        {
+          "label": "40-45",
+          "min_score": 40.0,
+          "max_score": 45.0,
+          "sample_count": 4038,
+          "event_count": 1705,
+          "probability_pct": 42.22
+        },
+        {
+          "label": "45-50",
+          "min_score": 45.0,
+          "max_score": 50.0,
+          "sample_count": 4000,
+          "event_count": 1744,
+          "probability_pct": 43.6
+        },
+        {
+          "label": "50-55",
+          "min_score": 50.0,
+          "max_score": 55.0,
+          "sample_count": 4048,
+          "event_count": 1777,
+          "probability_pct": 43.9
+        },
+        {
+          "label": "55-60",
+          "min_score": 55.0,
+          "max_score": 60.0,
+          "sample_count": 4033,
+          "event_count": 1726,
+          "probability_pct": 42.8
+        },
+        {
+          "label": "60-65",
+          "min_score": 60.0,
+          "max_score": 65.0,
+          "sample_count": 4034,
+          "event_count": 1705,
+          "probability_pct": 42.27
+        },
+        {
+          "label": "65-70",
+          "min_score": 65.0,
+          "max_score": 70.0,
+          "sample_count": 4039,
+          "event_count": 1772,
+          "probability_pct": 43.87
+        },
+        {
+          "label": "70-75",
+          "min_score": 70.0,
+          "max_score": 75.0,
+          "sample_count": 4006,
+          "event_count": 1750,
+          "probability_pct": 43.68
+        },
+        {
+          "label": "75-80",
+          "min_score": 75.0,
+          "max_score": 80.0,
+          "sample_count": 4045,
+          "event_count": 1750,
+          "probability_pct": 43.26
+        },
+        {
+          "label": "80-85",
+          "min_score": 80.0,
+          "max_score": 85.0,
+          "sample_count": 4037,
+          "event_count": 1767,
+          "probability_pct": 43.77
+        },
+        {
+          "label": "85-90",
+          "min_score": 85.0,
+          "max_score": 90.0,
+          "sample_count": 4016,
+          "event_count": 1765,
+          "probability_pct": 43.95
+        },
+        {
+          "label": "90-95",
+          "min_score": 90.0,
+          "max_score": 95.0,
+          "sample_count": 4046,
+          "event_count": 1762,
+          "probability_pct": 43.55
+        },
+        {
+          "label": "95-100",
+          "min_score": 95.0,
+          "max_score": 100.0,
+          "sample_count": 4106,
+          "event_count": 1766,
+          "probability_pct": 43.01
         }
       ]
     }

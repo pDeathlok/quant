@@ -155,6 +155,7 @@ def core_input_snapshots(
     project_root: Path, node_ids: Iterable[str], *,
     canonical_market: InputSnapshot | None = None,
     changes: Mapping[str, NodeChanges] | None = None,
+    target_trade_date: str | None = None,
 ) -> dict[str, InputSnapshot]:
     """Snapshot the concrete core-five reads; canonical SQL evidence is caller-owned.
 
@@ -163,10 +164,12 @@ def core_input_snapshots(
     historical consumers: its market output hash covers only the latest month.
     """
     from quant.routine.default_operations import DEFAULT_DAILY_OPERATION_REGISTRY
+    from quant.routine.checkpoint_store import canonical_fingerprint
 
     paths_by_node = {
         "data.daily_basic": ("data/raw/daily_basic",),
         "data.top_list": ("data/raw/top_list",),
+        "data.rank_flows": ("data/raw/moneyflow", "data/raw/margin_detail"),
         "source.market_daily_parquet": tuple(
             path for path in ("data/raw/daily", "data/raw/daily_partitioned")
             if (project_root / path).is_dir()
@@ -178,6 +181,19 @@ def core_input_snapshots(
                 paths_by_node[node] = definition.cache.output_paths
     snapshots = {}
     for node in node_ids:
+        if node in {'data.rank_flows', 'data.csi300_daily'} and canonical_market is not None:
+            from quant.application.left_side_ranking import DEFAULT_LEFT_SIDE_RANKING_CONFIG
+            if DEFAULT_LEFT_SIDE_RANKING_CONFIG.engine == 'rank_fusion':
+                names = (('moneyflow', 'margin_detail') if node == 'data.rank_flows' else
+                         tuple(f"index_{code.replace('.', '_')}" for code in DEFAULT_LEFT_SIDE_RANKING_CONFIG.required_indices))
+                fingerprints = canonical_market.payload.get('dataset_fingerprints', {})
+                if any(name not in fingerprints for name in names):
+                    raise ValueError(f'Sealed source coverage missing for {node}')
+                snapshots[node] = InputSnapshot(
+                    fingerprint=canonical_fingerprint({name: fingerprints[name] for name in names}),
+                    payload=canonical_market.payload, changes=NodeChanges(full_rebuild=True),
+                )
+                continue
         dataset = {"data.market_daily": "daily", "source.market_daily_parquet": "daily",
                    "data.daily_basic": "daily_basic", "data.top_list": "top_list"}.get(node)
         if dataset and canonical_market is not None and "sealed_datasets" in canonical_market.payload:
@@ -195,6 +211,13 @@ def core_input_snapshots(
             if canonical_market is None:
                 raise ValueError("data.market_daily requires a pinned canonical snapshot, not runtime freshness metadata")
             snapshots[node] = canonical_market
+        elif node == "source.short_etf_rank":
+            from quant.routine.short_etf_rank import market_context_identity
+
+            snapshots[node] = InputSnapshot(
+                fingerprint=(market_context_identity(target_trade_date, project_root)
+                             if target_trade_date else canonical_fingerprint({"status": "no_target"})),
+            )
         elif node in paths_by_node:
             snapshots[node] = snapshot_from_artifacts(
                 project_root, paths_by_node[node], changes=(changes or {}).get(node, NodeChanges()),

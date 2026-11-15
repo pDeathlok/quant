@@ -1,4 +1,5 @@
 import { createApiClient } from "./core/api-client.js";
+import { showIndexFuturesPage } from "./core/index-futures.js?v=20261115-retained-v3";
 import {
   escapeHtml,
   fmtMoney,
@@ -13,6 +14,8 @@ import {
 
 const DEFAULT_WORKSPACE_PAGE = "similar";
 const WORKSPACE_PAGE_BY_HASH = {
+  "#futures": "futures",
+  "#reviews": "reviews",
   "#plans": "plans",
   "#similar": "similar",
   "#chan": "chan",
@@ -81,6 +84,18 @@ const state = {
   directRefreshPromises: new Map(),
   loading: false,
   operationPlans: [],
+  reviewRecords: [],
+  reviewsLoading: false,
+  reviewsLoaded: false,
+  reviewsError: "",
+  reviewNoteDrafts: new Map(),
+  reviewPendingAdds: new Set(),
+  reviewQuery: "",
+  reviewSource: "",
+  reviewSort: "newest",
+  reviewExpanded: new Set(),
+  reviewBusyIds: new Set(),
+  reviewNoteStatuses: new Map(),
   operationPlansLoading: false,
   operationPlansLoaded: false,
   operationPlanFilter: "active",
@@ -231,8 +246,9 @@ const REFRESH_SCOPE_LABELS = {
   long: "长线",
   cb: "可转债",
   cbAllotment: "配债股",
-  byd: "过渡期右侧",
+  byd: "多状态右侧",
   similar: "自选池",
+  reviews: "复盘",
   plans: "操作计划",
 };
 const SHORT_STRATEGY_SIDE_BY_GROUP = Object.freeze({
@@ -288,9 +304,11 @@ const WORKSPACE_TABS = [
   { key: "long", label: "长线策略", description: "好股票 / 好价格", panelId: "longPage" },
   { key: "cb", label: "可转债策略", description: "低位候选 / 分批计划", panelId: "cbPage" },
   { key: "cbAllotment", label: "配债股", description: "发行流程 / 关键日期", panelId: "cbAllotmentPage" },
-  { key: "byd", label: "过渡期右侧", description: "趋势候选 / 次日执行", panelId: "bydPage" },
+  { key: "byd", label: "多状态右侧", description: "市场阶段 / 次日执行", panelId: "bydPage" },
+  { key: "futures", label: "股指战法", description: "状态期限 / 研究验证", panelId: "futuresPage" },
   { key: "similar", label: "自选池", description: "相似走势 / 策略联动", panelId: "similarPage" },
   { key: "plans", label: "操作计划", description: "次日执行 / 长期跟踪", panelId: "plansPage" },
+  { key: "reviews", label: "复盘", description: "加入依据 / 观察笔记", panelId: "reviewsPage" },
 ];
 let focusWorkspaceTabAfterRender = false;
 let workspaceTabDragKey = "";
@@ -517,7 +535,7 @@ const formatBuyPlanText = (text) => {
     return `${signalText}${openText}${suffix}`;
   });
 };
-const pageHash = (page) => page === "plans" ? "#plans" : page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#transition" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
+const pageHash = (page) => page === "futures" ? "#futures" : page === "reviews" ? "#reviews" : page === "plans" ? "#plans" : page === "similar" ? "#similar" : page === "chan" ? "#chan" : page === "long" ? "#long" : page === "byd" ? "#transition" : page === "cbAllotment" ? "#cb-allotment" : page === "cb" ? "#cb" : "#short";
 const currentLongStrategy = () => longStrategies.find((item) => item.key === state.longVariant) || longStrategies[0];
 
 function ensureWorkspaceTabs() {
@@ -571,7 +589,12 @@ function revealActiveWorkspaceTab() {
 }
 
 function loadActivePageData() {
-  if (state.activePage === "long" && !state.longPayload && !state.longLoading) {
+  if (state.activePage === "futures") {
+    showIndexFuturesPage();
+  } else if (state.activePage === "reviews") {
+    renderReviewRecords();
+    if (!state.reviewsLoaded && !state.reviewsLoading) loadReviewRecords();
+  } else if (state.activePage === "long" && !state.longPayload && !state.longLoading) {
     loadLongStockPool().catch(showError);
   } else if (state.activePage === "chan" && !state.chanPayload && !state.chanLoading) {
     loadChanModelStrategy().catch(showError);
@@ -921,6 +944,7 @@ const WORKSPACE_REQUEST_FIELDS = {
   byd: ["bydLoading", "bydPayload"],
   similar: ["similarLoading", "similarPayload", "similarError"],
   plans: ["operationPlansLoading"],
+  reviews: ["reviewsLoading", null, "reviewsError"],
 };
 
 function workspaceSelectionKey(scope, generationIdentity = state.workspaceGenerationEpoch) {
@@ -1003,6 +1027,8 @@ function runDirectWorkspaceRefresh(key, operation) {
 
 function renderShortPage() {
   renderHeader();
+  renderApplicationPortfolio();
+  renderShortEtfFlow();
   renderShortSideFilter();
   renderStrategyFilters();
   renderShortScoreSortHeaders();
@@ -1012,6 +1038,55 @@ function renderShortPage() {
   renderScoreProbabilityBands();
   renderCalendar();
   renderDateStatus();
+}
+
+function renderApplicationPortfolio() {
+  const panel = document.getElementById("applicationPortfolioPanel");
+  const portfolio = state.payload?.application_portfolio;
+  const ready = !state.loading && portfolio?.primary_application && (!state.signalDate || portfolio.signal_date === state.signalDate);
+  panel.hidden = !ready;
+  document.getElementById("shortStockPoolTitle").textContent = ready ? "候选明细 · 原模型分参考" : "股票池";
+  const sleeves = document.getElementById("applicationPortfolioSleeves");
+  if (!ready) { sleeves.replaceChildren(); return; }
+  document.getElementById("applicationPortfolioStatus").textContent = `${portfolio.signal_date} · ${portfolio.release_id}`;
+  document.getElementById("applicationPortfolioNote").textContent = `${portfolio.execution_note} 下个交易日收盘执行；下列为筛选视图，各路资金份额不随筛选改变。`;
+  sleeves.innerHTML = portfolio.sleeves.map(sleeve => {
+    const rows = sleeve.candidates || [];
+    const count = sleeve.visible_eligible_count ?? sleeve.eligible_count;
+    const body = rows.map(row => `<tr><td>${row.priority}</td><td><a href="${escapeHtml(xueqiuStockUrl(row.symbol))}" target="_blank" rel="noopener noreferrer">${escapeHtml(row.name || row.symbol)}</a><small>${escapeHtml(row.symbol)} · ${row.side === "left" ? "左侧" : "右侧"}</small></td><td>${fmtNumber(row.score * 100, 1)}</td></tr>`).join("");
+    return `<article class="application-portfolio-sleeve"><div class="panel-head"><h4>${escapeHtml(sleeve.label)}</h4><strong>${fmtNumber(sleeve.initial_capital_weight * 100, 0)}% 初始资金</strong></div><p>${count} 只候选 · 显示前 ${rows.length} 只 · 保留全队列序号</p>${rows.length ? `<div class="table-wrap"><table><thead><tr><th>序号</th><th>股票</th><th>组合分</th></tr></thead><tbody>${body}</tbody></table></div>` : `<p class="application-portfolio-empty">${portfolio.view_filtered ? "当前筛选下无候选" : "本路暂停新开仓，已有持仓按原规则退出"}</p>`}</article>`;
+  }).join("");
+}
+
+function renderShortEtfFlow() {
+  const status = document.getElementById("shortEtfStatus");
+  const content = document.getElementById("shortEtfContent");
+  const rows = document.getElementById("shortEtfRows");
+  const flow = state.payload?.etf_flow;
+  const matchingDate = !state.signalDate || flow?.signal_date === state.signalDate;
+  const ready = !state.loading && matchingDate && flow?.status === "success" && flow.baskets?.length;
+  content.hidden = !ready;
+  if (!ready) {
+    rows.replaceChildren();
+    status.textContent = state.loading ? "正在载入" : "当日快照暂未发布";
+    return;
+  }
+  status.textContent = `${flow.signal_date} · Tushare · 估算净申购`;
+  const flowCell = (amount, ratio, through, days, windowSize) => {
+    if (amount == null) return "—";
+    const amountText = `${amount > 0 ? "+" : ""}${fmtNumber(amount / 100000000)} 亿`;
+    const ratioText = ratio == null ? "" : ` · ${fmtRate(ratio, 2)}`;
+    const coverageText = days != null && days < windowSize ? ` · ${fmtNumber(days, 0)}/${windowSize} 日` : "";
+    const dateText = through ? `<small>截至 ${escapeHtml(through)}${coverageText}</small>` : "";
+    return `<span>${amountText}${ratioText}</span>${dateText}`;
+  };
+  rows.innerHTML = flow.baskets.map((basket) => `<tr>
+    <th scope="row">${escapeHtml(basket.label)}</th>
+    <td>${flowCell(basket.flow_yuan_5, basket.through_5 === basket.ratio_through_5 ? basket.flow_pct_5 : null, basket.through_5, basket.days_5, 5)}</td>
+    <td>${flowCell(basket.flow_yuan_20, basket.through_20 === basket.ratio_through_20 ? basket.flow_pct_20 : null, basket.through_20, basket.days_20, 20)}</td>
+    <td>${basket.turnover_multiple_20 == null ? "—" : `${fmtNumber(basket.turnover_multiple_20)}×`}</td>
+    <td>${fmtRate(basket.coverage_d2, 0)}</td>
+  </tr>`).join("");
 }
 
 async function loadSelector(options = {}) {
@@ -1968,14 +2043,15 @@ async function loadLongStockPool(options = {}) {
   }
 }
 
-async function loadTransitionPlan(options = {}) {
+async function loadTransitionPlan() {
   state.bydLoading = true;
   state.transitionError = "";
+  marketStrategyCatalogError = false;
   renderTransitionPage();
-  const endpoint = `/transition/plan?strategy=${encodeURIComponent(state.transitionStrategy)}${options.refresh ? "&refresh=true" : ""}`;
+  const endpoint = `/transition/plan?strategy=${encodeURIComponent(state.transitionStrategy)}`;
   const request = beginWorkspaceRequest("byd", endpoint);
   try {
-    const payload = await fetchJson(endpoint, { timeoutMs: 0 });
+    const payload = await fetchJson(endpoint, { timeoutMs: 60000 });
     if (!isCurrentWorkspaceRequest(request)) return;
     state.bydPayload = payload;
   } catch (error) {
@@ -2246,13 +2322,13 @@ function renderChanModelPage() {
   if (tbody) {
     tbody.innerHTML = rows.length ? rows.map((item) => `
       <tr class="${item.symbol === state.chanSelectedSymbol ? "selected-row" : ""}" data-chan-symbol="${item.symbol}" data-watchlist-symbol="${item.symbol}" data-watchlist-name="${item.name || ""}" data-watchlist-note="${escapeHtml(watchlistSourceNote(payload?.signal_date || item.date, `触发 ${chanRuleLabel(item)}`))}" tabindex="0">
-        <td><strong>${item.symbol}</strong><span>${item.name || ""}</span></td>
+        <td><strong>${escapeHtml(item.symbol)}</strong><span>${escapeHtml(item.name || "")}</span>${xueqiuStockUrl(item.symbol) ? `<a class="xueqiu-stock-link" data-chan-xueqiu href="${escapeHtml(xueqiuStockUrl(item.symbol))}" target="_blank" rel="noopener noreferrer" aria-label="在雪球查看 ${escapeHtml(item.name || item.symbol)}">雪球 ↗</a>` : '<span class="xueqiu-stock-unavailable">—</span>'}</td>
         <td><span class="tag ${item.rule_id === "chan_model_primary" ? "strong" : ""}">${chanRuleLabel(item)}</span></td>
         <td>${Number(item.rank_score || 0).toFixed(3)}</td>
         <td>
           <div class="score-stack">
-            <strong>${Number(item.pred_good || 0).toFixed(3)}</strong>
-            <em>大赚 ${Number(item.pred_big10 || 0).toFixed(3)}</em>
+            <strong>${fmtRate(item.pred_good)}</strong>
+            <em>大收益 ${fmtRate(item.pred_big10)}</em>
           </div>
         </td>
         <td>${Number(item.chan_score || 0).toFixed(1)}</td>
@@ -2648,13 +2724,14 @@ function renderStockRows() {
             雪球 ↗
           </a>
         ` : `<span class="xueqiu-stock-unavailable">—</span>`}
+        <button class="review-add-button" type="button" data-short-review-add>加入复盘</button>
       </td>
     </tr>
   `;
   }).join("");
   body.querySelectorAll("tr[data-symbol]").forEach((row) => {
     row.addEventListener("click", (event) => {
-      if (event.target.closest("[data-short-xueqiu]")) return;
+      if (event.target.closest("[data-short-xueqiu], [data-short-review-add]")) return;
       const selection = window.getSelection?.().toString();
       if (selection) return;
       state.selectedSymbol = row.dataset.symbol;
@@ -2727,6 +2804,7 @@ function shortCalibrationScores(calibration) {
   const field = calibration.score_field || ({
     model_right: "model_score_normalized",
     model_left: "model_score_normalized",
+    model_left_ranknet_v6: "model_score_normalized",
     buy: "buy_score_normalized",
     hold: "hold_score_normalized",
   })[calibration.key];
@@ -2734,11 +2812,13 @@ function shortCalibrationScores(calibration) {
     .filter((item) => (
       calibration.key === "model_right"
         ? item.ranking_source === "right_side_unified"
-        : calibration.key === "model_left" || calibration.key === "model_left_v5_shadow"
+        : ["model_left", "model_left_ranknet_v6", "model_left_v5_shadow"].includes(calibration.key)
         ? item.ranking_source === "left_side_unified"
         : true
     ))
-    .map((item) => Number(item?.[field]))
+    .map((item) => item?.[field])
+    .filter((score) => score != null && score !== "")
+    .map(Number)
     .filter(Number.isFinite);
 }
 
@@ -2753,13 +2833,7 @@ function currentProbabilityBands(calibration, scores) {
     ...band,
     current_count: scores.filter((score) => scoreInProbabilityBand(score, band, index === allBands.length - 1)).length,
   }));
-  const occupied = bands
-    .map((band, index) => band.current_count > 0 ? index : -1)
-    .filter((index) => index >= 0);
-  if (!occupied.length) return [];
-  const start = Math.max(0, Math.min(...occupied) - 1);
-  const end = Math.min(bands.length, Math.max(...occupied) + 2);
-  return bands.slice(start, end);
+  return bands;
 }
 
 function visibleScoreCalibrations(calibrations) {
@@ -2767,7 +2841,7 @@ function visibleScoreCalibrations(calibrations) {
     return calibrations.filter((item) => item.key !== "model_right");
   }
   if (state.shortSideFilter === "right") {
-    return calibrations.filter((item) => !["model_left", "model_left_v5_shadow"].includes(item.key));
+    return calibrations.filter((item) => !["model_left", "model_left_ranknet_v6", "model_left_v5_shadow"].includes(item.key));
   }
   return calibrations;
 }
@@ -2819,7 +2893,7 @@ function renderScoreProbabilityBands() {
           </tbody>
         </table>
       </div>
-      <p>${escapeHtml(calibration.target_definition || "")}。仅显示当前股票池覆盖分档及相邻一档。</p>
+      <p>${escapeHtml(calibration.target_definition || "")}。显示完整历史分档，高亮当前股票池所在分档。</p>
     </article>
   `;
   }).join("");
@@ -2844,10 +2918,9 @@ function operationPlanChecklistItemsFromForm() {
   return [...document.querySelectorAll("[data-operation-plan-checklist-item]")]
     .map((row) => ({
       id: row.dataset.operationPlanChecklistItem || operationPlanChecklistId(),
-      text: row.querySelector("[data-operation-plan-checklist-text]")?.value.trim() || "",
+      text: row.querySelector("[data-operation-plan-checklist-text]")?.value || "",
       completed: Boolean(row.querySelector("[data-operation-plan-checklist-completed]")?.checked),
-    }))
-    .filter((item) => item.text);
+    }));
 }
 
 function renderOperationPlanChecklistEditor(items = []) {
@@ -2918,6 +2991,302 @@ function renderOperationPlanCardChecklist(item) {
     </div>
   `;
 }
+
+function captureReviewRecord(symbol, name = "", sourceNote = "") {
+  const payload = ({ short: state.payload, chan: state.chanPayload, long: state.longPayload,
+    cbAllotment: state.cbAllotmentPayload, similar: state.similarPayload })[state.activePage] || {};
+  const candidates = [payload.stocks, payload.candidates, payload.results, payload.watchlist, payload.rows, payload.items, payload.records]
+    .filter(Array.isArray).flat();
+  const row = candidates.find((item) => (item.symbol || item.ts_code || item.stock_code) === symbol) || {};
+  const source = WORKSPACE_TABS.find((tab) => tab.key === state.activePage)?.label || "手动记录";
+  const lines = [];
+  const add = (label, value) => {
+    if (value !== undefined && value !== null && value !== "") lines.push(`${label}：${value}`);
+  };
+  add("命中策略", (row.matched_families || row.matched_groups || []).join(" / "));
+  add("命中数量", row.matched_count);
+  for (const signal of row.signals || []) {
+    add(signal.strategy_name || "策略命中原因", signal.reason || signal.logic);
+  }
+  add("股票信号日期", row.date);
+  add("收盘价", row.close);
+  if (state.activePage === "short") {
+    for (const [prefix, label] of [["model", "模型分"], ["buy", "买入分"], ["hold", "持有分"]]) {
+      add(label, `${shortScoreValue(row, prefix)}（${shortScoreRankText(row, prefix)}）`);
+    }
+    add("模型来源", row.model_score_source_label || row.ranking_source);
+    add("模型评分日期", row.ranking_score_date);
+    add("买入 / 持有评分日期", row.score_date);
+    add("评分档位", row.score_band);
+    add("排名范围", state.shortSideFilter === "left" ? "左侧" : state.shortSideFilter === "right" ? "右侧（含混）" : "全部");
+    const filters = (payload.available_strategies || []).filter((item) => state.selectedStrategies.has(item.key));
+    add("策略筛选", filters.map((item) => item.name || item.label || item.key).join(" / ") || "全部");
+  }
+  for (const [key, label] of [
+    ["opportunity_score", "买入原始分"], ["holding_score", "持有原始分"],
+    ["model_score_shadow_v5", "v5 影子分"], ["good_stock_score", "股票分"],
+    ["price_score", "价格分"], ["score", "评分"], ["best_avg_return_pct", "历史平均收益（%）"],
+    ["best_profit_factor", "历史盈亏比（PF）"],
+  ]) add(label, row[key]);
+  if (row.shadow_v5_trade_gate_open != null) add("v5 状态", row.shadow_v5_trade_gate_open ? "开闸" : "观望");
+  if (sourceNote && state.activePage !== "short") add("加入依据", sourceNote);
+  return JSON.parse(JSON.stringify({
+    symbol, name: name || row.name || row.stock_name || "", source,
+    signal_date: payload.signal_date || row.date || row.stock_price_date || null,
+    information: lines.join("\n"), note: "",
+    snapshot: { row, signal_date: payload.signal_date || null, generated_at: payload.generated_at || null,
+      execution_date: payload.execution_date || null, selected_strategies: [...state.selectedStrategies],
+      short_side_filter: state.shortSideFilter },
+  }));
+}
+
+function reviewTimestamp(value) {
+  if (!value) return "—";
+  return new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+}
+
+function filteredReviewRecords() {
+  const query = state.reviewQuery.trim().toLowerCase();
+  return state.reviewRecords.filter((item) => {
+    if (state.reviewSource && item.source !== state.reviewSource) return false;
+    const text = [item.symbol, item.name, item.source, item.signal_date, item.information,
+      state.reviewNoteDrafts.get(item.id) ?? item.note].join(" ").toLowerCase();
+    return !query || text.includes(query);
+  }).sort((a, b) => {
+    const dateKey = state.reviewSort === "signal" ? "signal_date" : "created_at";
+    const order = String(b[dateKey] || "").localeCompare(String(a[dateKey] || ""));
+    return state.reviewSort === "oldest" ? -order : order;
+  });
+}
+
+function reviewScoreSummary(item) {
+  const row = item.snapshot?.row || {};
+  const fields = item.source === "缠论策略"
+    ? [["pred_good", "好交易概率", true], ["rank_score", "排名分"], ["chan_score", "缠论分"]]
+    : [["model_score_normalized", "模型分"], ["buy_score_normalized", "买入分"], ["hold_score_normalized", "持有分"]];
+  const scores = fields.filter(([key]) => row[key] != null && row[key] !== "" && Number.isFinite(Number(row[key])));
+  if (!scores.length) return "";
+  return `<div class="review-scores">${scores.map(([key, label, probability]) => `<span><small>${label}</small><b>${probability ? fmtRate(row[key]) : Number(row[key]).toFixed(1)}</b></span>`).join("")}</div>`;
+}
+
+function reviewEntrySummary(item) {
+  const row = item.snapshot?.row || {};
+  const families = row.matched_families?.length ? row.matched_families : row.matched_groups;
+  const strategy = families?.join(" / ") || row.rule_name || row.signal_name || "";
+  const fallback = (item.information || "").split("\n").find((line) => line.startsWith("命中策略："));
+  const summary = strategy || fallback?.replace(/^命中策略：/, "") || item.information || "未填写加入依据";
+  return `<p class="review-entry-summary" title="${escapeHtml(summary)}">${escapeHtml(summary)}</p>${reviewScoreSummary(item)}`;
+}
+
+function renderReviewDraftCount() {
+  const count = state.reviewNoteDrafts.size;
+  document.querySelector("#reviewDraftCount").textContent = count ? `${count} 条备注未保存` : "";
+}
+
+function renderReviewRecords() {
+  const body = document.querySelector("#reviewRows");
+  if (!body) return;
+  const records = filteredReviewRecords();
+  document.querySelector("#reviewsMeta").textContent = state.reviewsLoading ? "正在加载…"
+    : state.reviewsError ? "加载失败" : `显示 ${records.length} / ${state.reviewRecords.length} 条记录`;
+  renderReviewDraftCount();
+  const sources = [...new Set(state.reviewRecords.map((item) => item.source).filter(Boolean))];
+  if (state.reviewSource && !sources.includes(state.reviewSource)) sources.push(state.reviewSource);
+  const sourceSelect = document.querySelector("#reviewSourceFilter");
+  sourceSelect.innerHTML = '<option value="">全部来源</option>' + sources.map((source) => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join("");
+  sourceSelect.value = state.reviewSource;
+  if (state.activePage === "reviews") document.querySelector("#generatedAt").textContent = "复盘记录";
+  if (state.reviewsError) {
+    body.innerHTML = `<tr><td colspan="4" class="empty-cell">${escapeHtml(state.reviewsError)} <button type="button" data-review-retry>重试</button></td></tr>`;
+    return;
+  }
+  if (!records.length) {
+    const message = state.reviewsLoading ? "正在加载复盘记录…" : state.reviewRecords.length
+      ? '没有符合条件的记录。<button type="button" data-review-clear>清空筛选</button>'
+      : "暂无复盘记录。从短线股票点击“加入复盘”，或在上方手动添加。";
+    body.innerHTML = `<tr><td colspan="4" class="empty-cell">${message}</td></tr>`;
+    return;
+  }
+  body.innerHTML = records.map((item) => {
+    const dirty = state.reviewNoteDrafts.has(item.id);
+    const busy = state.reviewBusyIds.has(item.id);
+    const note = dirty ? state.reviewNoteDrafts.get(item.id) : item.note || "";
+    const url = xueqiuStockUrl(item.symbol);
+    return `<tr data-review-id="${escapeHtml(item.id)}">
+      <td class="review-stock"><strong>${escapeHtml(item.name || item.symbol)}</strong><span>${escapeHtml(item.symbol)}</span><small>${escapeHtml(item.source || "手动记录")}</small></td>
+      <td>${url ? `<a class="xueqiu-stock-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">雪球 ↗</a>` : "—"}</td>
+      <td class="review-information"><div class="review-date"><span>依据日期</span><strong>${escapeHtml(item.signal_date || "未记录")}</strong></div>
+        ${reviewEntrySummary(item)}
+        <details class="review-snapshot" ${state.reviewExpanded.has(item.id) ? "open" : ""}><summary>完整加入信息</summary>
+          <span class="review-created">加入于 ${escapeHtml(reviewTimestamp(item.created_at))}</span>
+          <p>${escapeHtml(item.information || "未填写加入依据")}</p>
+        </details></td>
+      <td class="review-note-cell"><textarea data-review-note rows="3" maxlength="20000" aria-label="${escapeHtml(item.name || item.symbol)}的复盘备注" placeholder="写下后续观察…" ${busy ? "disabled" : ""}>${escapeHtml(note)}</textarea>
+        <div class="review-note-actions"><button type="button" data-review-save title="Ctrl / ⌘ + Enter 保存" ${busy || !dirty ? "disabled" : ""}>${busy ? "保存中…" : "保存备注"}</button><button type="button" data-review-delete ${busy ? "disabled" : ""}>删除</button></div>
+        <span data-review-note-status role="status">${escapeHtml(busy ? "正在保存…" : state.reviewNoteStatuses.get(item.id) || (dirty ? "备注未保存" : ""))}</span></td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadReviewRecords() {
+  const request = beginWorkspaceRequest("reviews", "/review-records");
+  state.reviewsLoading = true;
+  state.reviewsError = "";
+  renderReviewRecords();
+  try {
+    const payload = await fetchControlJson("/review-records");
+    if (!isCurrentWorkspaceRequest(request)) return;
+    state.reviewRecords = payload.records || [];
+    state.reviewsLoaded = true;
+  } catch (error) {
+    if (isCurrentWorkspaceRequest(request)) state.reviewsError = error.message || "复盘记录加载失败";
+  } finally {
+    if (isCurrentWorkspaceRequest(request)) {
+      state.reviewsLoading = false;
+      renderReviewRecords();
+    }
+  }
+}
+
+async function addReviewRecord(record) {
+  const key = JSON.stringify([record.symbol, record.source, record.signal_date]);
+  if (state.reviewPendingAdds.has(key)) return false;
+  state.reviewPendingAdds.add(key);
+  try {
+    await fetchControlJson("/review-records", { method: "POST", body: JSON.stringify(record) });
+    invalidateWorkspaceRequest("reviews");
+    state.reviewsLoaded = false;
+    showWatchlistToast(`${record.name || record.symbol} 已加入复盘，加入时的信息已保存`);
+    if (state.activePage === "reviews") await loadReviewRecords();
+    return true;
+  } catch (error) {
+    showWatchlistToast(error.message || "加入复盘失败", "error");
+    return false;
+  } finally {
+    state.reviewPendingAdds.delete(key);
+  }
+}
+
+document.querySelector("#reviewForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  if (button.disabled) return;
+  const values = Object.fromEntries(new FormData(form));
+  const controls = [...form.elements];
+  controls.forEach((control) => { control.disabled = true; });
+  try {
+    if (await addReviewRecord({ ...values, source: "手动记录", signal_date: values.signal_date || null })) form.reset();
+  } finally {
+    controls.forEach((control) => { control.disabled = false; });
+  }
+});
+
+document.querySelector("#reviewRows")?.addEventListener("input", (event) => {
+  if (!event.target.matches("[data-review-note]")) return;
+  const row = event.target.closest("[data-review-id]");
+  const id = row.dataset.reviewId;
+  const saved = state.reviewRecords.find((item) => item.id === id)?.note || "";
+  if (event.target.value === saved) state.reviewNoteDrafts.delete(id);
+  else state.reviewNoteDrafts.set(id, event.target.value);
+  state.reviewNoteStatuses.delete(id);
+  const dirty = state.reviewNoteDrafts.has(id);
+  row.querySelector("[data-review-note-status]").textContent = dirty ? "备注未保存" : "";
+  row.querySelector("[data-review-save]").disabled = !dirty || state.reviewBusyIds.has(id);
+  renderReviewDraftCount();
+});
+
+document.querySelector("#reviewSearch")?.addEventListener("input", (event) => {
+  state.reviewQuery = event.target.value;
+  renderReviewRecords();
+});
+document.querySelector("#reviewSourceFilter")?.addEventListener("change", (event) => {
+  state.reviewSource = event.target.value;
+  renderReviewRecords();
+});
+document.querySelector("#reviewSort")?.addEventListener("change", (event) => {
+  state.reviewSort = event.target.value;
+  renderReviewRecords();
+});
+document.querySelector("#reviewRows")?.addEventListener("toggle", (event) => {
+  if (!event.target.matches(".review-snapshot") || !event.target.isConnected) return;
+  const id = event.target.closest("[data-review-id]").dataset.reviewId;
+  if (event.target.open) state.reviewExpanded.add(id);
+  else state.reviewExpanded.delete(id);
+}, true);
+document.querySelector("#reviewRows")?.addEventListener("keydown", (event) => {
+  if (event.target.matches("[data-review-note]") && (event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    event.target.closest("[data-review-id]").querySelector("[data-review-save]").click();
+  }
+});
+
+document.querySelector("#reviewRows")?.addEventListener("click", async (event) => {
+  if (event.target.closest("[data-review-retry]")) return loadReviewRecords();
+  if (event.target.closest("[data-review-clear]")) {
+    state.reviewQuery = "";
+    state.reviewSource = "";
+    document.querySelector("#reviewSearch").value = "";
+    return renderReviewRecords();
+  }
+  const button = event.target.closest("[data-review-save], [data-review-delete]");
+  if (!button || button.disabled) return;
+  const row = button.closest("[data-review-id]");
+  const id = row.dataset.reviewId;
+  if (state.reviewBusyIds.has(id)) return;
+  const deleting = button.hasAttribute("data-review-delete");
+  if (deleting && !window.confirm("删除这条复盘记录？加入时的信息和备注将一并删除。")) return;
+  const textarea = row.querySelector("[data-review-note]");
+  const note = textarea.value;
+  state.reviewBusyIds.add(id);
+  const controls = row.querySelectorAll("button, textarea");
+  controls.forEach((control) => { control.disabled = true; });
+  row.querySelector("[data-review-note-status]").textContent = "正在保存…";
+  try {
+    const payload = await fetchControlJson(`/review-records/${encodeURIComponent(id)}${deleting ? "" : "/note"}`, {
+      method: deleting ? "DELETE" : "PUT", ...(deleting ? {} : { body: JSON.stringify({ note }) }),
+    });
+    state.reviewNoteDrafts.delete(id);
+    if (deleting) {
+      state.reviewRecords = state.reviewRecords.filter((item) => item.id !== id);
+      state.reviewExpanded.delete(id);
+      state.reviewNoteStatuses.delete(id);
+      renderReviewRecords();
+    } else {
+      state.reviewRecords = state.reviewRecords.map((item) => item.id === id ? payload.record : item);
+      state.reviewNoteStatuses.set(id, "备注已保存");
+    }
+  } catch (error) {
+    state.reviewNoteStatuses.set(id, error.message || "保存失败，请重试");
+  } finally {
+    state.reviewBusyIds.delete(id);
+    // The row may have been replaced by filtering or navigation during the save.
+    document.querySelectorAll("#reviewRows [data-review-id]").forEach((current) => {
+      if (current.dataset.reviewId !== id) return;
+      current.querySelectorAll("button, textarea").forEach((control) => { control.disabled = false; });
+      const save = current.querySelector("[data-review-save]");
+      save.disabled = !state.reviewNoteDrafts.has(id);
+      save.textContent = "保存备注";
+      current.querySelector("[data-review-note-status]").textContent = state.reviewNoteStatuses.get(id) || "";
+    });
+    renderReviewDraftCount();
+  }
+});
+
+document.querySelector("[data-review-context-add]")?.addEventListener("click", async () => {
+  const record = watchlistContextTarget?.review;
+  hideWatchlistContextMenu();
+  if (record) await addReviewRecord(record);
+});
+
+document.querySelector("#stockRows")?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-short-review-add]");
+  if (!button || button.disabled) return;
+  const row = button.closest("[data-symbol]");
+  const record = captureReviewRecord(row.dataset.symbol, row.dataset.watchlistName);
+  button.disabled = true;
+  try { await addReviewRecord(record); } finally { button.disabled = false; }
+});
 
 function renderOperationPlans() {
   const list = document.querySelector("#operationPlanList");
@@ -3007,51 +3376,92 @@ function setDefaultOperationPlanDate() {
   dateInput.dataset.defaulted = "true";
 }
 
-function resetOperationPlanForm() {
-  const form = document.querySelector("#operationPlanForm");
-  form?.reset();
-  document.querySelector("#operationPlanId").value = "";
-  document.querySelector("#operationPlanHorizon").value = "tomorrow";
-  setDefaultOperationPlanDate();
-  document.querySelector("#operationPlanTitle").value = "";
-  document.querySelector("#operationPlanSymbol").value = "";
-  document.querySelector("#operationPlanStatus").value = "planned";
-  document.querySelector("#operationPlanContent").value = "";
-  renderOperationPlanChecklistEditor();
-  document.querySelector("#operationPlanFormTitle").textContent = "新增计划";
-  document.querySelector("#operationPlanSave").textContent = "保存计划";
-  document.querySelector("#operationPlanSaveStatus").textContent = "";
-  document.querySelector("#operationPlanSaveStatus").classList.remove("error");
-}
+const OPERATION_PLAN_DRAFT_KEY = "quant.operationPlanDraft.v1";
+let hasOperationPlanDraft = false;
 
-function operationPlanPayload(overrides = {}) {
+function readOperationPlanForm() {
   return {
+    id: document.querySelector("#operationPlanId").value,
     horizon: document.querySelector("#operationPlanHorizon").value,
-    title: document.querySelector("#operationPlanTitle").value.trim(),
-    symbol: document.querySelector("#operationPlanSymbol").value.trim(),
+    title: document.querySelector("#operationPlanTitle").value,
+    symbol: document.querySelector("#operationPlanSymbol").value,
     target_date: document.querySelector("#operationPlanDate").value,
-    content: document.querySelector("#operationPlanContent").value.trim(),
+    dateDefaulted: document.querySelector("#operationPlanDate").dataset.defaulted === "true",
+    content: document.querySelector("#operationPlanContent").value,
     checklist: operationPlanChecklistItemsFromForm(),
     status: document.querySelector("#operationPlanStatus").value,
-    ...overrides,
   };
 }
 
-function editOperationPlan(planId) {
-  const item = state.operationPlans.find((plan) => plan.id === planId);
-  if (!item) return;
-  document.querySelector("#operationPlanId").value = item.id;
-  document.querySelector("#operationPlanHorizon").value = item.horizon;
+function fillOperationPlanForm(item = {}) {
+  document.querySelector("#operationPlanId").value = item.id || "";
+  document.querySelector("#operationPlanHorizon").value = item.horizon || "tomorrow";
   const dateInput = document.querySelector("#operationPlanDate");
-  dateInput.value = item.target_date || "";
-  dateInput.dataset.defaulted = "false";
+  dateInput.value = item.target_date ?? "";
+  dateInput.dataset.defaulted = String(Boolean(item.dateDefaulted));
+  if (!item.id && item.target_date === undefined) setDefaultOperationPlanDate();
   document.querySelector("#operationPlanTitle").value = item.title || "";
   document.querySelector("#operationPlanSymbol").value = item.symbol || "";
   document.querySelector("#operationPlanStatus").value = item.status || "planned";
   document.querySelector("#operationPlanContent").value = item.content || "";
   renderOperationPlanChecklistEditor(item.checklist || []);
-  document.querySelector("#operationPlanFormTitle").textContent = "编辑计划";
-  document.querySelector("#operationPlanSave").textContent = "更新计划";
+  document.querySelector("#operationPlanFormTitle").textContent = item.id ? "编辑计划" : "新增计划";
+  document.querySelector("#operationPlanSave").textContent = item.id ? "更新计划" : "保存计划";
+}
+
+function showOperationPlanSaveStatus(message, error = false) {
+  const status = document.querySelector("#operationPlanSaveStatus");
+  if (status.textContent !== message) status.textContent = message;
+  status.classList.toggle("error", error);
+}
+
+function saveOperationPlanDraft() {
+  hasOperationPlanDraft = true;
+  try {
+    sessionStorage.setItem(OPERATION_PLAN_DRAFT_KEY, JSON.stringify(readOperationPlanForm()));
+    showOperationPlanSaveStatus("草稿已自动保存");
+  } catch {
+    showOperationPlanSaveStatus("草稿保存失败，请在刷新前保存计划", true);
+  }
+}
+
+function restoreOperationPlanDraft() {
+  fillOperationPlanForm();
+  try {
+    const draft = JSON.parse(sessionStorage.getItem(OPERATION_PLAN_DRAFT_KEY));
+    if (!draft || !Array.isArray(draft.checklist)) return;
+    fillOperationPlanForm(draft);
+    hasOperationPlanDraft = true;
+    showOperationPlanSaveStatus("已恢复草稿");
+  } catch {
+    showOperationPlanSaveStatus("无法恢复草稿", true);
+  }
+}
+
+function clearOperationPlanDraft() {
+  hasOperationPlanDraft = false;
+  try {
+    sessionStorage.removeItem(OPERATION_PLAN_DRAFT_KEY);
+  } catch {
+    // The form remains usable when browser storage is unavailable.
+  }
+}
+
+function resetOperationPlanForm() {
+  clearOperationPlanDraft();
+  fillOperationPlanForm();
+  showOperationPlanSaveStatus("");
+}
+
+function editOperationPlan(planId) {
+  const item = state.operationPlans.find((plan) => plan.id === planId);
+  if (!item) return;
+  if (document.querySelector("#operationPlanId").value !== planId || !hasOperationPlanDraft) {
+    if (hasOperationPlanDraft && !window.confirm("切换计划会清除当前草稿，确定继续？")) return;
+    clearOperationPlanDraft();
+    fillOperationPlanForm(item);
+    showOperationPlanSaveStatus("");
+  }
   document.querySelector("#operationPlanTitle").focus();
   document.querySelector("#operationPlanForm").scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -3084,6 +3494,10 @@ function renderPageShell() {
   cbPage?.classList.toggle("active", state.activePage === "cb");
   cbAllotmentPage?.classList.toggle("active", state.activePage === "cbAllotment");
   plansPage?.classList.toggle("active", state.activePage === "plans");
+  document.querySelector("#reviewsPage")?.classList.toggle("active", state.activePage === "reviews");
+  document.querySelector("#futuresPage")?.classList.toggle("active", state.activePage === "futures");
+  document.querySelector("#futuresSidebar")?.classList.toggle("hidden", state.activePage !== "futures");
+  document.querySelector(".global-refresh-card")?.classList.toggle("hidden", state.activePage === "futures");
   filterSection?.classList.toggle("hidden", state.activePage !== "short");
   clearButton?.classList.toggle("hidden", state.activePage !== "short");
   longStrategySection?.classList.toggle("hidden", state.activePage !== "long");
@@ -3971,41 +4385,96 @@ function expireTransitionPlan() {
     p.holds = [...(p.holds || []), ...(p.sells || []).map((r) => ({ ...r, action: "CHECK", reason: "旧卖出计划已过期，请核对实际成交并重算" }))]; p.sells = [];
   }
 }
+let marketStrategyCatalog = null;
+let marketStrategyCatalogRequest = null;
+let marketStrategyCatalogError = false;
+
+function loadMarketStrategyCatalog() {
+  if (marketStrategyCatalogRequest || marketStrategyCatalogError) return;
+  marketStrategyCatalogRequest = fetch("./market-strategy-states.json", { cache: "no-cache", signal: AbortSignal.timeout(8000) })
+    .then((response) => {
+      if (!response.ok) throw new Error("市场阶段说明暂不可用");
+      return response.json();
+    })
+    .then((catalog) => {
+      marketStrategyCatalog = Object.entries(catalog).map(([state, profile]) => ({ state, ...profile }));
+    })
+    .catch(() => { marketStrategyCatalogError = true; })
+    .finally(() => {
+      marketStrategyCatalogRequest = null;
+      if (state.activePage === "byd") renderMarketStrategyStates(currentTransitionPlan());
+    });
+}
+
+function currentTransitionPlan() {
+  const plan = state.bydPayload;
+  return !state.bydLoading && plan?.strategy === state.transitionStrategy ? plan : null;
+}
+
+function renderMarketStrategyStates(plan) {
+  const profiles = plan?.strategy_states || marketStrategyCatalog;
+  const current = plan?.market_strategy || profiles?.find((profile) => profile.state === plan?.market?.state);
+  document.querySelector("#transitionCurrentStrategy").textContent = current
+    ? `${plan.market.label} · ${current.name}`
+    : plan?.market?.label || (state.transitionError ? "当前市场阶段待核对" : "正在识别市场阶段");
+  const list = document.querySelector("#transitionStrategyStates");
+  if (!profiles) {
+    list.innerHTML = `<li>${marketStrategyCatalogError ? "阶段说明加载失败，请点重算计划重试。" : "正在加载五阶段策略说明…"}</li>`;
+    loadMarketStrategyCatalog();
+    return;
+  }
+  const modes = { conditional_entry: "冻结候选 · 条件买入", research: "研究观察", cash: "现金防守" };
+  list.innerHTML = profiles.map((profile) => {
+    const active = profile.state === plan?.market?.state;
+    return `<li${active ? ' aria-current="true"' : ""}><span>${escapeHtml(profile.label)}${active ? " · 当前" : ""}</span><strong>${escapeHtml(profile.name)}</strong><p class="subline">${escapeHtml(modes[profile.mode] || "待核对")} · ${escapeHtml(profile.decision)}</p><p class="subline">${escapeHtml(profile.detail)}</p></li>`;
+  }).join("");
+}
 function renderTransitionPage() {
   expireTransitionPlan();
-  const p = state.bydPayload;
+  const p = currentTransitionPlan();
   const status = document.querySelector("#transitionStatus");
   if (!status) return;
   document.querySelector("#transitionStrategy").value = state.transitionStrategy;
-  const ready = p && p.strategy === state.transitionStrategy && !state.bydLoading;
+  const ready = Boolean(p);
+  renderMarketStrategyStates(p);
   status.textContent = state.bydLoading ? "正在核对行情、交易日历与持仓…" : !ready ? "计划不可用" : ({ ready: "次日条件计划已生成", needs_account: "先确认实际账户", blocked: "暂停交易 · 数据待核对" }[p.status] || "待核对");
   status.className = `transition-badge ${ready && p.status === "ready" ? "ready" : ""}`;
-  if (state.activePage === "byd") document.querySelector("#generatedAt").textContent = ready ? `收盘 ${p.signal_date || "待核对"}` : "正在核对收盘数据";
+  if (state.activePage === "byd") document.querySelector("#generatedAt").textContent = ready ? `收盘 ${p.signal_date || "待核对"}` : state.transitionError ? "收盘数据待核对" : "正在核对收盘数据";
   if (!ready) {
+    document.querySelector("#transitionSubline").textContent = "核对收盘数据、账户与下一交易日，再执行计划。";
     document.querySelector("#transitionOverview").textContent = "";
     document.querySelector("#transitionIssues").textContent = state.transitionError || "等待核对完整收盘数据与实际账户。";
     document.querySelector("#transitionBuySummary").textContent = "等待完整收盘数据与实际账户。";
     document.querySelector("#transitionBuys").textContent = "暂无可执行买入计划";
     document.querySelector("#transitionSellHold").textContent = "等待读取持仓";
+    document.querySelector("#transitionExecutionRules").textContent = "";
+    document.querySelector("#transitionIndices").textContent = "";
     return;
   }
-  document.querySelector("#transitionSubline").textContent = `信号收盘：${p.signal_date || "待更新"} → 执行交易日：${p.trade_date || "待确认"} · ${p.label} · 冻结研究候选 · ${p.execution_time || "次日收盘"}`;
+  document.querySelector("#transitionSubline").textContent = `信号收盘：${p.signal_date || "待更新"} → 执行交易日：${p.trade_date || "待确认"} · ${p.label}账户 · ${p.execution_time || "次日收盘"}`;
   document.querySelector("#transitionOverview").innerHTML = [["市场状态", p.market.label], ["账户权益参考", transitionMoney(p.equity)], ["可用现金", transitionMoney(p.account.cash)], ["单股建仓预算", transitionMoney(p.per_stock_budget)], ["实际持仓", `${p.account.positions.length} / 5`], ["新仓条件", p.can_open_new ? "允许条件买入" : "不买入 / 待核对"]].map(([k,v]) => `<div><span>${escapeHtml(k)}</span><strong>${escapeHtml(String(v))}</strong></div>`).join("");
   document.querySelector("#transitionIssues").innerHTML = (p.issues || []).map((x) => `<p class="transition-note">${escapeHtml(x)}</p>`).join("");
   const positions = [...(p.sells || []), ...(p.holds || [])];
-  document.querySelector("#transitionSellHold").innerHTML = positions.length ? positions.map((x) => `<div class="transition-position"><div><span class="transition-action ${x.action.toLowerCase()}">${({ SELL: "卖出", HOLD: "持有", CHECK: "待核对" })[x.action]}</span><strong>${escapeHtml(x.name)} · ${escapeHtml(x.symbol)}</strong></div><p>${escapeHtml(x.reason)}</p><p class="subline">${x.quantity}股 · 入场${escapeHtml(x.entry_date)} · 已持${x.holding_sessions ?? "—"}个交易日 · 到期${escapeHtml(x.deadline || "待确认")}</p><p class="subline">参考收盘 ${transitionMoney(x.close)} · 入场日参考收盘 ${transitionMoney(x.entry_reference)} · ${p.strategy === "return" ? `跟踪触发参考价 ${transitionMoney(x.trailing_price)}` : `止盈参考价 ${transitionMoney(x.take_profit_price)} / 止损参考价 ${transitionMoney(x.stop_loss_price)}`}</p>${x.action === "SELL" ? `<p><b>${escapeHtml(p.trade_date || "日期待确认")}收盘尝试卖出${x.sell_quantity}股</b>；跌停/停牌/容量不足则未成交部分顺延，不因反弹取消。</p>` : ""}</div>`).join("") : '<p class="transition-empty">当前没有已记录持仓，无需卖出。实际成交后再更新账户。</p>';
+  const emptyPositions = p.account.positions.length ? "已保存持仓，等待行情核对后生成卖出或持有计划。" : "当前没有已记录持仓，无需卖出。实际成交后再更新账户。";
+  document.querySelector("#transitionSellHold").innerHTML = positions.length ? positions.map((x) => `<div class="transition-position"><div><span class="transition-action ${x.action.toLowerCase()}">${({ SELL: "卖出", HOLD: "持有", CHECK: "待核对" })[x.action]}</span><strong>${escapeHtml(x.name)} · ${escapeHtml(x.symbol)}</strong></div><p>${escapeHtml(x.reason)}</p><p class="subline">${x.quantity}股 · 入场${escapeHtml(x.entry_date)} · 已持${x.holding_sessions ?? "—"}个交易日 · 到期${escapeHtml(x.deadline || "待确认")}</p><p class="subline">参考收盘 ${transitionMoney(x.close)} · 入场日参考收盘 ${transitionMoney(x.entry_reference)} · ${p.strategy === "return" ? `跟踪触发参考价 ${transitionMoney(x.trailing_price)}` : `止盈参考价 ${transitionMoney(x.take_profit_price)} / 止损参考价 ${transitionMoney(x.stop_loss_price)}`}</p>${x.action === "SELL" ? `<p><b>${escapeHtml(p.trade_date || "日期待确认")}收盘尝试卖出${x.sell_quantity}股</b>；跌停/停牌/容量不足则未成交部分顺延，不因反弹取消。</p>` : ""}</div>`).join("") : `<p class="transition-empty">${emptyPositions}</p>`;
   const buys = p.buys || [];
   const actionable = buys.filter((x) => x.action === "BUY");
-  document.querySelector("#transitionBuySummary").innerHTML = `<p class="transition-decision">${p.can_open_new ? `当前现金及空槽可支持${actionable.length}项条件买入` : p.market.state === "transition" ? "过渡阶段，等待账户或数据核对" : "市场非过渡阶段，次日不开新仓"}</p><p>按队列依次评估，先跳过已有持仓。当前无空槽或现金不足的股票保留为备选；卖出成交后才能重新核算。</p><p class="subline">数量是按信号收盘估算的参考值，次日收盘须按实际价格、现金和成交额上限重算。未成交不追单顺延，次日重新生成计划。</p>`;
-  document.querySelector("#transitionBuys").innerHTML = buys.length ? `<table class="transition-table"><thead><tr><th>顺序 / 操作</th><th>股票</th><th>参考收盘</th><th>距MA20 / 20日波动</th><th>预算 / 估算股数</th><th>条件与原因</th></tr></thead><tbody>${buys.map((x) => `<tr><td>${x.rank} <span class="transition-action ${x.action === "BUY" ? "buy" : "hold"}">${x.action === "BUY" ? "条件买入" : x.action === "AFTER_SELL" ? "卖后再评估" : "备选"}</span></td><td><b>${escapeHtml(x.name)}</b><br>${escapeHtml(x.symbol)}</td><td>${transitionMoney(x.close)}</td><td>${transitionPct(x.distance)} / ${transitionPct(x.vol20)}</td><td>${transitionMoney(x.budget)}元<br>${x.estimated_quantity}股</td><td>${escapeHtml(x.reason)}<br><small>${escapeHtml(x.execution)}</small></td></tr>`).join("")}</tbody></table>` : '<p class="transition-empty">没有满足冻结规则的备选，保持现金，等待下一收盘。</p>';
+  const entryStrategy = p.market_strategy?.mode === "conditional_entry";
+  const buyDecision = p.can_open_new ? `当前现金及空槽可支持${actionable.length}项条件买入`
+    : entryStrategy ? "等待账户或数据核对"
+    : p.market_strategy?.decision || "暂停新买入，等待市场阶段核对。";
+  document.querySelector("#transitionBuySummary").innerHTML = `<p class="transition-decision">${escapeHtml(buyDecision)}</p>${entryStrategy ? '<p>按队列依次评估，先跳过已有持仓。当前无空槽或现金不足的股票保留为备选；卖出成交后才能重新核算。</p><p class="subline">数量是按信号收盘估算的参考值，次日收盘须按实际价格、现金和成交额上限重算。未成交时等下一次计划。</p>' : ""}`;
+  document.querySelector("#transitionBuys").innerHTML = buys.length ? `<table class="transition-table"><thead><tr><th>顺序 / 操作</th><th>股票</th><th>参考收盘</th><th>距MA20 / 20日波动</th><th>预算 / 估算股数</th><th>条件与原因</th></tr></thead><tbody>${buys.map((x) => `<tr><td>${x.rank} <span class="transition-action ${x.action === "BUY" ? "buy" : "hold"}">${x.action === "BUY" ? "条件买入" : x.action === "AFTER_SELL" ? "卖后再评估" : "备选"}</span></td><td><b>${escapeHtml(x.name)}</b><br>${escapeHtml(x.symbol)}</td><td>${transitionMoney(x.close)}</td><td>${transitionPct(x.distance)} / ${transitionPct(x.vol20)}</td><td>${transitionMoney(x.budget)}元<br>${x.estimated_quantity}股</td><td>${escapeHtml(x.reason)}<br><small>${escapeHtml(x.execution)}</small></td></tr>`).join("")}</tbody></table>` : `<p class="transition-empty">${entryStrategy ? "没有满足冻结规则的备选，等待下一收盘。" : "当前阶段没有可执行的买入备选。"}</p>`;
   renderTransitionHoldings(p.account);
-  document.querySelector("#transitionExecutionRules").innerHTML = `<ol>${(p.rules || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ol><p class="transition-note">当前为冻结研究候选。每笔买卖需要人工核实并执行，页面不会连接券商自动下单。</p>`;
+  document.querySelector("#transitionExecutionRules").innerHTML = `<ol>${(p.rules || []).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ol><p class="transition-note">每笔买卖需要人工核实并执行。</p>`;
   document.querySelector("#transitionIndices").innerHTML = `<table class="transition-table"><thead><tr><th>指数</th><th>收盘</th><th>MA20</th><th>MA60</th><th>MA250</th></tr></thead><tbody>${(p.market.indices || []).map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${transitionMoney(r.close)}</td>${[20,60,250].map((n) => `<td>${transitionMoney(r[`ma${n}`])} · ${r[`above${n}`] ? "站上" : "未站上"}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 }
 
 function render() {
   renderPageShell();
-  if (state.activePage === "short") {
+  if (state.activePage === "futures") {
+    showIndexFuturesPage();
+  } else if (state.activePage === "short") {
     renderShortPage();
   } else if (state.activePage === "long") {
     renderCalendar();
@@ -4027,6 +4496,8 @@ function render() {
     renderTransitionPage();
   } else if (state.activePage === "similar") {
     renderSimilarPatternsPage();
+  } else if (state.activePage === "reviews") {
+    renderReviewRecords();
   }
 }
 
@@ -4477,7 +4948,7 @@ document.querySelector("#transitionStrategy")?.addEventListener("change", (event
   invalidateWorkspaceRequest("byd"); state.bydPayload = null;
   loadTransitionPlan().catch(showError);
 });
-document.querySelector("#transitionReload")?.addEventListener("click", () => runDirectWorkspaceRefresh("byd", () => loadTransitionPlan({ refresh: true })).catch(showError));
+document.querySelector("#transitionReload")?.addEventListener("click", () => runDirectWorkspaceRefresh("byd", loadTransitionPlan).catch(showError));
 document.querySelector("#transitionCash")?.addEventListener("input", rememberTransitionDraft);
 document.querySelector("#transitionHoldingInputs")?.addEventListener("input", rememberTransitionDraft);
 document.querySelector("#transitionHoldingInputs")?.addEventListener("click", (event) => {
@@ -4532,6 +5003,7 @@ function openWatchlistContextMenu(target, clientX, clientY) {
     note: target.dataset.watchlistNote || "",
     inWatchlist: Boolean(target.closest("#similarWatchlist")),
     pinned: target.dataset.watchlistPinned === "true",
+    review: captureReviewRecord(target.dataset.watchlistSymbol, target.dataset.watchlistName, target.dataset.watchlistNote),
   };
   const addButton = menu.querySelector("[data-watchlist-context-add]");
   const pinButton = menu.querySelector("[data-watchlist-context-pin]");
@@ -5207,6 +5679,7 @@ document.querySelector("#similarPage")?.addEventListener("focusout", (event) => 
 });
 
 document.querySelector("#chanPage")?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-chan-xueqiu]")) return;
   const row = event.target.closest("[data-chan-symbol]");
   if (!row) return;
   state.chanSelectedSymbol = row.dataset.chanSymbol;
@@ -5214,6 +5687,8 @@ document.querySelector("#chanPage")?.addEventListener("click", (event) => {
 });
 
 document.querySelector("#plansPage")?.addEventListener("click", async (event) => {
+  if (event.target.closest("[data-operation-plan-edit], [data-operation-plan-delete]")
+      && document.querySelector("#operationPlanSave").disabled) return;
   const checklistToggle = event.target.closest("[data-operation-plan-checklist-toggle]");
   if (checklistToggle) {
     const item = state.operationPlans.find(
@@ -5280,7 +5755,7 @@ document.querySelector("#plansPage")?.addEventListener("click", async (event) =>
   try {
     const payload = await fetchJson(`/operation-plans/${encodeURIComponent(item.id)}`, { method: "DELETE" });
     state.operationPlans = payload.plans || [];
-    resetOperationPlanForm();
+    if (document.querySelector("#operationPlanId").value === item.id) resetOperationPlanForm();
     renderOperationPlans();
   } catch (error) {
     showError(error);
@@ -5293,6 +5768,7 @@ document.querySelector("#operationPlanChecklistAdd")?.addEventListener("click", 
   const items = operationPlanChecklistItemsFromForm();
   items.push({ id: operationPlanChecklistId(), text: "", completed: false });
   renderOperationPlanChecklistEditor(items);
+  saveOperationPlanDraft();
   document.querySelector("[data-operation-plan-checklist-item]:last-child [data-operation-plan-checklist-text]")?.focus();
 });
 document.querySelector("#operationPlanChecklist")?.addEventListener("click", (event) => {
@@ -5302,6 +5778,7 @@ document.querySelector("#operationPlanChecklist")?.addEventListener("click", (ev
   if (!document.querySelector("[data-operation-plan-checklist-item]")) {
     renderOperationPlanChecklistEditor();
   }
+  saveOperationPlanDraft();
 });
 document.querySelector("#operationPlanChecklist")?.addEventListener("change", (event) => {
   if (!event.target.matches("[data-operation-plan-checklist-completed]")) return;
@@ -5312,37 +5789,51 @@ document.querySelector("#operationPlanDate")?.addEventListener("input", (event) 
   event.currentTarget.dataset.defaulted = "false";
 });
 document.querySelector("#operationPlanHorizon")?.addEventListener("change", (event) => {
-  if (document.querySelector("#operationPlanId").value) return;
-  const dateInput = document.querySelector("#operationPlanDate");
-  if (event.currentTarget.value === "tomorrow") {
-    if (!dateInput.value) setDefaultOperationPlanDate();
-  } else if (dateInput.dataset.defaulted === "true") {
-    dateInput.value = "";
-    dateInput.dataset.defaulted = "false";
+  if (!document.querySelector("#operationPlanId").value) {
+    const dateInput = document.querySelector("#operationPlanDate");
+    if (event.currentTarget.value === "tomorrow") {
+      if (!dateInput.value) setDefaultOperationPlanDate();
+    } else if (dateInput.dataset.defaulted === "true") {
+      dateInput.value = "";
+      dateInput.dataset.defaulted = "false";
+    }
   }
+  saveOperationPlanDraft();
+});
+document.querySelector("#operationPlanForm")?.addEventListener("input", (event) => {
+  if (event.target.id !== "operationPlanHorizon") saveOperationPlanDraft();
 });
 document.querySelector("#operationPlanForm")?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const id = document.querySelector("#operationPlanId").value;
   const button = document.querySelector("#operationPlanSave");
-  const status = document.querySelector("#operationPlanSaveStatus");
-  button.disabled = true;
+  if (button.disabled) return;
+  const draft = readOperationPlanForm();
+  const { id } = draft;
+  const request = operationPlanRequestPayload(draft, {
+    title: draft.title.trim(),
+    symbol: draft.symbol.trim(),
+    content: draft.content.trim(),
+    checklist: draft.checklist
+      .map((item) => ({ ...item, text: item.text.trim() }))
+      .filter((item) => item.text),
+  });
+  const controls = [...event.currentTarget.elements];
+  controls.forEach((control) => { control.disabled = true; });
   button.textContent = "保存中";
-  status.textContent = "";
+  showOperationPlanSaveStatus("");
   try {
     const payload = await fetchJson(id ? `/operation-plans/${encodeURIComponent(id)}` : "/operation-plans", {
       method: id ? "PUT" : "POST",
-      body: JSON.stringify(operationPlanPayload()),
+      body: JSON.stringify(request),
     });
     state.operationPlans = payload.plans || [];
     resetOperationPlanForm();
-    status.textContent = id ? "计划已更新" : "计划已保存";
+    showOperationPlanSaveStatus(id ? "计划已更新" : "计划已保存");
     renderOperationPlans();
   } catch (error) {
-    status.textContent = error.message || "保存失败";
-    status.classList.add("error");
+    showOperationPlanSaveStatus(error.message || "保存失败", true);
   } finally {
-    button.disabled = false;
+    controls.forEach((control) => { control.disabled = false; });
     button.textContent = document.querySelector("#operationPlanId").value ? "更新计划" : "保存计划";
   }
 });
@@ -5350,7 +5841,7 @@ document.querySelector("#operationPlanForm")?.addEventListener("submit", async (
 const initialDateInput = document.querySelector("#signalDateInput");
 if (initialDateInput) initialDateInput.value = "";
 state.signalDate = "";
-resetOperationPlanForm();
+restoreOperationPlanDraft();
 
 renderPageShell();
 renderLongStrategies();

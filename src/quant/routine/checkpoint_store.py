@@ -150,6 +150,7 @@ class CheckpointStore:
             "optional_contract_paths": list(definition.cache.optional_contract_paths),
             "environment_keys": list(definition.cache.environment_keys),
             "track_python_imports": definition.cache.track_python_imports,
+            "scope_invariant": definition.cache.scope_invariant,
         }
         if any(payload.get(key) != value for key, value in expected.items()):
             raise ValueError("checkpoint identity does not match operation contract")
@@ -214,8 +215,9 @@ class CheckpointStore:
             "environment_keys": list(definition.cache.environment_keys),
             "environment": {key: os.getenv(key) for key in definition.cache.environment_keys},
             "track_python_imports": definition.cache.track_python_imports,
+            "scope_invariant": definition.cache.scope_invariant,
             "target_trade_date": context.target_trade_date,
-            "scope": context.scope,
+            "scope": "shared" if definition.cache.scope_invariant else context.scope,
             "upstream_revisions": dict(sorted(context.upstream_revisions.items())),
             "upstream_fingerprints": dict(
                 sorted(context.upstream_fingerprints.items())

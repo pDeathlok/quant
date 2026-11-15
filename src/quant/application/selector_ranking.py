@@ -836,7 +836,7 @@ def apply_selector_ranking_source(
             ranking_source = "left_side_unified"
             artifact_sha = left_artifact_sha
             normalization = active_left.score_normalization
-            threshold_mode = "none_rank_only"
+            threshold_mode = str(left_manifest.get("production_threshold_mode") or "none_rank_only")
             shadow_values = left_shadow_scores.get(symbol)
             if shadow_values:
                 row.update(shadow_values)

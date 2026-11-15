@@ -61,7 +61,9 @@ from quant.research.left_side_unified_features import (
     LEFT_SIDE_SIGNALS,
     compute_left_side_rule_features,
 )
+from quant.infrastructure.publication import logical_publication_path
 from quant.routine.paths import PROJECT_ROOT
+from quant.routine.short_etf_rank import market_context_identity, model_identity, rank_with_etf
 from quant.routine.project_feature_cache import (
     load_exact_date_project_feature_cache,
 )
@@ -394,7 +396,7 @@ def _fingerprint(paths: tuple[Path, ...], payload: Mapping[str, Any]) -> str:
         raise RuntimeError(f"left-side production inputs missing: {missing}")
     document = {
         **payload,
-        "inputs": [(str(path), _sha256(path)) for path in paths],
+        "inputs": [(str(logical_publication_path(path)), _sha256(path)) for path in paths],
     }
     return hashlib.sha256(
         json.dumps(document, sort_keys=True).encode("utf-8")
@@ -482,6 +484,8 @@ def _score_input_fingerprint(
         "target_date": target.date().isoformat(),
         "builder_version": LEFT_SIDE_PRODUCTION_SCORE_BUILDER_VERSION,
         "score_schema_version": LEFT_SIDE_SCORE_SCHEMA_VERSION,
+        "etf_rank_model": model_identity(),
+        "etf_rank_context": market_context_identity(target.date().isoformat()),
         "normalization_schema_version": LEFT_SIDE_NORMALIZATION_SCHEMA_VERSION,
     })
 
@@ -693,6 +697,12 @@ def stage_left_side_ranking_release(
 def validate_left_side_production_artifact(
     config: LeftSideRankingConfig = DEFAULT_LEFT_SIDE_RANKING_CONFIG,
 ) -> dict[str, Any]:
+    if config.engine == 'rank_fusion':
+        from quant.ml.rank_fusion import RankFusion
+        model = RankFusion.load(config.paths.artifact_manifest)
+        return {'model': model, 'features': list(model.required_features),
+                'production_threshold_mode': 'none_rank_only' if model.minimum_expected_net_return is None else 'calibrated_net_return',
+                'schema_version': 'rank-fusion-v1', 'release_id': model.release_id}
     manifest = _load_json(config.paths.artifact_manifest)
     if manifest.get("schema_version") != LEFT_SIDE_ARTIFACT_SCHEMA_VERSION:
         raise RuntimeError("left-side artifact manifest schema mismatch")
@@ -833,9 +843,13 @@ def score_left_side_production(
     if not np.isfinite(probabilities).all():
         raise RuntimeError("left-side ranker returned non-finite probabilities")
     scored = frame[["ts_code", "symbol", "trade_date", "date", *LEFT_SIDE_SIGNALS]].copy()
-    scored["ranking_score"] = probabilities
-    scored["ranking_score_normalized"] = normalize_daily_percentile(probabilities)
     production_artifact_sha256 = _sha256(config.paths.artifact)
+    adjusted, etf_rank = rank_with_etf(
+        "left", frame, probabilities, target.date().isoformat(), production_artifact_sha256,
+    )
+    scored["ranking_score_base"] = probabilities
+    scored["ranking_score"] = adjusted
+    scored["ranking_score_normalized"] = normalize_daily_percentile(adjusted)
     scored["model_artifact_sha256"] = production_artifact_sha256
     shadow_status = "unavailable"
     shadow_reason: str | None = None
@@ -875,6 +889,7 @@ def score_left_side_production(
         "factor_contract_sha256": LEFT_SIDE_FACTOR_CONTRACT_SHA256,
         "source_input_fingerprint": _score_input_fingerprint(target, config),
         "candidate_count": len(scored),
+        "etf_rank": etf_rank,
         "policy_excluded_candidate_count": len(policy_excluded),
         "policy_excluded_candidate_symbols": policy_excluded,
         "score_field": "ranking_score",
@@ -928,6 +943,9 @@ def run_left_side_production(
         if not 1 <= factor_workers <= 32:
             raise ValueError("left-side production factor_workers must be in [1, 32]")
         config = replace(config, factor_workers=factor_workers)
+    if config.engine == "rank_fusion":
+        from quant.routine.left_ranknet_production import run_left_ranknet
+        return run_left_ranknet(target_date, config=config, root=PROJECT_ROOT)
     target = pd.to_datetime(target_date, errors="raise").normalize()
     feature_fingerprint = _feature_input_fingerprint(target, config)
     feature_checkpoint_reused = False
@@ -957,10 +975,13 @@ def run_left_side_production(
             and existing.get("source_input_fingerprint") == score_fingerprint
             and existing.get("output_sha256") == _sha256(config.paths.score_output)
         ):
-            validate_left_side_selector_adapter(target_date, config=config)
+            adapter = validate_left_side_selector_adapter(target_date, config=config)
             return {
                 "status": "success",
                 "target_date": target.date().isoformat(),
+                "feature": feature,
+                "score": existing,
+                "adapter": adapter,
                 "checkpoint_reused": True,
                 "feature_checkpoint_reused": feature_checkpoint_reused,
                 "candidate_count": existing.get("candidate_count"),
