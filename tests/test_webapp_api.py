@@ -1390,7 +1390,7 @@ def test_cached_similar_get_does_not_mix_newer_strategy_badges(monkeypatch):
     monkeypatch.setattr(services, "_read_selector_snapshot", lambda *args: {
         "signal_date": "2026-07-23", "stocks": [{"symbol": "000001.SZ"}],
     })
-    monkeypatch.setattr(services, "_display_selector_payload", lambda payload: payload)
+    monkeypatch.setattr(services, "_display_selector_payload", lambda payload, **kwargs: payload)
     monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: None)
     monkeypatch.setattr(services, "_read_long_stock_pool_snapshot", lambda *args, **kwargs: None)
     calls = []
@@ -5095,3 +5095,23 @@ def test_selector_etf_context_matches_the_actual_requested_date(monkeypatch):
     fallback = client.get("/api/selector/stocks?signal_date=2026-11-05")
     assert fallback.json()["etf_flow"] == {"status": "unavailable"}
     assert calls == ["2026-11-06", "2026-11-06"]
+
+
+def test_readonly_badges_use_persisted_scores_without_running_rankers(monkeypatch):
+    monkeypatch.setattr(services, "_read_selector_snapshot", lambda *args: {
+        "signal_date": "2026-07-23", "stocks": [{
+            "symbol": "000001.SZ", "matched_families": ["B1"],
+            "selector_score": 80.0, "matched_count": 1, "best_profit_factor": 2.0,
+            "opportunity_score": 70.0, "holding_score": 60.0,
+        }],
+    })
+    monkeypatch.setattr(services, "_row_display_quality_gate", lambda row: True)
+    monkeypatch.setattr(services, "_read_workspace_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(services, "_read_long_stock_pool_snapshot", lambda *args, **kwargs: None)
+    for name in ("_apply_historical_score_normalization", "apply_selector_ranking_source"):
+        monkeypatch.setattr(services, name, lambda *args, _name=name, **kwargs: pytest.fail(_name))
+    hits = services._collect_watchlist_strategy_hits(
+        ["000001.SZ"], signal_date="2026-07-23", read_only=True,
+    )
+    assert [hit["strategy_key"] for hit in hits["000001.SZ"]] == ["short"]
+    assert hits["000001.SZ"][0]["signal_date"] == "2026-07-23"

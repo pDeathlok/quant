@@ -4525,7 +4525,9 @@ def _collect_watchlist_strategy_hits(
         # Keep cross-workspace badges aligned with the short-strategy surface:
         # raw snapshot rows that fail the OOT quality gate or fall outside the
         # displayed shortlist must not be presented as visible strategy hits.
-        short_payload = _display_selector_payload(short_payload or {"stocks": []})
+        short_payload = _display_selector_payload(
+            short_payload or {"stocks": []}, persisted_scores_only=read_only,
+        )
         for item in short_payload.get("stocks") or []:
             families = " / ".join(str(value) for value in (item.get("matched_families") or [])[:4])
             append_hit(
@@ -5706,6 +5708,8 @@ def _display_selector_payload(
     payload: dict[str, Any],
     limit: int = DEFAULT_SELECTOR_LIMIT,
     side: str = "all",
+    *,
+    persisted_scores_only: bool = False,
 ) -> dict[str, Any]:
     normalized_side = str(side or "all").strip().lower()
     if normalized_side not in {"all", "left", "right"}:
@@ -5720,7 +5724,7 @@ def _display_selector_payload(
     ]
     publication = current_publication()
     committed = publication is not None and publication.generation is not None and not publication.writable
-    if not committed and any(
+    if not committed and not persisted_scores_only and any(
         row.get("buy_score_source") != "historical_return_model"
         or row.get("hold_score_source") != "historical_return_model"
         for row in display_rows
@@ -5737,7 +5741,7 @@ def _display_selector_payload(
         ]
     if committed:
         _validate_published_selector_ranks(display_rows, str(payload.get("signal_date") or ""))
-    else:
+    elif not persisted_scores_only:
         display_rows = apply_selector_ranking_source(
             display_rows,
             str(payload.get("signal_date") or "") or None,

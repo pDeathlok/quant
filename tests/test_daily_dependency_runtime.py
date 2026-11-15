@@ -1286,3 +1286,24 @@ def test_registry_definition_change_alters_node_contract_hash(
     )
 
     assert exact_hash["data.source"] != ttl_hash["data.source"]
+
+
+def test_page_coverage_is_persisted_without_changing_postflight_gate(tmp_path: Path) -> None:
+    node = replace(
+        DEFAULT_DAILY_DEPENDENCY_REGISTRY.nodes["product.long_pools"],
+        inputs=(), contract_sources=(),
+    )
+    registry = DependencyRegistry((node,), {"long": (node.node_id,)})
+    _, summary = _complete_snapshot_cycle(
+        tmp_path, date(2026, 11, 13), registry, _long_results(), scope="long",
+    )
+    assert summary["status"] == "success"
+    assert summary["baseline_committed"] is True
+    assert summary["refresh_node_ids"] == []
+    report = summary["page_refresh_coverage"]
+    assert report["scope"] == "long"
+    assert report["target_trade_date"] == "2026-11-13"
+    assert {page["tab"] for page in report["pages"] if page["in_scope"]} == {"long"}
+    for key in ("path", "committed_path", "dated_path"):
+        stored = json.loads(Path(summary[key]).read_text())
+        assert stored["page_refresh_coverage"] == json.loads(json.dumps(report))

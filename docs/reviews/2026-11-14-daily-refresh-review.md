@@ -1,5 +1,8 @@
 # Daily Refresh Coverage and Efficiency Review
 
+The separately published remote subset and its validation are preserved in
+[the isolated release record](2026-11-14-daily-refresh-isolated-release.md).
+
 ## Scope and Baseline
 
 Review of the current working tree, including its existing unpublished strategy changes.
