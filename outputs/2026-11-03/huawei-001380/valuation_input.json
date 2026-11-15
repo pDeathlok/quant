@@ -1,0 +1,63 @@
+{
+  "company": "华纬科技股份有限公司",
+  "ticker": "001380.SZ",
+  "as_of_date": "2026-11-03",
+  "target_date": "2027-11-03",
+  "analysis_cutoff": "2026-11-03T09:40:23+08:00",
+  "price_as_of": "2026-11-02T15:00:00+08:00",
+  "current_price": 14.17,
+  "current_price_source": "项目Tushare daily，完整日线按2026-11-02T16:00:00+08:00可得，妙想收盘价复核一致",
+  "price_basis": "unadjusted",
+  "currency": "CNY",
+  "scenarios_exhaustive": false,
+  "scenarios": {
+    "bear": {
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "metric_name": "归母净利润/目标期普通股股数（情景每股盈利）",
+      "metric_unit": "CNY_per_share",
+      "metric_per_share": 0.6497960703641716,
+      "multiple": 12,
+      "multiple_basis": "作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数",
+      "operating_assumptions": {
+        "revenue_CNY_million": 2200,
+        "parent_net_margin": 0.08,
+        "parent_profit_CNY_million": 176.0,
+        "diluted_shares_million": 270.854208
+      }
+    },
+    "base": {
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "metric_name": "归母净利润/目标期普通股股数（情景每股盈利）",
+      "metric_unit": "CNY_per_share",
+      "metric_per_share": 0.9691560708556537,
+      "multiple": 16,
+      "multiple_basis": "作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数",
+      "operating_assumptions": {
+        "revenue_CNY_million": 2500,
+        "parent_net_margin": 0.105,
+        "parent_profit_CNY_million": 262.5,
+        "diluted_shares_million": 270.854208
+      }
+    },
+    "bull": {
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "metric_name": "归母净利润/目标期普通股股数（情景每股盈利）",
+      "metric_unit": "CNY_per_share",
+      "metric_per_share": 1.1126972691090877,
+      "multiple": 20,
+      "multiple_basis": "作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数",
+      "operating_assumptions": {
+        "revenue_CNY_million": 2800,
+        "parent_net_margin": 0.12,
+        "parent_profit_CNY_million": 336.0,
+        "diluted_shares_million": 301.96892661471867
+      }
+    }
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "ticker": "001380.SZ",
+  "as_of_date": "2026-11-03",
+  "analysis_cutoff": "2026-11-03T09:40:23+08:00",
+  "last_bar_date": "2026-11-02",
+  "last_bar_available_at": "2026-11-02T16:00:00+08:00",
+  "source": "Tushare daily via project canonical MarketDataStore",
+  "price_basis": "unadjusted",
+  "adjustment_reference_date": null,
+  "volume_unit": "lots (手)",
+  "bar_count": 250,
+  "thresholds": {
+    "volume_expansion_ratio": 1.5,
+    "volume_contraction_ratio": 0.7,
+    "breakout_buffer_pct": 0.0,
+    "large_body_atr_ratio": 0.8,
+    "ma20_tolerance_pct": 0.02
+  },
+  "trend": {
+    "state": "cautious",
+    "close": 14.17,
+    "ma20": 16.1675,
+    "ma60": 17.0635,
+    "ma120": 17.036833,
+    "ma20_change_5d": -0.064191,
+    "long_term_alignment": "mixed_alignment"
+  },
+  "returns_and_location": {
+    "return_5d": -0.06221,
+    "return_20d": -0.241841,
+    "drawdown_from_60d_closing_high": -0.259279,
+    "location_in_60d_closing_range": 0.046154,
+    "prior_20d_high": 19.3,
+    "prior_20d_low": 13.89
+  },
+  "volume_price": {
+    "quadrant_5d": "price_down_volume_down",
+    "current_volume_ratio_to_prior_20d": 0.612157,
+    "avg_volume_5d_to_preceding_20d": 0.679549,
+    "up_volume_to_down_volume_20d": 0.406626
+  },
+  "momentum": {
+    "dif": -0.948877,
+    "dea": -0.741207,
+    "histogram_2x": -0.41534,
+    "zero_axis_state": "below",
+    "latest_cross": "none"
+  },
+  "risk_scale": {
+    "atr14": 0.727143,
+    "atr14_pct_of_close": 0.051316,
+    "realized_volatility_20d_annualized": 0.503055,
+    "latest_body_to_atr14": 0.137525
+  },
+  "signals": {
+    "breakout_on_expanded_volume": false,
+    "breakdown_on_expanded_volume": false,
+    "high_volume_bullish_key_bar": false,
+    "high_volume_bearish_key_bar": false,
+    "pullback_on_contracting_volume_after_impulse": false
+  },
+  "supportive_observations": [],
+  "risk_observations": [
+    "收盘价、MA20 与 MA60 构成谨慎中期趋势结构。"
+  ],
+  "warnings": [],
+  "limitations": [
+    "量价信号是启发式观察，不是统计胜率、内在价值或交易指令。",
+    "成交量不能单独证明资金身份、吸筹或出货。",
+    "支撑/压力为历史观察锚，后续价格可失效。",
+    "本脚本只分析单一序列；相对强弱需对同步宽基/行业序列另行复算。"
+  ]
+}

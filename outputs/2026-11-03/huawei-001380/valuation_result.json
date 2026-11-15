@@ -1,0 +1,62 @@
+{
+  "company": "华纬科技股份有限公司",
+  "ticker": "001380.SZ",
+  "currency": "CNY",
+  "as_of_date": "2026-11-03",
+  "analysis_cutoff": "2026-11-03T09:40:23+08:00",
+  "price_as_of": "2026-11-02T15:00:00+08:00",
+  "current_price": 14.17,
+  "current_price_source": "项目Tushare daily，完整日线按2026-11-02T16:00:00+08:00可得，妙想收盘价复核一致",
+  "price_basis": "unadjusted",
+  "target_date": "2027-11-03",
+  "horizon_days": 365,
+  "scenarios_exhaustive": false,
+  "probability_basis": null,
+  "scenarios": {
+    "bear": {
+      "label": "悲观",
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "target_price": 7.797552844370059,
+      "price_return": -0.44971398416583913,
+      "dividend_per_share": null,
+      "total_return": null,
+      "probability": null,
+      "calculation": "归母净利润/目标期普通股股数（情景每股盈利） 0.6497960703641716 CNY_per_share (FY2027E) × 12 [作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数] = 7.7975528443700592 CNY/share; bridge=2027-11-03",
+      "external_model_audit": null
+    },
+    "base": {
+      "label": "中性",
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "target_price": 15.50649713369046,
+      "price_return": 0.09431878148838808,
+      "dividend_per_share": null,
+      "total_return": null,
+      "probability": null,
+      "calculation": "归母净利润/目标期普通股股数（情景每股盈利） 0.9691560708556537 CNY_per_share (FY2027E) × 16 [作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数] = 15.5064971336904592 CNY/share; bridge=2027-11-03",
+      "external_model_audit": null
+    },
+    "bull": {
+      "label": "乐观",
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "target_price": 22.253945382181755,
+      "price_return": 0.5704972041059813,
+      "dividend_per_share": null,
+      "total_return": null,
+      "probability": null,
+      "calculation": "归母净利润/目标期普通股股数（情景每股盈利） 1.1126972691090877 CNY_per_share (FY2027E) × 20 [作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数] = 22.2539453821817540 CNY/share; bridge=2027-11-03",
+      "external_model_audit": null
+    }
+  },
+  "probability_weighted": null,
+  "warnings": [
+    "悲观情景未提供 dividend_per_share；不计算含息总回报。",
+    "中性情景未提供 dividend_per_share；不计算含息总回报。",
+    "乐观情景未提供 dividend_per_share；不计算含息总回报。"
+  ]
+}

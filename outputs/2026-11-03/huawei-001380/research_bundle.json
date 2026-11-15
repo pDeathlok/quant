@@ -1,0 +1,411 @@
+{
+  "schema_version": 1,
+  "ticker": "001380.SZ",
+  "company_name": "华纬科技股份有限公司",
+  "analysis_cutoff": "2026-11-03T09:40:23+08:00",
+  "mode": "full_coverage",
+  "trigger": {
+    "type": "initial",
+    "summary": "首次建立研究基线",
+    "source_refs": []
+  },
+  "baseline_record_id": null,
+  "conclusion": {
+    "stance": "neutral_cautious",
+    "confidence": "medium_low",
+    "summary": "Revenue growth has not translated into profit growth. Base conditional value CNY15.5 versus CNY14.17 close implies 9.4% upside with material margin and dilution risk."
+  },
+  "thesis": {
+    "pillars": [
+      {
+        "id": "P1",
+        "statement": "Customer certification and process capabilities create barriers but do not guarantee pricing power.",
+        "status": "new",
+        "monitoring": "Suspension revenue, utilization and gross margin",
+        "falsifier": "Two quarters with gross margin below 24% and falling suspension revenue"
+      },
+      {
+        "id": "P2",
+        "statement": "German asset acquisition expands revenue; sustainable profit conversion remains unproven.",
+        "status": "new",
+        "monitoring": "German operating profit, management expense ratio and deliveries",
+        "falsifier": "Two quarters with parent net margin below 8% despite revenue growth"
+      },
+      {
+        "id": "P3",
+        "statement": "OCF improvement is offset by capex and working-capital needs.",
+        "status": "new",
+        "monitoring": "OCF less capex, commercial bills and inventory",
+        "falsifier": "Persistently negative annual simplified FCF alongside further financed expansion"
+      }
+    ],
+    "strongest_counterargument": "Start-up and integration costs may be temporary; utilization gains could release operating leverage.",
+    "falsifiers": [
+      "Two quarters with gross margin below 24% and falling suspension revenue",
+      "Two quarters with parent net margin below 8% despite revenue growth",
+      "Persistently negative annual simplified FCF alongside further financed expansion"
+    ]
+  },
+  "scenarios": {
+    "bear": {
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "metric_name": "归母净利润/目标期普通股股数（情景每股盈利）",
+      "metric_unit": "CNY_per_share",
+      "metric_per_share": 0.6497960703641716,
+      "multiple": 12,
+      "multiple_basis": "作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数",
+      "operating_assumptions": {
+        "revenue_CNY_million": 2200,
+        "parent_net_margin": 0.08,
+        "parent_profit_CNY_million": 176.0,
+        "diluted_shares_million": 270.854208
+      },
+      "label": "悲观",
+      "target_price": 7.797552844370059,
+      "price_return": -0.44971398416583913,
+      "dividend_per_share": null,
+      "total_return": null,
+      "probability": null,
+      "calculation": "归母净利润/目标期普通股股数（情景每股盈利） 0.6497960703641716 CNY_per_share (FY2027E) × 12 [作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数] = 7.7975528443700592 CNY/share; bridge=2027-11-03",
+      "external_model_audit": null,
+      "narrative": "Pricing pressure and low utilization persist; integration expenses remain elevated; convertible remains debt.",
+      "falsifier": "Two consecutive quarters of gross margin above 28% and falling expense ratios.",
+      "target_date": "2027-11-03",
+      "cashflows_CNY_100million": {
+        "OCF": 2.1,
+        "capex": 3.2,
+        "simplified_FCF": -1.1
+      },
+      "dividend_assumption": "Not forecast; total return not calculated."
+    },
+    "base": {
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "metric_name": "归母净利润/目标期普通股股数（情景每股盈利）",
+      "metric_unit": "CNY_per_share",
+      "metric_per_share": 0.9691560708556537,
+      "multiple": 16,
+      "multiple_basis": "作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数",
+      "operating_assumptions": {
+        "revenue_CNY_million": 2500,
+        "parent_net_margin": 0.105,
+        "parent_profit_CNY_million": 262.5,
+        "diluted_shares_million": 270.854208
+      },
+      "label": "中性",
+      "target_price": 15.50649713369046,
+      "price_return": 0.09431878148838808,
+      "dividend_per_share": null,
+      "total_return": null,
+      "probability": null,
+      "calculation": "归母净利润/目标期普通股股数（情景每股盈利） 0.9691560708556537 CNY_per_share (FY2027E) × 16 [作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数] = 15.5064971336904592 CNY/share; bridge=2027-11-03",
+      "external_model_audit": null,
+      "narrative": "Suspension stabilizes and German integration expenses normalize; no conversion or downward reset assumed.",
+      "falsifier": "Two consecutive quarters of parent net margin below 8%, or a conversion-price reset.",
+      "target_date": "2027-11-03",
+      "cashflows_CNY_100million": {
+        "OCF": 3.2,
+        "capex": 3.0,
+        "simplified_FCF": 0.2
+      },
+      "dividend_assumption": "Not forecast; total return not calculated."
+    },
+    "bull": {
+      "method": "per_share_multiple",
+      "metric_period": "FY2027E",
+      "bridge_as_of": "2027-11-03",
+      "metric_name": "归母净利润/目标期普通股股数（情景每股盈利）",
+      "metric_unit": "CNY_per_share",
+      "metric_per_share": 1.1126972691090877,
+      "multiple": 20,
+      "multiple_basis": "作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数",
+      "operating_assumptions": {
+        "revenue_CNY_million": 2800,
+        "parent_net_margin": 0.12,
+        "parent_profit_CNY_million": 336.0,
+        "diluted_shares_million": 301.96892661471867
+      },
+      "label": "乐观",
+      "target_price": 22.253945382181755,
+      "price_return": 0.5704972041059813,
+      "dividend_per_share": null,
+      "total_return": null,
+      "probability": null,
+      "calculation": "归母净利润/目标期普通股股数（情景每股盈利） 1.1126972691090877 CNY_per_share (FY2027E) × 20 [作者假设；参考2026-11-02华纬16.40、美力25.59、中鼎18.03倍TTM，前瞻期不同，按利润修复/执行风险折让，不是同行前瞻中位数] = 22.2539453821817540 CNY/share; bridge=2027-11-03",
+      "external_model_audit": null,
+      "narrative": "Deliveries, utilization, expense ratio and cash collection improve together; full conversion at initial CNY18.48 assumed.",
+      "falsifier": "2027 H1 gross margin remains below 26% with no German operating improvement.",
+      "target_date": "2027-11-03",
+      "cashflows_CNY_100million": {
+        "OCF": 4.3,
+        "capex": 2.8,
+        "simplified_FCF": 1.5
+      },
+      "dividend_assumption": "Not forecast; total return not calculated."
+    }
+  },
+  "monitoring": [
+    {
+      "pillar_id": "P1",
+      "item": "Suspension revenue, utilization and gross margin",
+      "frequency": "Quarterly and material announcements",
+      "invalidation": "Two quarters with gross margin below 24% and falling suspension revenue"
+    },
+    {
+      "pillar_id": "P2",
+      "item": "German operating profit, management expense ratio and deliveries",
+      "frequency": "Quarterly and material announcements",
+      "invalidation": "Two quarters with parent net margin below 8% despite revenue growth"
+    },
+    {
+      "pillar_id": "P3",
+      "item": "OCF less capex, commercial bills and inventory",
+      "frequency": "Quarterly and material announcements",
+      "invalidation": "Persistently negative annual simplified FCF alongside further financed expansion"
+    },
+    {
+      "item": "Convertible reset decisions, actual conversion price and share count",
+      "next_check": "2026-11-06"
+    },
+    {
+      "item": "Delayed capital-project acceptance and utilization",
+      "next_check": "2026-12-31"
+    },
+    {
+      "item": "Verified robot customers, orders, revenue and collections",
+      "frequency": "Contract and IR announcements"
+    },
+    {
+      "item": "Related-party transactions, pledges, sales by shareholders, regulatory and litigation updates",
+      "frequency": "Event-driven"
+    }
+  ],
+  "evidence_ledger": [
+    {
+      "id": "annual",
+      "title": "FY2025 audited annual report",
+      "published_at": "2026-04-03",
+      "available_at": "2026-04-04T00:00:00+08:00",
+      "availability_policy": "Date-only source conservatively admitted at next calendar-day midnight.",
+      "accessed_at": "2026-11-03T09:49:45+08:00",
+      "accessed_at_definition": "Verification completed at; not first public availability.",
+      "url": "https://disc.static.szse.cn/download/disc/disk03/finalpage/2026-04-03/ffd4be59-1a69-4db5-bdaf-ecbcb7b2c859.PDF",
+      "classification": "fact",
+      "verified": true
+    },
+    {
+      "id": "h1",
+      "title": "2026 H1 report",
+      "published_at": "2026-08-27",
+      "available_at": "2026-08-28T00:00:00+08:00",
+      "availability_policy": "Date-only source conservatively admitted at next calendar-day midnight.",
+      "accessed_at": "2026-11-03T09:49:45+08:00",
+      "accessed_at_definition": "Verification completed at; not first public availability.",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-08-27/1225512040.PDF",
+      "classification": "fact",
+      "verified": true
+    },
+    {
+      "id": "q3",
+      "title": "2026 Q3 and nine-month report",
+      "published_at": "2026-10-24",
+      "available_at": "2026-10-25T00:00:00+08:00",
+      "availability_policy": "Date-only source conservatively admitted at next calendar-day midnight.",
+      "accessed_at": "2026-11-03T09:49:45+08:00",
+      "accessed_at_definition": "Verification completed at; not first public availability.",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-10-24/1225619897.PDF",
+      "classification": "fact",
+      "verified": true
+    },
+    {
+      "id": "prospectus",
+      "title": "Convertible prospectus summary",
+      "published_at": "2026-10-13",
+      "available_at": "2026-10-14T00:00:00+08:00",
+      "availability_policy": "Date-only source conservatively admitted at next calendar-day midnight.",
+      "accessed_at": "2026-11-03T09:49:45+08:00",
+      "accessed_at_definition": "Verification completed at; not first public availability.",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-10-13/1225602400.PDF",
+      "classification": "fact",
+      "verified": true
+    },
+    {
+      "id": "downward",
+      "title": "Potential conversion-price reset notice",
+      "published_at": "2026-10-30",
+      "available_at": "2026-10-31T00:00:00+08:00",
+      "availability_policy": "Date-only source conservatively admitted at next calendar-day midnight.",
+      "accessed_at": "2026-11-03T09:49:45+08:00",
+      "accessed_at_definition": "Verification completed at; not first public availability.",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-10-30/1225639056.PDF",
+      "classification": "fact",
+      "verified": true
+    },
+    {
+      "id": "listing",
+      "title": "Convertible listing announcement",
+      "published_at": "2026-10-31",
+      "available_at": "2026-11-01T00:00:00+08:00",
+      "availability_policy": "Date-only source conservatively admitted at next calendar-day midnight.",
+      "accessed_at": "2026-11-03T09:49:45+08:00",
+      "accessed_at_definition": "Verification completed at; not first public availability.",
+      "url": "https://static.cninfo.com.cn/finalpage/2026-10-31/1225649914.PDF",
+      "classification": "fact",
+      "verified": true
+    },
+    {
+      "id": "market",
+      "period": "2026-11-02",
+      "price": 14.17,
+      "source": "Project canonical Tushare daily; cross-checked with Choice MCP.",
+      "available_at": "2026-11-02T16:00:00+08:00",
+      "classification": "fact",
+      "verified": true
+    }
+  ],
+  "data_snapshot": {
+    "currency": "CNY",
+    "current_price": 14.17,
+    "price_as_of": "2026-11-02T15:00:00+08:00",
+    "price_available_at": "2026-11-02T16:00:00+08:00",
+    "price_basis": "unadjusted",
+    "total_shares": 270854208,
+    "treasury_shares": 1240100,
+    "market_cap_CNY": 3838004127.36,
+    "technical_snapshot": {
+      "ticker": "001380.SZ",
+      "as_of_date": "2026-11-03",
+      "analysis_cutoff": "2026-11-03T09:40:23+08:00",
+      "last_bar_date": "2026-11-02",
+      "last_bar_available_at": "2026-11-02T16:00:00+08:00",
+      "source": "Tushare daily via project canonical MarketDataStore",
+      "price_basis": "unadjusted",
+      "adjustment_reference_date": null,
+      "volume_unit": "lots (手)",
+      "bar_count": 250,
+      "thresholds": {
+        "volume_expansion_ratio": 1.5,
+        "volume_contraction_ratio": 0.7,
+        "breakout_buffer_pct": 0.0,
+        "large_body_atr_ratio": 0.8,
+        "ma20_tolerance_pct": 0.02
+      },
+      "trend": {
+        "state": "cautious",
+        "close": 14.17,
+        "ma20": 16.1675,
+        "ma60": 17.0635,
+        "ma120": 17.036833,
+        "ma20_change_5d": -0.064191,
+        "long_term_alignment": "mixed_alignment"
+      },
+      "returns_and_location": {
+        "return_5d": -0.06221,
+        "return_20d": -0.241841,
+        "drawdown_from_60d_closing_high": -0.259279,
+        "location_in_60d_closing_range": 0.046154,
+        "prior_20d_high": 19.3,
+        "prior_20d_low": 13.89
+      },
+      "volume_price": {
+        "quadrant_5d": "price_down_volume_down",
+        "current_volume_ratio_to_prior_20d": 0.612157,
+        "avg_volume_5d_to_preceding_20d": 0.679549,
+        "up_volume_to_down_volume_20d": 0.406626
+      },
+      "momentum": {
+        "dif": -0.948877,
+        "dea": -0.741207,
+        "histogram_2x": -0.41534,
+        "zero_axis_state": "below",
+        "latest_cross": "none"
+      },
+      "risk_scale": {
+        "atr14": 0.727143,
+        "atr14_pct_of_close": 0.051316,
+        "realized_volatility_20d_annualized": 0.503055,
+        "latest_body_to_atr14": 0.137525
+      },
+      "signals": {
+        "breakout_on_expanded_volume": false,
+        "breakdown_on_expanded_volume": false,
+        "high_volume_bullish_key_bar": false,
+        "high_volume_bearish_key_bar": false,
+        "pullback_on_contracting_volume_after_impulse": false
+      },
+      "supportive_observations": [],
+      "risk_observations": [
+        "收盘价、MA20 与 MA60 构成谨慎中期趋势结构。"
+      ],
+      "warnings": [],
+      "limitations": [
+        "量价信号是启发式观察，不是统计胜率、内在价值或交易指令。",
+        "成交量不能单独证明资金身份、吸筹或出货。",
+        "支撑/压力为历史观察锚，后续价格可失效。",
+        "本脚本只分析单一序列；相对强弱需对同步宽基/行业序列另行复算。"
+      ]
+    },
+    "benchmark": "000300.SH, synchronized 250 complete daily bars; no sector benchmark.",
+    "mcp_execution": {
+      "provider": "Eastmoney Miaoxiang/Choice",
+      "server": "mx-ds-mcp",
+      "runtime_loaded": true,
+      "attempted": true,
+      "actual_call_count": 4,
+      "successful_call_count": 3,
+      "empty_result_count": 1,
+      "tools": [
+        {
+          "name": "mx_ashare_finance_data",
+          "request_summary": "Identity, latest financials and 2026-11-02 market valuation."
+        },
+        {
+          "name": "mx_finance_search_notice",
+          "request_summary": "Annual, interim, Q3 reports and material events."
+        },
+        {
+          "name": "mx_finance_search_notice",
+          "request_summary": "Post-quarter convertible and risk notices; empty result."
+        },
+        {
+          "name": "mx_ashare_finance_data",
+          "request_summary": "Same-date 001380, 300611, 000887 valuation and consensus metadata."
+        }
+      ],
+      "adopted_fields": [
+        "Close 14.17",
+        "PE TTM 16.4",
+        "PB 1.864",
+        "Share count",
+        "Financial discovery",
+        "Rough peer valuation references"
+      ],
+      "cross_checked_fields": [
+        "Identity",
+        "Close",
+        "Financial statements",
+        "Share count",
+        "Convertible issuance and terms"
+      ],
+      "excluded_fields": [
+        "Intraday quotes after research cutoff",
+        "FY1 consensus without clear fiscal-year mapping or sample count"
+      ],
+      "status": "partial_success",
+      "failure_class": "one_empty_notice_response_and_incomplete_consensus_metadata",
+      "fallback": "Canonical project prices and official CNINFO/SZSE filings; official announcement query resolved post-quarter events."
+    },
+    "data_gaps": [
+      "Sector index",
+      "Robot-specific orders and operating data",
+      "Qualified 2027 consensus",
+      "Future financing amortization, free cash and conversion path",
+      "No exhaustive regulatory/judicial database review"
+    ]
+  },
+  "revision": null,
+  "report_markdown": "# 华纬科技（001380.SZ）投资研究\n\n分析截止：2026-11-03T09:40:23+08:00。目标日期：2027-11-03。首次建档，无历史基线。单位为人民币。\n\n**结论：中性偏谨慎，研究置信度中低。** 公司具备汽车弹性元件工艺、认证和客户积累，但收入增长与利润兑现出现背离。中性条件价值15.5元，比基准价高约9.4%，安全边际不突出。最强反方是新工厂和德国业务早期费用可能具有阶段性，产能爬坡后利润弹性可能高于本次中性假设。\n\n## 研究快照\n\n华纬科技股份有限公司，深交所主板普通A股，2023年5月16日上市。基准为2026年11月2日15:00未复权收盘14.17元；日线按16:00保守可得。项目Tushare正式daily与妙想交叉核对一致。总股本270,854,208股，整体A股总市值约38.38亿元；回购库存股1,240,100股。最新审计年报FY2025，最新季报2026年前三季度，季报未经审计。PE TTM约16.4倍，PB约1.86倍。\n\n价格、财务关键字段及股本已复核。量价使用250根完整未复权日线及同步沪深300，缺行业基准。妙想实际调用4次，3次取得可用结果，1次公告查询空结果；期后公告通过巨潮官方列表和原文补齐。剔除晚于截止时点的盘中报价及缺年度映射、样本数的FY1一致预期。\n\n## 业务、论点与反证\n\nP1：公司主要产品是悬架弹簧、稳定杆、制动弹簧及阀类和异形零部件，下游付款方为车企和零部件厂商。安全件认证、同步研发、制造稳定性和规模交付构成壁垒，但不保证定价权。2025年前五客户占收入66.06%，2026H1按同控客户归集口径为51.30%，客户议价仍重要。行业参与者包括国内外弹簧厂商，没有可靠份额口径支持称公司为绝对垄断龙头。\n\nP2：2026H1悬架系统收入7.117亿元，同比下降11.49%；阀类及异形零部件1.989亿元，增长246.37%；外销1.838亿元，增长221.25%。募集说明书明确后两项增长主要来自2026年1月德国资产收购。因此应区分并购扩张和内生增长。公司产品应用涉及工业机器人，但未取得可单独验证的人形机器人重大订单、收入和利润贡献，不为该题材单列中性估值溢价。\n\nP3：经营现金流改善，但资本开支、库存和商业承兑汇票限制现金释放。核心验证链是“客户采购和交付→利用率/单位成本→利润率→现金流→估值”，不能仅凭收入增长认定价值增长。\n\n五原则检验：细分工艺能力有支持；景气和供不应求缺充分证据；收入兑现可见、利润承压；上游零件具有认证壁垒也承受客户压价；技术趋势谨慎。卡脖子地位待验证，持续提价未获证据；缺可信事前预期基准，不能宣称收入已超市场预期。政策支持需经客户实际采购兑现，未使用未经核验的政策版本直接推算订单。\n\n## 财务与会计质量\n\n单位：亿元。全年、累计和单季严格分开。\n\n| 指标 | 2024全年 | 2025全年 | 2026H1 | 2026前三季度 | 2026Q3单季 |\n|---|---:|---:|---:|---:|---:|\n| 收入 | 18.604 | 19.922 | 10.017 | 16.017 | 6.000 |\n| 归母净利润 | 2.264 | 2.751 | 1.167 | 1.635 | 0.468 |\n| 扣非归母净利润 | 2.131 | 2.503 | 1.143 | 1.601 | 0.458 |\n| 经营现金流 | -1.984 | 3.496 | 1.266 | 2.161 | 0.895 |\n\nQ3现金流为前三季度减半年数。Q3收入同比+26.43%，归母利润-39.67%；归母净利率约7.80%。累计还原的Q3毛利率23.51%，H1累计毛利率30.19%；二者期间不同，不能称环比下降。前三季度管理费用8132万元，同比+87.83%，公告解释为新增子公司运营带来的薪酬、中介和折旧增加；财务费用因汇兑等增加。信用减值由上期收益转为损失。毛利率下降中价格、产品结构和工厂爬坡的贡献尚未被充分量化，不把券商推测当公告事实。\n\n经营现金流2.161亿元/合并净利润1.683亿元=1.28倍；资本开支1.872亿元，简化FCF仅约0.289亿元。此数未扣并购与投资，不等同可分配现金。9月末存货3.468亿元，较年初+32.61%；应收票据2.319亿元，较年初+361.52%，主要系商业承兑增加。账款虽下降，但账款、票据与应收款项融资合计约13.30亿元，年初约12.87亿元，不能只看账款下降便判断回款全面改善。\n\n2025年标准无保留审计意见，研发投入资本化为零。实际控制人为金雷，上市公告书披露其控制65.63%股份。约2000万元回购已于7月完成，用途包括员工持股、激励或转债转股，并非价格保底。关联交易、减持、质押和诉讼须持续核查；本次未作监管/司法全库穷尽检索，不能宣称不存在相关风险。\n\n## 转债与股本桥\n\n10月发行5.75亿元转债，净募集5.6626亿元于10月21日到账；11月3日上市，2027年4月21日起可转股，初始转股价18.48元。按初始价全转新增约3111.47万股，相当现总股本11.49%；保守未抵减库存股交付的潜在好处。\n\n9月末货币资金3.2189亿元，有息债务约0.579亿元。仅做发行桥且不计其他变动，发行后有息债务约6.329亿元、货币资金约8.8815亿元；这是模拟桥，不是11月实际资产负债表。募集专户和受限资金不能全部冲减债务。募集资金用于南京原材料、重庆基地、仓储与补流，不在PE股权价值上重复加回现金。\n\n截至10月29日已出现10个交易日收盘低于转股价85%的情形。预计触发不等于已经下修，尚需满足条件及法定决议。若假设下修至14元且全转，股本约3.1193亿股；同样中性利润和倍数下，每股价值约13.5元。该值仅为稀释压力测试，不预测实际下修。\n\n## 三情景与估值\n\n下列经营、现金流和倍数均为作者独立条件假设，不是公司指引或一致预期。经营期FY2027E；目标日2027-11-03。不赋概率，不计算加权目标价；不含股息，实际股息未预测，含息回报暂不计算。\n\n| 情景 | 收入 | 归母净利率 | 归母利润 | OCF/资本开支/简化FCF | 股本/转债 | PE | 条件价值 | 较14.17元 |\n|---|---:|---:|---:|---|---|---:|---:|---:|\n| 悲观 | 22亿元 | 8% | 1.76亿元 | 2.1/3.2/-1.1亿元 | 2.7085亿股，债务保留 | 12倍 | 7.8元 | -45.0% |\n| 中性 | 25亿元 | 10.5% | 2.625亿元 | 3.2/3.0/0.2亿元 | 2.7085亿股，债务保留，无下修 | 16倍 | 15.5元 | +9.4% |\n| 乐观 | 28亿元 | 12% | 3.36亿元 | 4.3/2.8/1.5亿元 | 初始价全转后约3.0197亿股 | 20倍 | 22.3元 | +57.0% |\n\n悲观：压价和低利用率延续，整合费用持续。连续两季毛利率回到28%以上且费用率下降则弱化。中性：悬架企稳、德国整合后费用增速回落；连续两季归母净利率低于8%或转股价下修需重算。乐观：订单、利用率、费用和回款共同改善；2027中报毛利率仍低于26%且德国未改善则缺支持。阈值是研究假设。\n\n2026全年工作假设为收入21.8亿元、归母2.15亿元，要求Q4收入约5.78亿元、利润约0.51亿元。2027中性收入较此约+14.7%，净利率仍低于2025年的13.81%。收入产品桥：悲观悬架15.8+阀类4.2+制动1.5+其他0.5=22亿元；中性17.8+4.8+1.8+0.6=25亿元；乐观19.5+5.8+2.0+0.7=28亿元。假设是否兑现须靠订单、产销和报表验证。\n\n公式：每股价值=收入×归母净利率×PE÷目标期股数。中性=25×10.5%×16÷2.70854208=15.5元。悲观同理；乐观分母为2.70854208+5.75÷18.48，利润率按融资/转股后归母口径估算。此为情景每股盈利，不冒充法定加权EPS。归母利润已经扣融资费用，不能再扣全部债务；不同转股路径须重估。\n\n倍数参照为2026年11月2日妙想快照：华纬16.40倍TTM、美力科技25.59倍、中鼎股份18.03倍。美力为弹簧业务参照，中鼎仅作多元悬架相关业务粗参照；期间、产品和增长不同，未把它们作为同口径2027行业中位数。12/16/20倍分别体现持续承压、温和修复和执行改善，均属研究判断。\n\n交叉检查：9月末归母净资产/总股本约7.60元，假设静态PB1.8—2.1倍对应13.7—16.0元，接近中性PE。该PB带是合理性检查，未计未来留存及转股权益，不独立证明公平价值，也不与PE平均。由于资本开支、营运资金和新业务贡献不稳定，不给精确DCF。\n\n敏感性：25亿元收入下，净利率每变1个百分点，利润变化0.25亿元；按16倍PE与未转股股本，每股价值变化约1.48元。中性利润下PE每变2倍，价值变化约1.94元。净利率9.5%—11.5%、PE14—18倍组合约12.3—19.1元，未含额外下修摊薄。\n\n反向估值：14.17×2.70854208÷16=隐含归母利润约2.40亿元，25亿元收入下隐含净利率约9.6%。现价已需要一定利润修复。TTM利润=2025全年2.7508+2026前三季1.6354-2025前三季2.0456=2.3407亿元；16.4倍TTM含2025Q4利润，不能直接代表当前单季盈利速度。\n\n## 量价辅助、催化与监测\n\n未复权价格收益，不含股息；长窗口均线可能受公司行动影响。收盘14.17低于MA20约16.17、MA60约17.06、MA120约17.04。20日价格收益-24.18%，沪深300-7.46%，落后16.72个百分点。近5日均量/此前20日0.68，价跌量缩不证明止跌；MACD零轴下，ATR14约0.73元（股价5.13%）。技术判断谨慎，与盈利承压一致。\n\n观察锚为近期低点13.60—13.90、近期交易区15.1—15.8及当前MA20约16.17元。位置会变化，不保证支撑压力，也不构成买卖指令。技术信号不修改盈利、倍数、目标价或情景概率。\n\n后续检查：①每季核对悬架收入、德国经营利润和管理费用率；②每季核对毛利率与归母净利率，连续两季净利率低于8%则下调中性；③每季核对OCF减资本开支和票据库存，年度FCF持续负值则降低资本配置评价；④随公告检查下修、转股及股本，下一例行检查11月6日；⑤12月31日检查延期募投验收计划，计划节点不等于已投产；⑥机器人仅在客户、订单、收入、回款可核实后纳入新增估值；⑦随公告检查减持、质押与关联交易。\n\n最主要风险是客户压价、需求不及预期、德国整合/汇兑、低利用率与折旧、商承回款、资本开支回收和转债摊薄。连续两季毛利率恢复至28%以上、费用率下降且OCF覆盖资本开支时，修复论点才得到更强支持。\n\n## 原始来源与限制\n\n| 文件 | 发布日期 | 保守可得时点（上海时区） | 用途 |\n|---|---|---|---|\n| [2025年报](https://disc.static.szse.cn/download/disc/disk03/finalpage/2026-04-03/ffd4be59-1a69-4db5-bdaf-ecbcb7b2c859.PDF) | 2026-04-03 | 2026-04-04T00:00:00+08:00 | 财务、审计、客户、研发 |\n| [2026半年报](https://static.cninfo.com.cn/finalpage/2026-08-27/1225512040.PDF) | 2026-08-27 | 2026-08-28T00:00:00+08:00 | 业务结构、费用 |\n| [2026三季报](https://static.cninfo.com.cn/finalpage/2026-10-24/1225619897.PDF) | 2026-10-24 | 2026-10-25T00:00:00+08:00 | 最新经营、现金和股本 |\n| [募集说明书摘要](https://static.cninfo.com.cn/finalpage/2026-10-13/1225602400.PDF) | 2026-10-13 | 2026-10-14T00:00:00+08:00 | 德国收购、产能、项目 |\n| [下修提示](https://static.cninfo.com.cn/finalpage/2026-10-30/1225639056.PDF) | 2026-10-30 | 2026-10-31T00:00:00+08:00 | 发行到账、下修可能性 |\n| [上市公告书](https://static.cninfo.com.cn/finalpage/2026-10-31/1225649914.PDF) | 2026-10-31 | 2026-11-01T00:00:00+08:00 | 证券身份、转债和控制人 |\n\n源仅标日期时保守按次日零时纳入；没有伪造原始分钟。访问发生于2026年11月3日上午，结构化记录保存完成核对的时点。缺行业基准、机器人独立经营数据及可靠2027一致预期；前瞻利润、现金流和倍数均为作者假设。融资后自由现金、会计利息摊销和真实转股路径仍可能显著改变结果。资料未支持穷尽所有治理风险。算术精确不代表预测精确。\n\n首次覆盖，baseline_record_id无。报告及结构化包由项目历史工具保存为不可变记录。\n\n本报告仅供研究与教育用途，不构成个性化投资建议、收益承诺或交易指令。\n"
+}

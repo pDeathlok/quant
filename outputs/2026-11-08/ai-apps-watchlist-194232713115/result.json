@@ -1,0 +1,58 @@
+{
+  "completed_at": "2026-11-08T19:42:32+08:00",
+  "before_count": 96,
+  "after_count": 101,
+  "new_symbols": 5,
+  "new_alerts": 5,
+  "items": [
+    {
+      "symbol": "688111.SH",
+      "name": "金山办公",
+      "new_symbol": false,
+      "new_alert": false
+    },
+    {
+      "symbol": "688095.SH",
+      "name": "福昕软件",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "300624.SZ",
+      "name": "万兴科技",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "600588.SH",
+      "name": "用友网络",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "688777.SH",
+      "name": "中控技术",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "002410.SZ",
+      "name": "广联达",
+      "new_symbol": true,
+      "new_alert": true
+    },
+    {
+      "symbol": "300364.SZ",
+      "name": "中文在线",
+      "new_symbol": false,
+      "new_alert": false
+    },
+    {
+      "symbol": "300418.SZ",
+      "name": "昆仑万维",
+      "new_symbol": false,
+      "new_alert": false
+    }
+  ],
+  "verification": "PASS"
+}

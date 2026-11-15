@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "ticker": "001380.SZ",
+  "company_name": "华纬科技股份有限公司",
+  "analysis_cutoff": "2026-11-03T09:41:23+08:00",
+  "mode": "full_coverage",
+  "trigger": {
+    "type": "initial",
+    "summary": "首次建立研究基线",
+    "source_refs": []
+  },
+  "baseline_record_id": null,
+  "conclusion": {
+    "stance": "neutral",
+    "confidence": "low",
+    "summary": ""
+  },
+  "thesis": {
+    "pillars": [],
+    "strongest_counterargument": "",
+    "falsifiers": []
+  },
+  "scenarios": {
+    "bear": {},
+    "base": {},
+    "bull": {}
+  },
+  "monitoring": [],
+  "evidence_ledger": [],
+  "data_snapshot": {},
+  "revision": null,
+  "report_markdown": "# 待填写研究报告"
+}
