@@ -22,6 +22,8 @@
 | `GET` | `/api/convertible-bonds/plan` | `trade_date`、`limit`、`refresh` | 可转债计划 |
 | `GET` | `/api/convertible-bonds/allotments` | `limit`、`include_listed_days`、`refresh`、`stage_scope` | 配债股跟踪 |
 | `GET` | `/api/byd/daily-plan` | 持仓、成本和当日做T参数 | BYD 日线计划 |
+| `GET` | `/api/transition/plan` | `strategy=return\|win`、`refresh` | 当前市场过渡工作区 |
+| `PUT` | `/api/transition/account/{strategy}` | `revision`、`cash`、`positions` | 保存用户提供的过渡账户状态；版本冲突返回 409 |
 | `GET` | `/api/similar-patterns/analysis` | `refresh` | 相似走势分析 |
 | `POST` | `/api/similar-patterns/analysis/refresh` | 无 | 强制刷新相似走势 |
 
@@ -58,16 +60,40 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 
 | `scope` | 页面 |
 | --- | --- |
-| `all` | 全部工作区 |
+| `all` | 全部日常策略工作区；不包含股指独立研究刷新及用户记录 |
 | `short` | 短线策略 |
 | `chan` | 缠论策略 |
 | `long` | 长线策略 |
 | `cb` | 可转债策略 |
 | `cbAllotment` | 配债股 |
-| `byd` | BYD 做T |
+| `byd` | 市场过渡（沿用内部兼容名称） |
 | `similar` | 相似走势 |
 
 状态响应包含 `status`、`percent`、`current_step`、`steps`、`result` 和 `error`。终态为 `success` 或 `failed`。
+
+`/api/selector/stocks` 还返回同日 ETF 资金背景 `etf_flow`；历史查询按信号日读取。已启用的模型组合由正式发布产物读取，不在 GET 请求中重新训练。模型/日期不匹配的候选结果不能替代历史发布快照。
+
+## 复盘记录与操作计划
+
+| 方法 | 路径 | 输入与行为 |
+| --- | --- | --- |
+| `GET` | `/api/review-records` | 返回 `records` 数组 |
+| `POST` | `/api/review-records` | 必填 `symbol`；可带 `name`、`source`、`signal_date`、`information`、`snapshot`、`note`，返回 `record` |
+| `PUT` | `/api/review-records/{record_id}/note` | 仅接受 `note`，保留加入时的快照和依据；其他字段返回参数校验错误 |
+| `DELETE` | `/api/review-records/{record_id}` | 删除指定记录，返回 `{"deleted":true}` |
+| `GET` / `POST` | `/api/operation-plans` | 查询 / 新建用户操作计划，字段以 OpenAPI 为准 |
+| `PUT` / `DELETE` | `/api/operation-plans/{plan_id}` | 更新 / 删除指定计划 |
+
+复盘股票代码支持六位代码及 `.SH` / `.SZ` / `.BJ` 后缀；非法代码返回 400，未知记录的笔记修改和删除返回 404。数据存于 `web/data/review_records.json`，写操作使用文件锁和原子替换。损坏文件会显式报错，不会作为空记录覆盖。操作计划和复盘均为用户记录，日常刷新不会重写，部署前应备份 `web/data/`。
+
+## 股指战法独立刷新
+
+| 方法 | 路径 | 行为 |
+| --- | --- | --- |
+| `POST` | `/api/index-futures/refresh` | 启动独立后台行情与预案刷新；正在运行时复用当前任务 |
+| `GET` | `/api/index-futures/refresh/status` | 返回 `status` 和可选 `message` |
+
+此接口的状态为 `idle`、`running`、`complete`、`failed`，与日常刷新使用的 `success` 不同。后台子进程时限为 300 秒，失败保留此前公开结果。历史页面来自冻结研究导出；详细数据时钟和季度模型要求见 [股指战法工作台](strategies/index_futures_workspace.md)。
 
 ## 研究与历史接口
 

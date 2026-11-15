@@ -21,6 +21,7 @@ wheels/
 
 # Virtual environments
 .venv/
+.venv-*/
 env/
 venv/
 
@@ -66,6 +67,11 @@ Thumbs.db
 logs/*.log
 .run/
 .playwright-cli/
+
+# Rebuildable local dependencies, downloads and tool caches
+/.tmp/
+.pytest_cache/
+.ruff_cache/
 
 # Claude
 .claude/

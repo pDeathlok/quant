@@ -1,6 +1,6 @@
 # Quant 策略工作台
 
-Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、长线、可转债、配债股、BYD 做T 和相似走势 7 个工作区。
+Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、长线、可转债、配债股、市场过渡和相似走势，并提供独立的股指战法研究页、操作计划和复盘记录。
 
 > 本项目用于策略研究和数据分析，不构成投资建议。数据、模型、回测与页面信号都需要结合交易所公告和真实账户约束复核。
 
@@ -11,7 +11,8 @@ Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、
 - 复用正式日线生成每日 `risk_on/neutral/risk_off` 市场状态；无需接入第二套行情源。
 - 构建 B1/B2/B3 与扩展策略特征、模型评分和每日候选池。
 - 提供组合构建、防泄漏 Walk-Forward、因子诊断、绩效归因、风险容量、标准报告和可持久化模拟交易能力。
-- 在一个 FastAPI + 静态前端工作台中查看 7 类策略结果。
+- 在 FastAPI + 静态前端工作台中查看策略结果、模型组合候选和 ETF 资金背景。
+- 股指战法使用冻结研究历史与独立更新的开仓预案；操作计划和复盘笔记由用户维护。
 - 按日期保存选股器和工作区快照，支持历史复盘。
 - 每日流水线采用有依赖的并行编排，单个非核心工作区失败不会阻断其他工作区。
 - 以模块化单体方式维护应用用例、存储适配和 HTTP 交付边界，避免工作区继续堆叠在 Web 服务层。
@@ -19,7 +20,7 @@ Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、
 
 ## 前置条件
 
-- Python 3.9 或更高版本。
+- 项目声明 Python 3.9 或更高版本；完整应用和新增研究脚本建议使用 Python 3.13。CI 的版本覆盖范围见 [开发说明](docs/development.md)。
 - 正式刷新行情时需要有效的 `TUSHARE_TOKEN`。
 - MySQL 为生产推荐项；本地开发可以仅使用 Parquet。
 
@@ -36,6 +37,8 @@ PYTHONPATH=src python scripts/run_webapp.py
 ```
 
 打开 [http://127.0.0.1:8088](http://127.0.0.1:8088)。API 健康检查位于 [http://127.0.0.1:8088/api/health](http://127.0.0.1:8088/api/health)，交互式 API 文档位于 [http://127.0.0.1:8088/docs](http://127.0.0.1:8088/docs)。
+
+Git 不包含正式行情、模型权重与页面快照。首次启动不会自动生成历史研究成果；需要恢复对应产物并核对版本后才能获得完整策略输出，详见 [开发与验证](docs/development.md)。
 
 首次进行真实数据刷新前，编辑 `.env` 并至少填写：
 
@@ -63,10 +66,16 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 3. 按活动依赖闭包清理缓存并刷新共享 Tushare 行情、当前策略实际需要的 `daily_basic` 与参考数据；`tradability` 只在研究/显式回填任务中刷新。
 4. 使用截至当日的沪深300、全市场宽度、波动率和成交额生成市场状态日期快照与 `latest.json`。
 5. 先增量构建便宜的规则信号和 B1/Z 候选并集，再只为命中股票计算完整重因子，避免全市场重复计算和两套进程池争抢资源。
-6. 共享数据就绪后先并行启动可转债、配债股和 BYD 做T；特征与规则信号完成后，并行生成每日计划、Dashboard、模型评分与缠论评分，再计算短线股票池和剩余工作区。
+6. 共享数据封存后按依赖和统一资源配额启动下游任务；相似走势向量分析可提前执行，策略快照齐备后再补齐同日买入/持有评分和只读策略标记。排名、模型组合与页面产物按所选作用域执行。
 7. 原子发布正式文件，并将步骤状态、起止时间、耗时和结果写入 `data/routine/<运行时间>_<run_id>/manifest.json`。
 
-短线策略由主流水线生成，因此这套流程覆盖全部 7 个 Tab。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述统一入口。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
+「更新全部」和短线页的「更新本页」会发布同日宽基 ETF 资金快照。快照使用 Tushare 日度数据和固定的 15 只 ETF，显示 5/20 交易日估算净申购、占期初规模比例、放量倍数和覆盖率。成交指标滞后一交易日，资金指标至少滞后两交易日并遵守净值公告日。接口随 `/api/selector/stocks` 返回 `etf_flow`，历史日期按当日快照读取。ETF 采集异常会记录到刷新结果，候选评分可继续完成。
+
+左右侧正式排序共用同一日的 ETF 特征快照。模型发布文件为 `configs/strategies/short_etf_rank.json`，每侧对原排序分的修正上限为 4 个百分点。评分产物保留原分 `ranking_score_base`，并用 `ranking_score` 排序。ETF 数据缺失或基础模型版本不匹配时沿用原分。只有 ETF 输入或排序层变化时会重评排序并复用有效的个股特征缓存。排序层单独通过 `scripts/research/train_short_etf_rank.py` 训练，日常刷新直接读取发布文件。
+
+这套流程覆盖 7 个日常策略工作区；市场过渡沿用内部 `byd` 作用域。股指战法独立按需刷新，操作计划和复盘记录不由日更覆盖。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述统一入口。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
+
+当前左侧使用 RankNet 融合，短线默认模型应用组合由 `configs/strategies/application_portfolio.json` 管理；发布/回滚和研究入口见 [研究工作流索引](docs/research_workflows.md)。排序分、校准概率与资金队列是不同口径，页面候选不代表已下单或真实账户持仓。
 
 ## 配置
 
@@ -85,8 +94,8 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 | `MARKET_DATA_SQL_WRITE_TIMEOUT` | `60` | MySQL 写入超时，单位秒 |
 | `ROUTINE_DAILY_WORKERS` | `4` | 日线刷新并发数 |
 | `ROUTINE_DAILY_SLEEP` | `0.08` | Tushare 请求间隔，单位秒 |
-| `ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES` | `12` | 当天日线为空或覆盖率不足时允许连续失败次数；第 13 次探测仍失败才终止 |
-| `ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL` | `300` | 当天日线可用性探测间隔，单位秒；默认每 5 分钟一次 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_FAILURES` | `12` | 历史日线或非缺失错误的失败预算；当日缺失采用 17:20 截止规则 |
+| `ROUTINE_DAILY_AVAILABILITY_RETRY_INTERVAL` | `600` | 历史或非缺失错误的重试间隔，单位秒；当日缺失每 600 秒重试 |
 | `ROUTINE_DAILY_BATCH_MIN_COVERAGE_RATE` | `0.995` | 每个交易日全市场批量响应的最低股票覆盖率；低于阈值拒绝发布 |
 | `ROUTINE_DAILY_BASIC_WORKERS` | `4` | `daily_basic` 按交易日刷新的并发数 |
 | `ROUTINE_DAILY_BASIC_SLEEP` | `0.25` | `daily_basic` 请求最小间隔，单位秒 |
@@ -95,6 +104,10 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 | `ROUTINE_TRADABILITY_RETRIES` | `3` | 涨跌停、停牌和 ST 接口的单日重试次数 |
 | `ROUTINE_MARKET_REGIME_LOOKBACK_DAYS` | `252` | 每日市场状态读取正式行情的自然日回看窗口，最小 90 |
 | `ROUTINE_FEATURE_WORKERS` | `8` | 特征构建并发数 |
+| `ROUTINE_TOTAL_WORKERS` | CPU 核数 | DAG 统一 CPU 配额；各任务及嵌套并行共同受此约束 |
+| `ROUTINE_IO_SLOTS` | `4` | DAG 统一 I/O 配额；新左侧分区读取最多占 2 槽，配置为 1 时串行 |
+| `ROUTINE_MEMORY_BUDGET_MB` | `8192` | 调度内存预算；新左侧声明 6144 MB，预算不足会阻断任务 |
+| `ROUTINE_DB_CONNECTIONS` | `8` | DAG 数据库连接配额 |
 | `ROUTINE_MODEL_SCORE_WORKERS` | `4` | Web 每日更新中策略模型评分的 worker 数；与缠论评分并行时上限为 4 |
 | `ROUTINE_RIGHT_SIDE_WORKERS` | `6` | 右侧统一因子 worker 数；等待模型评分完成后与缠论 4 workers 并行，总上限为 10 |
 | `ROUTINE_FEATURE_EXECUTOR` | `processes` | 特征计算执行器；CPU 密集计算默认使用多进程 |
@@ -125,10 +138,11 @@ PYTHONPATH=src python -m quant.routine.tradability_refresh \
 PYTHONPATH=src python main.py backtest --strategy momentum --symbol 600000 \
   --start-date 20200101 --end-date 20231231
 
-# 测试与静态检查
+# 测试与静态检查；隔离数据根目录的完整命令见 docs/development.md
 PYTHONPATH=src pytest -q
+node --test tests/frontend/*.test.js
 PYTHONPATH=src python -m compileall -q src tests scripts
-ruff check src tests
+python -m ruff check --select E9,F63,F7,F82 src tests scripts
 ```
 
 ## 配债股自选池复核任务
@@ -214,6 +228,8 @@ web/                       单页工作台前端
 web/core/                  前端 API 客户端与格式化基础模块
 scripts/research/          研究、训练、回测和校准脚本
 configs/strategies/        已确认的生产策略配置
+configs/releases/          发布候选与回滚配置
+configs/research/          研究参数与候选方案
 docs/strategies/           策略依据、口径和迭代记录
 tests/                     单元、集成和 API 测试
 ```
@@ -227,6 +243,8 @@ tests/                     单元、集成和 API 测试
 ## 文档
 
 - [文档中心](docs/README.md)
+- [开发、验证与提交](docs/development.md)
+- [研究与生产入口索引](docs/research_workflows.md)
 - [系统架构与数据流](docs/architecture.md)
 - [API 参考](docs/api.md)
 - [每日运行与故障排查](docs/operations.md)
