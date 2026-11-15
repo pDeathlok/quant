@@ -652,7 +652,11 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
     )
     empty_tradability = pd.DataFrame()
 
-    def iter_tasks() -> Iterator[tuple[object, ...]]:
+    def iter_tasks(
+        market: pd.DataFrame,
+        by_family: dict[str, pd.DataFrame],
+        by_tradability: dict[str, pd.DataFrame],
+    ) -> Iterator[tuple[object, ...]]:
         for symbol, group in market.groupby("ts_code", sort=True):
             symbol_text = str(symbol)
             yield (
@@ -718,7 +722,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         entry_modes.update(labels["entry_mode"].astype(str).value_counts().to_dict())
         horizons.update(labels["horizon"].astype(int).value_counts().to_dict())
 
-    task_iterator = iter(iter_tasks())
+    task_iterator = iter(iter_tasks(market, by_family, by_tradability))
     completed = 0
     total_tasks = len(selected_symbols)
     try:

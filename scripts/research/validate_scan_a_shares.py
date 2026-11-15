@@ -321,9 +321,9 @@ def run(output: Path, supplement: Path | None = None) -> None:
             print(f"Continuous adjustment {number}/{len(codes)}",flush=True)
     adjusted = pd.concat(chunks,ignore_index=True)
     del raw,chunks
-    def matrix(col: str) -> pd.DataFrame:
-        return adjusted.pivot(index="date",columns="ts_code",values=col).reindex(index=dates,columns=codes).astype("float32")
-    close,open_,high,low,amount = [matrix(col) for col in ["close","open","high","low","amount"]]
+    def matrix(frame: pd.DataFrame, col: str) -> pd.DataFrame:
+        return frame.pivot(index="date",columns="ts_code",values=col).reindex(index=dates,columns=codes).astype("float32")
+    close,open_,high,low,amount = [matrix(adjusted, col) for col in ["close","open","high","low","amount"]]
     observed = close.notna()
     del adjusted
     info = features(close,amount,observed,high,low)

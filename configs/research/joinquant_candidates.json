@@ -1,0 +1,171 @@
+{
+  "version": "jq-local-research-v1",
+  "status": "research_candidate",
+  "entrypoint": "quant.features.joinquant_candidates",
+  "source": "Tushare local historical caches; inspired by JoinQuant definitions, not vendor-certified numerical parity",
+  "official_top_ranking_verified": false,
+  "official_catalog": "https://www.joinquant.com/help/api/help?name=factor_values",
+  "official_dashboard": "https://www.joinquant.com/view/factorlib/list",
+  "factors": [
+    {
+      "name": "jq_DAVOL5",
+      "family": "price",
+      "formula": "mean(turnover_rate,5)/mean(turnover_rate,120)"
+    },
+    {
+      "name": "jq_DAVOL10",
+      "family": "price",
+      "formula": "mean(turnover_rate,10)/mean(turnover_rate,120)"
+    },
+    {
+      "name": "jq_DAVOL20",
+      "family": "price",
+      "formula": "mean(turnover_rate,20)/mean(turnover_rate,120)"
+    },
+    {
+      "name": "jq_turnover_volatility",
+      "family": "price",
+      "formula": "std(turnover_rate,20), sample ddof=1"
+    },
+    {
+      "name": "jq_VOL60",
+      "family": "price",
+      "formula": "mean(turnover_rate,60)"
+    },
+    {
+      "name": "jq_VOL120",
+      "family": "price",
+      "formula": "mean(turnover_rate,120)"
+    },
+    {
+      "name": "jq_VOL240",
+      "family": "price",
+      "formula": "mean(turnover_rate,240)"
+    },
+    {
+      "name": "jq_Skewness20",
+      "family": "price",
+      "formula": "unbiased_skew(daily_return,20)"
+    },
+    {
+      "name": "jq_Skewness60",
+      "family": "price",
+      "formula": "unbiased_skew(daily_return,60)"
+    },
+    {
+      "name": "jq_Skewness120",
+      "family": "price",
+      "formula": "unbiased_skew(daily_return,120)"
+    },
+    {
+      "name": "jq_Kurtosis20",
+      "family": "price",
+      "formula": "unbiased_excess_kurtosis(daily_return,20)"
+    },
+    {
+      "name": "jq_Kurtosis60",
+      "family": "price",
+      "formula": "unbiased_excess_kurtosis(daily_return,60)"
+    },
+    {
+      "name": "jq_Kurtosis120",
+      "family": "price",
+      "formula": "unbiased_excess_kurtosis(daily_return,120)"
+    },
+    {
+      "name": "jq_VOSC",
+      "family": "price",
+      "formula": "100*(EMA(volume,12)-EMA(volume,26))/EMA(volume,12)"
+    },
+    {
+      "name": "jq_WVAD",
+      "family": "price",
+      "formula": "sum((close-open)/(high-low)*volume,6)"
+    },
+    {
+      "name": "jq_MAWVAD",
+      "family": "price",
+      "formula": "mean(WVAD,6)"
+    },
+    {
+      "name": "jq_MFI14",
+      "family": "price",
+      "formula": "100*positive_typical_price_flow14/(positive_flow14+negative_flow14)"
+    },
+    {
+      "name": "jq_arron_up_25",
+      "family": "price",
+      "formula": "100*(25-days_since_latest_highest_high_in25)/25"
+    },
+    {
+      "name": "jq_arron_down_25",
+      "family": "price",
+      "formula": "100*(25-days_since_latest_lowest_low_in25)/25"
+    },
+    {
+      "name": "jq_cash_earnings_to_price_ratio",
+      "family": "finance",
+      "formula": "CFO_TTM/(total_mv*10000)"
+    },
+    {
+      "name": "jq_operating_profit_yield_proxy",
+      "family": "finance",
+      "formula": "operating_profit_TTM/(total_mv*10000)"
+    },
+    {
+      "name": "jq_operating_profit_ratio",
+      "family": "finance",
+      "formula": "operating_profit_TTM/revenue_TTM"
+    },
+    {
+      "name": "jq_operating_revenue_growth_rate",
+      "family": "finance",
+      "formula": "revenue_TTM/prior_year_revenue_TTM-1; positive base"
+    },
+    {
+      "name": "jq_operating_profit_growth_rate",
+      "family": "finance",
+      "formula": "operating_profit_TTM/prior_year_operating_profit_TTM-1; positive base"
+    },
+    {
+      "name": "jq_gross_margin_change_pp_proxy",
+      "family": "finance",
+      "formula": "current reported cumulative gross margin minus same period previous year, percentage points"
+    },
+    {
+      "name": "jq_OperatingCycle_proxy",
+      "family": "finance",
+      "formula": "360/reported_ar_turn+360/reported_inv_turn; reported cumulative turnover proxy"
+    }
+  ],
+  "deferred": [
+    {
+      "factor": "cfo_to_ev",
+      "reason": "balance sheet history currently stops at2026Q1; refresh required"
+    },
+    {
+      "factor": "DEGM",
+      "reason": "missing TTM operating cost; use separately named cumulative margin-change proxy"
+    },
+    {
+      "factor": "residual_volatility / CNE5",
+      "reason": "requires full weighted risk descriptors and cross-sectional orthogonalization; ordinary60d IVOL is not equivalent"
+    },
+    {
+      "factor": "Alpha101/Alpha191 complete sets",
+      "reason": "separate libraries; existing partial implementations need formula-level parity review before expansion"
+    }
+  ],
+  "existing_not_reimplemented": [
+    "PE/PB/PS/dividend yield",
+    "ROE/ROA/debt ratio",
+    "moving averages, MACD, RSI, KDJ, ATR",
+    "annual accrual and cashflow-quality factors"
+  ],
+  "limitations": [
+    "No current official TopN leaderboard available due regional restriction",
+    "Point-in-time announcement alignment tested; provider retrospective restatements unverified",
+    "Existing cohorts and historical diagnostic periods reused; future fresh holdout required",
+    "Research catalog only; no live model replacement"
+  ]
+}

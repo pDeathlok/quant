@@ -1,0 +1,4 @@
+# Optional dependencies for the frozen model-application v2 experiments.
+# Install in a research environment with the project's [ml] extra.
+tabm==0.0.3
+rtdl-num-embeddings==0.0.12

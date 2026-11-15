@@ -1,0 +1,87 @@
+{
+  "id": "etf_defensive_monthly_v1",
+  "status": "research_frozen_not_live",
+  "version_date": "2026-11-11",
+  "data_end": "2026-11-10",
+  "reference_capital_CNY": 1000000.0,
+  "base_weights": {
+    "510300.SH": 0.1,
+    "510880.SH": 0.1,
+    "511010.SH": 0.25,
+    "511260.SH": 0.25,
+    "518880.SH": 0.2,
+    "159985.SZ": 0.03333333333333333,
+    "159981.SZ": 0.03333333333333333,
+    "159980.SZ": 0.03333333333333333
+  },
+  "cash_return_assumption": 0,
+  "rebalance": {
+    "signal": "last_trading_day_of_month_close",
+    "simulation_fill": "next_trading_day_close",
+    "initial_state": "cash",
+    "unsatisfied_budget": "cash_no_redistribution",
+    "unfilled_orders": "no_automatic_retry_until_next_month",
+    "shorting": false,
+    "leverage": false
+  },
+  "eligibility": {
+    "valid_trading_quotes_min": 120,
+    "median20_amount_CNY_min": 20000000,
+    "current_valid_quote_required": true,
+    "nav_announcement": "strictly_before_signal_date",
+    "nav_valuation_age_calendar_days_max": 7,
+    "premium": "close_on_NAV_valuation_date / unit_NAV - 1",
+    "premium_max": 0.005,
+    "premium_data_sanity_min": -0.5,
+    "missing_information": "target_cash",
+    "complete_60_day_covariance_required": true
+  },
+  "execution": {
+    "buy_lot": 100,
+    "sell_first": true,
+    "commission": 0.0002,
+    "minimum_commission_CNY": 5,
+    "slippage": 0.0008,
+    "participation_of_prior20_median_max": 0.01,
+    "borrowing": false,
+    "dividends": "adjusted_return_reinvestment_approximation"
+  },
+  "live_checks_not_backtested": [
+    "account_permissions",
+    "halt_and_price_limits",
+    "bid_ask_spread",
+    "valid_current_IOPV_and_premium_before_buy; skip_if_unavailable_or_abnormal"
+  ],
+  "inactive_methods": [
+    "trend_timing",
+    "risk_parity",
+    "volatility_targeting",
+    "daily_stop_loss"
+  ],
+  "latest_completed_month_signal": "2026-10-30",
+  "latest_completed_month_target": {
+    "510300.SH": 0.1,
+    "510880.SH": 0.1,
+    "511010.SH": 0.25,
+    "511260.SH": 0.25,
+    "518880.SH": 0.2,
+    "159985.SZ": 0.0,
+    "159981.SZ": 0.03333333333333333,
+    "159980.SZ": 0.03333333333333333
+  },
+  "monitor_only_date": "2026-11-10",
+  "monitor_only_weights": {
+    "510300.SH": 0.1,
+    "510880.SH": 0.1,
+    "511010.SH": 0.25,
+    "511260.SH": 0.25,
+    "518880.SH": 0.2,
+    "159985.SZ": 0.0,
+    "159981.SZ": 0.03333333333333333,
+    "159980.SZ": 0.03333333333333333
+  },
+  "report": "/Users/didi/Project/quant/reports/research/final_etf_strategy_20261111/report.md",
+  "backtest_summary": "/Users/didi/Project/quant/reports/research/final_etf_strategy_20261111/selected_strategy.json",
+  "selection_script_sha256": "d2021c3ebba6e04845e649b18acb606ff88dcf8346398d55f1fd5b55bdd94fdf",
+  "protocol_sha256": "430ec97fcddf67840b356a0f43d98d5bf40196446390bf917d5f0842328a3129"
+}
