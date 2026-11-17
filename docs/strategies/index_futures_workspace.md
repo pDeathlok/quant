@@ -7,7 +7,7 @@
 ## 两个独立的数据时钟
 
 - 历史表现：冻结至2026-11-06；逐年独立50万元、各年启动累计、122/244日窗口、月度/相邻日起点、2025启动持续账户及近20/60/120交易日。近窗口回撤包含窗口期初权益；不会把逐年重置拼成持续账户。
-- 开仓预案：通过更新按钮获取Tushare期货、现货指数、ETF和交易日历，以及AKShare映射的QVIX数据源。新输入只写 `data/research/index_futures/workspace_live/sources`，不修改冻结研究数据。已完成交易日收盘后评分，下一交易日开盘前有效。页面在到期、重新显示或切换时检查有效性。
+- 开仓预案：每日例行入口和页面更新按钮获取Tushare期货、现货指数、ETF和交易日历，以及AKShare映射的QVIX数据源。新输入只写 `data/research/index_futures/workspace_live/sources`，不修改冻结研究数据。已完成交易日收盘后评分，下一交易日开盘前有效。页面在到期、重新显示或切换时检查有效性。
 
 开仓区默认**50万元权益、空仓的新账户**，不读取真实账户、不跟踪持仓、不执行交易。历史持续账户权益不能作为用户实际余额。若已有持仓或权益不同，应按该账户重建启动/切换状态，不能直接沿用此试算。
 
@@ -26,6 +26,8 @@
 PYTHONPATH=src python scripts/research/build_index_futures_signal.py --refresh --publish
 ```
 
+网页「更新全部」和定时入口共用全量任务，先发布其他策略，再于北京时间 18:00 后生成股指预案。发布前要求四个股指均有目标交易日的完整特征，并通过已有模型校验；数据尚未就绪时单独重试至 19:00。新预案原子写入 `web/data/index-futures/signal.json`，独立于冻结研究。
+
 按钮调用 `POST /api/index-futures/refresh`，通过 `GET /api/index-futures/refresh/status` 读取结果。并发请求合并，文件锁避免重复发布；后台任务300秒超时。失败保留上次公开快照，并在界面提示错误及过期状态。日志在 `data/research/index_futures/workspace_live/refresh.log`。
 
 单独重新导出历史页面：
@@ -34,4 +36,4 @@ PYTHONPATH=src python scripts/research/build_index_futures_signal.py --refresh -
 python scripts/research/build_index_futures_workspace.py
 ```
 
-现阶段季度模型服务仅支持冻结研究中已存在的季度。进入新季度，必须先生成新的成熟标签训练版本；未准备好时拒绝发布，不自动沿用上一季度模型冒充已重训。研究历史不会因点击更新按钮而延长，也未接入每天自动刷新任务。
+现阶段季度模型服务仅支持冻结研究中已存在的季度。进入新季度，必须先生成新的成熟标签训练版本；未准备好时拒绝发布，不自动沿用上一季度模型冒充已重训。每日任务和手动刷新均不改写或延长研究历史。

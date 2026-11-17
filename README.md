@@ -73,7 +73,7 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 
 左右侧正式排序共用同一日的 ETF 特征快照。模型发布文件为 `configs/strategies/short_etf_rank.json`，每侧对原排序分的修正上限为 4 个百分点。评分产物保留原分 `ranking_score_base`，并用 `ranking_score` 排序。ETF 数据缺失或基础模型版本不匹配时沿用原分。只有 ETF 输入或排序层变化时会重评排序并复用有效的个股特征缓存。排序层单独通过 `scripts/research/train_short_etf_rank.py` 训练，日常刷新直接读取发布文件。
 
-这套流程覆盖 7 个日常策略工作区；市场过渡沿用内部 `byd` 作用域。股指战法独立按需刷新，操作计划和复盘记录不由日更覆盖。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述统一入口。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
+网页「更新全部」和定时入口共用全量任务。任务先发布 7 个股票策略工作区，再于北京时间 18:00 后更新股指开仓预案。股指页也可手动刷新。股指历史研究、操作计划和复盘不由日更覆盖。项目提供每日任务入口，但不内置常驻调度器；生产环境需要由 cron、launchd 或其他调度平台每天调用上述统一入口。详细操作和故障处理见 [每日运行与故障排查](docs/operations.md)。
 
 当前左侧使用 RankNet 融合，短线默认模型应用组合由 `configs/strategies/application_portfolio.json` 管理；发布/回滚和研究入口见 [研究工作流索引](docs/research_workflows.md)。排序分、校准概率与资金队列是不同口径，页面候选不代表已下单或真实账户持仓。
 

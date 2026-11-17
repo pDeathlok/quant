@@ -116,13 +116,23 @@ export function showIndexFuturesPage(reload=false) {
     setInterval(expireIfNeeded,60000);
   }
   if(pending)return pending;
-  if(payload&&!reload){render();return Promise.resolve();}
   error='';
-  pending=fetch('/data/index-futures/research.json',{cache:'no-store'}).then(async response=>{
+  const loadResearch=async()=>{
+    if(payload&&!reload)return payload;
+    const response=await fetch('/data/index-futures/research.json',{cache:'no-store'});
     if(!response.ok)throw new Error(`研究数据暂不可用（${response.status}）`);
     const next=await response.json();
     if(next.version!==2||!Array.isArray(next.records)||!next.records.length||!next.recent||!next.modes)throw new Error('研究数据格式不完整');
+    return next;
+  };
+  pending=loadResearch().then(async next=>{
     payload=next;if(!payload.modes[view.mode])view.mode=payload.default_mode;
+    const response=await fetch('/data/index-futures/signal.json',{cache:'no-store'});
+    if(response.status===404)return; // Legacy research exports may embed the last signal.
+    if(!response.ok)throw new Error(`开仓预案暂不可用（${response.status}）`);
+    const signal=await response.json();
+    if(signal.version!==1||!signal.signal_date||!signal.profiles)throw new Error('开仓预案格式不完整');
+    payload={...payload,signal};
   }).catch(err=>{error=err.message||'研究结果载入失败';}).finally(()=>{pending=null;render();});
   render();return pending;
 }

@@ -1994,7 +1994,7 @@ def test_successful_same_day_refresh_reuses_all_downstream_after_source_poll(
     assert all(
         step["checkpoint_reused"] is True
         for step in status["steps"]
-        if step["key"] != "refresh_data"
+        if step["key"] not in {"refresh_data", "index_futures"}
     )
 
 
@@ -2515,6 +2515,33 @@ def test_global_refresh_includes_daily_similar_pattern_step() -> None:
 
     assert "convertible_bond_allotment" in step_keys
     assert "similar_patterns" in step_keys
+    assert step_keys[-1] == "index_futures"
+
+
+@pytest.mark.parametrize("preview_status", ["success", "failed"])
+def test_global_refresh_records_futures_preview_in_terminal_manifest(monkeypatch, preview_status):
+    from quant.webapp import index_futures
+
+    status = _stub_successful_global_refresh(monkeypatch)
+    manifests = []
+
+    def preview(root, trade_date, report):
+        assert status["status"] == "running"
+        assert status["current_step"] == "index_futures"
+        assert status["result"]["dependency_postflight"]["status"] == "success"
+        assert trade_date == date(2026, 7, 23)
+        if preview_status == "failed":
+            return {"status": "failed", "error": "preview unavailable"}
+        return {"status": "success", "signal_date": trade_date.isoformat()}
+
+    monkeypatch.setattr(index_futures, "refresh_daily_preview", preview)
+    monkeypatch.setattr(services, "_write_terminal_refresh_manifest_unlocked",
+                        lambda: manifests.append(status["result"]["index_futures"]["status"]))
+    services._run_latest_refresh_job("all", run_id="with-futures")
+
+    assert status["status"] == preview_status
+    assert status["current_step"] == "index_futures"
+    assert manifests == [preview_status]
 
 
 def test_similar_refresh_scope_refreshes_shared_daily_inputs_first(monkeypatch) -> None:

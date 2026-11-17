@@ -1,5 +1,7 @@
 """Serving guards: closed-bar prices, policy/financing gates and drawdown origin."""
 import sys
+from datetime import date, datetime, timedelta
+from subprocess import CalledProcessError
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +9,7 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts/research'))
+import build_index_futures_signal as signal
 from build_index_futures_signal import evaluate_candidates
 from build_index_futures_workspace import recent_performance
 from quant.webapp import index_futures as service
@@ -67,3 +70,44 @@ def test_duplicate_refresh_is_coalesced(monkeypatch):
     def fail(*args,**kwargs): raise AssertionError('must not start second thread')
     monkeypatch.setattr(service.threading,'Thread',fail)
     assert service.start_refresh()['status']=='running'
+
+
+def test_missing_target_session_preserves_previous_signal(monkeypatch, tmp_path):
+    current = tmp_path / 'signal.json'
+    current.write_text('previous signal')
+    monkeypatch.setattr(signal, 'LIVE', tmp_path)
+    monkeypatch.setattr(signal, 'feature_panel', lambda: pd.DataFrame(
+        {'symbol': ['IF', 'IH'], 'trade_date': ['20261116', '20261113']}))
+    monkeypatch.setattr(signal.pd, 'read_parquet', lambda _: pd.DataFrame(
+        {'cal_date': ['20261113', '20261116', '20261117']}))
+
+    with pytest.raises(RuntimeError, match='available=20261113'):
+        signal.build('20261116')
+    assert current.read_text() == 'previous signal'
+
+
+@pytest.mark.parametrize("publish", [True, False])
+def test_daily_preview_waits_for_data_and_retries(monkeypatch, tmp_path, publish):
+    day = date(2026, 11, 16)
+    now = datetime(2026, 11, 16, 17, 55)
+    calls = []
+
+    def sleep(seconds):
+        nonlocal now
+        now += timedelta(seconds=seconds)
+
+    def preview(root, python, trade_date):
+        calls.append((now.strftime("%H:%M"), trade_date))
+        if not publish or len(calls) == 1:
+            raise CalledProcessError(1, "build_index_futures_signal")
+
+    monkeypatch.setattr(service, "market_now", lambda: now)
+    monkeypatch.setattr(service, "time", type("Clock", (), {"sleep": staticmethod(sleep)}))
+    monkeypatch.setattr(service, "refresh_preview", preview)
+    result = service.refresh_daily_preview(tmp_path, day, lambda _: None)
+    assert calls[:2] == [("18:00", day), ("18:10", day)]
+    if publish:
+        assert result == {"status": "success", "signal_date": day.isoformat(), "attempts": 2}
+    else:
+        assert result["status"] == "failed"
+        assert calls[-1] == ("19:00", day)

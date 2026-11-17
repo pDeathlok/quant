@@ -101,7 +101,7 @@ python scripts/run_daily_web_refresh.py
 find data/routine -name manifest.json -type f -print | sort | tail -1
 ```
 
-打开该 JSON，确认关键步骤 `status` 为 `success`；主动跳过的数据刷新或回测会显示 `skipped`。
+核对清单的 `run_id`、`scope` 和 `trade_date`，再确认 `status` 与各步骤状态。当日 `all` 任务还要检查 `result.index_futures.status` 为 `success`，并核对其 `signal_date` 与 `web/data/index-futures/signal.json` 一致。股指预案另有 `execution_date`，表示下一交易日。
 
 正式入口会先从当前生产产品和晋级模型反推活动依赖，只刷新该 scope 真正使用的数据。当前左侧 RankNet 已将 moneyflow、margin_detail、龙虎榜及所需指数纳入生产闭包；这些源会按合同刷新。`tradability`、holder-trade 等未被活动消费者要求的研究输入不会被顺带日更。
 
@@ -128,8 +128,8 @@ PYTHONPATH=src python -m quant.routine.tradability_refresh \
 ## 当前排名、页面覆盖与记录备份
 
 - 左侧生效配置：`configs/strategies/left_side_unified.yaml`；应用组合：`configs/strategies/application_portfolio.json`；ETF 排名修正：`configs/strategies/short_etf_rank.json`。候选发布及回滚清单位于 `configs/releases/`，模型文件需单独恢复并核对哈希。详见 [研究与生产入口](research_workflows.md)。
-- `all` 覆盖短线、缠论、长线、可转债、配债股、市场过渡和相似走势；市场过渡的刷新 scope 仍为 `byd`。新页面必须登记刷新归属，不能仅增加 UI 按钮。
-- 股指战法由独立接口和子进程按需更新，300 秒超时；失败日志位于 `data/research/index_futures/workspace_live/refresh.log`，历史研究仍冻结至 2026-11-06。见 [股指工作台](strategies/index_futures_workspace.md)。
+- `all` 先发布短线、缠论、长线、可转债、配债股、多状态右侧和自选池，再更新当天股指开仓预案。多状态右侧继续使用 `byd` 作用域。新增页面时登记其刷新归属。
+- 股指开仓预案是全量任务的最后一步，也可通过独立接口手动更新；子进程单次限时 300 秒。日志位于 `data/research/index_futures/workspace_live/refresh.log`，历史研究仍冻结至 2026-11-06。见 [股指工作台](strategies/index_futures_workspace.md)。
 - 操作计划和复盘是用户记录；备份 `web/data/` 时应包含 `operation_plans.json` 与 `review_records.json`。这些文件不在 Git 中，刷新不会替用户重建，不能当作可随意删除的派生缓存。
 - 日更结果中的页面覆盖信息用于确认归属和观测状态，不替代源日期、质量、模型身份及发布门禁。相似走势只有同日评分和策略标记完成后才能成功。
 
@@ -217,16 +217,17 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 1. 读取项目 `.env`。
 2. 获取 `.run/daily_web_refresh.lock` 跨进程锁；已有任务运行时立即返回 `busy`，不启动第二套写盘任务。
 3. 用 Tushare `trade_cal` 判断当天是否为 A 股交易日；非交易日跳过，无法可靠确认时按失败处理。
-4. 默认复用健康的本地 Web 服务；仅显式传入 `--restart-service` 时才会在刷新前重启脚本托管的服务。
+4. 定时脚本默认尝试重启托管服务，有活动任务时会复用服务。传入 `--no-restart-service` 可直接复用健康服务。`quant.routine.cli web-refresh` 默认复用健康服务。
 5. 检查 `http://127.0.0.1:8088/api/health` 和前端首页 `http://127.0.0.1:8088/`，确认前后端已就绪。
 6. 触发 `POST /api/selector/refresh-latest`，作用域默认 `all`。
-7. 轮询 `/api/selector/refresh-latest/status` 并打印进度。
+7. 轮询 `/api/selector/refresh-latest/status`。网页显示已完成步数、当下的状态消息和各步骤状态。并行步骤先完成时只增加相应步数，总步数进度不表示剩余耗时。
 8. 当日 Tushare 数据为空、行数不足或关键字段覆盖率未达标时，每 10 分钟重新获取一次，直到北京时间 17:20；不足 10 分钟时缩短最后一次等待，在 17:20 做最终检查，仍缺失才失败。此类等待不消耗总入口的 3 次普通错误重试额度；日线和 `daily_basic` 在当前步骤内等待并更新进度，不重复启动整套策略计算。数据已齐、正在计算的任务不会因超过 17:20 被中断。权限、网络及计算错误仍按原有普通重试规则处理，其他 `failed/error` 终态重试继续复用服务端断点。
-9. 每次终态都会保存独立的 `data/routine/<运行时间>_<run_id>/manifest.json`，其中包含每一步的状态、起止时间、耗时、结果和错误；`latest_refresh_status.json` 只作为最新状态指针。
-10. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应正式文件存在且非空时才删除。已被合并可转债日线覆盖的逐日请求缓存会删除；B1 时间戳研究报告每类保留最近 2 版，可重建的超大 trade-samples 只保留最新 1 版，内容相同的 `latest` 文件使用硬链接去重。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
-11. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
-12. B1 与 Z 当日候选先取 symbol 并集，只计算一次 147 项目因子；B1 原缓存保留 B1 gate 语义，Z 优先复用 `active_candidate_project_features.parquet`，缺失 symbol 才补算。
-13. 模型 artifact 与策略/因子 `contract_sources` 都按内容哈希复用；只有版本变化才重新编译模型特征合同并把对应下游标为 dirty。
+9. 股票策略发布后，全量任务最早于北京时间 18:00 生成股指开仓预案。网页进度和同一次任务的清单均记录此步骤。未通过数据或模型检查时，每隔至多 10 分钟单独重试至 19:00；19:00 后才进入这一步则立即检查一次。仍未发布会保留上一份预案，并在全量任务的 `result.index_futures` 和定时入口的退出码中报错；已发布的 7 个页面不受影响。历史日期补跑与单页任务跳过股指步骤。
+10. 每次 Web 刷新终态都会保存独立的 `data/routine/<运行时间>_<run_id>/manifest.json`，其中包含每一步的状态、起止时间、耗时、结果和错误；`latest_refresh_status.json` 只作为最新状态指针。
+11. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应正式文件存在且非空时才删除。已被合并可转债日线覆盖的逐日请求缓存会删除；B1 时间戳研究报告每类保留最近 2 版，可重建的超大 trade-samples 只保留最新 1 版，内容相同的 `latest` 文件使用硬链接去重。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
+12. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
+13. B1 与 Z 当日候选先取 symbol 并集，只计算一次 147 项目因子；B1 原缓存保留 B1 gate 语义，Z 优先复用 `active_candidate_project_features.parquet`，缺失 symbol 才补算。
+14. 模型 artifact 与策略/因子 `contract_sources` 都按内容哈希复用；只有版本变化才重新编译模型特征合同并把对应下游标为 dirty。
 
 清理逻辑也会在 `daily` CLI 开始前执行。需要单独维护或立即释放空间时可运行：
 

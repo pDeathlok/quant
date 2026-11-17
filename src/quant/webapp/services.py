@@ -9730,6 +9730,24 @@ def _run_latest_refresh_job_in_generation(
     executed_callbacks: set[str] = set()
     expected_signal_date = ""
 
+    def finish_futures_preview(results: dict[str, Any], signal_date: str) -> str:
+        if refresh_scope != "all":
+            return "snapshot"
+
+        from quant.webapp.index_futures import refresh_daily_preview
+
+        def report(message: str) -> None:
+            _set_refresh_progress(
+                step_key="index_futures", message=message, percent=99, result=results,
+            )
+
+        report("正在检查股指开仓预案")
+        preview = refresh_daily_preview(PROJECT_ROOT, date.fromisoformat(signal_date), report)
+        results["index_futures"] = preview
+        if preview["status"] == "failed":
+            raise RuntimeError(preview["error"])
+        return "index_futures"
+
     def composed(operation_id, callback, *args, **kwargs):
         from quant.routine.composed_operations import execute_composed_operation
 
@@ -10047,18 +10065,19 @@ def _run_latest_refresh_job_in_generation(
                 expected_tail_trade_date = _source_expected_trade_date(results)
                 if expected_tail_trade_date is None:
                     raise RuntimeError("断点续跑缺少目标交易日，无法执行每日依赖门禁")
+                tail_signal_date = pd.to_datetime(
+                    expected_tail_trade_date, format="%Y%m%d",
+                ).date().isoformat()
                 publish_dependency_gate(
                     results,
-                    pd.to_datetime(
-                        expected_tail_trade_date,
-                        format="%Y%m%d",
-                    ).date().isoformat(),
+                    tail_signal_date,
                     phase="postflight",
                     strict_freshness=True,
                 )
+                final_step = finish_futures_preview(results, tail_signal_date)
                 _set_refresh_progress(
                     status="success",
-                    step_key="snapshot",
+                    step_key=final_step,
                     message="刷新任务完成，所有工作区数据与策略结果已生成",
                     percent=100,
                     result=results,
@@ -10273,7 +10292,7 @@ def _run_latest_refresh_job_in_generation(
             with _REFRESH_LOCK:
                 now = datetime.now()
                 for step in _REFRESH_STATUS["steps"]:
-                    if step.get("key") != "refresh_data":
+                    if step.get("key") not in {"refresh_data", "index_futures"}:
                         _mark_refresh_step_checkpoint_reused(step, now)
                 _persist_refresh_status_unlocked()
             publish_dependency_gate(
@@ -10282,14 +10301,15 @@ def _run_latest_refresh_job_in_generation(
                 phase="postflight",
                 strict_freshness=True,
             )
+            final_step = finish_futures_preview(results, expected_signal_date)
             _set_refresh_progress(
                 status="success",
-                step_key="snapshot",
-                message="输入与合同未变化，已复用同日全部下游产物",
+                step_key=final_step,
+                message="刷新任务完成，已复用同日股票策略产物",
                 percent=100,
                 result=results,
                 complete_previous=False,
-                checkpoint_reused=True,
+                checkpoint_reused=final_step == "snapshot",
             )
             with _REFRESH_LOCK:
                 for step in _REFRESH_STATUS["steps"]:
@@ -11358,9 +11378,10 @@ def _run_latest_refresh_job_in_generation(
             strict_freshness=True,
         )
 
+        final_step = finish_futures_preview(results, expected_signal_date)
         _set_refresh_progress(
             status="success",
-            step_key="snapshot",
+            step_key=final_step,
             message="刷新任务完成，所有工作区数据与策略结果已生成",
             percent=100,
             result=results,

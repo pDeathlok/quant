@@ -111,7 +111,7 @@ flowchart TD
 - CPU、I/O、内存及数据库连接共享 `ResourceScheduler` 配额，嵌套子任务只拆分已获授权的资源。具体并发取决于依赖、预算和任务声明，不能将各 worker 参数简单相加。
 - 长线校验 `tea`、`tea_safe`、`v44` 与 blood-chip；市场过渡校验 `return` 和 `win`。汇总日期不能替代每个必需变体的日期证据。
 - 检查点复用要求完整输入、代码、模型与输出身份一致；所有消费者结束后才释放封存输入。失败不会提交半完成的正式发布代。
-- `page_refresh_coverage.py` 记录每日页面、用户记录、独立按需页面和可选 ETF 背景的归属；ETF 缺失按既有策略降级，不自动放宽其他产品门禁。
+- `page_refresh_coverage.py` 记录股票策略页面、用户记录、研究页面和可选 ETF 背景的归属。股指实时预案在股票策略通过发布门禁后执行，结果进入同一份 Web 刷新清单。ETF 缺失按既有策略降级。
 
 实现审查与性能证据见 [日更效率记录](daily_refresh_performance_20261111.md) 和 [2026-11-14 审查](reviews/2026-11-14-daily-refresh-review.md)。
 
@@ -126,7 +126,7 @@ flowchart TD
 | 配债股 | `/api/convertible-bonds/allotments` | 发行流程、关键日期和配售数据 |
 | 市场过渡 | `/api/transition/plan`（内部 scope=`byd`） | return / win 两种方案及账户约束 |
 | 相似走势 | `/api/similar-patterns/analysis` | 自选池相似案例、同日买入/持有分和策略标记 |
-| 股指战法 | `/api/index-futures/refresh` | 独立按需更新预案；历史研究冻结，不属于每日 all |
+| 股指战法 | `/api/index-futures/refresh` | 每日 all 的最后一步更新预案；也可按需刷新，历史研究冻结 |
 | 操作计划 / 复盘 | `/api/operation-plans`、`/api/review-records` | 用户维护，日常刷新不覆盖 |
 
 页面上的“更新全部”走后台刷新任务；单页按钮使用对应作用域或专用刷新接口。配债股和相似走势还会检查缓存日期，缓存不是当天时首次打开自动补刷。

@@ -8,7 +8,7 @@ import argparse
 import json
 import io
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -275,13 +275,16 @@ def evaluate_candidates(predictions, policy, fee, margin, capital=CAPITAL):
     return sorted(result,key=lambda r:(-r['confidence'],r['symbol']))
 
 
-def build():
+def build(target_date=None):
     now = datetime.now(ZoneInfo('Asia/Shanghai'))
     panel = feature_panel()
     calendar = pd.read_parquet(SOURCES/'calendar.parquet').cal_date.sort_values()
     cutoff = (now.date() if now.hour>=18 else now.date()-timedelta(days=1)).strftime('%Y%m%d')
     expected = calendar.loc[calendar.le(cutoff)].max()
     latest = panel.groupby('symbol').trade_date.max().min()
+    required = target_date or expected
+    if latest != required or expected != required:
+        raise RuntimeError(f'Signal date mismatch: required={required}, expected={expected}, available={latest}')
     next_date = calendar.loc[calendar.gt(latest)].min()
     if not isinstance(next_date,str):
         raise RuntimeError('Exchange calendar must be refreshed')
@@ -328,19 +331,24 @@ def build():
     temporary.write_text(json.dumps(json_clean(snapshot),ensure_ascii=False,allow_nan=False,indent=2))
     temporary.replace(target)
     print('Signal snapshot',latest,'next',next_date,'due',due,'parity',audit['max_parity_error'],flush=True)
+    return target
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--refresh',action='store_true')
     parser.add_argument('--publish',action='store_true')
+    parser.add_argument('--trade-date', type=date.fromisoformat, help='Require this closing session (YYYY-MM-DD)')
     args=parser.parse_args()
     import fcntl
     LIVE.mkdir(parents=True,exist_ok=True)
     with (LIVE/'refresh.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         if args.refresh: refresh_sources()
-        build()
+        signal_path = build(args.trade_date.strftime('%Y%m%d') if args.trade_date else None)
         if args.publish:
-            from build_index_futures_workspace import main
-            main()
+            from build_index_futures_workspace import OUT
+            OUT.mkdir(parents=True, exist_ok=True)
+            temporary = OUT/'signal.tmp'
+            temporary.write_bytes(signal_path.read_bytes())
+            temporary.replace(OUT/'signal.json')

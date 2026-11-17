@@ -44,7 +44,7 @@
 - [BYD 日内做T策略](strategies/byd_002594_minute_t_strategy.md)
 - [扩展策略模型记录](strategies/extended_strategy_model_record_20260607.md)
 - [ETF四类资产月度再平衡 V1（研究定版，保留待用）](strategies/etf_defensive_monthly_v1_record.md)
-- [股指战法工作台](strategies/index_futures_workspace.md)：冻结历史、独立预案和按需刷新。
+- [股指战法工作台](strategies/index_futures_workspace.md)：冻结历史、每日开仓预案和按需刷新。
 - [股指期货研究](strategies/index_futures_research.md)、[恐慌因子](strategies/index_futures_panic_research.md)、[期权隐波](strategies/index_futures_option_iv_research.md) 与 [后续研究](strategies/index_futures_next_research.md)。
 
 ## 项目整理与历史归档

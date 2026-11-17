@@ -1938,9 +1938,11 @@ h3 {
   justify-content: flex-end;
 }
 
-.refresh-status strong {
+.refresh-status-line strong {
   color: var(--accent);
   font-size: 13px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .refresh-progress-track {

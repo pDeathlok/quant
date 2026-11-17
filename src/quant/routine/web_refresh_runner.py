@@ -631,7 +631,7 @@ def _run_refresh_workflow_locked(
     env_values = load_env_file(config.env_path)
     os.environ.update(env_values)
 
-    decision = decide_trade_day(target_date=target_date, fetcher_factory=fetcher_factory)
+    decision = decide_trade_day(target_date=target_date or now_fn().date(), fetcher_factory=fetcher_factory)
     print_fn(f"[trade-day] {decision.reason}")
     if decision.error:
         return {
@@ -732,6 +732,9 @@ def _run_refresh_workflow_locked(
             continue
 
         if terminal.get("status") == "success":
+            if config.scope == "all" and terminal.get("scope") not in {None, "all"}:
+                print_fn(f"[refresh] 已有任务只更新了 {terminal['scope']}，继续提交全量刷新")
+                continue
             actual_date = str(
                 terminal.get("trade_date")
                 or ((terminal.get("result") or {}).get("refresh_data") or {}).get("expected_trade_date")
@@ -777,7 +780,11 @@ def _run_refresh_workflow_locked(
         else:
             ordinary_failures += 1
 
-        if retry_delay is None or ordinary_failures >= config.max_attempts:
+        if (
+            terminal.get("current_step") == "index_futures"
+            or retry_delay is None
+            or ordinary_failures >= config.max_attempts
+        ):
             return {
                 "status": str(terminal.get("status") or "failed"),
                 "trade_date": decision.trade_date,

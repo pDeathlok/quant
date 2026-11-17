@@ -4633,21 +4633,27 @@ function setRefreshStatus(status) {
   const previousScope = state.latestRefreshStatus?.scope;
   state.latestRefreshStatus = status;
   const time = status.finished_at || status.started_at || "";
-  const percent = Number(status.percent || 0);
-  const legacyWorkspace = status.scope === "byd" && !["running", "queued"].includes(status.status) && (status.steps || []).some((step) => (step.label || "").includes("BYD"));
+  const steps = status.steps || [];
+  const total = steps.length;
+  const completed = steps.filter((step) => ["success", "skipped"].includes(step.status)).length;
+  const progress = total ? (completed / total) * 100 : 0;
+  const active = ["running", "queued"].includes(status.status);
+  const legacyWorkspace = status.scope === "byd" && !active && steps.some((step) => (step.label || "").includes("BYD"));
   const scopeLabel = legacyWorkspace ? "旧工作区历史任务" : status.scope_label || REFRESH_SCOPE_LABELS[status.scope] || "";
   const statusMessage = formatRefreshStatusMessage(status, scopeLabel);
   localStorage.setItem(REFRESH_STATUS_STORAGE_KEY, JSON.stringify(status));
   const statusHtml = `
     <div class="refresh-status-line">
       <span>${scopeLabel ? `${scopeLabel} · ` : ""}${statusMessage}${time ? ` · ${formatRefreshTime(time)}` : ""}</span>
-      <strong>${percent}%</strong>
+      ${total ? `<strong>已完成 ${completed} / ${total} 步</strong>` : ""}
     </div>
-    <div class="refresh-progress-track">
-      <div class="refresh-progress-fill ${status.status === "running" || status.status === "queued" ? "active" : ""}" style="width: ${Math.max(0, Math.min(100, percent))}%"></div>
-    </div>
+    ${total ? `
+      <div class="refresh-progress-track" role="progressbar" aria-label="刷新步骤" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${completed}">
+        <div class="refresh-progress-fill ${active ? "active" : ""}" style="width: ${progress}%"></div>
+      </div>
+    ` : ""}
   `;
-  const stepsHtml = (status.steps || []).map((step) => `
+  const stepsHtml = steps.map((step) => `
     <span class="progress-step ${step.status || "pending"}">${step.key === "byd_daily_plan" && (step.label || "").includes("BYD") ? "旧工作区计划（历史记录）" : step.label}</span>
   `).join("");
   statusEls.forEach((el) => { el.innerHTML = statusHtml; });

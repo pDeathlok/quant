@@ -19,13 +19,13 @@ REFRESH_SCOPE_LABELS = {
     "leftSideRanking": "左侧统一模型生产验收",
 }
 
-# Compatibility export used by the Web progress UI.  The dependency registry
-# is the source of truth; this is a derived presentation view, not a second
-# hand-maintained workflow definition.
+# Dependency steps come from the registry. The live futures preview runs
+# after publication and has its own source and freshness checks.
 REFRESH_SCOPE_STEPS = {
     scope: list(DEFAULT_DAILY_DEPENDENCY_REGISTRY.progress_steps(scope))
     for scope in DEFAULT_DAILY_DEPENDENCY_REGISTRY.scope_roots
 }
+REFRESH_SCOPE_STEPS["all"].append("index_futures")
 
 REFRESH_STEP_DEFINITIONS = {
     "refresh_data": {"label": "拉取 Tushare 最新日线数据", "percent": 10},
@@ -42,6 +42,7 @@ REFRESH_STEP_DEFINITIONS = {
     "byd_daily_plan": {"label": "刷新多状态右侧次日计划", "percent": 97},
     "similar_patterns": {"label": "刷新自选池相似走势", "percent": 97},
     "snapshot": {"label": "写入策略股票池快照", "percent": 98},
+    "index_futures": {"label": "刷新股指开仓预案", "percent": 99},
     "right_side_shadow_features": {"label": "构建右侧影子 canonical 因子", "percent": 80},
     "right_side_shadow_score": {"label": "计算右侧统一模型影子排序", "percent": 90},
     "right_side_shadow_product": {"label": "发布右侧影子候选", "percent": 98},

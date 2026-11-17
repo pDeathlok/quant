@@ -60,7 +60,7 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 
 | `scope` | 页面 |
 | --- | --- |
-| `all` | 全部日常策略工作区；不包含股指独立研究刷新及用户记录 |
+| `all` | 7 个日常策略工作区及当天股指开仓预案 |
 | `short` | 短线策略 |
 | `chan` | 缠论策略 |
 | `long` | 长线策略 |
@@ -69,7 +69,7 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 | `byd` | 市场过渡（沿用内部兼容名称） |
 | `similar` | 相似走势 |
 
-状态响应包含 `status`、`percent`、`current_step`、`steps`、`result` 和 `error`。终态为 `success` 或 `failed`。
+状态响应包含 `run_id`、`trade_date`、`status`、`percent`、`current_step`、`steps`、`result` 和 `error`。网页按 `steps` 显示已完成步数，`percent` 保留为兼容字段。终态为 `success` 或 `failed`，可通过 `manifest_path` 查看运行清单。当日全量任务将股指步骤记在 `steps` 的 `index_futures` 项，预案结果写入 `result.index_futures`。
 
 `/api/selector/stocks` 还返回同日 ETF 资金背景 `etf_flow`；历史查询按信号日读取。已启用的模型组合由正式发布产物读取，不在 GET 请求中重新训练。模型/日期不匹配的候选结果不能替代历史发布快照。
 
@@ -86,12 +86,13 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 
 复盘股票代码支持六位代码及 `.SH` / `.SZ` / `.BJ` 后缀；非法代码返回 400，未知记录的笔记修改和删除返回 404。数据存于 `web/data/review_records.json`，写操作使用文件锁和原子替换。损坏文件会显式报错，不会作为空记录覆盖。操作计划和复盘均为用户记录，日常刷新不会重写，部署前应备份 `web/data/`。
 
-## 股指战法独立刷新
+## 股指战法手动刷新与已发布预案
 
 | 方法 | 路径 | 行为 |
 | --- | --- | --- |
 | `POST` | `/api/index-futures/refresh` | 启动独立后台行情与预案刷新；正在运行时复用当前任务 |
-| `GET` | `/api/index-futures/refresh/status` | 返回 `status` 和可选 `message` |
+| `GET` | `/api/index-futures/refresh/status` | 返回手动刷新任务的 `status` 和可选 `message` |
+| `GET` | `/data/index-futures/signal.json` | 读取最近发布的预案，包括 `generated_at`、`signal_date` 和 `execution_date` |
 
 此接口的状态为 `idle`、`running`、`complete`、`failed`，与日常刷新使用的 `success` 不同。后台子进程时限为 300 秒，失败保留此前公开结果。历史页面来自冻结研究导出；详细数据时钟和季度模型要求见 [股指战法工作台](strategies/index_futures_workspace.md)。
 
