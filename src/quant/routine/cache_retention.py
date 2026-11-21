@@ -25,6 +25,7 @@ TUSHARE_SINGLE_SYMBOL_CACHE_RETENTION_DAYS = 7
 ROOT_MARKET_REQUEST_CACHE_RETENTION_DAYS = 30
 TUSHARE_LIVE_PROBE_RETENTION_DAYS = 2
 ABANDONED_CACHE_RETENTION_DAYS = 2
+RANK_FEATURE_CACHE_RETENTION_DAYS = 14
 FACTOR_SCHEMA_MIN_COVERAGE_RATIO = 0.98
 TUSHARE_SINGLE_SYMBOL_CACHE_PATTERN = re.compile(
     r"^tushare_\d{6}\.(?:SH|SZ|BJ)_\d{8}_\d{8}_(?:None|qfq|hfq)\.parquet$"
@@ -115,6 +116,7 @@ MANAGED_CACHE_STORAGE_PATHS = (
     _StoragePathSpec("root_market_requests", "data/cache", direct_files_only=True),
     _StoragePathSpec("source_merge_requests", "data/cache/source_merge"),
     _StoragePathSpec("daily_factor_layer", "data/features/daily_factor_layer"),
+    _StoragePathSpec("rank_features", "data/features/rank_runtime"),
     _StoragePathSpec(
         "similar_pattern_vectors",
         "data/research/similar_patterns/vector_cache",
@@ -468,6 +470,49 @@ def _cleanup_abandoned_cache_builds(
         "reclaimed_bytes": reclaimed_bytes,
         "kept_paths": kept_paths,
     }
+
+
+def _cleanup_rank_feature_cache(root: Path, today: date, errors: list[str]) -> dict[str, Any]:
+    cache = root / "data/features/rank_runtime"
+    market = cache / "market"
+    locks = cache / "locks"
+    cutoff = today - timedelta(days=RANK_FEATURE_CACHE_RETENTION_DAYS)
+    result = {"retention_days": RANK_FEATURE_CACHE_RETENTION_DAYS, "cutoff_date": cutoff.isoformat(),
+              "deleted_directories": 0, "reclaimed_bytes": 0, "locked_dates": []}
+    if not cache.is_dir() or any(
+        path.is_symlink() for path in (root / "data", cache.parent, cache, market, locks)
+    ):
+        return result
+    dates = {path.name for parent in (cache, market) for path in parent.glob("*")
+             if path.is_dir() and not path.is_symlink() and re.fullmatch(r"[0-9]{8}", path.name)}
+    for day in sorted(dates):
+        try:
+            if datetime.strptime(day, "%Y%m%d").date() >= cutoff:
+                continue
+        except ValueError:
+            continue
+        try:
+            locks.mkdir(exist_ok=True)
+            # Same per-day lock as the calculator; never unlink the lock file.
+            lock_path = locks / f"{day}.lock"
+            if lock_path.is_symlink():
+                continue
+            with lock_path.open("a+") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    result["locked_dates"].append(day)
+                    continue
+                for parent in (cache, market):
+                    path = parent / day
+                    if path.is_dir() and not path.is_symlink():
+                        size = _directory_size(path)
+                        shutil.rmtree(path)
+                        result["deleted_directories"] += 1
+                        result["reclaimed_bytes"] += size
+        except OSError as exc:
+            errors.append(f"rank_features:{day}:{exc}")
+    return result
 
 
 def _parse_snapshot_date(value: object) -> date | None:
@@ -1310,6 +1355,7 @@ def cleanup_daily_caches(
     abandoned_cache_builds = _cleanup_abandoned_cache_builds(
         root, today, errors, protected_paths=active_vector_paths,
     )
+    rank_features = _cleanup_rank_feature_cache(root, today, errors)
 
     long_cache_dir = root / "data/research/long_dividend_quality"
     deleted_long_files = 0
@@ -1419,6 +1465,7 @@ def cleanup_daily_caches(
         factor_schemas["reclaimed_bytes"]
         + root_market_requests["reclaimed_bytes"]
         + abandoned_cache_builds["reclaimed_bytes"]
+        + rank_features["reclaimed_bytes"]
         + reclaimed_long_bytes
         + reclaimed_vector_bytes
         + reclaimed_smoke_bytes
@@ -1450,6 +1497,7 @@ def cleanup_daily_caches(
         "daily_factor_schemas": factor_schemas,
         "root_market_request_cache": root_market_requests,
         "abandoned_cache_builds": abandoned_cache_builds,
+        "rank_features": rank_features,
         "long_strategy": {
             "retention_versions": LONG_CACHE_RETENTION_VERSIONS,
             "kept_versions": [key for key, _ in ordered_groups[-LONG_CACHE_RETENTION_VERSIONS:]],

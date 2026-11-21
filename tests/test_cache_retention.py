@@ -150,6 +150,27 @@ def test_cleanup_daily_caches_keeps_unowned_vectors_including_smoke(tmp_path: Pa
     }
 
 
+def test_rank_feature_retention_preserves_active_date(tmp_path: Path) -> None:
+    import fcntl
+
+    cache = tmp_path / "data/features/rank_runtime"
+    for branch, day in [("", "20260701"), ("market", "20260701"), ("", "20260629"), ("", "20260715")]:
+        path = cache / branch / day / "features.parquet"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"cache")
+    locks = cache / "locks"
+    locks.mkdir()
+    with (locks / "20260629.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        result = cleanup_daily_caches(tmp_path, reference_date=date(2026, 7, 16))["rank_features"]
+    assert result["locked_dates"] == ["20260629"]
+    assert result["deleted_directories"] == 2
+    assert result["reclaimed_bytes"] == 10
+    assert (cache / "20260629/features.parquet").exists()
+    assert (cache / "20260715/features.parquet").exists()
+    assert (locks / "20260701.lock").is_file()
+
+
 def test_cleanup_daily_caches_keeps_two_complete_long_cache_versions(tmp_path: Path) -> None:
     long_cache = tmp_path / "data/research/long_dividend_quality"
     for index, name in enumerate(["old", "previous", "latest"], start=1):

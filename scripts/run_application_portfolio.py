@@ -39,7 +39,7 @@ def run(args):
     hashes, pieces, materialization = {}, [], None
     if args.latest:
         from quant.application.selector_ranking import load_selector_ranking_config
-        from quant.routine.rank_feature_runtime import materialize_rank_features
+        from quant.routine.rank_feature_runtime import materialize_production_rank_features
         paths = {'left': ROOT / 'data/features/left_side_ranknet_v6/latest_scores.parquet',
                  'right': load_selector_ranking_config(ROOT).paths.score_output}
         for side, path in paths.items():
@@ -55,9 +55,9 @@ def run(args):
                 base = _normalize_ranking_scores(base, right_artifact['score_normalization']) / 100
             pieces.append(scores[['symbol', 'date']].assign(side=side, base_score=base))
         candidates = pd.concat(pieces, ignore_index=True)
-        features, materialization = materialize_rank_features(str(date.date()), sorted(candidates.symbol.unique()),
+        features, materialization = materialize_production_rank_features(str(date.date()), sorted(candidates.symbol.unique()),
             sorted(set(runtime.required_features('left') + runtime.required_features('right'))),
-            root=ROOT, cache_root=ROOT / 'data/features/rank_runtime', workers=args.workers)
+            root=ROOT, workers=args.workers)
         candidates = candidates.merge(features, on=['symbol', 'date'], how='left', validate='many_to_one', indicator=True)
         if not candidates['_merge'].eq('both').all():
             raise ValueError('Missing materialized candidate rows')

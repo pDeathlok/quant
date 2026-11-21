@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
@@ -195,3 +196,75 @@ def test_runtime_boundary_guard_detects_indirect_loading(source: str) -> None:
 
 def test_runtime_boundary_guard_allows_static_package_imports() -> None:
     assert _runtime_boundary_violations("from quant.research import long_dividend_quality") == []
+
+
+RANK_RUNTIME = "quant.routine.rank_feature_runtime"
+RANK_CALCULATOR = "quant.features.rank_runtime"
+RANK_ENTRYPOINT = f"{RANK_RUNTIME}.materialize_production_rank_features"
+
+
+def _rank_runtime_imports(source: str, package: str) -> list[tuple[int, str]]:
+    imports = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imports.extend((node.lineno, alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                module = resolve_name("." * node.level + module, package)
+            imports.extend((node.lineno, f"{module}.{alias.name}") for alias in node.names)
+    return [
+        (lineno, name) for lineno, name in imports
+        if any(name == module or name.startswith(module + ".")
+               for module in (RANK_RUNTIME, RANK_CALCULATOR))
+    ]
+
+
+def test_production_modules_access_rank_features_only_via_shared_entrypoint() -> None:
+    # Cover every package module, including new consumers added to the DAG.
+    # Research CLIs are intentionally outside this rule.
+    owner = PACKAGE_ROOT / "routine/rank_feature_runtime.py"
+    cli = PROJECT_ROOT / "scripts/run_application_portfolio.py"
+    violations = {}
+    for path in [*sorted(PACKAGE_ROOT.rglob("*.py")), cli]:
+        if path == owner:
+            continue
+        package = ".".join(path.parent.relative_to(PACKAGE_ROOT.parent).parts) if path != cli else ""
+        imports = _rank_runtime_imports(path.read_text(encoding="utf-8"), package)
+        if found := [f"{line}: {name}" for line, name in imports if name != RANK_ENTRYPOINT]:
+            violations[str(path.relative_to(PROJECT_ROOT))] = found
+    assert violations == {}
+
+
+@pytest.mark.parametrize("module_name", ["left_ranknet_production", "application_portfolio_production"])
+def test_active_rank_consumer_calls_shared_entrypoint(module_name: str) -> None:
+    path = PACKAGE_ROOT / "routine" / f"{module_name}.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    entrypoint = RANK_ENTRYPOINT.rsplit(".", 1)[1]
+    bindings = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == RANK_RUNTIME
+        for alias in node.names if alias.name == entrypoint
+    }
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id in bindings for node in ast.walk(tree)), str(path)
+
+
+@pytest.mark.parametrize("source", [
+    "from quant.routine.rank_feature_runtime import materialize_rank_features as load",
+    "from .rank_feature_runtime import _materialize_rank_features",
+    "from quant.routine import rank_feature_runtime as runtime",
+    "import quant.routine.rank_feature_runtime as runtime",
+    "from quant.features import rank_runtime as calc",
+    "from ..features.rank_runtime import stock_price_features",
+])
+def test_rank_feature_guard_detects_private_or_calculator_imports(source: str) -> None:
+    imports = _rank_runtime_imports(source, "quant.routine")
+    assert imports
+    assert all(name != RANK_ENTRYPOINT for _, name in imports)
+
+
+def test_rank_feature_guard_allows_shared_entrypoint() -> None:
+    source = "from .rank_feature_runtime import materialize_production_rank_features as load"
+    assert _rank_runtime_imports(source, "quant.routine") == [(1, RANK_ENTRYPOINT)]

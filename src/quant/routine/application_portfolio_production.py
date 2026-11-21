@@ -14,7 +14,7 @@ from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 from quant.infrastructure.publication import publication_path
 from quant.ml.portfolio_policy import PortfolioPolicy
 from quant.ml.rank_fusion import file_sha256
-from quant.routine.rank_feature_runtime import materialize_rank_features
+from quant.routine.rank_feature_runtime import materialize_production_rank_features
 from quant.routine.right_side_unified_production import _normalize_ranking_scores
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -48,8 +48,9 @@ def run_portfolio(target_date: str, *, root: Path = ROOT, workers: int = 4, conf
         pieces.append(source[['symbol', 'date']].assign(side=side, base_score=base))
     candidates = pd.concat(pieces, ignore_index=True)
     required = sorted(set(policy.required_features('left') + policy.required_features('right')))
-    features, feature_manifest = materialize_rank_features(str(target.date()), sorted(candidates.symbol.unique()), required,
-        root=root, cache_root=root / 'data/features/rank_runtime', workers=workers)
+    features, feature_manifest = materialize_production_rank_features(
+        str(target.date()), sorted(candidates.symbol.unique()), required, root=root, workers=workers,
+    )
     candidates = candidates.merge(features.copy(), on=['symbol', 'date'], how='left', validate='many_to_one', indicator=True)
     if not candidates['_merge'].eq('both').all():
         raise RuntimeError('Application feature coverage incomplete')

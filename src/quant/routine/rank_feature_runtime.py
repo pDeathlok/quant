@@ -11,7 +11,7 @@ import inspect
 import fcntl
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -22,6 +22,9 @@ from quant.features.active_market_value import KEY_INDEX_SPECS
 from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 from quant.ml.rank_fusion import file_sha256
 from quant.data.market_snapshot import current_market_snapshot, pinned_dataset_path, read_pinned_parquet
+
+
+_LEGACY_PREFIX = "selector_legacy__"
 
 
 def _dated(frame: pd.DataFrame) -> pd.DataFrame:
@@ -46,20 +49,98 @@ def _identity(paths: list[Path]) -> str:
     return hashlib.sha256(json.dumps(records).encode()).hexdigest()
 
 
-def _stock_task(task: tuple[pd.DataFrame,pd.Timestamp,list[str]]) -> pd.DataFrame:
+def _stock_task(task: tuple[pd.DataFrame, pd.Timestamp, list[str] | None]) -> pd.DataFrame:
     raw,target,required=task
     frame=calc.stock_price_features(raw)
+    if required is None:
+        return _target_numeric_features(frame, target)
     result=frame.loc[frame.date.eq(target),['symbol','date',*[c for c in required if c in frame]]].copy()
-    compatibility=[c for c in required if c.startswith('selector_legacy__')]
+    compatibility=[c for c in required if c.startswith(_LEGACY_PREFIX)]
     if compatibility:
-        from quant.data.source_merge import normalize_tushare_daily
-        from quant.research.left_side_unified_features import compute_left_side_rule_features
-        normalized=normalize_tushare_daily(raw,str(raw.symbol.iloc[0])).sort_values('date').reset_index(drop=True)
-        history=normalized.loc[normalized.date.le(target)].tail(260).reset_index(drop=True)
-        legacy=compute_left_side_rule_features(history).iloc[-1]
+        legacy = _legacy_task((raw, target)).iloc[0]
         for column in compatibility:
-            result[column]=legacy[column.removeprefix('selector_legacy__')]
+            result[column]=legacy[column]
     return result
+
+
+def _target_numeric_features(frame: pd.DataFrame, target: pd.Timestamp) -> pd.DataFrame:
+    columns = frame.select_dtypes(include=["number", "bool"]).columns.difference(calc.KEYS)
+    return frame.loc[frame.date.eq(target), [*calc.KEYS, *columns]].copy()
+
+
+def _legacy_task(task: tuple[pd.DataFrame, pd.Timestamp]) -> pd.DataFrame:
+    from quant.data.source_merge import normalize_tushare_daily
+    from quant.research.left_side_unified_features import (
+        LEFT_SIDE_RULE_FEATURE_COLUMNS, compute_left_side_rule_features,
+    )
+
+    raw, target = task
+    symbol = str(raw.symbol.iloc[0])
+    normalized = normalize_tushare_daily(raw, symbol)
+    history = normalized.loc[normalized.date.le(target)].tail(260).reset_index(drop=True)
+    legacy = compute_left_side_rule_features(history).iloc[-1]
+    return pd.DataFrame([{"symbol": symbol, "date": target, **{
+        f"{_LEGACY_PREFIX}{column}": legacy[column] for column in LEFT_SIDE_RULE_FEATURE_COLUMNS
+    }}])
+
+
+def _map_stock_tasks(fn, tasks, workers: int) -> pd.DataFrame:
+    if workers == 1:
+        return pd.concat([fn(task) for task in tasks], ignore_index=True)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        return pd.concat(pool.map(fn, tasks, chunksize=8), ignore_index=True)
+
+
+def _read_shared_block(path: Path, contract: dict[str, Any]) -> pd.DataFrame | None:
+    metadata = path.with_suffix(".json")
+    try:
+        saved = json.loads(metadata.read_text())
+        if saved.get("contract") != contract or saved.get("sha256") != file_sha256(path):
+            return None
+        frame = pd.read_parquet(path)
+        if (len(frame) != saved.get("rows") or frame.symbol.duplicated().any()
+                or not frame.date.eq(pd.Timestamp(contract["target"])).all()):
+            return None
+        return frame
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _extend_shared_block(
+    path: Path,
+    contract: dict[str, Any],
+    symbols: list[str],
+    columns: list[str],
+    build: Callable[[list[str]], pd.DataFrame],
+    validate_sources: Callable[[], None],
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    cached = _read_shared_block(path, contract)
+    if cached is not None and not set(columns) <= set(cached):
+        raise RuntimeError(f"Unmaterialized rank features: {sorted(set(columns) - set(cached))}")
+    available = set(cached.symbol) if cached is not None else set()
+    missing = sorted(set(symbols) - available)
+    if missing:
+        fresh = build(missing)
+        if (fresh.symbol.duplicated().any() or set(fresh.symbol) != set(missing)
+                or not fresh.date.eq(pd.Timestamp(contract["target"])).all()):
+            raise RuntimeError("Shared rank block did not cover the requested exact-date keys")
+        if not set(columns) <= set(fresh):
+            raise RuntimeError(f"Unmaterialized rank features: {sorted(set(columns) - set(fresh))}")
+        features = fresh.columns.difference(calc.KEYS)
+        fresh[features] = fresh[features].astype("float32").replace([np.inf, -np.inf], np.nan)
+        if cached is not None and set(cached) != set(fresh):
+            raise RuntimeError("Shared rank block schema differs across candidate partitions")
+        cached = fresh if cached is None else pd.concat([cached, fresh], ignore_index=True)
+        validate_sources()
+        atomic_write_parquet(cached.sort_values("symbol"), path, index=False)
+        atomic_write_json(
+            {"contract": contract, "sha256": file_sha256(path), "rows": len(cached)},
+            path.with_suffix(".json"),
+        )
+    assert cached is not None
+    result = cached.loc[cached.symbol.isin(symbols), [*calc.KEYS, *columns]]
+    result = result.sort_values("symbol").reset_index(drop=True)
+    return result, {"computed_symbols": len(missing), "reused_symbols": len(symbols) - len(missing)}
 
 
 def materialize_rank_features(target_date: str, symbols: list[str], required: list[str], *,
@@ -75,6 +156,21 @@ def materialize_rank_features(target_date: str, symbols: list[str], required: li
                 workers=workers,index_root=index_root,require_complete_context=require_complete_context)
         finally:
             fcntl.flock(lock,fcntl.LOCK_UN)
+
+
+def materialize_production_rank_features(
+    target_date: str,
+    symbols: list[str],
+    required: list[str],
+    *,
+    root: Path,
+    workers: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Production consumers declare their projection, not a cache namespace."""
+    return materialize_rank_features(
+        target_date, symbols, required, root=root,
+        cache_root=root / "data/features/rank_runtime", workers=workers,
+    )
 
 
 def _read_candidate_partitions(paths: list[Path], symbols: set[str], workers: int, *,
@@ -146,36 +242,40 @@ def _materialize_rank_features(target_date: str, symbols: list[str], required: l
     observed_identity=_identity(source_paths)
     identity=(hashlib.sha256((json.dumps(pin.manifest['datasets'],sort_keys=True)+_identity(formula_paths)).encode()).hexdigest()
               if pin else observed_identity)
-    contract=dict(version=calc.VERSION,target=target.date().isoformat(),symbols=symbols,features=required,input_identity=identity)
-    key=hashlib.sha256(json.dumps(contract,sort_keys=True).encode()).hexdigest()
-    directory=cache_root/compact/key; manifest_path=directory/'manifest.json';output_path=directory/'features.parquet'
-    if manifest_path.exists() and output_path.exists():
-        old=json.loads(manifest_path.read_text())
-        if old.get('contract')==contract and old.get('output_sha256')==file_sha256(output_path):
-            return pd.read_parquet(output_path),{**old,'cache_hit':True}
-    directory.mkdir(parents=True,exist_ok=True)
-    keys=pd.DataFrame({'symbol':symbols,'date':target})
-    if not symbols:
-        result=keys.reindex(columns=['symbol','date',*required])
-    else:
-        store=MarketDataStore(MarketDataStoreConfig(backend='parquet',root=raw_root))
-        raw=_dated(store.read_market_range('daily',start_date='20140101',end_date=compact,symbols=symbols))
-        if raw.duplicated(calc.KEYS).any() or not set(symbols)<=set(raw.loc[raw.date.eq(target),'symbol']):
+    shared_contract = dict(
+        version=calc.VERSION, target=target.date().isoformat(), input_identity=identity,
+        source_mode="sealed" if pin else "local", complete_context=require_complete_context,
+        universe="canonical-market-cross-section",
+    )
+    mode = shared_contract["source_mode"]
+    context = "strict" if require_complete_context else "relaxed"
+    directory = cache_root / compact / f"shared-{mode}-{context}"
+    store = MarketDataStore(MarketDataStoreConfig(backend="parquet", root=raw_root))
+    legacy_columns = [column for column in required if column.startswith(_LEGACY_PREFIX)]
+    base_columns = [column for column in required if not column.startswith(_LEGACY_PREFIX)]
+    recent = None
+
+    def validate_sources():
+        if _identity(source_paths) != observed_identity:
+            raise RuntimeError("Inputs changed during rank feature calculation; retry from stable sources")
+
+    def read_prices(symbols):
+        raw = _dated(store.read_market_range("daily", start_date="20140101", end_date=compact, symbols=symbols))
+        if raw.duplicated(calc.KEYS).any() or not set(symbols) <= set(raw.loc[raw.date.eq(target), "symbol"]):
             raise RuntimeError('Rank candidate prices duplicated or missing on target date')
-        if 'vol' not in raw:
-            raw['vol']=raw.volume
+        if "vol" not in raw:
+            raw["vol"] = raw.volume
+        return raw
+
+    def build_base(symbols):
+        nonlocal recent
+        keys = pd.DataFrame({"symbol": symbols, "date": target})
+        raw = read_prices(symbols)
+        if legacy_columns:
+            recent = raw.sort_values("date").groupby("symbol", sort=False).tail(260)
         print('RANK FEATURES price',len(symbols),flush=True)
-        calculation_features=set(required)
-        if 'return_120d_minus_market' in required:
-            calculation_features.update(['return_120d','market_return_26w'])
-        if 'dividend_to_volatility' in required:
-            calculation_features.add('volatility_60d')
-        tasks=[(g.copy(),target,sorted(calculation_features)) for _,g in raw.groupby('symbol',sort=True)]
-        if workers==1:
-            prices=pd.concat([_stock_task(task) for task in tasks],ignore_index=True)
-        else:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                prices=pd.concat(list(pool.map(_stock_task,tasks,chunksize=8)),ignore_index=True)
+        tasks = ((group, target, None) for _, group in raw.groupby("symbol", sort=True))
+        prices = _map_stock_tasks(_stock_task, tasks, workers)
         # Read candidate daily-basic history once; retain the complete target
         # cross section for ranks, and older weekly observations for PB ranks.
         basic_columns=['ts_code','trade_date','turnover_rate','turnover_rate_f','volume_ratio','total_mv','circ_mv',
@@ -190,8 +290,10 @@ def _materialize_rank_features(target_date: str, symbols: list[str], required: l
         result=keys.merge(prices,on=calc.KEYS,validate='one_to_one')
         def attach(other: pd.DataFrame, *, on: list[str] = calc.KEYS) -> None:
             nonlocal result
-            columns=[c for c in sorted(calculation_features) if c in other and c not in result]
-            result=result.merge(other[[*on,*columns]],on=on,how='left',validate='many_to_one' if on==['date'] else 'one_to_one')
+            columns = other.select_dtypes(include=["number", "bool"]).columns.difference(result.columns)
+            if len(columns):
+                result = result.merge(other[[*on, *columns]], on=on, how="left",
+                                      validate="many_to_one" if on == ["date"] else "one_to_one")
         attach(basic_current)
         jq=calc.jq_price_features(raw,basic.loc[basic.symbol.isin(symbols)])
         attach(jq.loc[jq.date.eq(target)])
@@ -227,12 +329,10 @@ def _materialize_rank_features(target_date: str, symbols: list[str], required: l
         if set(indices.loc[indices.date.eq(target),'ts_code'])!={s.ts_code for s in KEY_INDEX_SPECS}:
             raise RuntimeError('Required index data incomplete on target date')
         index=calc.index_features(indices);attach(index.loc[index.date.eq(target)],on=['date'])
-        if 'return_120d_minus_market' in required:
-            result['return_120d_minus_market']=result.return_120d.astype('float32')-result.market_return_26w
-        if 'dividend_to_volatility' in required:
-            volatility=prices.set_index('symbol').volatility_60d.astype('float32')
-            dv=basic_current.set_index('symbol').dv_ttm.astype('float32')
-            result['dividend_to_volatility']=result.symbol.map(dv/volatility.replace(0,np.nan))
+        result['return_120d_minus_market']=result.return_120d.astype('float32')-result.market_return_26w
+        volatility=prices.set_index('symbol').volatility_60d.astype('float32')
+        dv=basic_current.set_index('symbol').dv_ttm.astype('float32')
+        result['dividend_to_volatility']=result.symbol.map(dv/volatility.replace(0,np.nan))
         for kind,paths in flow_paths.items():
             if not paths:
                 raise RuntimeError(f'Missing required {kind} source')
@@ -240,15 +340,43 @@ def _materialize_rank_features(target_date: str, symbols: list[str], required: l
             attach(calc.align_prior(keys,calc.flow_features(flows,kind)))
         events=_dated(pd.concat(_read_candidate_partitions(top_paths,set(symbols),workers),ignore_index=True))
         attach(calc.top_list_features(keys,events,dates,pd.DatetimeIndex(pd.to_datetime([p.stem.rsplit('_',1)[-1] for p in top_paths]))))
-        missing=set(required)-set(result)
+        return result
+
+    def build_legacy(symbols):
+        # Reuse bars from the base block when both are requested together.
+        have = set(recent.symbol) if recent is not None else set()
+        missing = sorted(set(symbols) - have)
+        parts = []
+        if have.intersection(symbols):
+            parts.append(recent.loc[recent.symbol.isin(symbols)])
         if missing:
-            raise RuntimeError(f'Unmaterialized rank features: {sorted(missing)}')
-        result=result[['symbol','date',*required]]
-        result[required]=result[required].astype('float32').replace([np.inf,-np.inf],np.nan)
-    if _identity(source_paths)!=observed_identity:
-        raise RuntimeError('Inputs changed during rank feature calculation; retry from stable sources')
-    atomic_write_parquet(result,output_path,index=False)
-    manifest=dict(status='success',contract=contract,output_sha256=file_sha256(output_path),rows=len(result),
-                  coverage=result[required].notna().mean().to_dict(),cache_hit=False,input_files=len(source_paths))
-    atomic_write_json(manifest,manifest_path)
+            parts.append(read_prices(missing))
+        raw = pd.concat(parts, ignore_index=True)
+        tasks = ((group, target) for _, group in raw.groupby("symbol", sort=True))
+        return _map_stock_tasks(_legacy_task, tasks, workers)
+
+    # These blocks use symbol-local history or a fixed market-wide observation
+    # universe. Never add a caller-universe rank to a shared block.
+    blocks = {}
+    result = pd.DataFrame({"symbol": pd.Series(symbols, dtype="str"), "date": target})
+    for block, columns, build in (("base", base_columns, build_base), ("legacy", legacy_columns, build_legacy)):
+        if symbols and columns:
+            rows, blocks[block] = _extend_shared_block(
+                directory / f"{block}.parquet", {**shared_contract, "block": block},
+                symbols, columns, build, validate_sources,
+            )
+            result = result.merge(rows, on=calc.KEYS, validate="one_to_one")
+    result = result.reindex(columns=[*calc.KEYS, *required])
+    validate_sources()
+    # The per-consumer digest remains a Parquet digest, without retaining a
+    # second on-disk copy for every distinct projection.
+    digest = hashlib.sha256(result.to_parquet(index=False)).hexdigest()
+    contract = dict(version=calc.VERSION, target=target.date().isoformat(), symbols=symbols,
+                    features=required, input_identity=identity)
+    manifest = dict(
+        status="success", contract=contract, output_sha256=digest, rows=len(result),
+        coverage=result[required].notna().mean().to_dict(),
+        cache_hit=bool(blocks) and all(item["computed_symbols"] == 0 for item in blocks.values()),
+        shared_blocks=blocks, input_files=len(source_paths),
+    )
     return result,manifest

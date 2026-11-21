@@ -58,7 +58,7 @@ jobs:
         run: |
           python -m pip --isolated install --disable-pip-version-check \
             --index-url https://pypi.org/simple \
-            -c requirements/constraints-ci-py313.txt xgboost==3.2.0
+            -c requirements/constraints-ci-py313.txt xgboost==3.2.0 polars
           python -m pip check
           python -m pip show xgboost
       - name: Record actual runtime in the job log
@@ -77,6 +77,12 @@ jobs:
           tests/test_f5_source_journal.py
           tests/test_dataset_revision_store.py tests/test_quant.py::TestMarketDataStore
           tests/test_ci_runtime.py tests/test_architecture_boundaries.py
+      - name: Enforce shared rank feature reuse and invalidation
+        if: matrix.python == '3.13'
+        run: >-
+          python -m pytest -q
+          tests/test_rank_feature_snapshot.py::test_rank_materialization_reads_sealed_sources_and_reuses_cache
+          tests/test_rank_feature_snapshot.py::test_rank_block_invalidates_on_source_revision_and_checksum_failure
       - name: Check refresh source coverage and checkpoint contracts
         run: >-
           python -m pytest -q

@@ -12,7 +12,7 @@ import pandas as pd
 from quant.application.left_side_ranking import LeftSideRankingConfig, load_left_side_ranking_scores
 from quant.data.atomic_io import atomic_write_json, atomic_write_parquet
 from quant.ml.rank_fusion import RankFusion, file_sha256
-from quant.routine.rank_feature_runtime import materialize_rank_features
+from quant.routine.rank_feature_runtime import materialize_production_rank_features
 
 
 def run_left_ranknet(target_date: str, *, config: LeftSideRankingConfig, root: Path) -> dict[str,Any]:
@@ -23,9 +23,9 @@ def run_left_ranknet(target_date: str, *, config: LeftSideRankingConfig, root: P
     model=RankFusion.load(config.paths.artifact_manifest)
     signals=load_left_side_signal_universe(target,config=config)
     compatibility={c:f'selector_legacy__{c}' for c in LEFT_SIDE_RULE_FEATURE_COLUMNS}
-    features,feature_cache=materialize_rank_features(date,signals.symbol.tolist(),
+    features,feature_cache=materialize_production_rank_features(date,signals.symbol.tolist(),
         [*model.required_features,*compatibility.values()],
-        root=root,cache_root=root/'data/features/rank_runtime',workers=config.factor_workers)
+        root=root,workers=config.factor_workers)
     feature_frame=features.merge(signals,on=['symbol','date'],validate='one_to_one').copy()
     feature_frame['ts_code']=feature_frame.symbol;feature_frame['trade_date']=target.strftime('%Y%m%d')
     identity=dict(features=feature_cache['output_sha256'],release=file_sha256(config.paths.artifact_manifest),

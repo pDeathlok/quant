@@ -26,7 +26,7 @@ def test_cash_gate_excludes_all_rows_and_repeated_score_reuses_checkpoint(tmp_pa
     signals=features[['symbol','date']].assign(B1=True,SB1=False,SUPER_B1=False,LOW_PULLBACK=False)
     monkeypatch.setattr(old,'load_left_side_signal_universe',lambda *a,**k:signals)
     cache={'output_sha256':'fixed-source','cache_hit':True,'contract':{'input_identity':'fixed'}}
-    monkeypatch.setattr(live,'materialize_rank_features',lambda *a,**k:(features,cache))
+    monkeypatch.setattr(live,'materialize_production_rank_features',lambda *a,**k:(features,cache))
     monkeypatch.setattr(etf,'model_identity',lambda:None)
     monkeypatch.setattr(etf,'market_context_identity',lambda _: 'fixed')
     monkeypatch.setattr(etf,'rank_with_etf',lambda side,frame,base,*a,**k:(base,{'status':'not_admitted'}))
