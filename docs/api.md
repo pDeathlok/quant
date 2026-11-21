@@ -19,15 +19,16 @@
 | `GET` | `/api/chan/strategy-plan` | `top_n`、`signal_date`、`refresh` | 缠论候选 |
 | `POST` | `/api/chan/strategy-plan/refresh` | `top_n`、`signal_date` | 强制刷新缠论候选 |
 | `GET` | `/api/long/stock-pool` | `variant`、`signal_date`、`refresh` | 长线股票池 |
+| `GET` | `/api/long/blood-chip` | `signal_date`、`refresh` | 带血筹长线计划 |
 | `GET` | `/api/convertible-bonds/plan` | `trade_date`、`limit`、`refresh` | 可转债计划 |
 | `GET` | `/api/convertible-bonds/allotments` | `limit`、`include_listed_days`、`refresh`、`stage_scope` | 配债股跟踪 |
 | `GET` | `/api/byd/daily-plan` | 持仓、成本和当日做T参数 | BYD 日线计划 |
-| `GET` | `/api/transition/plan` | `strategy=return\|win`、`refresh` | 当前市场过渡工作区 |
+| `GET` | `/api/transition/plan` | `strategy=return\|win`、`refresh` | 多状态右侧收益型或胜率型 |
 | `PUT` | `/api/transition/account/{strategy}` | `revision`、`cash`、`positions` | 保存用户提供的过渡账户状态；版本冲突返回 409 |
 | `GET` | `/api/similar-patterns/analysis` | `refresh` | 相似走势分析 |
 | `POST` | `/api/similar-patterns/analysis/refresh` | 无 | 强制刷新相似走势 |
 
-日期参数中，股票和策略信号日期使用 `YYYY-MM-DD`；可转债 `trade_date` 使用 `YYYYMMDD`。
+日期参数中，股票和策略信号日期使用 `YYYY-MM-DD`；可转债返回的 `trade_date` 为 `YYYYMMDD`，验收时先统一格式再比较。
 
 ## 相似走势自选池
 
@@ -56,7 +57,7 @@ curl -X POST http://127.0.0.1:8088/api/selector/refresh-latest \
 curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 ```
 
-可用作用域：
+指定历史补跑日期时，在请求体传 `"trade_date":"YYYY-MM-DD"`；例行运行优先使用[统一脚本](operations.md#手工刷新页面工作区)，由脚本检查交易日并处理重试。可用作用域：
 
 | `scope` | 页面 |
 | --- | --- |
@@ -66,12 +67,36 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 | `long` | 长线策略 |
 | `cb` | 可转债策略 |
 | `cbAllotment` | 配债股 |
-| `byd` | 市场过渡（沿用内部兼容名称） |
+| `byd` | 多状态右侧（沿用内部兼容名称，不是历史 BYD 分钟策略） |
 | `similar` | 相似走势 |
 
 状态响应包含 `run_id`、`trade_date`、`status`、`percent`、`current_step`、`steps`、`result` 和 `error`。网页按 `steps` 显示已完成步数，`percent` 保留为兼容字段。终态为 `success` 或 `failed`，可通过 `manifest_path` 查看运行清单。当日全量任务将股指步骤记在 `steps` 的 `index_futures` 项，预案结果写入 `result.index_futures`。
 
 `/api/selector/stocks` 还返回同日 ETF 资金背景 `etf_flow`；历史查询按信号日读取。已启用的模型组合由正式发布产物读取，不在 GET 请求中重新训练。模型/日期不匹配的候选结果不能替代历史发布快照。
+
+### 核验页面实际读取
+
+先查询交易日历，记录响应头 `X-Quant-Generation`，再给相关 GET 请求携带同一代标识。版本不可用时按 409 处理，重新取交易日历；不要把不同版本的响应拼在一起。示例（将变量替换为待验证发布代和日期）：
+
+```bash
+base=http://127.0.0.1:8088
+generation=$(curl -fsS -D - -o /dev/null "$base/api/selector/calendar" |
+  awk 'tolower($1) == "x-quant-generation:" {sub(/\r$/, "", $2); print $2}')
+test -n "$generation" || exit 1
+target=2026-11-20
+curl -fsS -D - -H "X-Quant-Generation: $generation" \
+  "$base/api/selector/stocks?signal_date=$target&include_extended=true"
+```
+
+| 页面 | 核对字段和路径 |
+| --- | --- |
+| 短线、缠论、长线 | 各接口的 `signal_date`；长线分别核对股票池与带血筹 |
+| 可转债、配债股 | `trade_date`、`asof`；配债股另核对实际明细的行情和股本日期 |
+| 多状态右侧 | 分别请求 `strategy=return` 和 `strategy=win`，核对 `signal_date`、下一交易日 `trade_date` 及响应耗时 |
+| 自选池与向量 | `/api/similar-patterns/analysis` 的 `target_date` 与参考库来源日；`/api/similar-patterns/watchlist?include_scores=true` 的逐股 `score_date` |
+| 股指战法 | `/data/index-futures/signal.json` 的信号日和执行日；`research.json` 的冻结回测日期不当作信号日 |
+
+操作计划和复盘是用户记录，不要求记录日期等于日更日期。仅核验时不要传 `refresh=true` 或提交刷新请求。
 
 ## 复盘记录与操作计划
 

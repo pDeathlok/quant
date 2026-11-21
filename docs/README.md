@@ -27,6 +27,7 @@
 ## 因子与变量
 
 - [因子治理与生命周期](factor_governance.md)：统一注册表、计算层、生产日更边界、生命周期状态机、迁移门禁和维护流程。
+- [因子执行与并行治理](factor_execution_and_parallelism.md)：新模型与变量如何接入共享计算，复用边界、资源预算与必跑回归。
 - [完整因子目录](factor_catalog.md)：从机器注册表自动生成的全部因子、兼容别名和身份字段清单。
 - [每日统一因子层](daily_factor_layer.md)：日频项目因子、轻量缓存和长线快照的计算与物化边界。
 - [Tushare 因子体系](factor_tushare_factor_system.md)

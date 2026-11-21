@@ -7,14 +7,14 @@ Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、
 ## 能力概览
 
 - 增量刷新 Tushare 日线数据；MySQL 使用统一 `market_daily` 表，Parquet 使用年月分区镜像。
-- 每日同步 `daily_basic`、`stock_basic`、沪深300、最近报告期财务数据，以及涨跌停、停牌、ST 的当日可交易快照。
+- 按活动策略依赖同步 `daily_basic`、`stock_basic`、指数、资金流、龙虎榜及财报等生产输入。涨跌停、停牌和 ST 的独立可交易性快照按研究或回填需要刷新。
 - 复用正式日线生成每日 `risk_on/neutral/risk_off` 市场状态；无需接入第二套行情源。
 - 构建 B1/B2/B3 与扩展策略特征、模型评分和每日候选池。
 - 提供组合构建、防泄漏 Walk-Forward、因子诊断、绩效归因、风险容量、标准报告和可持久化模拟交易能力。
 - 在 FastAPI + 静态前端工作台中查看策略结果、模型组合候选和 ETF 资金背景。
 - 股指战法使用冻结研究历史与独立更新的开仓预案；操作计划和复盘笔记由用户维护。
 - 按日期保存选股器和工作区快照，支持历史复盘。
-- 每日流水线采用有依赖的并行编排，单个非核心工作区失败不会阻断其他工作区。
+- 每日流水线按依赖并行计算；必需产物缺失或校验失败时不会发布半成品。
 - 以模块化单体方式维护应用用例、存储适配和 HTTP 交付边界，避免工作区继续堆叠在 Web 服务层。
 - JS/CSS 静态资源支持 gzip、模块预加载和显式缓存策略，桌面端与 390px 移动端均纳入真实浏览器验收。
 
@@ -33,18 +33,15 @@ Tushare-first 的量化研究与每日策略工作台，覆盖短线、缠论、
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install -e ".[dev]" && (test -f .env || cp .env.example .env)
+```
+
+Git 不包含正式行情、模型权重与页面快照。按[开发说明](docs/development.md#环境与运行产物)恢复已启用模型的产物与清单，选择 MySQL 或显式配置文件后端，再启动：
+
+```bash
 PYTHONPATH=src python scripts/run_webapp.py
 ```
 
-打开 [http://127.0.0.1:8088](http://127.0.0.1:8088)。API 健康检查位于 [http://127.0.0.1:8088/api/health](http://127.0.0.1:8088/api/health)，交互式 API 文档位于 [http://127.0.0.1:8088/docs](http://127.0.0.1:8088/docs)。
-
-Git 不包含正式行情、模型权重与页面快照。首次启动不会自动生成历史研究成果；需要恢复对应产物并核对版本后才能获得完整策略输出，详见 [开发与验证](docs/development.md)。
-
-首次进行真实数据刷新前，编辑 `.env` 并至少填写：
-
-```dotenv
-TUSHARE_TOKEN=your_token
-```
+打开 [工作台](http://127.0.0.1:8088)、[健康检查](http://127.0.0.1:8088/api/health)或 [API 文档](http://127.0.0.1:8088/docs)。健康检查成功不代表当天策略已发布。正式刷新前在 `.env` 中配置有效的 `TUSHARE_TOKEN`。
 
 ## 每日任务
 
@@ -52,7 +49,7 @@ TUSHARE_TOKEN=your_token
 
 ```bash
 python scripts/run_daily_web_refresh.py
-# 等价入口
+# 同一编排的 CLI；默认复用健康服务
 PYTHONPATH=src python -m quant.routine.cli web-refresh
 ```
 
@@ -62,12 +59,12 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 执行顺序为：
 
 1. 获取跨进程单实例锁，并用交易日历确认当天是否执行。
-2. 复用健康的 Web 服务，通过 API 启动与页面“更新全部”一致的任务。
+2. 定时脚本默认尝试重启托管服务（已有活动任务时接管监控），通过 API 启动与页面“更新全部”一致的任务；`--no-restart-service` 可复用健康服务。
 3. 按活动依赖闭包清理缓存并刷新共享 Tushare 行情、当前策略实际需要的 `daily_basic` 与参考数据；`tradability` 只在研究/显式回填任务中刷新。
 4. 使用截至当日的沪深300、全市场宽度、波动率和成交额生成市场状态日期快照与 `latest.json`。
 5. 先增量构建便宜的规则信号和 B1/Z 候选并集，再只为命中股票计算完整重因子，避免全市场重复计算和两套进程池争抢资源。
 6. 共享数据封存后按依赖和统一资源配额启动下游任务；相似走势向量分析可提前执行，策略快照齐备后再补齐同日买入/持有评分和只读策略标记。排名、模型组合与页面产物按所选作用域执行。
-7. 原子发布正式文件，并将步骤状态、起止时间、耗时和结果写入 `data/routine/<运行时间>_<run_id>/manifest.json`。
+7. 历史审计和当日产物校验通过后原子发布。按[刷新验收清单](docs/operations.md#刷新验收)核对日期、发布指针和实际页面读数。
 
 「更新全部」和短线页的「更新本页」会发布同日宽基 ETF 资金快照。快照使用 Tushare 日度数据和固定的 15 只 ETF，显示 5/20 交易日估算净申购、占期初规模比例、放量倍数和覆盖率。成交指标滞后一交易日，资金指标至少滞后两交易日并遵守净值公告日。接口随 `/api/selector/stocks` 返回 `etf_flow`，历史日期按当日快照读取。ETF 采集异常会记录到刷新结果，候选评分可继续完成。
 
@@ -85,7 +82,7 @@ PYTHONPATH=src python -m quant.routine.cli web-refresh
 | --- | --- | --- |
 | `TUSHARE_TOKEN` | 无 | 正式拉取 Tushare 数据时必填 |
 | `MARKET_DATA_BACKEND` | `mysql` | `mysql`/`sql` 使用 SQL 主存储，其他值使用 Parquet |
-| `MARKET_DATA_SQL_URL` | 无 | SQLAlchemy MySQL 连接串；未配置时可回落到 Parquet 镜像 |
+| `MARKET_DATA_SQL_URL` | 无 | MySQL 后端必填；改用 Parquet 时显式设置 `MARKET_DATA_BACKEND=file` |
 | `MARKET_DATA_ROOT` | `data/raw` | Parquet 数据根目录 |
 | `MARKET_DATA_MIRROR_PARQUET` | `1` | SQL 写入时是否同时更新 `data/raw/daily_partitioned/year_month=YYYYMM/data.parquet` |
 | `MARKET_DATA_SQL_BATCH_SIZE` | `5000` | 全市场 MySQL 批量 upsert 每批行数 |
@@ -159,12 +156,12 @@ python scripts/review_convertible_bond_watchlist.py plan
 python scripts/review_convertible_bond_watchlist.py plan --refresh
 ```
 
-生成计划前会逐股比较每日页面结果和复核全集中的阶段、公告标题、公告日期和公告链接；两边任一股票缺失或公告证据不一致都会中止，不产出可执行计划。计划会写入 `data/routine/convertible_bond_watchlist_review_latest.json`，并输出待出池、待入池、待补配债标记和需人工复核四类名单。只有确认名单后，才使用计划输出的完整 `plan_id` 执行：
+生成计划前会逐股比较每日页面结果和复核全集中的阶段、公告标题、公告日期和公告链接；两边任一股票缺失或公告证据不一致都会中止，不产出可执行计划。计划会写入 `data/routine/convertible_bond_watchlist_review_latest.json`，并输出待出池、待入池、待补配债标记和需人工复核四类名单。只有确认名单后，才将计划输出的完整 `plan_id` 赋给同名 Shell 变量并执行：
 
 ```bash
 PYTHONPATH=src python scripts/review_convertible_bond_watchlist.py apply \
   --plan data/routine/convertible_bond_watchlist_review_latest.json \
-  --confirm <plan_id>
+  --confirm "$plan_id"
 ```
 
 `apply` 会拒绝错误确认码、非当日计划，以及生成计划后又被其他操作改动过的自选池。执行前会在同目录生成 `watchlist.before_cb_review_<时间>_<plan_id>.json` 备份，再原子更新正式自选池。入池条件是“上市委通过”或“同意注册”；股权登记日早于复核日才列为待出池。数据源缺失或阶段异常回退只会进入人工复核，不会自动出池。

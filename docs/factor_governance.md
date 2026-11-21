@@ -4,20 +4,11 @@
 
 ## 当前治理基线
 
-注册表 schema 为 `factor_registry_v2_governed`，当前共有 628 条记录。
+注册表 schema 为 `factor_registry_v4_orthogonal_execution_dag`。记录、分组和数量以机器生成的[因子目录](factor_catalog.md)及运行时注册表为准，不在这里维护第二份计数。
 
-| 维度 | 状态 | 数量 | 含义 |
-| --- | --- | ---: | --- |
-| 角色 | `feature` | 610 | 有独立语义的规范因子 |
-| 角色 | `compatibility_alias` | 0 | 旧名称消费者已清零并从注册表删除 |
-| 角色 | `strategy_identity` | 18 | 左/右策略身份字段 |
-| 生命周期 | `production_model` | 236 | 被当前生产模型直接消费 |
-| 生命周期 | `production_materialized` | 218 | 被生产规则、页面或快照直接物化 |
-| 生命周期 | `research_candidate` | 156 | 已登记且可研究，未承诺生产日更 |
-| 生命周期 | `compatibility_alias` | 0 | 当前没有活动兼容别名 |
-| 生命周期 | `strategy_identity` | 18 | 随对应策略产物管理 |
-
-刷新节奏共有 472 条 `trade_daily` 记录和 156 条 `on_demand` 记录。刷新节奏是声明，活动 DAG 才是执行依据；两者不一致时生产门禁必须失败，而不是静默漏算。
+- 角色区分规范公式（`feature`）、兼容别名（`compatibility_alias`）和策略身份（`strategy_identity`）。
+- 生命周期区分生产模型输入（`production_model`）、被规则或快照物化（`production_materialized`）和研究候选（`research_candidate`）。
+- 刷新节奏（`trade_daily`、`on_demand`）是声明，活动 DAG 才是执行依据。两者不一致时生产门禁必须失败，而不是静默漏算。
 
 ## 三个事实来源
 
@@ -117,6 +108,8 @@ compatibility_alias
 3. 模型覆盖、分布、缺列和 schema 不兼容测试通过；
 4. 先发布新 artifact，再切换活动消费者；
 5. 生命周期改为 `production_model`，不得让旧模型静默消费新公式。
+
+新增生产消费者还须证明实际走共享计算入口，而不只是已登记同一规范字段。接入、缓存口径及回归要求见[排序模型的共享执行契约](factor_execution_and_parallelism.md#排序模型的共享执行契约)。
 
 ### 生产因子降级为研究候选
 

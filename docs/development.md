@@ -14,7 +14,7 @@ test -f .env || cp .env.example .env
 PYTHONPATH=src python scripts/run_webapp.py
 ```
 
-源码仓库不含 `data/`、`models/`、`reports/` 和 `web/data/`。空数据目录可以启动服务，但不会自动获得正式候选、模型评分或冻结研究页面；生产配置引用的模型及其 manifest 必须另行恢复并核对哈希。不要通过放宽日期、缺失数据或模型身份检查来让空环境看起来已就绪。
+源码仓库不含 `data/`、`models/`、`reports/` 和 `web/data/` 的运行产物。启动前从受控备份恢复当前生产配置引用的模型、策略清单及权重，并核对哈希；缺少活动模型时应用初始化也可能失败。要查看已有结果，还需恢复正式行情、页面产物与对应发布指针。只用 Parquet 时显式设置 `MARKET_DATA_BACKEND=file`，不要保留 `mysql` 后端再假设会自动回退。不要通过放宽日期、缺失数据或模型身份检查让空环境看起来已就绪。
 
 ## 本地回归
 
@@ -36,6 +36,8 @@ git diff --check
 Node 用于前端回归；`tests/frontend/*.test.js` 不需要启动 Web 服务，也不等同于真实浏览器验收。缺少 PyTorch 等可选依赖时应保留并报告 skip 原因。完整 Ruff 规则仍可用于局部清理，但上述命令针对语法错误和未定义名称，不宣称所有历史代码均满足格式规范。
 
 涉及因子注册表时运行 `PYTHONPATH=src python scripts/generate_factor_catalog.py` 并核对差异。涉及刷新、模型发布或页面交互时，优先覆盖输入日期、候选覆盖、版本身份、失败保留旧产物和历史快照隔离。
+
+新增生产模型或因子先阅读 [仓库约定](../AGENTS.md) 和 [共享计算验收](factor_execution_and_parallelism.md#新模型和变量接入)。仅完成注册不代表计算已复用；提交应附重叠候选计算次数、输出等价性和源修订失效的验证结果。
 
 ## 文件归属与提交
 

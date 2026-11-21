@@ -88,7 +88,7 @@ curl --fail http://127.0.0.1:8088/api/health
 
 ```bash
 python scripts/run_daily_web_refresh.py
-# 等价：PYTHONPATH=src python -m quant.routine.cli web-refresh
+# 同一编排的 CLI：PYTHONPATH=src python -m quant.routine.cli web-refresh
 ```
 
 - 该入口与页面“更新全部”共用 Web 编排、断点续跑和状态记录。
@@ -101,18 +101,22 @@ python scripts/run_daily_web_refresh.py
 find data/routine -name manifest.json -type f -print | sort | tail -1
 ```
 
-核对清单的 `run_id`、`scope` 和 `trade_date`，再确认 `status` 与各步骤状态。当日 `all` 任务还要检查 `result.index_futures.status` 为 `success`，并核对其 `signal_date` 与 `web/data/index-futures/signal.json` 一致。股指预案另有 `execution_date`，表示下一交易日。
-
 正式入口会先从当前生产产品和晋级模型反推活动依赖，只刷新该 scope 真正使用的数据。当前左侧 RankNet 已将 moneyflow、margin_detail、龙虎榜及所需指数纳入生产闭包；这些源会按合同刷新。`tradability`、holder-trade 等未被活动消费者要求的研究输入不会被顺带日更。
 
-刷新前后分别发布 `data/contracts/daily_dependencies/*-preflight.json` 和 `*-postflight.json`。结束时检查 `latest.json`：
+### 刷新验收
 
-- `target_trade_date` 等于行情源确认的目标交易日；
-- `freshness_audit.status` 为 `success`；
-- `refresh_node_ids` 为空，表示没有尚未执行的 dirty/poll 节点；
-- 行情、模型分和最终产物等 exact-date 节点均为目标日；
-- 财报、研报和维表等事件源证明已轮询到目标日，即使当天没有新记录；
-- 当前 scope 使用市场状态时，`data/features/market_regime/latest.json` 的 `as_of` 与沪深300、全市场日线日期一致。
+不要只看页面进度 100% 或 `latest_refresh_status.json` 的最后一条状态：单页任务也会覆盖它。用脚本返回的运行清单匹配 `run_id`、`scope` 和目标交易日，再逐项核对：
+
+| 层次 | 核验依据 | 全量验收条件 |
+| --- | --- | --- |
+| 脚本终态 | 退出码、`manifest_path`、`started_at`、`finished_at` | 正常退出，`status=success`，`failed_count=0`；`skipped` 不是完成刷新 |
+| 历史底层 | `data/routine/historical_integrity_latest.json` | 审计覆盖目标日且 `failure_count=0`；单独记录 `warning_count` |
+| 当日产物 | 对应运行的 `result.dependency_postflight` 与 `data/contracts/daily_dependencies/*-postflight.json` | 目标日匹配、`status=success`、`freshness_audit.status=success`，且 `refresh_node_ids` 为空 |
+| 历史变更 | `data/routine/daily_basic_dirty_dates.json` | 变更待重算清单已清空；未清空不能称依赖缓存已齐全 |
+| 发布与读取 | `result.publication`、`data/publications/current.json`、浏览器实际请求 | 发布代和目标日一致；响应确实读到目标日，且不是旧快照或临时计算失败 |
+| 当日股指 | `result.index_futures`、`GET /data/index-futures/signal.json` | 当日任务要求预案时已成功，`signal_date` 是目标日；`execution_date` 是下一交易日 |
+
+信号、行情、评分等 exact-date 节点必须与目标日一致；财报、研报等事件源验证的是轮询覆盖日期，不要求当天一定有新公告。已发布的股票代和股指同日预案是两个验收项，后者失败不能把前者也报成未发布。接口和代际校验示例见 [API 参考](api.md#核验页面实际读取)。
 
 完整合同和新增策略/因子的维护流程见 [每日依赖注册表](daily_dependency_registry.md)。
 
@@ -198,6 +202,15 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 
 只补跑单个工作区时，将作用域替换为 `short`、`chan`、`long`、`cb`、`cbAllotment`、`byd` 或 `similar`。后台状态同时持久化到 `data/routine/latest_refresh_status.json`。
 
+运维补跑指定日期用同一个入口，例如：
+
+```bash
+python scripts/run_daily_web_refresh.py --trade-date 2026-11-20
+python scripts/run_daily_web_refresh.py --trade-date 2026-11-20 --scope byd
+```
+
+单页补跑不等于补齐该日全量产物。目标日全量未发布时，应补跑 `all`；不要用单页结果替代全量验收。
+
 ## 例行一键刷新脚本
 
 日常定时任务优先调用同一个脚本，让它自己完成交易日判断、服务检查/启动、触发“更新全部”、进度打印，以及失败后的自动重试：
@@ -225,9 +238,11 @@ cd /absolute/path/to/quant && PYTHONPATH=src python3 -m quant.routine.cli web-re
 9. 股票策略发布后，全量任务最早于北京时间 18:00 生成股指开仓预案。网页进度和同一次任务的清单均记录此步骤。未通过数据或模型检查时，每隔至多 10 分钟单独重试至 19:00；19:00 后才进入这一步则立即检查一次。仍未发布会保留上一份预案，并在全量任务的 `result.index_futures` 和定时入口的退出码中报错；已发布的 7 个页面不受影响。历史日期补跑与单页任务跳过股指步骤。
 10. 每次 Web 刷新终态都会保存独立的 `data/routine/<运行时间>_<run_id>/manifest.json`，其中包含每一步的状态、起止时间、耗时、结果和错误；`latest_refresh_status.json` 只作为最新状态指针。
 11. 服务端刷新开始前自动清理缓存：手工回测生成的长线研究缓存只保留最近 2 组，相似走势正式向量只保留最新一套，smoke 测试向量缓存全部删除，Tushare 单股请求缓存保留最近 7 天。Tushare `daily_basic` 请求缓存也保留最近 7 天，但只有对应正式文件存在且非空时才删除。已被合并可转债日线覆盖的逐日请求缓存会删除；B1 时间戳研究报告每类保留最近 2 版，可重建的超大 trade-samples 只保留最新 1 版，内容相同的 `latest` 文件使用硬链接去重。策略快照保留 30 天、每个业务分组最多 10 个日期；workspace 快照保留 14 天、每组最多 3 个日期；数据源审计保留 30 天且最多 10 次；routine 历史运行保留 14 天且最多 5 次。每个业务分组最新一期始终保留，对应 MySQL 快照表同步执行相同规则。
-12. 相似走势的全市场历史参考库每 7 天最多重建一次；每日任务仍会直接读取自选池股票的最新日线，现场计算目标向量并完成匹配。因此自选股信号按日更新，历史样本及其后续收益标签按周更新。
+12. 自选池目标向量、当日评分与历史参考向量库是不同产物。参考库通常在周五 15:00（北京时间）后、周五数据就绪时更新；目录损坏、缺失、过期或显式强制时按修复策略处理，不受正常周更窗口限制。核对分析响应中的 `target_date`、`watchlist_score_dates`、`cache.reference_library_source_trade_date` 和 `cache.reference_library_refreshed_at`，不要仅凭文件修改时间判断是否重建。
 13. B1 与 Z 当日候选先取 symbol 并集，只计算一次 147 项目因子；B1 原缓存保留 B1 gate 语义，Z 优先复用 `active_candidate_project_features.parquet`，缺失 symbol 才补算。
 14. 模型 artifact 与策略/因子 `contract_sources` 都按内容哈希复用；只有版本变化才重新编译模型特征合同并把对应下游标为 dirty。
+
+左侧 RankNet 与组合策略共用按目标日和封存输入分区的特征缓存。在两个特征清单的 `shared_blocks` 分别看 `computed_symbols` 和 `reused_symbols`，将实际计算和等待源数据、封存及发布耗时分开比较。排序特征缓存清理见[因子执行契约](factor_execution_and_parallelism.md#排序模型的共享执行契约)。
 
 清理逻辑也会在 `daily` CLI 开始前执行。需要单独维护或立即释放空间时可运行：
 
@@ -366,15 +381,13 @@ ROUTINE_DAILY_FINAL_RETRY_SLEEP=1.5
 
 处理：
 
-1. 检查 `MARKET_DATA_SQL_URL`、网络和账号权限。
-2. 保持 `MARKET_DATA_MIRROR_PARQUET=1`，本地计算可继续使用 Parquet 镜像。
-3. MySQL 恢复后重跑每日任务，补写当日快照。
-
-未配置 SQL URL 时，行情层可以回落到 Parquet；依赖 SQL 的历史工作区快照不会持久化，页面可能重新计算。
+1. 检查 `MARKET_DATA_SQL_URL`、网络和账号权限。MySQL 后端不会因连接失败自动切换到文件后端。
+2. 本地诊断需要用镜像时，显式设置 `MARKET_DATA_BACKEND=file`，并先核对镜像日期与覆盖率。不要把诊断输出发布为生产代。
+3. 恢复生产 MySQL 后重跑原入口，并按[刷新验收](#刷新验收)核对结果。
 
 ### 单个 Tab 失败
 
-每日流水线会继续执行其他非短线工作区，并在 manifest 的 `refresh_daily_web_workspaces` 下记录失败项和错误文本。
+并行分支可能继续计算，但缺少必需工作区会阻止全量发布。先看对应运行的 `steps`、`error` 和 `result`，再用该页实际请求区分“产物没生成”“没发布”和“读取超时”。
 
 处理：
 
@@ -400,8 +413,8 @@ curl http://127.0.0.1:8088/api/selector/refresh-latest/status
 1. 当天是否为交易日，Tushare 是否已经发布当日日线。
 2. manifest 的 `refresh_data` 是否成功，最新行情日期是否前进。
 3. 对应工作区步骤是否成功。
-4. 页面是否读取了带旧参数的快照；使用页面刷新按钮强制重建。
-5. 配债股和相似走势的 `generated_at` 是否为当天；两者首次打开会自动补刷过期缓存。
+4. 检查请求的 `signal_date`、工作区变体和响应的 `X-Quant-Generation`，确认读取的就是目标发布代。
+5. 日期字段比 `generated_at` 更可靠。日期正确但 GET 超时时，先排查读取路径是否在请求中联网或重算；不要直接当作上游缺数据继续全量重跑。
 
 ### BYD 历史分钟训练数据（兼容入口）
 
